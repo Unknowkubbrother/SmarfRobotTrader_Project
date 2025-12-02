@@ -1,0 +1,21 @@
+version: '3'
+services:
+  metatrader5-macos:
+    platform: linux/amd64
+    image: unknowkubbrother/metatrader5_macos
+    container_name: metatrader5-macos
+    volumes:
+      - config:/config
+    ports:
+      - 3000:3000
+      - 8001:8001
+      - 5555:5555
+      - 6000:6000
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - CUSTOM_USER=admin
+      - PASSWORD=12345
+
+volumes:
+  config:

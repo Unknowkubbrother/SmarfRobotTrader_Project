@@ -1,0 +1,19 @@
+version: '3'
+services:
+  mt5:
+    image: ghcr.io/gmag11/metatrader5-docker:2.2
+    container_name: mt5
+    network_mode: bridge
+    ports:
+      - 3000:3000
+      - 8001:8001
+      - 5555:5555
+      - 6000:6000
+    volumes:
+      - config:/config
+    environment:
+      - CUSTOM_USER=admin
+      - PASSWORD=1234
+
+volumes:
+  config:
