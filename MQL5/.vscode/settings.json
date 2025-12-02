@@ -1,10 +1,11 @@
 {
-    "C_Cpp.default.forcedInclude": [
-        "c:\\Users\\Hp\\.vscode\\extensions\\l-i-v.mql-tools-2.2.0\\data\\mql5_en.mqh"
-    ],
-    "C_Cpp.errorSquiggles": "disabled",
-    "files.associations": {
-        "*.dbclient-js": "javascript",
-        "*.mq5": "cpp"
-    }
+  "C_Cpp.default.forcedInclude": [
+    "c:\\Users\\Hp\\.antigravity\\extensions\\l-i-v.mql-tools-2.2.0\\data\\mql5_en.mqh"
+  ],
+  "C_Cpp.errorSquiggles": "disabled",
+  "files.associations": {
+    "*.mqh": "cpp",
+    "*.mq4": "cpp",
+    "*.mq5": "cpp"
+  }
 }
