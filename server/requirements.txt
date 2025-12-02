@@ -1,0 +1,3 @@
+fastapi[standard]
+uvicorn
+git+https://github.com/lucas-campagna/mt5linux.git@master
