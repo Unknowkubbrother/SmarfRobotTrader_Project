@@ -1,0 +1,10 @@
+gymnasium
+stable-baselines3
+pandas
+numpy
+shimmy
+ta
+scikit-learn
+joblib
+matplotlib
+torch
