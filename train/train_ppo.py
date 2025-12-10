@@ -113,14 +113,21 @@ def load_and_process_data(filepath, save_scaler=True):
     
     return df, feature_cols
 
-def train_ppo():
+def train_ppo(use_llm_analysis=True, analysis_interval=5):
     """
     ฟังก์ชันหลักสำหรับเทรนโมเดล PPO
     - โหลดและประมวลผลข้อมูล
     - แบ่งข้อมูลเป็น Train/Test
     - สร้าง Environment
-    - เทรนโมเดล
+    - เทรนโมเดล (พร้อม LLM Analysis)
     - บันทึกโมเดลและข้อมูลทดสอบ
+    
+    Parameters:
+    -----------
+    use_llm_analysis : bool
+        เปิดใช้งาน LLM Analysis หรือไม่ (default: True)
+    analysis_interval : int
+        ทุกๆ กี่ iteration จะให้ LLM วิเคราะห์ (default: 5)
     """
     # โหลดและประมวลผลข้อมูล
     df, feature_cols = load_and_process_data('EURUSD_2009_to_present.csv')
@@ -145,6 +152,15 @@ def train_ppo():
     train_env = DummyVecEnv([lambda: TradingEnv(train_df[env_cols])])
     
     # ==========================================
+    # สร้าง LLM Analyzer (ถ้าเปิดใช้งาน)
+    # ==========================================
+    llm_analyzer = None
+    if use_llm_analysis:
+        from llm_analyzer import LLMTrainingAnalyzer
+        llm_analyzer = LLMTrainingAnalyzer()
+        print(f"🤖 LLM Analysis enabled (every {analysis_interval} iterations)")
+    
+    # ==========================================
     # สร้างโมเดล PPO
     # ==========================================
     print("🤖 Initializing PPO model...")
@@ -154,14 +170,94 @@ def train_ppo():
     model = PPO("MlpPolicy", train_env, verbose=1, tensorboard_log="./ppo_trading_tensorboard/")
     
     # ==========================================
-    # เริ่มเทรนโมเดล
+    # เริ่มเทรนโมเดล (พร้อม LLM Analysis)
     # ==========================================
     print("🚀 Starting training...")
+    
+    # กำหนดจำนวน timesteps
+    total_timesteps = 50000
+    timesteps_per_iteration = 2048  # PPO default
+    total_iterations = total_timesteps // timesteps_per_iteration
+    
     try:
-        # total_timesteps = จำนวน step ทั้งหมดที่จะเทรน
-        # ยิ่งมากยิ่งดี แต่ใช้เวลานาน (50,000 เป็นค่าที่ใช้สำหรับ demo)
-        model.learn(total_timesteps=50000)
+        # เทรนทีละ iteration เพื่อให้สามารถวิเคราะห์ระหว่างทางได้
+        for iteration in range(1, total_iterations + 1):
+            # เทรน 1 iteration
+            model.learn(total_timesteps=timesteps_per_iteration, reset_num_timesteps=False)
+            
+            # บันทึก metrics จาก logger (ถ้ามี LLM analyzer)
+            if llm_analyzer and llm_analyzer.enabled:
+                try:
+                    # ดึง metrics จาก model logger
+                    logger = model.logger
+                    if hasattr(logger, 'name_to_value'):
+                        metrics = {}
+                        for key, value in logger.name_to_value.items():
+                            if 'train/' in key:
+                                clean_key = key.replace('train/', '')
+                                metrics[clean_key] = value
+                        
+                        if metrics:
+                            llm_analyzer.log_metrics(iteration, metrics)
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not log metrics: {e}")
+            
+            # วิเคราะห์ด้วย LLM ทุกๆ analysis_interval iterations
+            if llm_analyzer and llm_analyzer.enabled and iteration % analysis_interval == 0:
+                print(f"\n{'='*80}")
+                print(f"🔍 Running LLM Analysis at iteration {iteration}/{total_iterations}")
+                print(f"{'='*80}")
+                
+                # สร้างกราฟ
+                chart_path = llm_analyzer.create_training_chart(
+                    save_path=f'training_progress_iter_{iteration}.png'
+                )
+                
+                # วิเคราะห์ด้วย LLM
+                if chart_path:
+                    analysis = llm_analyzer.analyze_with_llm(
+                        chart_path, 
+                        current_iteration=iteration,
+                        total_iterations=total_iterations
+                    )
+                    
+                    # แสดงผล
+                    llm_analyzer.print_analysis(analysis)
+                    
+                    # บันทึกผล
+                    llm_analyzer.save_analysis(
+                        analysis, 
+                        filepath=f'llm_analysis_iter_{iteration}.json'
+                    )
+                    
+                    # ตรวจสอบว่า LLM แนะนำให้หยุดหรือไม่
+                    if analysis.get('should_continue') == False:
+                        print("\n🛑 LLM recommends stopping training.")
+                        user_input = input("Do you want to stop? (y/n): ")
+                        if user_input.lower() == 'y':
+                            print("⏹️ Training stopped by user based on LLM recommendation.")
+                            break
+        
         print("✅ Training finished!")
+        
+        # ==========================================
+        # วิเคราะห์ครั้งสุดท้ายหลังเทรนเสร็จ
+        # ==========================================
+        if llm_analyzer and llm_analyzer.enabled and llm_analyzer.metrics_history:
+            print(f"\n{'='*80}")
+            print("🔍 Final LLM Analysis")
+            print(f"{'='*80}")
+            
+            chart_path = llm_analyzer.create_training_chart(save_path='training_progress_final.png')
+            if chart_path:
+                final_analysis = llm_analyzer.analyze_with_llm(
+                    chart_path,
+                    current_iteration=total_iterations,
+                    total_iterations=total_iterations
+                )
+                llm_analyzer.print_analysis(final_analysis)
+                llm_analyzer.save_analysis(final_analysis, filepath='llm_analysis_final.json')
+        
     except KeyboardInterrupt:
         print("\n⏹️ Training stopped manually.")
         
@@ -179,4 +275,5 @@ def train_ppo():
 
 # เริ่มต้นโปรแกรม
 if __name__ == "__main__":
-    train_ppo()
+    # เทรนพร้อม LLM Analysis (วิเคราะห์ทุกๆ 5 iterations)
+    train_ppo(use_llm_analysis=True, analysis_interval=5)
