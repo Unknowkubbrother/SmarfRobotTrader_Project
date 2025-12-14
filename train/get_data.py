@@ -3,7 +3,16 @@ MT5 Data Collector สำหรับ Train Reinforcement Learning
 รองรับทั้ง Historical Data และ Real-time Tick Data
 """
 
-import MetaTrader5 as mt5
+# import MetaTrader5 as mt5 # Windows only
+from mt5linux import MetaTrader5
+# connect to the mt5linux server running in Docker
+mt5 = MetaTrader5(host='192.168.0.105', port=8001)
+# Fix for NameError: name 'datetime' is not defined on server
+try:
+    mt5._MetaTrader5__conn.execute("import datetime")
+except Exception as e:
+    print(f"⚠️ Could not import datetime on server: {e}")
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -52,10 +61,10 @@ class MT5DataCollector:
             return None
         
         # คำนวณวันที่
-        utc_to = datetime.now()
+        utc_to = datetime.now().astimezone()
         
         if from_year:
-            utc_from = datetime(from_year, 1, 1)
+            utc_from = datetime(from_year, 1, 1).astimezone()
             print(f"📅 กำลังดึงข้อมูลตั้งแต่ปี {from_year} ถึงปัจจุบัน...")
             
             # ถ้าช่วงเวลายาวมาก ให้แบ่งดึงเป็นช่วงๆ
@@ -70,7 +79,8 @@ class MT5DataCollector:
             utc_from = utc_to - timedelta(days=days)
         
         # ดึงข้อมูลแบบปกติ (สำหรับช่วงสั้นๆ)
-        rates = mt5.copy_rates_range(self.symbol, self.timeframe, utc_from, utc_to)
+        end_ts = int(utc_to.timestamp())
+        rates = mt5.copy_rates_range(self.symbol, self.timeframe, utc_from, end_ts)
         
         if rates is None:
             print(f"❌ ไม่สามารถดึงข้อมูลได้, error: {mt5.last_error()}")
@@ -118,7 +128,9 @@ class MT5DataCollector:
             print(f"📦 Chunk {chunk}: {current_start.strftime('%Y-%m-%d')} ถึง {current_end.strftime('%Y-%m-%d')}", end=" ")
             
             # ดึงข้อมูลสำหรับช่วงนี้
-            rates = mt5.copy_rates_range(self.symbol, self.timeframe, current_start, current_end)
+            # mt5linux requires start to be datetime (for .astimezone()) but end to be int/repr-safe
+            end_ts = int(current_end.timestamp())
+            rates = mt5.copy_rates_range(self.symbol, self.timeframe, current_start, end_ts)
             
             if rates is None or len(rates) == 0:
                 print(f"⚠️  ไม่มีข้อมูล")

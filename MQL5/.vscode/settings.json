@@ -1,11 +1,34 @@
 {
   "C_Cpp.default.forcedInclude": [
-    "c:\\Users\\Hp\\.antigravity\\extensions\\l-i-v.mql-tools-2.2.0\\data\\mql5_en.mqh"
+    "/Users/unknowkubbrother/.antigravity/extensions/l-i-v.mql-tools-2.2.0/data/mql5_en.mqh"
   ],
   "C_Cpp.errorSquiggles": "disabled",
   "files.associations": {
     "*.mqh": "cpp",
     "*.mq4": "cpp",
     "*.mq5": "cpp"
-  }
+  },
+  "C_Cpp.default.includePath": [
+    "${workspaceFolder}/**",
+    "${workspaceFolder}/Include"
+  ],
+  "C_Cpp.default.compilerPath": "",
+  "C_Cpp.default.intelliSenseMode": "gcc-x64",
+  "C_Cpp.autocompleteAddParentheses": true,
+  "files.exclude": {
+    "**/*.ex4": true,
+    "**/*.ex5": true,
+    "**/*_@!!@.mq4": true,
+    "**/*_@!!@.mq5": true,
+    "**/*_@!!@.mqh": true,
+    "**/*_@!!@.log": true,
+    "**/*_@!@.log": true,
+    "**/*_@!@.ex4": true,
+    "**/*_@!@.ex5": true,
+    "**/*_@!@.mq4": true,
+    "**/*_@!@.mq5": true,
+    "**/*_@!@.mqh": true
+  },
+  "editor.tabSize": 3,
+  "C_Cpp.clang_format_style": "file:/Users/unknowkubbrother/.antigravity/extensions/l-i-v.mql-tools-2.2.0/files/.clang-format"
 }
