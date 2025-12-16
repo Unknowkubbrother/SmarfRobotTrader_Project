@@ -39,7 +39,6 @@ if os.path.exists(output_filename):
     print("🗑️ ลบไฟล์เก่าเรียบร้อย")
 
 current_date = start_date
-# ดึงทีละ 1 วัน (ป้องกัน Timeout สำหรับข้อมูล Tick ที่มีความละเอียดสูง)
 delta = timedelta(days=1) 
 total_ticks = 0
 
@@ -52,7 +51,6 @@ try:
             
         print(f"⏳ กำลังดึง {current_date.date()} ...", end="", flush=True)
         
-        # ดึงข้อมูล
         ticks = mt5.copy_ticks_range(
             symbol, 
             current_date, 
@@ -64,12 +62,11 @@ try:
             count = len(ticks)
             total_ticks += count
             
-            # แปลงเป็น DataFrame
+        
             df = pd.DataFrame(ticks)
             df['time'] = pd.to_datetime(df['time'], unit='s')
             
-            # บันทึกลงไฟล์ (Append mode)
-            # เขียน Header เฉพาะรอบแรก (เมื่อไฟล์ยังไม่มี)
+        
             header = not os.path.exists(output_filename) or os.path.getsize(output_filename) == 0
             df.to_csv(output_filename, mode='a', index=False, header=header)
             

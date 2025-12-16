@@ -31,7 +31,8 @@ if os.path.exists(output_file):
     os.remove(output_file)
 
 chunk_iter = pd.read_csv(input_file, chunksize=chunk_size, parse_dates=['time'])
-first_chunk = True
+header_written = False
+first_chunk = True # Keep for logic inside loop for dropna if needed (yes, line 140 uses it)
 total_rows_processed = 0
 
 for i, chunk in enumerate(chunk_iter):
@@ -50,6 +51,13 @@ for i, chunk in enumerate(chunk_iter):
     # เก็บข้อมูลส่วนท้ายของ chunk นี้ไว้เป็น buffer สำหรับรอบถัดไป
     buffer_df = chunk.iloc[-buffer_size:].copy()
     
+    # --- Data Cleaning ---
+    # Forward fill missing OHLC values (ถ้าไม่มีข้อมูลในวินาทีนั้น ให้ใช้ราคาเดิม)
+    working_df.ffill(inplace=True)
+    
+    # ถ้ายังมี NaN เหลืออยู่ (เช่น แถวแรกสุด) ให้ drop ทิ้งก่อนคำนวณ
+    working_df.dropna(subset=['close'], inplace=True)
+
     # --- Part 1: คำนวณ Features พื้นฐาน (ไม่ต้องใช้ state ข้าม chunk หรือใช้แค่แถวตัวเอง) ---
     working_df['price_change'] = working_df['close'] - working_df['open']
     
@@ -59,11 +67,26 @@ for i, chunk in enumerate(chunk_iter):
     # working_df['spread'] = working_df['ask'] - working_df['bid'] # ข้อมูลไม่มี ask/bid แยก มีแค่ OHLC
     working_df['mid_price'] = (working_df['high'] + working_df['low']) / 2
 
-    # --- Part 2: คำนวณ Rolling Features (SMA, RSI) ---
+    # --- Part 2: คำนวณ Rolling Features (SMA, RSI, Volatility, Momentum) ---
     # คำนวณบน working_df ซึ่งมี buffer แปะอยู่ข้างหน้าแล้ว ทำให้ค่าต้น chunk ถูกต้อง
     
-    # SMA 10
-    working_df['sma_10'] = working_df['close'].rolling(window=10).mean()
+    # Log Return
+    working_df['log_return'] = np.log(working_df['close'] / working_df['close'].shift(1))
+    
+    # Volatility (60-period rolling std of log returns)
+    working_df['volatility_60'] = working_df['log_return'].rolling(window=60).std()
+    
+    # Momentum (60-period price change)
+    working_df['mom_60'] = working_df['close'].pct_change(periods=60, fill_method=None)
+    
+    # SMA 60 for distance calculation
+    working_df['sma_60'] = working_df['close'].rolling(window=60).mean()
+    working_df['dist_sma_60'] = (working_df['close'] - working_df['sma_60']) / working_df['sma_60']
+    
+    # Relative Volume (current volume / 60-period average volume)
+    avg_vol_60 = working_df['volume'].rolling(window=60).mean()
+    # ถ้า volume เป็น 0 ตลอด (avg=0) ให้ค่าเป็น 0 ไปเลยเพื่อป้องกัน NaN/Inf
+    working_df['rel_vol'] = (working_df['volume'] / avg_vol_60.replace(0, np.nan)).fillna(0)
     
     # RSI 14
     delta = working_df['close'].diff()
@@ -72,7 +95,7 @@ for i, chunk in enumerate(chunk_iter):
     rs = gain / (loss.replace(0, np.nan)) # กันหาร 0
     # ถ้า loss เป็น 0 คือราคาขึ้นตลอด rs จะเป็น inf -> rsi เป็น 100
     rsi = 100 - (100 / (1 + rs))
-    working_df['rsi_14'] = rsi.fillna(100) # handle case loss=0 appropriately if needed, or fillna
+    working_df['rsi_14'] = rsi.fillna(50) # fillna with neutral value
 
     # --- Part 3: คำนวณ Cumulative Features (สะสมค่า) ---
     # เราต้องตัดเอาเฉพาะส่วนที่เป็น chunk ปัจจุบันออกมาคำนวณและบวกค่าสะสมจากรอบก่อน
@@ -80,6 +103,11 @@ for i, chunk in enumerate(chunk_iter):
     
     # ตัดเอาเฉพาะข้อมูลใหม่ (New Data)
     new_data = working_df.iloc[start_idx:].copy()
+    
+    if new_data.empty:
+        # ถ้าไม่มีข้อมูลใหม่ (อาจเพราะโดน dropna หมด) ให้ข้าม
+        print(f"Chunk {i+1} is empty after cleaning. Skipping...")
+        continue
     
     # คำนวณค่าที่จะนำมาสะสม (Increments) เฉพาะในส่วน new_data
     # ใช้วิธีคำนวณ vector ใน new_data แล้วค่อย cumsum
@@ -114,11 +142,10 @@ for i, chunk in enumerate(chunk_iter):
 
     # --- Clean up & Save ---
     
-    # เลือกคอลัมน์
+    # เลือกคอลัมน์ที่ต้องการสำหรับ RL (ตรงกับ train_ppo.py)
     features_cols = [
-        'price_up', 'price_dn', 'tick_up', 'tick_dn', 
-        'up_vol', 'dn_vol', 'mid_price',
-        'sma_10', 'rsi_14'
+        'log_return', 'volatility_60', 'mom_60', 
+        'rel_vol', 'rsi_14', 'dist_sma_60', 'mid_price'
     ]
     
     final_chunk = new_data[features_cols].copy()
@@ -133,7 +160,13 @@ for i, chunk in enumerate(chunk_iter):
     
     if not final_chunk.empty:
         # บันทึกทีละ chunk แบบ append (mode='a')
-        final_chunk.to_csv(output_file, mode='a', header=first_chunk)
+        # Logic Fix: เขียน header เฉพาะครั้งแรกที่มีข้อมูล (ไม่จำเป็นต้องเป็น chunk แรกสุด ถ้า chunk แรกโดน drop หมด)
+        if not header_written:
+            final_chunk.to_csv(output_file, mode='a', header=True)
+            header_written = True
+        else:
+            final_chunk.to_csv(output_file, mode='a', header=False)
+            
         total_rows_processed += len(final_chunk)
     
     first_chunk = False
