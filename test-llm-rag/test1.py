@@ -12,7 +12,7 @@ from langchain_ollama import OllamaLLM
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model, preprocess = clip.load("ViT-B/32", device=device)
 
-# ===================== TEXT EMBEDDING (CLIP TEXT) =====================
+# ===================== TEXT EMBEDDING =====================
 class CLIPTextEmbeddings(Embeddings):
     def embed_documents(self, texts):
         with torch.no_grad():
@@ -24,7 +24,7 @@ class CLIPTextEmbeddings(Embeddings):
     def embed_query(self, text):
         return self.embed_documents([text])[0]
 
-# ===================== IMAGE EMBEDDING (CLIP IMAGE) =====================
+# ===================== IMAGE EMBEDDING =====================
 class CLIPImageEmbeddings(Embeddings):
     def embed_documents(self, image_paths):
         vectors = []
@@ -33,7 +33,7 @@ class CLIPImageEmbeddings(Embeddings):
             with torch.no_grad():
                 vec = model.encode_image(image)
                 vec = vec / vec.norm(dim=-1, keepdim=True)
-            vectors.append(vec.cpu().numpy()[0])
+            vectors.append(vec.cpu().numpy()[0].tolist())
         return vectors
 
     def embed_query(self, image_path):
@@ -41,7 +41,15 @@ class CLIPImageEmbeddings(Embeddings):
         with torch.no_grad():
             vec = model.encode_image(image)
             vec = vec / vec.norm(dim=-1, keepdim=True)
-        return vec.cpu().numpy()[0]
+        return vec.cpu().numpy()[0].tolist()
+
+# ===================== MANUAL IMAGE EMBED (FOR by_vector) =====================
+def embed_image(image_path):
+    image = preprocess(Image.open(image_path)).unsqueeze(0).to(device)
+    with torch.no_grad():
+        vec = model.encode_image(image)
+        vec = vec / vec.norm(dim=-1, keepdim=True)
+    return vec.cpu().numpy()[0].tolist()
 
 # ===================== LOAD DATASET =====================
 def load_dataset(json_path):
@@ -70,7 +78,7 @@ print("✅ Text RAG ready")
 # ===================== BUILD IMAGE RAG =====================
 image_docs = [
     Document(
-        page_content=item["image"],     # ใช้ path เป็น key
+        page_content=item["image"],   # path เป็น identifier
         metadata={"image": item["image"]}
     )
     for item in raw
@@ -90,7 +98,7 @@ vision_llm = OllamaLLM(
     temperature=0
 )
 
-NEW_IMAGE = "datasets/new_chart7.png"
+NEW_IMAGE = "datasets/chart2.png"
 
 # ===================== STEP A: IMAGE → AUTO TEXT =====================
 auto_text = vision_llm.invoke(
@@ -109,10 +117,19 @@ print(auto_text)
 # ===================== STEP B: TEXT RAG =====================
 text_hits = text_db.similarity_search(auto_text, k=2)
 
-# ===================== STEP C: IMAGE RAG =====================
-image_hits = image_db.similarity_search(NEW_IMAGE, k=2)
+print("\n📝 Text-based hits:")
+for hit in text_hits:
+    print(hit.metadata["image"])
 
-print("\n🖼️ Image-based hits:")
+# ===================== STEP C: IMAGE RAG (by_vector) =====================
+query_vec = embed_image(NEW_IMAGE)
+
+image_hits = image_db.similarity_search_by_vector(
+    query_vec,
+    k=2
+)
+
+print("\n🖼️ Image-based hits (by_vector):")
 for hit in image_hits:
     print(hit.metadata["image"])
 
@@ -123,7 +140,6 @@ for d in text_hits:
     contexts.add(d.page_content)
 
 for d in image_hits:
-    # ดึง text ที่คู่กับ image นั้น
     for item in raw:
         if item["image"] == d.metadata["image"]:
             contexts.add(item["data"])
