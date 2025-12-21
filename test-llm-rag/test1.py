@@ -100,7 +100,7 @@ vision_llm = OllamaLLM(
     temperature=0
 )
 
-NEW_IMAGE = "datasets/image.png"
+NEW_IMAGE = "datasets/new_chart7.png"
 
 # ===================== STEP A: IMAGE → AUTO TEXT =====================
 auto_text = vision_llm.invoke(
