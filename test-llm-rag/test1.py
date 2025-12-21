@@ -8,6 +8,8 @@ from langchain.embeddings.base import Embeddings
 from langchain_core.documents import Document
 from langchain_ollama import OllamaLLM
 
+from sentence_transformers import SentenceTransformer
+
 # ===================== SETUP =====================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model, preprocess = clip.load("ViT-B/32", device=device)
@@ -98,7 +100,7 @@ vision_llm = OllamaLLM(
     temperature=0
 )
 
-NEW_IMAGE = "datasets/chart2.png"
+NEW_IMAGE = "datasets/image.png"
 
 # ===================== STEP A: IMAGE → AUTO TEXT =====================
 auto_text = vision_llm.invoke(
@@ -115,7 +117,7 @@ print("\n📝 Auto-text from image:")
 print(auto_text)
 
 # ===================== STEP B: TEXT RAG =====================
-text_hits = text_db.similarity_search(auto_text, k=2)
+text_hits = text_db.similarity_search(auto_text, k=1)
 
 print("\n📝 Text-based hits:")
 for hit in text_hits:
@@ -126,14 +128,13 @@ query_vec = embed_image(NEW_IMAGE)
 
 image_hits = image_db.similarity_search_by_vector(
     query_vec,
-    k=2
+    k=1
 )
 
 print("\n🖼️ Image-based hits (by_vector):")
 for hit in image_hits:
     print(hit.metadata["image"])
 
-# ===================== MERGE HYBRID CONTEXT =====================
 contexts = set()
 
 for d in text_hits:
@@ -149,7 +150,6 @@ rag_context = "\n".join(contexts)
 print("\n🔎 Hybrid RAG context:")
 print(rag_context)
 
-# ===================== FINAL ANALYSIS =====================
 final_prompt = f"""
 คุณคือนักเทรดที่เขียนไอเดียเทรดแบบสั้น คม และอ่านรู้เรื่องทันที
 
@@ -182,3 +182,12 @@ final_answer = vision_llm.invoke(
 
 print("\n🧠 Final Analysis:")
 print(final_answer)
+
+
+# model_MiniLM = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+# final_vec = model_MiniLM.encode(final_answer, normalize_embeddings=True)
+
+# print("\n MiniLM Vector")
+# print(final_vec)
+# print(final_vec.shape)
