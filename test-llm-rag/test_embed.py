@@ -10,4 +10,3 @@ model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 final_vec = model.encode(final_answer, normalize_embeddings=True)
 
 print(final_vec.shape)
-

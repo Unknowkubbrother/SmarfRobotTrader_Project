@@ -2,65 +2,105 @@ import torch
 import clip
 import json
 from PIL import Image
+import numpy as np
 
 from langchain_community.vectorstores import Chroma
 from langchain.embeddings.base import Embeddings
 from langchain_core.documents import Document
 from langchain_ollama import OllamaLLM
 
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
-# ===================== SETUP =====================
+# ============================================================
+# 1) SETUP
+# ============================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model, preprocess = clip.load("ViT-B/32", device=device)
+clip_model, preprocess = clip.load("ViT-B/32", device=device)
 
-# ===================== TEXT EMBEDDING =====================
-class CLIPTextEmbeddings(Embeddings):
+# Multilingual text embedding (รองรับภาษาไทยดี)
+text_embedder = SentenceTransformer(
+    "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+)
+
+# Multilingual Cross-Encoder สำหรับ re-ranking
+reranker = CrossEncoder(
+    "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+)
+
+# ============================================================
+# 2) TEXT EMBEDDING (Multilingual)
+# ============================================================
+class MultilingualTextEmbeddings(Embeddings):
     def embed_documents(self, texts):
-        with torch.no_grad():
-            tokens = clip.tokenize(texts, truncate=True).to(device)
-            vecs = model.encode_text(tokens)
-            vecs = vecs / vecs.norm(dim=-1, keepdim=True)
-        return vecs.cpu().numpy().tolist()
+        vecs = text_embedder.encode(texts, normalize_embeddings=True)
+        return vecs.tolist()
 
     def embed_query(self, text):
-        return self.embed_documents([text])[0]
+        vec = text_embedder.encode([text], normalize_embeddings=True)
+        return vec[0].tolist()
 
-# ===================== IMAGE EMBEDDING =====================
+# ============================================================
+# 3) IMAGE EMBEDDING (CLIP with chart crop)
+# ============================================================
+def preprocess_chart_only(image: Image.Image):
+    """
+    Crop ขอบบน/ล่างเล็กน้อยเพื่อลด textbox / legend noise
+    """
+    w, h = image.size
+    crop = image.crop((0, int(h * 0.08), w, int(h * 0.92)))
+    return preprocess(crop)
+
 class CLIPImageEmbeddings(Embeddings):
     def embed_documents(self, image_paths):
         vectors = []
         for path in image_paths:
-            image = preprocess(Image.open(path)).unsqueeze(0).to(device)
+            img = Image.open(path).convert("RGB")
+            img = preprocess_chart_only(img).unsqueeze(0).to(device)
             with torch.no_grad():
-                vec = model.encode_image(image)
+                vec = clip_model.encode_image(img)
                 vec = vec / vec.norm(dim=-1, keepdim=True)
             vectors.append(vec.cpu().numpy()[0].tolist())
         return vectors
 
     def embed_query(self, image_path):
-        image = preprocess(Image.open(image_path)).unsqueeze(0).to(device)
+        img = Image.open(image_path).convert("RGB")
+        img = preprocess_chart_only(img).unsqueeze(0).to(device)
         with torch.no_grad():
-            vec = model.encode_image(image)
+            vec = clip_model.encode_image(img)
             vec = vec / vec.norm(dim=-1, keepdim=True)
         return vec.cpu().numpy()[0].tolist()
 
-# ===================== MANUAL IMAGE EMBED (FOR by_vector) =====================
+# helper สำหรับ by_vector
 def embed_image(image_path):
-    image = preprocess(Image.open(image_path)).unsqueeze(0).to(device)
+    img = Image.open(image_path).convert("RGB")
+    img = preprocess_chart_only(img).unsqueeze(0).to(device)
     with torch.no_grad():
-        vec = model.encode_image(image)
+        vec = clip_model.encode_image(img)
         vec = vec / vec.norm(dim=-1, keepdim=True)
     return vec.cpu().numpy()[0].tolist()
 
-# ===================== LOAD DATASET =====================
+# ============================================================
+# 4) LOAD DATASET
+# ============================================================
 def load_dataset(json_path):
     with open(json_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+def remove_duplicates(hits):
+    seen = set()
+    unique = []
+    for h in hits:
+        img = h.metadata.get("image")
+        if img not in seen:
+            seen.add(img)
+            unique.append(h)
+    return unique
+
 raw = load_dataset("dataset.json")
 
-# ===================== BUILD TEXT RAG =====================
+# ============================================================
+# 5) BUILD TEXT RAG
+# ============================================================
 text_docs = [
     Document(
         page_content=item["data"],
@@ -71,30 +111,35 @@ text_docs = [
 
 text_db = Chroma.from_documents(
     text_docs,
-    embedding=CLIPTextEmbeddings(),
-    persist_directory="./chroma_text"
+    embedding=MultilingualTextEmbeddings(),
+    collection_name="text_multilingual"
 )
 
 print("✅ Text RAG ready")
 
-# ===================== BUILD IMAGE RAG =====================
+# ============================================================
+# 6) BUILD IMAGE RAG
+# ============================================================
 image_docs = [
     Document(
-        page_content=item["image"],   # path เป็น identifier
+        page_content=item["image"], 
         metadata={"image": item["image"]}
     )
     for item in raw
 ]
 
+
 image_db = Chroma.from_documents(
     image_docs,
     embedding=CLIPImageEmbeddings(),
-    persist_directory="./chroma_image"
+    collection_name="image_clip"
 )
 
 print("✅ Image RAG ready")
 
-# ===================== LOAD VISION LLM =====================
+# ============================================================
+# 7) LOAD VISION LLM
+# ============================================================
 vision_llm = OllamaLLM(
     model="ministral-3:14b",
     temperature=0
@@ -102,62 +147,113 @@ vision_llm = OllamaLLM(
 
 NEW_IMAGE = "datasets/new_chart7.png"
 
-# ===================== STEP A: IMAGE → AUTO TEXT =====================
+# ============================================================
+# 8) STEP A — IMAGE → AUTO TEXT (Pattern Focus)
+# ============================================================
 auto_text = vision_llm.invoke(
     """
-อธิบายกราฟจากภาพนี้แบบสั้น
-บอกว่าเป็น ขาขึ้น ขาลง หรือ แกว่ง
-บอกสภาพแรงซื้อแรงขายคร่าว ๆ
-ไม่เกิน 50 tokens
+วิเคราะห์พฤติกรรมราคาและโครงสร้างของกราฟ (PA Logic) เพื่อใช้ค้นหากราฟที่มีทรงคล้ายกันในอดีต
+
+- ลักษณะการเคลื่อนไหวโดยรวม
+- การยก High/Low หรือการถูกปฏิเสธราคา
+- พฤติกรรมแท่งเทียนสำคัญ
+- อยู่ในช่วงสะสม ไล่ราคา หรือกระจายของ
+- เหตุผลเชิงพฤติกรรมตลาด
+
+ห้ามระบุตัวเลขราคา
+เขียนเชิงอธิบายเชิงเทคนิค
+ประมาณ 80–120 คำ
 """,
     images=[NEW_IMAGE]
 )
 
-print("\n📝 Auto-text from image:")
+print("\n📝 Auto-text:")
 print(auto_text)
 
-# ===================== STEP B: TEXT RAG =====================
-text_hits = text_db.similarity_search(auto_text, k=1)
-
-print("\n📝 Text-based hits:")
-for hit in text_hits:
-    print(hit.metadata["image"])
-
-# ===================== STEP C: IMAGE RAG (by_vector) =====================
-query_vec = embed_image(NEW_IMAGE)
-
-image_hits = image_db.similarity_search_by_vector(
-    query_vec,
-    k=1
+# ============================================================
+# 9) STEP B — TEXT RAG (MMR)
+# ============================================================
+text_hits_raw = text_db.max_marginal_relevance_search(
+    auto_text,
+    k=3,
+    fetch_k=15,
+    lambda_mult=0.5
 )
 
-print("\n🖼️ Image-based hits (by_vector):")
+text_hits = remove_duplicates(text_hits_raw)
+
+# ============================================================
+# 10) STEP C — IMAGE RAG (by_vector)
+# ============================================================
+query_vec = embed_image(NEW_IMAGE)
+
+image_hits_raw = image_db.similarity_search_by_vector(
+    query_vec,
+    k=3
+)
+
+image_hits = remove_duplicates(image_hits_raw)
+
+# ============================================================
+# 11) MERGE CANDIDATES
+# ============================================================
+candidates = []
+
+for hit in text_hits:
+    candidates.append({
+        "text": hit.page_content,
+        "image": hit.metadata["image"],
+        "source": "text_rag"
+    })
+    print(f"\nImage: {hit.metadata['image']} by Text RAG")
+
 for hit in image_hits:
-    print(hit.metadata["image"])
-
-contexts = set()
-
-for d in text_hits:
-    contexts.add(d.page_content)
-
-for d in image_hits:
     for item in raw:
-        if item["image"] == d.metadata["image"]:
-            contexts.add(item["data"])
+        if item["image"] == hit.metadata["image"]:
+            if not any(c["image"] == item["image"] for c in candidates):
+                candidates.append({
+                    "text": item["data"],
+                    "image": item["image"],
+                    "source": "image_rag"
+                })
+                print(f"\nImage: {item['image']} by Image RAG")
 
-rag_context = "\n".join(contexts)
+print(f"\nCandidates before re-rank: {len(candidates)}")
 
-print("\n🔎 Hybrid RAG context:")
+# ============================================================
+# 12) RE-RANK (Cross-Encoder)
+# ============================================================
+pairs = [[auto_text, c["text"]] for c in candidates]
+scores = reranker.predict(pairs)
+
+ranked = sorted(
+    zip(candidates, scores),
+    key=lambda x: x[1],
+    reverse=True
+)
+
+top_candidates = [c for c, _ in ranked[:5]]
+
+# ============================================================
+# 13) BUILD FINAL CONTEXT
+# ============================================================
+rag_context = "\n\n---\n\n".join([c["text"] for c in top_candidates])
+rag_context = rag_context[:1500]
+
+print("\n🔎 RAG Context:")
 print(rag_context)
 
+# ============================================================
+# 14) FINAL ANALYSIS
+# ============================================================
 final_prompt = f"""
-คุณคือนักเทรดที่เขียนไอเดียเทรดแบบสั้น คม และอ่านรู้เรื่องทันที
+คุณคือนักเทรดผู้เชี่ยวชาญ
 
-บริบทจากกราฟเก่าที่คล้ายกัน:
+1. วิเคราะห์กราฟปัจจุบันจากภาพ โดยอ้างอิงระดับราคาที่เห็นชัดเจนจากกราฟเท่านั้น (ไม่เดา ไม่เทียบกับบริบท)
+2. นำแนวคิดการเข้าออกจากกราฟในอดีตที่คล้ายกันมาประยุกต์ใช้ โดยดูที่ Logic การเล่น ไม่ใช่ตัวเลขราคา
+
+บริบทจากกราฟเก่า (Pattern คล้ายกัน):
 {rag_context}
-
-ภาพรวมกราฟปัจจุบัน:
-{auto_text}
 
 กติกา:
 - เขียนเป็นย่อหน้าเดียว
@@ -171,8 +267,8 @@ final_prompt = f"""
 
 รูปแบบ:
 1. เปิดด้วย "PA อยู่ในช่วง..." หรือ "PA เป็นของฝั่ง..."
-2. บอกแนวรับ แนวต้าน และใครเสียเปรียบ
-3. ปิดด้วยกลยุทธ์ว่าควรรอเล่นตรงไหน
+2. ระบุแนวรับและแนวต้านจากภาพปัจจุบัน พร้อมบอกว่าใครเสียเปรียบ
+3. ปิดด้วยกลยุทธ์สั้น ๆ ว่าควรรอเล่นตรงไหน
 """
 
 final_answer = vision_llm.invoke(
@@ -182,12 +278,3 @@ final_answer = vision_llm.invoke(
 
 print("\n🧠 Final Analysis:")
 print(final_answer)
-
-
-# model_MiniLM = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-# final_vec = model_MiniLM.encode(final_answer, normalize_embeddings=True)
-
-# print("\n MiniLM Vector")
-# print(final_vec)
-# print(final_vec.shape)
