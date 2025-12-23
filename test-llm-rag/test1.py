@@ -40,22 +40,16 @@ class MultilingualTextEmbeddings(Embeddings):
         return vec[0].tolist()
 
 # ============================================================
-# 3) IMAGE EMBEDDING (CLIP with chart crop)
+# 3) IMAGE EMBEDDING (CLIP)
 # ============================================================
-def preprocess_chart_only(image: Image.Image):
-    """
-    Crop ขอบบน/ล่างเล็กน้อยเพื่อลด textbox / legend noise
-    """
-    w, h = image.size
-    crop = image.crop((0, int(h * 0.08), w, int(h * 0.92)))
-    return preprocess(crop)
+
 
 class CLIPImageEmbeddings(Embeddings):
     def embed_documents(self, image_paths):
         vectors = []
         for path in image_paths:
             img = Image.open(path).convert("RGB")
-            img = preprocess_chart_only(img).unsqueeze(0).to(device)
+            img = preprocess(img).unsqueeze(0).to(device)
             with torch.no_grad():
                 vec = clip_model.encode_image(img)
                 vec = vec / vec.norm(dim=-1, keepdim=True)
@@ -64,7 +58,7 @@ class CLIPImageEmbeddings(Embeddings):
 
     def embed_query(self, image_path):
         img = Image.open(image_path).convert("RGB")
-        img = preprocess_chart_only(img).unsqueeze(0).to(device)
+        img = preprocess(img).unsqueeze(0).to(device)
         with torch.no_grad():
             vec = clip_model.encode_image(img)
             vec = vec / vec.norm(dim=-1, keepdim=True)
@@ -73,7 +67,7 @@ class CLIPImageEmbeddings(Embeddings):
 # helper สำหรับ by_vector
 def embed_image(image_path):
     img = Image.open(image_path).convert("RGB")
-    img = preprocess_chart_only(img).unsqueeze(0).to(device)
+    img = preprocess(img).unsqueeze(0).to(device)
     with torch.no_grad():
         vec = clip_model.encode_image(img)
         vec = vec / vec.norm(dim=-1, keepdim=True)
@@ -145,7 +139,7 @@ vision_llm = OllamaLLM(
     temperature=0
 )
 
-NEW_IMAGE = "datasets/new_chart7.png"
+NEW_IMAGE = "datasets/image.png"
 
 # ============================================================
 # 8) STEP A — IMAGE → AUTO TEXT (Pattern Focus)
