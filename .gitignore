@@ -1,4 +1,5 @@
 .venv
+.venv311
 EURUSD_ticks_2009_to_2025.csv
 .DS_Store
 EURUSD_1sec_bars.csv

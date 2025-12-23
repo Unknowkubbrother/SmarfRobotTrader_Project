@@ -139,7 +139,7 @@ vision_llm = OllamaLLM(
     temperature=0
 )
 
-NEW_IMAGE = "datasets/image.png"
+NEW_IMAGE = "datasets/new_chart3.png"
 
 # ============================================================
 # 8) STEP A — IMAGE → AUTO TEXT (Pattern Focus)

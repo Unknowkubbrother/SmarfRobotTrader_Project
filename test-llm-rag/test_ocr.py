@@ -78,25 +78,31 @@ def extract_candles_with_ocr_cleanup(image_path):
 
     return rgb, mask_text_expanded, final_result
 
-# --- Run Code ---
-image_path = "datasets/chart21.png"
-original, text_mask, result = extract_candles_with_ocr_cleanup(image_path)
+if __name__ == "__main__":
+    # --- Run Code ---
+    image_path = "datasets/chart21.png"
+    # ตรวจสอบว่าไฟล์มีอยู่จริงหรือไม่ก่อนรัน
+    import os
+    if os.path.exists(image_path):
+        original, text_mask, result = extract_candles_with_ocr_cleanup(image_path)
 
-plt.figure(figsize=(15, 5))
+        plt.figure(figsize=(15, 5))
 
-plt.subplot(1, 3, 1)
-plt.imshow(original)
-plt.title("Original Image")
-plt.axis("off")
+        plt.subplot(1, 3, 1)
+        plt.imshow(original)
+        plt.title("Original Image")
+        plt.axis("off")
 
-plt.subplot(1, 3, 2)
-plt.imshow(text_mask, cmap='gray')
-plt.title("Detected Text Zones (OCR)")
-plt.axis("off")
+        plt.subplot(1, 3, 2)
+        plt.imshow(text_mask, cmap='gray')
+        plt.title("Detected Text Zones (OCR)")
+        plt.axis("off")
 
-plt.subplot(1, 3, 3)
-plt.imshow(result)
-plt.title("Final Result (Color - OCR)")
-plt.axis("off")
+        plt.subplot(1, 3, 3)
+        plt.imshow(result)
+        plt.title("Final Result (Color - OCR)")
+        plt.axis("off")
 
-plt.show()
+        plt.show()
+    else:
+        print(f"File not found: {image_path}")

@@ -1,0 +1,19 @@
+# AI Core & Math
+torch
+torchvision
+numpy
+
+# Image Processing
+pillow
+
+# LangChain Ecosystem
+langchain
+langchain-community
+langchain-ollama
+
+# Vector Database
+chromadb
+
+# Embeddings & Models
+sentence-transformers
+git+https://github.com/openai/CLIP.git
