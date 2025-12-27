@@ -1,8 +1,9 @@
 import torch
-import clip
 import json
 from PIL import Image
 import numpy as np
+
+from transformers import CLIPProcessor, CLIPModel
 
 from langchain_community.vectorstores import Chroma
 from langchain.embeddings.base import Embeddings
@@ -15,7 +16,8 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 # 1) SETUP
 # ============================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
-clip_model, preprocess = clip.load("ViT-B/32", device=device)
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 # Multilingual text embedding (รองรับภาษาไทยดี)
 text_embedder = SentenceTransformer(
@@ -48,28 +50,28 @@ class CLIPImageEmbeddings(Embeddings):
     def embed_documents(self, image_paths):
         vectors = []
         for path in image_paths:
-            img = Image.open(path).convert("RGB")
-            img = preprocess(img).unsqueeze(0).to(device)
+            img = Image.open(path) # PIL Image
+            inputs = processor(images=img, return_tensors="pt").to(device)
             with torch.no_grad():
-                vec = clip_model.encode_image(img)
+                vec = clip_model.get_image_features(**inputs)
                 vec = vec / vec.norm(dim=-1, keepdim=True)
             vectors.append(vec.cpu().numpy()[0].tolist())
         return vectors
 
     def embed_query(self, image_path):
-        img = Image.open(image_path).convert("RGB")
-        img = preprocess(img).unsqueeze(0).to(device)
+        img = Image.open(image_path)
+        inputs = processor(images=img, return_tensors="pt").to(device)
         with torch.no_grad():
-            vec = clip_model.encode_image(img)
+            vec = clip_model.get_image_features(**inputs)
             vec = vec / vec.norm(dim=-1, keepdim=True)
         return vec.cpu().numpy()[0].tolist()
 
 # helper สำหรับ by_vector
 def embed_image(image_path):
-    img = Image.open(image_path).convert("RGB")
-    img = preprocess(img).unsqueeze(0).to(device)
+    img = Image.open(image_path)
+    inputs = processor(images=img, return_tensors="pt").to(device)
     with torch.no_grad():
-        vec = clip_model.encode_image(img)
+        vec = clip_model.get_image_features(**inputs)
         vec = vec / vec.norm(dim=-1, keepdim=True)
     return vec.cpu().numpy()[0].tolist()
 
