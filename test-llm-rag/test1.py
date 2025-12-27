@@ -16,7 +16,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 # 1) SETUP
 # ============================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 # Multilingual text embedding (รองรับภาษาไทยดี)
@@ -50,7 +50,7 @@ class CLIPImageEmbeddings(Embeddings):
     def embed_documents(self, image_paths):
         vectors = []
         for path in image_paths:
-            img = Image.open(path) # PIL Image
+            img = Image.open(path).convert("RGB")
             inputs = processor(images=img, return_tensors="pt").to(device)
             with torch.no_grad():
                 vec = clip_model.get_image_features(**inputs)
@@ -141,7 +141,7 @@ vision_llm = OllamaLLM(
     temperature=0
 )
 
-NEW_IMAGE = "datasets1/new_chart4.png"
+NEW_IMAGE = "datasets1/new_chart1.png"
 
 # ============================================================
 # 8) STEP A — IMAGE → AUTO TEXT (Pattern Focus)
