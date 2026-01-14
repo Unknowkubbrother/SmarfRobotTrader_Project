@@ -1,14 +1,3 @@
-# clip_chart_prod_final_v2_fixed.py
-# ------------------------------------------------------------
-# FIXED VERSION (focus: debug heatmap contrast)
-# What changed:
-# 1) visualize_debug(): use percentile normalization (not global min-max)
-#    -> removes "yellow everywhere" and makes PA patches pop out clearly.
-# 2) visualize_debug(): optional stronger overlay contrast + adjustable dim factor.
-#
-# NOTE: Embedding pipeline is unchanged (only debug visualization improved).
-# ------------------------------------------------------------
-
 import os
 import json
 import math
@@ -24,14 +13,9 @@ from langchain_community.vectorstores import Chroma
 from langchain.embeddings.base import Embeddings
 from langchain_core.documents import Document
 
-
-# ============================================================
-# CONFIG
-# ============================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 MODEL_NAME = "openai/clip-vit-large-patch14"
-# MODEL_NAME = "openai/clip-vit-base-patch32"
 
 ROI_CUT = dict(left=0.02, top=0.06, right=0.10, bottom=0.10)
 
@@ -57,20 +41,14 @@ PROMPTS = [
     "price action candlesticks",
 ]
 
+PERSIST_DIR = "chroma_store_images"
+COLLECTION = "chart_clip"
 
-# ============================================================
-# MODEL
-# ============================================================
 clip_model = CLIPModel.from_pretrained(MODEL_NAME).to(DEVICE).eval()
 processor = CLIPProcessor.from_pretrained(MODEL_NAME)
 
-
-# ============================================================
-# IMAGE PREP
-# ============================================================
 def load_rgb(path: str) -> Image.Image:
     return Image.open(path).convert("RGB")
-
 
 def crop_chart_roi(pil_img: Image.Image, left=0.02, top=0.06, right=0.10, bottom=0.10) -> Image.Image:
     w, h = pil_img.size
@@ -79,7 +57,6 @@ def crop_chart_roi(pil_img: Image.Image, left=0.02, top=0.06, right=0.10, bottom
     x2 = int(w * (1 - right))
     y2 = int(h * (1 - bottom))
     return pil_img.crop((x1, y1, x2, y2))
-
 
 def letterbox(pil_img: Image.Image, out_size=224) -> Image.Image:
     img = pil_img.convert("RGB")
@@ -94,13 +71,11 @@ def letterbox(pil_img: Image.Image, out_size=224) -> Image.Image:
     canvas.paste(img, (x0, y0))
     return canvas
 
-
 def build_views(pil_img: Image.Image):
     roi = crop_chart_roi(pil_img, **ROI_CUT)
     w, h = roi.size
     zoom = roi.crop((0, 0, w, int(h * 0.55)))
     return letterbox(roi, 224), letterbox(zoom, 224)
-
 
 def make_structure_view(pil_224: Image.Image) -> Image.Image:
     img = np.array(pil_224)
@@ -112,21 +87,13 @@ def make_structure_view(pil_224: Image.Image) -> Image.Image:
     edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
     return Image.fromarray(edges_rgb)
 
-
-# ============================================================
-# TEXT FEAT
-# ============================================================
 @torch.no_grad()
 def build_text_feature(prompts):
     text_inputs = processor(text=prompts, return_tensors="pt", padding=True).to(DEVICE)
-    text_feat = clip_model.get_text_features(**text_inputs)  # [T,E]
-    text_feat = F.normalize(text_feat, dim=-1).mean(dim=0, keepdim=True)  # [1,E]
+    text_feat = clip_model.get_text_features(**text_inputs)
+    text_feat = F.normalize(text_feat, dim=-1).mean(dim=0, keepdim=True)
     return F.normalize(text_feat, dim=-1)
 
-
-# ============================================================
-# PRIORS & MASKS
-# ============================================================
 def spatial_prior(grid_size: int, strength=1.6) -> np.ndarray:
     g = grid_size
     ys, xs = np.mgrid[0:g, 0:g].astype(np.float32)
@@ -138,14 +105,13 @@ def spatial_prior(grid_size: int, strength=1.6) -> np.ndarray:
     prior = prior / (prior.max() + 1e-9)
     return prior
 
-
 def patch_density_mask(pil_224: Image.Image, grid_size: int) -> np.ndarray:
     img = np.array(pil_224)
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)  # vertical edges
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)  # horizontal edges
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
 
     mag_x = np.abs(gx)
     mag_y = np.abs(gy)
@@ -165,7 +131,6 @@ def patch_density_mask(pil_224: Image.Image, grid_size: int) -> np.ndarray:
     score = (score - score.min()) / (score.max() - score.min() + 1e-9)
     score = np.clip(score, DENSITY_MIN_CLIP, 1.0)
     return score
-
 
 def suppress_long_horizontal_runs(density_grid: np.ndarray, min_run: int = 3, penalty: float = 0.15) -> np.ndarray:
     g = density_grid.shape[0]
@@ -191,7 +156,6 @@ def suppress_long_horizontal_runs(density_grid: np.ndarray, min_run: int = 3, pe
 
     return np.clip(out, 0.0, 1.0)
 
-
 def prune_by_connectivity(keep_mask: np.ndarray, min_area: int = 2, aspect_ratio_thresh: float = 0.45) -> np.ndarray:
     m = (keep_mask.astype(np.uint8) * 255)
     num, labels = cv2.connectedComponents(m, connectivity=8)
@@ -213,10 +177,6 @@ def prune_by_connectivity(keep_mask: np.ndarray, min_area: int = 2, aspect_ratio
 
     return out
 
-
-# ============================================================
-# CORE: PATCH POOLING
-# ============================================================
 @torch.no_grad()
 def patch_pooled_embedding(
     pil_224: Image.Image,
@@ -233,12 +193,12 @@ def patch_pooled_embedding(
 
     for ly in layers:
         hs = vision_out.hidden_states[ly] if ly != -1 else vision_out.last_hidden_state
-        patch_tokens = hs[:, 1:, :]  # [1,P,D]
+        patch_tokens = hs[:, 1:, :]
 
-        patch_emb = clip_model.visual_projection(patch_tokens)  # [1,P,E]
+        patch_emb = clip_model.visual_projection(patch_tokens)
         patch_emb = F.normalize(patch_emb, dim=-1)
 
-        sim = (patch_emb @ text_feat.transpose(-1, -2)).squeeze(0).squeeze(-1)  # [P]
+        sim = (patch_emb @ text_feat.transpose(-1, -2)).squeeze(0).squeeze(-1)
         sim_np = sim.detach().cpu().numpy()
 
         P = sim_np.shape[0]
@@ -282,9 +242,6 @@ def patch_pooled_embedding(
     return out.detach().cpu().numpy()
 
 
-# ============================================================
-# FINAL EMBEDDING
-# ============================================================
 def embed_chart_image(image_path: str) -> list:
     pil = load_rgb(image_path)
     wide224, zoom224 = build_views(pil)
@@ -303,10 +260,6 @@ def embed_chart_image(image_path: str) -> list:
     out = out / (np.linalg.norm(out) + 1e-9)
     return out.tolist()
 
-
-# ============================================================
-# LANGCHAIN EMBEDDINGS
-# ============================================================
 class ProductionCLIPChartEmbeddings(Embeddings):
     def embed_documents(self, image_paths):
         return [embed_chart_image(p) for p in image_paths]
@@ -314,16 +267,30 @@ class ProductionCLIPChartEmbeddings(Embeddings):
     def embed_query(self, image_path):
         return embed_chart_image(image_path)
 
-
-# ============================================================
-# CHROMA
-# ============================================================
 def load_dataset(json_path: str):
     with open(json_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+def build_image_db(dataset_json: str, collection_name=COLLECTION, persist_directory=PERSIST_DIR, rebuild=False):
+    """
+    rebuild=False: ถ้ามี DB อยู่แล้ว -> เปิดใช้เลย (ไม่ add ซ้ำ)
+    rebuild=True : ลบทิ้งแล้วสร้างใหม่ (index ใหม่ทั้งหมด)
+    """
+    if rebuild and os.path.exists(persist_directory):
+        # ลบทิ้งทั้งโฟลเดอร์เพื่อกันข้อมูลเก่าปน (ชัวร์สุด)
+        import shutil
+        shutil.rmtree(persist_directory)
 
-def build_image_db(dataset_json: str, collection_name="chart_clip_prod_final_v2"):
+    # ถ้าเคยสร้างไว้แล้ว -> OPEN (ไม่สร้างซ้ำ)
+    if os.path.exists(persist_directory) and not rebuild:
+        db = Chroma(
+            collection_name=collection_name,
+            embedding_function=ProductionCLIPChartEmbeddings(),  # ต้องเหมือนเดิม
+            persist_directory=persist_directory,
+        )
+        return db
+
+    # ไม่เจอของเดิม -> BUILD
     raw = load_dataset(dataset_json)
 
     docs = []
@@ -331,12 +298,14 @@ def build_image_db(dataset_json: str, collection_name="chart_clip_prod_final_v2"
         p = os.path.normpath(item["image"])
         docs.append(Document(page_content=p, metadata={"image": p}))
 
-    return Chroma.from_documents(
+    db = Chroma.from_documents(
         docs,
         embedding=ProductionCLIPChartEmbeddings(),
-        collection_name=collection_name
+        collection_name=collection_name,
+        persist_directory=persist_directory,
     )
-
+    # ไม่ต้อง db.persist() แล้ว (Chroma ใหม่ auto persist)
+    return db
 
 def search_similar(db: Chroma, query_image: str, k=10):
     hits = db.similarity_search(query_image, k=k)
@@ -344,28 +313,23 @@ def search_similar(db: Chroma, query_image: str, k=10):
     out = []
     for h in hits:
         img = h.metadata.get("image")
-        if img not in seen:
-            seen.add(img)
-            out.append(h)
+        # if img not in seen:
+        seen.add(img)
+        out.append(h)
     return out
 
-
-# ============================================================
-# DEBUG VISUALIZATION (FIXED)
-# ============================================================
 def _percentile_norm(x: np.ndarray, lo_p=20, hi_p=95) -> np.ndarray:
     lo = np.percentile(x, lo_p)
     hi = np.percentile(x, hi_p)
     return np.clip((x - lo) / (hi - lo + 1e-9), 0.0, 1.0)
 
-
 @torch.no_grad()
 def visualize_debug(
     image_path: str,
-    lo_p: int = 20,           # lower percentile for heat normalization
-    hi_p: int = 95,           # upper percentile for heat normalization
-    heat_alpha: float = 0.55, # overlay intensity
-    dim_factor: float = 0.25, # how dark non-kept area is (0.08 too dark for some people)
+    lo_p: int = 20,
+    hi_p: int = 95,
+    heat_alpha: float = 0.55,
+    dim_factor: float = 0.25,
 ):
     pil = load_rgb(image_path)
     wide224, _ = build_views(pil)
@@ -392,7 +356,6 @@ def visualize_debug(
 
     sim2 = sim_grid * prior * (dens ** DENSITY_POWER)
 
-    # top-k + pruning
     flat = sim2.flatten()
     k = max(1, int(len(flat) * float(TOPK_RATIO)))
     thr = np.sort(flat)[-k]
@@ -401,13 +364,11 @@ def visualize_debug(
     if not keep.any():
         keep = keep0
 
-    # FIX: percentile normalization (better contrast than global min-max)
     sim_norm = _percentile_norm(sim2, lo_p=lo_p, hi_p=hi_p)
 
     img_np = np.array(wide224)
     H, W = img_np.shape[:2]
 
-    # upscale patch grid to image resolution
     heat = np.kron(sim_norm, np.ones((H // g, W // g)))[:H, :W]
     keep_map = np.kron(keep.astype(np.float32), np.ones((H // g, W // g)))[:H, :W]
 
@@ -435,25 +396,19 @@ def visualize_debug(
     plt.tight_layout()
     plt.show()
 
-
-# ============================================================
-# MAIN
-# ============================================================
 if __name__ == "__main__":
     DATASET_JSON = "dataset.json"
-    QUERY_IMAGE = "datasets1/XAUUSD.png"
+    QUERY_IMAGE = "datasets1/new_chart3.png"
 
-    # Debug (fixed)
-    # visualize_debug(
-    #     QUERY_IMAGE,
-    #     lo_p=20, hi_p=95,        # adjust to 10/99 if you want even more contrast
-    #     heat_alpha=0.55,
-    #     dim_factor=0.25          # change back to 0.08 if you want very strict "kept only"
-    # )
+    # visualize_debug(QUERY_IMAGE)
+    text_data = load_dataset(DATASET_JSON)
 
-    # Build DB / search (optional)
-    db = build_image_db(DATASET_JSON)
+    db = build_image_db(DATASET_JSON, rebuild=True)
+    print("db count:", db._collection.count())
     hits = search_similar(db, QUERY_IMAGE, k=5)
     print("\nTop matches:")
     for i, h in enumerate(hits, 1):
-        print(f"{i}. {h.metadata['image']}")
+        for item in text_data:
+            if item['image'] == h.metadata['image']:
+                print(f"{i}. {h.metadata['image']} : {item['data']}")
+            
