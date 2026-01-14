@@ -1,32 +1,38 @@
 import os
-import json
 import math
+import shutil
+from typing import List, Tuple
+
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-import matplotlib.pyplot as plt
 
 from transformers import CLIPProcessor, CLIPModel
 from langchain_community.vectorstores import Chroma
 from langchain.embeddings.base import Embeddings
 from langchain_core.documents import Document
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+from .dataset_utils import dataset_unique_paths
 
+
+# ============================================================
+# CONFIG
+# ============================================================
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_NAME = "openai/clip-vit-large-patch14"
 
-ROI_CUT = dict(left=0.02, top=0.06, right=0.10, bottom=0.10)
+ROI_CUT = dict(left=0.02, top=0.06, right=0.14, bottom=0.12)
 
 LAYERS = (-6, -3)
 TOPK_RATIO = 0.12
 PRIOR_STRENGTH = 1.6
-DENSITY_POWER = 2.0
+DENSITY_POWER = 2.3
 DENSITY_MIN_CLIP = 0.12
 
 HLINE_MIN_RUN = 3
-HLINE_PENALTY = 0.15
+HLINE_PENALTY = 0.10
 
 CC_MIN_AREA = 2
 CC_ASPECT_THRESH = 0.45
@@ -35,22 +41,37 @@ W_REAL = 0.55
 W_STRUCT = 0.45
 
 PROMPTS = [
-    "candlestick bodies and wicks",
-    "bullish and bearish candle shapes",
-    "candlestick rejection wicks",
-    "price action candlesticks",
+    "candlestick wick rejection",
+    "single candlestick body and wick",
+    "long wick rejection at swing",
+    "bullish bearish candle body and wick",
 ]
 
 PERSIST_DIR = "chroma_store_images"
-COLLECTION = "chart_clip"
+COLLECTION = "chart_clip_images"
 
-clip_model = CLIPModel.from_pretrained(MODEL_NAME).to(DEVICE).eval()
-processor = CLIPProcessor.from_pretrained(MODEL_NAME)
 
+# ============================================================
+# LAZY MODEL LOADER (avoid double-load on import)
+# ============================================================
+_clip_model = None
+_processor = None
+
+def get_clip() -> Tuple[CLIPModel, CLIPProcessor]:
+    global _clip_model, _processor
+    if _clip_model is None or _processor is None:
+        _clip_model = CLIPModel.from_pretrained(MODEL_NAME).to(DEVICE).eval()
+        _processor = CLIPProcessor.from_pretrained(MODEL_NAME, use_fast=True)
+    return _clip_model, _processor
+
+
+# ============================================================
+# IMAGE PREP
+# ============================================================
 def load_rgb(path: str) -> Image.Image:
     return Image.open(path).convert("RGB")
 
-def crop_chart_roi(pil_img: Image.Image, left=0.02, top=0.06, right=0.10, bottom=0.10) -> Image.Image:
+def crop_chart_roi(pil_img: Image.Image, left=0.02, top=0.06, right=0.14, bottom=0.12) -> Image.Image:
     w, h = pil_img.size
     x1 = int(w * left)
     y1 = int(h * top)
@@ -71,29 +92,73 @@ def letterbox(pil_img: Image.Image, out_size=224) -> Image.Image:
     canvas.paste(img, (x0, y0))
     return canvas
 
+def _auto_focus_crop(roi: Image.Image, win_ratio=0.72) -> Image.Image:
+    img = np.array(roi)
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    energy = np.abs(gx).mean(axis=0)
+
+    w = gray.shape[1]
+    win = max(32, int(w * win_ratio))
+
+    cs = np.cumsum(energy, dtype=np.float64)
+    cs = np.concatenate([[0.0], cs])
+
+    best_s, best_v = 0, -1e18
+    for s in range(0, w - win + 1, max(1, win // 40)):
+        v = cs[s + win] - cs[s]
+        if v > best_v:
+            best_v, best_s = v, s
+
+    x1, x2 = best_s, best_s + win
+    return roi.crop((x1, 0, x2, roi.size[1]))
+
 def build_views(pil_img: Image.Image):
     roi = crop_chart_roi(pil_img, **ROI_CUT)
     w, h = roi.size
     zoom = roi.crop((0, 0, w, int(h * 0.55)))
-    return letterbox(roi, 224), letterbox(zoom, 224)
+    focus = _auto_focus_crop(roi, win_ratio=0.72)
+    return (
+        letterbox(roi, 224),
+        letterbox(zoom, 224),
+        letterbox(focus, 224),
+    )
 
 def make_structure_view(pil_224: Image.Image) -> Image.Image:
     img = np.array(pil_224)
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
     edges = cv2.Canny(gray, 40, 120)
+
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 1))
+    h_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, h_kernel, iterations=1)
+    edges = cv2.subtract(edges, h_lines)
+
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     edges = cv2.dilate(edges, kernel, iterations=1)
+
     edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
     return Image.fromarray(edges_rgb)
 
-@torch.no_grad()
-def build_text_feature(prompts):
-    text_inputs = processor(text=prompts, return_tensors="pt", padding=True).to(DEVICE)
-    text_feat = clip_model.get_text_features(**text_inputs)
-    text_feat = F.normalize(text_feat, dim=-1).mean(dim=0, keepdim=True)
-    return F.normalize(text_feat, dim=-1)
 
+# ============================================================
+# TEXT FEAT (PROMPT ENSEMBLE MAX)
+# ============================================================
+@torch.no_grad()
+def build_text_features(prompts):
+    clip_model, processor = get_clip()
+    t_in = processor(text=prompts, return_tensors="pt", padding=True).to(DEVICE)
+    t_feat = clip_model.get_text_features(**t_in)
+    t_feat = F.normalize(t_feat, dim=-1)
+    return t_feat
+
+
+# ============================================================
+# PRIORS & MASKS
+# ============================================================
 def spatial_prior(grid_size: int, strength=1.6) -> np.ndarray:
     g = grid_size
     ys, xs = np.mgrid[0:g, 0:g].astype(np.float32)
@@ -132,7 +197,7 @@ def patch_density_mask(pil_224: Image.Image, grid_size: int) -> np.ndarray:
     score = np.clip(score, DENSITY_MIN_CLIP, 1.0)
     return score
 
-def suppress_long_horizontal_runs(density_grid: np.ndarray, min_run: int = 3, penalty: float = 0.15) -> np.ndarray:
+def suppress_long_horizontal_runs(density_grid: np.ndarray, min_run: int = 3, penalty: float = 0.10) -> np.ndarray:
     g = density_grid.shape[0]
     out = density_grid.copy()
 
@@ -161,7 +226,6 @@ def prune_by_connectivity(keep_mask: np.ndarray, min_area: int = 2, aspect_ratio
     num, labels = cv2.connectedComponents(m, connectivity=8)
 
     out = np.zeros_like(keep_mask, dtype=bool)
-
     for lab in range(1, num):
         ys, xs = np.where(labels == lab)
         area = len(xs)
@@ -177,15 +241,21 @@ def prune_by_connectivity(keep_mask: np.ndarray, min_area: int = 2, aspect_ratio
 
     return out
 
+
+# ============================================================
+# CORE: PATCH POOLING (PROMPT MAX)
+# ============================================================
 @torch.no_grad()
 def patch_pooled_embedding(
     pil_224: Image.Image,
-    text_feat: torch.Tensor,
+    text_feats: torch.Tensor,
     layers=LAYERS,
     topk_ratio=TOPK_RATIO,
     prior_strength=PRIOR_STRENGTH,
     density_power=DENSITY_POWER,
 ):
+    clip_model, processor = get_clip()
+
     inputs = processor(images=pil_224, return_tensors="pt").to(DEVICE)
     vision_out = clip_model.vision_model(**inputs, output_hidden_states=True)
 
@@ -198,14 +268,14 @@ def patch_pooled_embedding(
         patch_emb = clip_model.visual_projection(patch_tokens)
         patch_emb = F.normalize(patch_emb, dim=-1)
 
-        sim = (patch_emb @ text_feat.transpose(-1, -2)).squeeze(0).squeeze(-1)
+        sim_all = patch_emb @ text_feats.T
+        sim = sim_all.max(dim=-1).values.squeeze(0)
         sim_np = sim.detach().cpu().numpy()
 
         P = sim_np.shape[0]
         g = int(round(math.sqrt(P)))
         if g * g != P:
-            raise ValueError(f"Patch count {P} not square.")
-
+            raise ValueError(f"Patch count {P} not square (got {P}).")
         sim_grid = sim_np.reshape(g, g)
 
         prior = spatial_prior(g, strength=prior_strength)
@@ -213,7 +283,6 @@ def patch_pooled_embedding(
 
         dens = patch_density_mask(pil_224, g)
         dens = suppress_long_horizontal_runs(dens, min_run=HLINE_MIN_RUN, penalty=HLINE_PENALTY)
-
         sim_grid = sim_grid * (dens ** density_power)
 
         flat = sim_grid.flatten()
@@ -227,8 +296,8 @@ def patch_pooled_embedding(
 
         keep_flat = keep.flatten()
         sim2 = torch.tensor(sim_grid.flatten(), device=DEVICE, dtype=sim.dtype)
-
         mask = torch.tensor(keep_flat, device=DEVICE)
+
         selected = patch_emb[0][mask]
         selected_sim = sim2[mask]
 
@@ -242,23 +311,34 @@ def patch_pooled_embedding(
     return out.detach().cpu().numpy()
 
 
-def embed_chart_image(image_path: str) -> list:
+def embed_chart_image(image_path: str) -> List[float]:
     pil = load_rgb(image_path)
-    wide224, zoom224 = build_views(pil)
-    text_feat = build_text_feature(PROMPTS)
+    wide224, zoom224, focus224 = build_views(pil)
 
-    v_real = (patch_pooled_embedding(wide224, text_feat) + patch_pooled_embedding(zoom224, text_feat)) / 2.0
+    text_feats = build_text_features(PROMPTS)
+
+    v_real = (
+        patch_pooled_embedding(wide224, text_feats) +
+        patch_pooled_embedding(zoom224, text_feats) +
+        patch_pooled_embedding(focus224, text_feats)
+    ) / 3.0
     v_real = v_real / (np.linalg.norm(v_real) + 1e-9)
 
-    wide_struct = make_structure_view(wide224)
-    zoom_struct = make_structure_view(zoom224)
+    wide_s = make_structure_view(wide224)
+    zoom_s = make_structure_view(zoom224)
+    focus_s = make_structure_view(focus224)
 
-    v_struct = (patch_pooled_embedding(wide_struct, text_feat) + patch_pooled_embedding(zoom_struct, text_feat)) / 2.0
+    v_struct = (
+        patch_pooled_embedding(wide_s, text_feats) +
+        patch_pooled_embedding(zoom_s, text_feats) +
+        patch_pooled_embedding(focus_s, text_feats)
+    ) / 3.0
     v_struct = v_struct / (np.linalg.norm(v_struct) + 1e-9)
 
     out = (W_REAL * v_real) + (W_STRUCT * v_struct)
     out = out / (np.linalg.norm(out) + 1e-9)
     return out.tolist()
+
 
 class ProductionCLIPChartEmbeddings(Embeddings):
     def embed_documents(self, image_paths):
@@ -267,148 +347,55 @@ class ProductionCLIPChartEmbeddings(Embeddings):
     def embed_query(self, image_path):
         return embed_chart_image(image_path)
 
-def load_dataset(json_path: str):
-    with open(json_path, "r", encoding="utf-8") as f:
-        return json.load(f)
 
-def build_image_db(dataset_json: str, collection_name=COLLECTION, persist_directory=PERSIST_DIR, rebuild=False):
-    """
-    rebuild=False: ถ้ามี DB อยู่แล้ว -> เปิดใช้เลย (ไม่ add ซ้ำ)
-    rebuild=True : ลบทิ้งแล้วสร้างใหม่ (index ใหม่ทั้งหมด)
-    """
-    if rebuild and os.path.exists(persist_directory):
-        # ลบทิ้งทั้งโฟลเดอร์เพื่อกันข้อมูลเก่าปน (ชัวร์สุด)
-        import shutil
-        shutil.rmtree(persist_directory)
+# ============================================================
+# CHROMA (IMAGE)
+# ============================================================
+def open_image_db():
+    return Chroma(
+        collection_name=COLLECTION,
+        embedding_function=ProductionCLIPChartEmbeddings(),
+        persist_directory=PERSIST_DIR,
+    )
 
-    # ถ้าเคยสร้างไว้แล้ว -> OPEN (ไม่สร้างซ้ำ)
-    if os.path.exists(persist_directory) and not rebuild:
-        db = Chroma(
-            collection_name=collection_name,
-            embedding_function=ProductionCLIPChartEmbeddings(),  # ต้องเหมือนเดิม
-            persist_directory=persist_directory,
-        )
+def _get_existing_ids_batched(db: Chroma, ids: List[str], batch=1000):
+    existing = set()
+    for i in range(0, len(ids), batch):
+        chunk = ids[i:i+batch]
+        got = db._collection.get(ids=chunk, include=[])
+        if got and "ids" in got and got["ids"]:
+            existing.update(got["ids"])
+    return existing
+
+def upsert_image_dataset(dataset_json: str):
+    db = open_image_db()
+    _, uniq_paths = dataset_unique_paths(dataset_json)
+    if not uniq_paths:
+        raise ValueError("dataset.json contains no image paths")
+
+    existing = _get_existing_ids_batched(db, uniq_paths, batch=1000)
+    new_paths = [p for p in uniq_paths if p not in existing]
+
+    if not new_paths:
+        print(f"✅ Image DB: no new images. count={db._collection.count()}")
         return db
 
-    # ไม่เจอของเดิม -> BUILD
-    raw = load_dataset(dataset_json)
-
-    docs = []
-    for item in raw:
-        p = os.path.normpath(item["image"])
-        docs.append(Document(page_content=p, metadata={"image": p}))
-
-    db = Chroma.from_documents(
-        docs,
-        embedding=ProductionCLIPChartEmbeddings(),
-        collection_name=collection_name,
-        persist_directory=persist_directory,
-    )
-    # ไม่ต้อง db.persist() แล้ว (Chroma ใหม่ auto persist)
+    docs = [Document(page_content=p, metadata={"image": p}) for p in new_paths]
+    ids = new_paths[:]
+    db.add_documents(docs, ids=ids)
+    print(f"✅ Image DB: added {len(new_paths)} new images. count={db._collection.count()}")
     return db
 
-def search_similar(db: Chroma, query_image: str, k=10):
-    hits = db.similarity_search(query_image, k=k)
-    seen = set()
-    out = []
-    for h in hits:
-        img = h.metadata.get("image")
-        # if img not in seen:
-        seen.add(img)
-        out.append(h)
-    return out
+def rebuild_image_db(dataset_json: str):
+    if os.path.exists(PERSIST_DIR):
+        shutil.rmtree(PERSIST_DIR)
 
-def _percentile_norm(x: np.ndarray, lo_p=20, hi_p=95) -> np.ndarray:
-    lo = np.percentile(x, lo_p)
-    hi = np.percentile(x, hi_p)
-    return np.clip((x - lo) / (hi - lo + 1e-9), 0.0, 1.0)
+    db = open_image_db()
+    _, uniq_paths = dataset_unique_paths(dataset_json)
+    docs = [Document(page_content=p, metadata={"image": p}) for p in uniq_paths]
+    db.add_documents(docs, ids=uniq_paths[:])
+    print(f"✅ Image DB: rebuilt. unique_docs={len(uniq_paths)} count={db._collection.count()}")
+    return db
 
-@torch.no_grad()
-def visualize_debug(
-    image_path: str,
-    lo_p: int = 20,
-    hi_p: int = 95,
-    heat_alpha: float = 0.55,
-    dim_factor: float = 0.25,
-):
-    pil = load_rgb(image_path)
-    wide224, _ = build_views(pil)
-    text_feat = build_text_feature(PROMPTS)
-
-    ly = LAYERS[-1]
-
-    inputs = processor(images=wide224, return_tensors="pt").to(DEVICE)
-    vision_out = clip_model.vision_model(**inputs, output_hidden_states=True)
-
-    hs = vision_out.hidden_states[ly]
-    patch_tokens = hs[:, 1:, :]
-    patch_emb = clip_model.visual_projection(patch_tokens)
-    patch_emb = F.normalize(patch_emb, dim=-1)
-
-    sim = (patch_emb @ text_feat.transpose(-1, -2)).squeeze(0).squeeze(-1).detach().cpu().numpy()
-    P = sim.shape[0]
-    g = int(round(math.sqrt(P)))
-    sim_grid = sim.reshape(g, g)
-
-    prior = spatial_prior(g, strength=PRIOR_STRENGTH)
-    dens = patch_density_mask(wide224, g)
-    dens = suppress_long_horizontal_runs(dens, min_run=HLINE_MIN_RUN, penalty=HLINE_PENALTY)
-
-    sim2 = sim_grid * prior * (dens ** DENSITY_POWER)
-
-    flat = sim2.flatten()
-    k = max(1, int(len(flat) * float(TOPK_RATIO)))
-    thr = np.sort(flat)[-k]
-    keep0 = (sim2 >= thr)
-    keep = prune_by_connectivity(keep0, min_area=CC_MIN_AREA, aspect_ratio_thresh=CC_ASPECT_THRESH)
-    if not keep.any():
-        keep = keep0
-
-    sim_norm = _percentile_norm(sim2, lo_p=lo_p, hi_p=hi_p)
-
-    img_np = np.array(wide224)
-    H, W = img_np.shape[:2]
-
-    heat = np.kron(sim_norm, np.ones((H // g, W // g)))[:H, :W]
-    keep_map = np.kron(keep.astype(np.float32), np.ones((H // g, W // g)))[:H, :W]
-
-    masked = img_np.astype(np.float32)
-    masked[keep_map < 0.5] *= float(dim_factor)
-    masked = np.clip(masked, 0, 255).astype(np.uint8)
-
-    plt.figure(figsize=(16, 5))
-    plt.subplot(1, 3, 1)
-    plt.title("Wide View (ROI+letterbox)")
-    plt.imshow(img_np)
-    plt.axis("off")
-
-    plt.subplot(1, 3, 2)
-    plt.title(f"Heatmap (layer {ly}) [percentile norm {lo_p}-{hi_p}]")
-    plt.imshow(img_np)
-    plt.imshow(heat, alpha=float(heat_alpha))
-    plt.axis("off")
-
-    plt.subplot(1, 3, 3)
-    plt.title(f"Top-{int(TOPK_RATIO*100)}% kept (pruned) [dim={dim_factor}]")
-    plt.imshow(masked)
-    plt.axis("off")
-
-    plt.tight_layout()
-    plt.show()
-
-if __name__ == "__main__":
-    DATASET_JSON = "dataset.json"
-    QUERY_IMAGE = "datasets1/new_chart3.png"
-
-    # visualize_debug(QUERY_IMAGE)
-    text_data = load_dataset(DATASET_JSON)
-
-    db = build_image_db(DATASET_JSON, rebuild=True)
-    print("db count:", db._collection.count())
-    hits = search_similar(db, QUERY_IMAGE, k=5)
-    print("\nTop matches:")
-    for i, h in enumerate(hits, 1):
-        for item in text_data:
-            if item['image'] == h.metadata['image']:
-                print(f"{i}. {h.metadata['image']} : {item['data']}")
-            
+def search_image(db: Chroma, query_image: str, k=10):
+    return db.similarity_search(query_image, k=k)
