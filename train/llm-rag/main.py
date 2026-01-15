@@ -108,13 +108,22 @@ def print_results(title: str, results):
             snippet = snippet[:180] + "..."
 
         ranks = []
-        for k in ["img_rank", "t_rank"]:  # ✅ ลบ x_rank
+        for k in ["img_rank", "t_rank"]:
             if r.get(k) is not None:
                 ranks.append(f"{k}={r[k]}")
 
+        extra = []
+        if r.get("final_score") is not None:
+            extra.append(f"final={float(r['final_score']):.4f}")
+        if r.get("rerank_text_score") is not None:
+            extra.append(f"rerank={float(r['rerank_text_score']):.4f}")
+
         print(f"{i}. {r['image']}")
-        print(f"   rrf={r['rrf']:.6f}" + (f" | {' | '.join(ranks)}" if ranks else ""))
+        print(f"   rrf={r['rrf']:.6f}"
+              + (f" | {' | '.join(ranks)}" if ranks else "")
+              + (f" | {' | '.join(extra)}" if extra else ""))
         print(f"   {snippet}\n")
+
 
 
 def build_rag_context(results, max_chars: int = 1500) -> str:
@@ -187,8 +196,13 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
         k_img=15,
         k_t=15,
         final_k=5,
-        w_img=0.78,
-        w_t=0.22,
+        w_img=0.85,
+        w_t=0.15,
+
+        # ✅ rerank
+        rerank=True,
+        rerank_top_m=30,
+        w_rerank=0.45,
     )
 
     print_results("IMAGE → HYBRID (Chart + Text via auto_text)", results)
@@ -231,8 +245,8 @@ if __name__ == "__main__":
     main()
 
 
-1 datasets1/chart7.jpg
-2 datasets1/chart8.jpg
-3 datasets1/chart16.png
-4 datasets1/chart18.png
-5 datasets1/chart21.png
+# 1 datasets1/chart7.jpg
+# 2 datasets1/chart8.jpg
+# 3 datasets1/chart16.png
+# 4 datasets1/chart18.png
+# 5 datasets1/chart21.png
