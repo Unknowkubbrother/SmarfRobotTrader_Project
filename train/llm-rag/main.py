@@ -7,7 +7,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from retrieval import (
     upsert_image_dataset,
     upsert_text_dataset,
-    upsert_xmodal_image_dataset,
     hybrid_search_image_query,
 )
 
@@ -109,7 +108,7 @@ def print_results(title: str, results):
             snippet = snippet[:180] + "..."
 
         ranks = []
-        for k in ["img_rank", "t_rank", "x_rank"]:
+        for k in ["img_rank", "t_rank"]:  # ✅ ลบ x_rank
             if r.get(k) is not None:
                 ranks.append(f"{k}={r[k]}")
 
@@ -136,9 +135,8 @@ def main():
     QUERY_IMAGE = "datasets1/new_chart3.png"
 
     # 1) build/update indexes
-    chart_db = upsert_image_dataset(DATASET_JSON)          # V4 image->image
-    text_db = upsert_text_dataset(DATASET_JSON)            # dataset.data text->text
-    xmodal_db = upsert_xmodal_image_dataset(DATASET_JSON)  # auto_text(text)->image
+    chart_db = upsert_image_dataset(DATASET_JSON)  # image->image
+    text_db = upsert_text_dataset(DATASET_JSON)    # dataset.data text->text
 
     vision_llm = OllamaLLM(model="ministral-3:14b", temperature=0)
 
@@ -147,14 +145,15 @@ def main():
     print("\n📝 Draft (from image):\n", draft)
 
     # 3) pull domain examples from dataset (TEXT ONLY)
-    #    (use draft to retrieve writing style closest to your dataset)
     try:
         ex_docs = text_db.similarity_search(draft, k=6)
     except Exception as e:
         ex_docs = []
         print("\n⚠️ text_db.similarity_search failed, fallback to empty examples:", e)
 
-    domain_examples = "\n\n---\n\n".join(mask_numbers(d.page_content) for d in ex_docs if getattr(d, "page_content", None))
+    domain_examples = "\n\n---\n\n".join(
+        mask_numbers(d.page_content) for d in ex_docs if getattr(d, "page_content", None)
+    )
     if not domain_examples:
         domain_examples = "ไม่มีตัวอย่าง (fallback): ให้ใช้สำนวนเทคนิคแบบนักเทรดไทย เน้น PA logic และคำค้นที่ชัดเจน"
 
@@ -174,24 +173,25 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
     auto_text = vision_llm.invoke(rewrite_prompt, images=[QUERY_IMAGE])
     print("\n📝 Auto-text (domain rewritten):\n", auto_text)
 
-    # 5) compress -> query_text (for text_db/xmodal)
+    # 5) compress -> query_text (for text_db)
     query_text = build_query_text_from_auto(auto_text)
-    print("\n🔎 Query text (used for text/xmodal):\n", query_text)
+    print("\n🔎 Query text (used for text):\n", query_text)
 
-    # 6) hybrid search (IMAGE MODE)
+    # 6) hybrid search (IMAGE + TEXT)
     results = hybrid_search_image_query(
         chart_db=chart_db,
         text_db=text_db,
         dataset_json=DATASET_JSON,
         query_image=QUERY_IMAGE,
         auto_text=query_text,
-        xmodal_image_db=xmodal_db,
-        k_img=15, k_t=15, k_x=15,
+        k_img=15,
+        k_t=15,
         final_k=5,
-        w_img=0.75, w_t=0.18, w_x=0.07,
+        w_img=0.78,
+        w_t=0.22,
     )
 
-    print_results("IMAGE → HYBRID (Chart V4 + Text + XModal via auto_text)", results)
+    print_results("IMAGE → HYBRID (Chart + Text via auto_text)", results)
 
     # 7) RAG context from retrieved examples
     rag_context = build_rag_context(results, max_chars=1500)
@@ -229,3 +229,10 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
 
 if __name__ == "__main__":
     main()
+
+
+1 datasets1/chart7.jpg
+2 datasets1/chart8.jpg
+3 datasets1/chart16.png
+4 datasets1/chart18.png
+5 datasets1/chart21.png

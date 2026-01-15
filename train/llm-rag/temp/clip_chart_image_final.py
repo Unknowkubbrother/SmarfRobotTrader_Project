@@ -609,11 +609,11 @@ def visualize_used_for_vectordb(image_path: str, lo_p=20, hi_p=95):
 # ============================================================
 if __name__ == "__main__":
     DATASET_JSON = "dataset.json"
-    QUERY_IMAGE = "datasets1/new_chart3.png"
+    QUERY_IMAGE = "datasets1/eurusd_mt5.png"
 
-    # visualize_used_for_vectordb(QUERY_IMAGE)
+    visualize_used_for_vectordb(QUERY_IMAGE)
 
-    db = upsert_dataset(DATASET_JSON)
-    hits = search_similar(db, QUERY_IMAGE, k=5)
-    for i, h in enumerate(hits, 1):
-        print(i, h.metadata.get("image"))
+    # db = upsert_dataset(DATASET_JSON)
+    # hits = search_similar(db, QUERY_IMAGE, k=5)
+    # for i, h in enumerate(hits, 1):
+    #     print(i, h.metadata.get("image"))

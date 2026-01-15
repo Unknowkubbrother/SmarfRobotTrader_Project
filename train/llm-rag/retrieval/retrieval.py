@@ -49,17 +49,15 @@ def hybrid_search_image_query(
     dataset_json: str,
     query_image: str,
     auto_text: Optional[str] = None,
-    xmodal_image_db: Optional[Chroma] = None,
-    k_img=30,
-    k_t=30,
-    k_x=30,
-    final_k=10,
-    w_img=0.75,
-    w_t=0.18,
-    w_x=0.07,
+    k_img: int = 30,
+    k_t: int = 30,
+    final_k: int = 10,
+    w_img: float = 0.75,
+    w_t: float = 0.25,
 ):
     """
-    IMAGE -> (chart search) + (text search via auto_text) + (xmodal via auto_text) -> RRF merge
+    IMAGE -> (chart search) + (text search via auto_text) -> RRF merge
+    ไม่มี xmodal แล้ว
     """
     img_hits = chroma_search_rank_only(chart_db, query_image, k=k_img)
 
@@ -71,11 +69,6 @@ def hybrid_search_image_query(
         hit_lists.append(t_hits)
         weights.append(w_t)
 
-        if xmodal_image_db is not None:
-            x_hits = chroma_search_rank_only(xmodal_image_db, auto_text, k=k_x)
-            hit_lists.append(x_hits)
-            weights.append(w_x)
-
     fused = rrf_fuse_multi(hit_lists, weights, final_k=final_k)
     lookup = build_text_lookup(dataset_json)
 
@@ -86,7 +79,6 @@ def hybrid_search_image_query(
             "rrf": float(rrf_score),
             "img_rank": ranks.get(0),
             "t_rank": ranks.get(1),
-            "x_rank": ranks.get(2),
             "data": lookup.get(key, ""),
         })
     return results
