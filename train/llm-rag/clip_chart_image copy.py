@@ -53,16 +53,25 @@ CC_ASPECT_THRESH = 0.45
 W_REAL = 0.55
 W_STRUCT = 0.45
 
-# Prompt แคบ + ใช้ MAX ensemble ต่อ patch (สำคัญ)
-PROMPTS = [
-    "candlestick wick rejection",
-    "single candlestick body and wick",
-    "long wick rejection at swing",
-    "bullish bearish candle body and wick",
+ANCHOR_PROMPTS = [
+    "TradingView candlestick chart screenshot",
+    "MetaTrader 5 candlestick chart screenshot",
 ]
 
-PERSIST_DIR = "chroma_store_images"
-COLLECTION = "chart_clip_images"
+CANDLE_PROMPTS = [
+    "OHLC candlesticks body and wicks close-up on trading chart",
+    "red and green candlesticks with wicks close-up",
+    "pin bar long upper wick rejection at resistance on candlestick chart",
+    "pin bar long lower wick rejection at support on candlestick chart",
+    "long wick rejection candle at swing high",
+    "long wick rejection candle at swing low",
+    "liquidity sweep wick then reversal on candlestick chart",
+    "fakeout breakout wick then reversal on candlestick chart",
+]
+
+
+PERSIST_DIR = "chroma_store_images1"
+COLLECTION = "chart_clip_images1"
 
 
 # ============================================================
@@ -185,7 +194,7 @@ def make_structure_view(pil_224: Image.Image) -> Image.Image:
 # TEXT FEAT (PROMPT ENSEMBLE MAX)
 # ============================================================
 @torch.no_grad()
-def build_text_features(prompts):
+def build_text_features(prompts: list[str]):
     """
     Return: [T,E] normalized text features (NO averaging)
     We'll take max similarity per patch across prompts.
@@ -358,13 +367,14 @@ def embed_chart_image(image_path: str) -> list:
     pil = load_rgb(image_path)
     wide224, zoom224, focus224 = build_views(pil)
 
-    text_feats = build_text_features(PROMPTS)
+    text_anchor = build_text_features(ANCHOR_PROMPTS)
+    text_candle = build_text_features(CANDLE_PROMPTS)
 
     # REAL: average 3 views
     v_real = (
-        patch_pooled_embedding(wide224, text_feats) +
-        patch_pooled_embedding(zoom224, text_feats) +
-        patch_pooled_embedding(focus224, text_feats)
+        patch_pooled_embedding(wide224, text_anchor) +
+        patch_pooled_embedding(zoom224, text_candle) +
+        patch_pooled_embedding(focus224, text_candle)
     ) / 3.0
     v_real = v_real / (np.linalg.norm(v_real) + 1e-9)
 
@@ -374,9 +384,9 @@ def embed_chart_image(image_path: str) -> list:
     focus_s = make_structure_view(focus224)
 
     v_struct = (
-        patch_pooled_embedding(wide_s, text_feats) +
-        patch_pooled_embedding(zoom_s, text_feats) +
-        patch_pooled_embedding(focus_s, text_feats)
+        patch_pooled_embedding(wide_s, text_anchor) +
+        patch_pooled_embedding(zoom_s, text_candle) +
+        patch_pooled_embedding(focus_s, text_candle)
     ) / 3.0
     v_struct = v_struct / (np.linalg.norm(v_struct) + 1e-9)
 
@@ -483,7 +493,9 @@ def _percentile_norm(x: np.ndarray, lo_p=20, hi_p=95) -> np.ndarray:
 def visualize_debug(image_path: str, lo_p=20, hi_p=95, heat_alpha=0.55, dim_factor=0.25):
     pil = load_rgb(image_path)
     wide224, _, _ = build_views(pil)
-    text_feats = build_text_features(PROMPTS)
+    anchor_feats = build_text_features(ANCHOR_PROMPTS)
+    candle_feats = build_text_features(CANDLE_PROMPTS)
+    
     ly = LAYERS[-1]
 
     inputs = processor(images=wide224, return_tensors="pt").to(DEVICE)
@@ -494,8 +506,11 @@ def visualize_debug(image_path: str, lo_p=20, hi_p=95, heat_alpha=0.55, dim_fact
     patch_emb = clip_model.visual_projection(patch_tokens)
     patch_emb = F.normalize(patch_emb, dim=-1)
 
-    sim_all = patch_emb @ text_feats.T
-    sim = sim_all.max(dim=-1).values.squeeze(0).detach().cpu().numpy()
+    sim_anchor = patch_emb @ anchor_feats.T
+    sim_candle = patch_emb @ candle_feats.T
+    sim_anchor = sim_anchor.max(dim=-1).values.squeeze(0).detach().cpu().numpy()
+    sim_candle = sim_candle.max(dim=-1).values.squeeze(0).detach().cpu().numpy()
+    sim = sim_candle + 0.15 *sim_anchor
 
     P = sim.shape[0]
     g = int(round(math.sqrt(P)))
@@ -526,10 +541,13 @@ def visualize_debug(image_path: str, lo_p=20, hi_p=95, heat_alpha=0.55, dim_fact
     masked[keep_map < 0.5] *= float(dim_factor)
     masked = np.clip(masked, 0, 255).astype(np.uint8)
 
+    overlay = img_np.copy()
+    overlay[keep_map >= 0.5] = (255, 0, 0)  # แดงทับพื้นที่ที่ keep
+
     plt.figure(figsize=(16, 5))
     plt.subplot(1, 3, 1); plt.title("Wide (ROI+letterbox)"); plt.imshow(img_np); plt.axis("off")
     plt.subplot(1, 3, 2); plt.title(f"Heatmap MAX-prompt (layer {ly})"); plt.imshow(img_np); plt.imshow(heat, alpha=float(heat_alpha)); plt.axis("off")
-    plt.subplot(1, 3, 3); plt.title(f"Top-{int(TOPK_RATIO*100)}% kept"); plt.imshow(masked); plt.axis("off")
+    plt.subplot(1, 3, 3); plt.title("Masked"); plt.imshow(img_np); plt.imshow(overlay, alpha=0.25); plt.axis("off")
     plt.tight_layout()
     plt.show()
 
@@ -539,22 +557,22 @@ def visualize_debug(image_path: str, lo_p=20, hi_p=95, heat_alpha=0.55, dim_fact
 # ============================================================
 if __name__ == "__main__":
     DATASET_JSON = "dataset.json"
-    QUERY_IMAGE = "datasets1/THBUSD.png"
+    QUERY_IMAGE = "datasets1/new_chart3.png"
 
     # Production default: upsert only new, no duplicates, no rebuild
-    db = upsert_dataset(DATASET_JSON)
+    # db = upsert_dataset(DATASET_JSON)
 
-    print("db count:", db._collection.count())
+    # print("db count:", db._collection.count())
 
     # Optional debug
-    # visualize_debug(QUERY_IMAGE)
+    visualize_debug(QUERY_IMAGE)
 
-    hits = search_similar(db, QUERY_IMAGE, k=5)
+    # hits = search_similar(db, QUERY_IMAGE, k=5)
 
-    raw = load_dataset(DATASET_JSON)
-    lookup = {norm_path(it["image"]): it.get("data", "") for it in raw if "image" in it}
+    # raw = load_dataset(DATASET_JSON)
+    # lookup = {norm_path(it["image"]): it.get("data", "") for it in raw if "image" in it}
 
-    print("\nTop matches:")
-    for i, h in enumerate(hits, 1):
-        p = norm_path(h.metadata["image"])
-        print(f"{i}. {p} : {lookup.get(p, '')}")
+    # print("\nTop matches:")
+    # for i, h in enumerate(hits, 1):
+    #     p = norm_path(h.metadata["image"])
+    #     print(f"{i}. {p} : {lookup.get(p, '')}")

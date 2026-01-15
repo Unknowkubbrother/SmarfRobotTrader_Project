@@ -133,7 +133,7 @@ def build_rag_context(results, max_chars: int = 1500) -> str:
 # ----------------------------
 def main():
     DATASET_JSON = "dataset.json"
-    QUERY_IMAGE = "datasets1/XAUUSD.png"
+    QUERY_IMAGE = "datasets1/new_chart3.png"
 
     # 1) build/update indexes
     chart_db = upsert_image_dataset(DATASET_JSON)          # V4 image->image
@@ -171,7 +171,7 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
 {AUTO_TEXT_COMPRESS_NOTE}
 """.strip()
 
-    auto_text = vision_llm.invoke(rewrite_prompt)
+    auto_text = vision_llm.invoke(rewrite_prompt, images=[QUERY_IMAGE])
     print("\n📝 Auto-text (domain rewritten):\n", auto_text)
 
     # 5) compress -> query_text (for text_db/xmodal)
@@ -213,7 +213,6 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
 - ไม่ใช้ bullet
 - ข้อความล้วน ไม่มี Markdown ไม่มีสัญลักษณ์พิเศษ
 - ไม่พูดคำว่า แนวโน้ม โมเมนตัม โครงสร้างราคา
-- ถ้าตัวเลขราคาในภาพไม่ชัด ให้ใช้คำว่า "โซนบน/โซนล่าง" แทน ห้ามเดาตัวเลข
 - ห้ามพูดคำว่า KEYWORDS
 
 รูปแบบ:
