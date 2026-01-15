@@ -50,7 +50,7 @@ LAYERS = (-6, -3, 24)
 LAYER_WEIGHTS = (0.25, 0.25, 0.50)
 
 # Patch selection
-TOPK_RATIO = 0.14
+TOPK_RATIO = 0.16
 MIN_KEEP_PATCHES = 12
 CC_MIN_AREA = 2
 CC_ASPECT_THRESH = 0.45
@@ -67,8 +67,8 @@ EDGE_BASE_THR = 0.0035
 EDGE_PCT = 75.0
 
 # New: suppress background
-EDGE_BOOST_POWER = 1.35     # emphasize edge-rich patches
-BG_SUBTRACT = 0.35          # subtract mean score on invalid/background-ish patches
+EDGE_BOOST_POWER = 1.6     # emphasize edge-rich patches
+BG_SUBTRACT = 0.45        # subtract mean score on invalid/background-ish patches
 CONTENT_GLOBAL_EDGE_GAMMA = 1.5  # weights for building content-global from edge density
 
 # Views
@@ -619,11 +619,11 @@ def visualize_used_for_vectordb(image_path: str, lo_p=20, hi_p=95):
 # ============================================================
 if __name__ == "__main__":
     DATASET_JSON = "dataset.json"
-    QUERY_IMAGE = "datasets1/NVDA.png"
+    QUERY_IMAGE = "datasets1/chart22.png"
 
-    visualize_used_for_vectordb(QUERY_IMAGE)
+    # visualize_used_for_vectordb(QUERY_IMAGE)
 
-    # db = upsert_dataset(DATASET_JSON)
-    # hits = search_similar(db, QUERY_IMAGE, k=5)
-    # for i, h in enumerate(hits, 1):
-    #     print(i, h.metadata.get("image"))
+    db = upsert_dataset(DATASET_JSON)
+    hits = search_similar(db, QUERY_IMAGE, k=5)
+    for i, h in enumerate(hits, 1):
+        print(i, h.metadata.get("image"))
