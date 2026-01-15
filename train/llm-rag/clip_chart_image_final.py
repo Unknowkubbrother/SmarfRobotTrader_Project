@@ -76,8 +76,7 @@ USE_VIEWS = True
 W_REAL = 0.60
 W_STRUCT = 0.40
 
-# Pooling weight mode
-WEIGHT_MODE = "softmax"  # "softmax" | "linear" | "uniform"
+# Pooling
 SOFTMAX_TEMP = 1.2
 
 
@@ -431,16 +430,7 @@ def pooled_embedding_one_view(
         flat_scores = score_grid.flatten()
         sel_scores = flat_scores[keep.flatten()].astype(np.float32)
 
-        if WEIGHT_MODE == "uniform":
-            ww = np.ones_like(sel_scores, dtype=np.float32)
-            ww = ww / (ww.sum() + 1e-9)
-        elif WEIGHT_MODE == "linear":
-            ww = np.clip(sel_scores, 0.0, None)
-            if float(ww.sum()) <= 1e-9:
-                ww = np.ones_like(sel_scores, dtype=np.float32)
-            ww = ww / (ww.sum() + 1e-9)
-        else:
-            ww = _softmax_np(sel_scores, temp=SOFTMAX_TEMP)
+        ww = _softmax_np(sel_scores, temp=SOFTMAX_TEMP)
 
         # pooled vector for this layer
         keep_t = torch.tensor(keep.flatten(), device=DEVICE)
@@ -619,11 +609,11 @@ def visualize_used_for_vectordb(image_path: str, lo_p=20, hi_p=95):
 # ============================================================
 if __name__ == "__main__":
     DATASET_JSON = "dataset.json"
-    QUERY_IMAGE = "datasets1/chart22.png"
+    QUERY_IMAGE = "datasets1/eurusd_mt5.png"
 
-    # visualize_used_for_vectordb(QUERY_IMAGE)
+    visualize_used_for_vectordb(QUERY_IMAGE)
 
-    db = upsert_dataset(DATASET_JSON)
-    hits = search_similar(db, QUERY_IMAGE, k=5)
-    for i, h in enumerate(hits, 1):
-        print(i, h.metadata.get("image"))
+    # db = upsert_dataset(DATASET_JSON)
+    # hits = search_similar(db, QUERY_IMAGE, k=5)
+    # for i, h in enumerate(hits, 1):
+    #     print(i, h.metadata.get("image"))
