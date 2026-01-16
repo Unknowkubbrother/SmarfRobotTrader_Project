@@ -33,6 +33,7 @@ from langchain_core.documents import Document
 # ============================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_NAME = "openai/clip-vit-large-patch14"
+# MODEL_NAME = "openai/clip-vit-base-patch32"
 
 PERSIST_DIR = "chroma_store_images1"
 COLLECTION = "chart_clip_images1"
@@ -41,13 +42,12 @@ COLLECTION = "chart_clip_images1"
 ROI_CUT = dict(left=0.02, top=0.06, right=0.14, bottom=0.12)
 
 # Remove big black bars inside ROI
-CONTENT_CROP = True
 CONTENT_ROW_THR = 10
 CONTENT_MARGIN = 6
 
 # Multi-layer pooling (USED for VectorDB)
-LAYERS = (-6, -3, 24)
-LAYER_WEIGHTS = (0.25, 0.25, 0.50)
+LAYERS = (-6, -3, -1)
+LAYER_WEIGHTS = (0.15, 0.20, 0.65)
 
 # Patch selection
 TOPK_RATIO = 0.16
@@ -72,7 +72,6 @@ BG_SUBTRACT = 0.45        # subtract mean score on invalid/background-ish patche
 CONTENT_GLOBAL_EDGE_GAMMA = 1.5  # weights for building content-global from edge density
 
 # Views
-USE_VIEWS = True
 W_REAL = 0.60
 W_STRUCT = 0.40
 
@@ -144,42 +143,10 @@ def letterbox(pil_img: Image.Image, out_size=224) -> Image.Image:
     canvas.paste(img, (x0, y0))
     return canvas
 
-def _auto_focus_crop(roi: Image.Image, win_ratio=0.72) -> Image.Image:
-    img = np.array(roi)
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    energy = np.abs(gx).mean(axis=0)
-
-    w = gray.shape[1]
-    win = max(32, int(w * float(win_ratio)))
-    cs = np.cumsum(energy, dtype=np.float64)
-    cs = np.concatenate([[0.0], cs])
-
-    best_s, best_v = 0, -1e18
-    step = max(1, win // 40)
-    for s in range(0, w - win + 1, step):
-        v = cs[s + win] - cs[s]
-        if v > best_v:
-            best_v, best_s = v, s
-
-    x1, x2 = best_s, best_s + win
-    return roi.crop((x1, 0, x2, roi.size[1]))
-
-def build_views(pil_img: Image.Image):
+def build_views(pil_img: Image.Image) -> Image.Image:
     roi = crop_chart_roi(pil_img, **ROI_CUT)
-    if CONTENT_CROP:
-        roi = content_crop_rows(roi, thr=CONTENT_ROW_THR, margin=CONTENT_MARGIN)
-
-    w, h = roi.size
-    zoom = roi.crop((0, 0, w, int(h * 0.60)))
-    focus = _auto_focus_crop(roi, win_ratio=0.72)
-
-    return (
-        letterbox(roi, 224),
-        letterbox(zoom, 224),
-        letterbox(focus, 224),
-    )
+    roi = content_crop_rows(roi, thr=CONTENT_ROW_THR, margin=CONTENT_MARGIN)
+    return letterbox(roi, 224)
 
 def make_structure_view(pil_224: Image.Image) -> Image.Image:
     img = np.array(pil_224)
@@ -336,7 +303,7 @@ def _softmax_np(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
     return e / (float(e.sum()) + 1e-9)
 
 @torch.no_grad()
-def pooled_embedding_one_view(
+def pooled_embedding(
     pil_224: Image.Image,
     layers=LAYERS,
     layer_weights=LAYER_WEIGHTS,
@@ -465,31 +432,22 @@ def pooled_embedding_one_view(
 # ============================================================
 def embed_chart_image(image_path: str) -> list:
     pil = load_rgb(image_path)
-    wide224, zoom224, focus224 = build_views(pil)
 
-    views = [wide224] if not USE_VIEWS else [wide224, zoom224, focus224]
+    # wide only
+    wide224 = build_views(pil)
 
-    # REAL
-    vecs_real = []
-    for v in views:
-        vec, _, _, _ = pooled_embedding_one_view(v)
-        vecs_real.append(vec)
-    v_real = np.mean(vecs_real, axis=0)
+    # REAL (wide only)
+    v_real, _, _, _ = pooled_embedding(wide224)
     v_real = v_real / (np.linalg.norm(v_real) + 1e-9)
 
-    # STRUCT
-    vecs_struct = []
-    for v in views:
-        vs = make_structure_view(v)
-        vec, _, _, _ = pooled_embedding_one_view(vs)
-        vecs_struct.append(vec)
-    v_struct = np.mean(vecs_struct, axis=0)
+    # STRUCT (wide only)
+    wide_struct = make_structure_view(wide224)
+    v_struct, _, _, _ = pooled_embedding(wide_struct)
     v_struct = v_struct / (np.linalg.norm(v_struct) + 1e-9)
 
     out = float(W_REAL) * v_real + float(W_STRUCT) * v_struct
     out = out / (np.linalg.norm(out) + 1e-9)
     return out.tolist()
-
 
 # ============================================================
 # LANGCHAIN EMBEDDINGS
@@ -567,41 +525,112 @@ def _percentile_norm(x: np.ndarray, lo_p=20, hi_p=95) -> np.ndarray:
     lo = np.percentile(x, float(lo_p))
     hi = np.percentile(x, float(hi_p))
     return np.clip((x - lo) / (hi - lo + 1e-9), 0.0, 1.0)
-
+    
 @torch.no_grad()
-def visualize_used_for_vectordb(image_path: str, lo_p=20, hi_p=95):
+def visualize_used_for_vectordb(image_path: str, lo_p=20, hi_p=95,
+                                figsize=(13.0, 7.6), dpi=120, title_fs=9, suptitle_fs=11,
+                                pad=0.6, w_pad=0.3, h_pad=0.6):
+    """
+    Single-page (3x4) compact layout for MacBook 13":
+    - REAL / STRUCT / FINAL in one figure
+    - uses wide224 only
+    """
     pil = load_rgb(image_path)
-    wide224, _, _ = build_views(pil)
+    wide224 = build_views(pil)  # wide-only build_views()
 
-    vec, score, keep, wgrid = pooled_embedding_one_view(wide224)
+    def _prep(proc_img: Image.Image):
+        vec, score, keep, wgrid = pooled_embedding(proc_img)
+        return vec, score.astype(np.float32), keep.astype(bool), wgrid.astype(np.float32)
 
-    g = score.shape[0]
-    img_np = np.array(wide224)
-    H, W = img_np.shape[:2]
+    def _upsample(xg: np.ndarray, g: int, H: int, W: int) -> np.ndarray:
+        return np.kron(xg, np.ones((H // g, W // g), dtype=np.float32))[:H, :W]
 
-    score_norm = _percentile_norm(score, lo_p=lo_p, hi_p=hi_p)
-    score_up = np.kron(score_norm, np.ones((H // g, W // g), dtype=np.float32))[:H, :W]
+    def _make_panels(bg_img: Image.Image, score_g: np.ndarray, keep_g: np.ndarray, wgrid_g: np.ndarray):
+        img_np = np.array(bg_img)
+        H, W = img_np.shape[:2]
+        g = score_g.shape[0]
 
-    keep_map = np.kron(keep.astype(np.float32), np.ones((H // g, W // g), dtype=np.float32))[:H, :W]
+        score_norm = _percentile_norm(score_g, lo_p=lo_p, hi_p=hi_p)
+        score_up = _upsample(score_norm, g, H, W)
 
-    w_up = np.kron(wgrid, np.ones((H // g, W // g), dtype=np.float32))[:H, :W]
-    # make weights more visible
-    w_vis = np.power(w_up / (float(w_up.max()) + 1e-9), 0.35)
+        keep_up = _upsample(keep_g.astype(np.float32), g, H, W)
 
-    nz = int(keep.sum())
-    print(f"USED patches: {nz}/{g*g} = {nz/(g*g):.2%} | vec_dim={len(vec)}")
+        w_up = _upsample(wgrid_g.astype(np.float32), g, H, W)
+        w_mx = float(w_up.max())
+        w_vis = np.power(w_up / (w_mx + 1e-9), 0.35) if w_mx > 0 else w_up
 
-    used_only = img_np.copy().astype(np.float32)
-    used_only[keep_map < 0.5] *= 0.07
-    used_only = np.clip(used_only, 0, 255).astype(np.uint8)
+        used_only = img_np.copy().astype(np.float32)
+        used_only[keep_up < 0.5] *= 0.07
+        used_only = np.clip(used_only, 0, 255).astype(np.uint8)
 
-    plt.figure(figsize=(18, 5))
-    plt.subplot(1, 4, 1); plt.title("Wide"); plt.imshow(img_np); plt.axis("off")
-    plt.subplot(1, 4, 2); plt.title("Score heatmap (USED pipeline)"); plt.imshow(img_np); plt.imshow(score_up, alpha=0.55); plt.axis("off")
-    plt.subplot(1, 4, 3); plt.title("Keep mask (binary, used patches)"); plt.imshow(img_np); plt.imshow(keep_map, alpha=0.35); plt.axis("off")
-    plt.subplot(1, 4, 4); plt.title("Pooling weights (USED for VectorDB)"); plt.imshow(used_only); plt.imshow(w_vis, alpha=0.90); plt.axis("off")
-    plt.tight_layout()
+        return img_np, score_up, keep_up, used_only, w_vis
+
+    # ---------- REAL (wide) ----------
+    v_real, score_real, keep_real, wgrid_real = _prep(wide224)
+
+    # ---------- STRUCT (structure(wide)) ----------
+    wide_struct = make_structure_view(wide224)
+    v_struct, score_struct, keep_struct, wgrid_struct = _prep(wide_struct)
+
+    # ---------- FINAL (match embed_chart_image wide-only) ----------
+    out_vec = float(W_REAL) * v_real + float(W_STRUCT) * v_struct
+    out_vec = out_vec / (np.linalg.norm(out_vec) + 1e-9)
+
+    score_final = float(W_REAL) * score_real + float(W_STRUCT) * score_struct
+    keep_final = (float(W_REAL) * keep_real.astype(np.float32) + float(W_STRUCT) * keep_struct.astype(np.float32)) > 0.5
+
+    wgrid_final = float(W_REAL) * wgrid_real + float(W_STRUCT) * wgrid_struct
+    s = float(wgrid_final.sum())
+    if s > 1e-9:
+        wgrid_final = wgrid_final / s
+
+    g = score_real.shape[0]
+    print(f"[REAL]   USED patches: {int(keep_real.sum())}/{g*g} = {int(keep_real.sum())/(g*g):.2%} | vec_dim={len(v_real)}")
+    print(f"[STRUCT] USED patches: {int(keep_struct.sum())}/{g*g} = {int(keep_struct.sum())/(g*g):.2%} | vec_dim={len(v_struct)}")
+    print(f"[FINAL]  USED patches: {int(keep_final.sum())}/{g*g} = {int(keep_final.sum())/(g*g):.2%} | vec_dim={len(out_vec)} | W_REAL={W_REAL} W_STRUCT={W_STRUCT}")
+
+    # panels
+    r_img, r_score, r_keep, r_used, r_wvis = _make_panels(wide224,     score_real,   keep_real,   wgrid_real)
+    s_img, s_score, s_keep, s_used, s_wvis = _make_panels(wide_struct, score_struct, keep_struct, wgrid_struct)
+    f_img, f_score, f_keep, f_used, f_wvis = _make_panels(wide224,     score_final,  keep_final,  wgrid_final)
+
+    # ---------- PLOT (single page, compact) ----------
+    fig, axs = plt.subplots(3, 4, figsize=figsize, dpi=dpi)
+    fig.suptitle("DEBUG CHART EIEI", fontsize=suptitle_fs)
+
+    rows = [
+        ("REAL",   r_img, r_score, r_keep, r_used, r_wvis),
+        ("STRUCT", s_img, s_score, s_keep, s_used, s_wvis),
+        ("FINAL (REAL + STRUCT (UNION))",  f_img, f_score, f_keep, f_used, f_wvis),
+    ]
+
+    for ri, (name, img_np, score_up, keep_up, used_only, w_vis) in enumerate(rows):
+        # col 0
+        axs[ri, 0].set_title(f"{name}: Base", fontsize=title_fs)
+        axs[ri, 0].imshow(img_np); axs[ri, 0].axis("off")
+
+        # col 1
+        axs[ri, 1].set_title("Heat map Score", fontsize=title_fs)
+        axs[ri, 1].imshow(img_np)
+        axs[ri, 1].imshow(score_up, alpha=0.55)
+        axs[ri, 1].axis("off")
+
+        # col 2
+        axs[ri, 2].set_title("Keep", fontsize=title_fs)
+        axs[ri, 2].imshow(img_np)
+        axs[ri, 2].imshow(keep_up, alpha=0.35)
+        axs[ri, 2].axis("off")
+
+        # col 3
+        axs[ri, 3].set_title("Weights", fontsize=title_fs)
+        axs[ri, 3].imshow(used_only)
+        # axs[ri, 3].imshow(w_vis, alpha=0.30)
+        axs[ri, 3].axis("off")
+
+    # tighter spacing for 13" screens
+    plt.tight_layout(pad=pad, w_pad=w_pad, h_pad=h_pad)
     plt.show()
+
 
 
 # ============================================================
@@ -609,11 +638,13 @@ def visualize_used_for_vectordb(image_path: str, lo_p=20, hi_p=95):
 # ============================================================
 if __name__ == "__main__":
     DATASET_JSON = "dataset.json"
-    QUERY_IMAGE = "datasets1/new_chart3.png"
+    QUERY_IMAGE = "datasets1/image1.png"
 
-    # visualize_used_for_vectordb(QUERY_IMAGE)
+    visualize_used_for_vectordb(QUERY_IMAGE, figsize=(12, 7), dpi=120, title_fs=8, h_pad=0.3, w_pad=0.1)
 
-    db = upsert_dataset(DATASET_JSON)
-    hits = search_similar(db, QUERY_IMAGE, k=5)
-    for i, h in enumerate(hits, 1):
-        print(i, h.metadata.get("image"))
+
+
+    # db = upsert_dataset(DATASET_JSON)
+    # hits = search_similar(db, QUERY_IMAGE, k=5)
+    # for i, h in enumerate(hits, 1):
+    #     print(i, h.metadata.get("image"))
