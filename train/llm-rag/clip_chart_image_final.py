@@ -638,7 +638,7 @@ def visualize_used_for_vectordb(image_path: str, lo_p=20, hi_p=95,
 # ============================================================
 if __name__ == "__main__":
     DATASET_JSON = "dataset.json"
-    QUERY_IMAGE = "datasets1/image1.png"
+    QUERY_IMAGE = "datasets1/new_chart3.png"
 
     visualize_used_for_vectordb(QUERY_IMAGE, figsize=(12, 7), dpi=120, title_fs=8, h_pad=0.3, w_pad=0.1)
 

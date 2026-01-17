@@ -3,17 +3,17 @@
 # Production-grade Chart Retrieval (CLIP hidden-layer) - V6 (NO PROMPT)
 # MASTER SOURCE: clip_chart_prod_v6_noprompt.py (user provided)
 #
-# - content-global (from edge-rich patches) instead of global image embedding
-# - edge mask removes horizontal lines BEFORE scoring/valid-mask
-# - edge-boost + background-subtract to suppress background bands
-# - keep mask never empty (adaptive + min_keep + fallback)
-# - single pipeline used for VectorDB (no global/local confusion)
+# Fixes:
+# ✅ content-global (from edge-rich patches) instead of global image embedding
+# ✅ edge mask removes horizontal lines BEFORE scoring/valid-mask
+# ✅ edge-boost + background-subtract to suppress background bands
+# ✅ keep mask never empty (adaptive + min_keep + fallback)
+# ✅ single pipeline = USED for VectorDB (no global/local confusion)
 #
 # Port notes for module:
 # - lazy-load CLIP model/processor to avoid double-load on import
 # - dataset_unique_paths imported from .dataset_utils
 # - dedupe/upsert by normalized path ids
-# - keep debug visualize function (matplotlib imported lazily)
 # ------------------------------------------------------------
 
 import os
@@ -36,27 +36,27 @@ from langchain_core.documents import Document
 
 from .dataset_utils import dataset_unique_paths
 
+
 # ============================================================
-# CONFIG
+# CONFIG (match clip_chart_prod_v6_noprompt.py)
 # ============================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_NAME = "openai/clip-vit-large-patch14"
 
 # You can override via env without changing code
-PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_store_images")
-COLLECTION = os.getenv("CHROMA_COLLECTION", "chart_clip_images")
+PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_store_images1")
+COLLECTION = os.getenv("CHROMA_COLLECTION", "chart_clip_images1")
 
 # Crop UI (tune for MT5/TV)
 ROI_CUT = dict(left=0.02, top=0.06, right=0.14, bottom=0.12)
 
 # Remove big black bars inside ROI
-CONTENT_CROP = True
 CONTENT_ROW_THR = 10
 CONTENT_MARGIN = 6
 
 # Multi-layer pooling (USED for VectorDB)
-LAYERS = (-6, -3, 24)
-LAYER_WEIGHTS = (0.25, 0.25, 0.50)
+LAYERS = (-6, -3, -1)
+LAYER_WEIGHTS = (0.15, 0.20, 0.65)
 
 # Patch selection
 TOPK_RATIO = 0.16
@@ -80,8 +80,7 @@ EDGE_BOOST_POWER = 1.6
 BG_SUBTRACT = 0.45
 CONTENT_GLOBAL_EDGE_GAMMA = 1.5
 
-# Views
-USE_VIEWS = True
+# Views (REAL + STRUCT)
 W_REAL = 0.60
 W_STRUCT = 0.40
 
@@ -115,7 +114,7 @@ def norm_path(p: str) -> str:
 
 
 # ============================================================
-# IMAGE PREP
+# IMAGE PREP (match latest: wide-only)
 # ============================================================
 def load_rgb(path: str) -> Image.Image:
     return Image.open(path).convert("RGB")
@@ -164,43 +163,10 @@ def letterbox(pil_img: Image.Image, out_size=224) -> Image.Image:
     return canvas
 
 
-def _auto_focus_crop(roi: Image.Image, win_ratio=0.72) -> Image.Image:
-    img = np.array(roi)
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    energy = np.abs(gx).mean(axis=0)
-
-    w = gray.shape[1]
-    win = max(32, int(w * float(win_ratio)))
-    cs = np.cumsum(energy, dtype=np.float64)
-    cs = np.concatenate([[0.0], cs])
-
-    best_s, best_v = 0, -1e18
-    step = max(1, win // 40)
-    for s in range(0, w - win + 1, step):
-        v = cs[s + win] - cs[s]
-        if v > best_v:
-            best_v, best_s = v, s
-
-    x1, x2 = best_s, best_s + win
-    return roi.crop((x1, 0, x2, roi.size[1]))
-
-
-def build_views(pil_img: Image.Image):
+def build_views(pil_img: Image.Image) -> Image.Image:
     roi = crop_chart_roi(pil_img, **ROI_CUT)
-    if CONTENT_CROP:
-        roi = content_crop_rows(roi, thr=CONTENT_ROW_THR, margin=CONTENT_MARGIN)
-
-    w, h = roi.size
-    zoom = roi.crop((0, 0, w, int(h * 0.60)))
-    focus = _auto_focus_crop(roi, win_ratio=0.72)
-
-    return (
-        letterbox(roi, 224),
-        letterbox(zoom, 224),
-        letterbox(focus, 224),
-    )
+    roi = content_crop_rows(roi, thr=CONTENT_ROW_THR, margin=CONTENT_MARGIN)
+    return letterbox(roi, 224)
 
 
 def make_structure_view(pil_224: Image.Image) -> Image.Image:
@@ -209,10 +175,13 @@ def make_structure_view(pil_224: Image.Image) -> Image.Image:
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
     edges = cv2.Canny(gray, 40, 120)
+
+    # remove horizontal lines
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (19, 1))
     h_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, h_kernel, iterations=1)
     edges = cv2.subtract(edges, h_lines)
 
+    # thicken
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     edges = cv2.dilate(edges, kernel, iterations=1)
 
@@ -322,11 +291,13 @@ def _topk_mask_from_grid(grid: np.ndarray, ratio: float) -> np.ndarray:
 
 
 def edge_density_grid_no_hline(pil_224: Image.Image, g: int) -> np.ndarray:
+    """Edge density per patch, with horizontal lines removed first."""
     img = np.array(pil_224)
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     edges = cv2.Canny(gray, 40, 120)
 
+    # remove horizontal lines
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (19, 1))
     h_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, h_kernel, iterations=1)
     edges = cv2.subtract(edges, h_lines)
@@ -374,7 +345,7 @@ def _softmax_np(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
 
 
 @torch.no_grad()
-def pooled_embedding_one_view(
+def pooled_embedding(
     pil_224: Image.Image,
     layers=LAYERS,
     layer_weights=LAYER_WEIGHTS,
@@ -385,6 +356,7 @@ def pooled_embedding_one_view(
     inputs = processor(images=pil_224, return_tensors="pt").to(DEVICE)
     vision_out = clip_model.vision_model(**inputs, output_hidden_states=True)
 
+    # grid size
     first_hs = vision_out.hidden_states[layers[0]] if layers[0] != -1 else vision_out.last_hidden_state
     P = first_hs.shape[1] - 1
     g = int(round(math.sqrt(P)))
@@ -395,6 +367,7 @@ def pooled_embedding_one_view(
     dens = patch_density_mask(pil_224, g)
     dens = suppress_long_horizontal_runs(dens, min_run=HLINE_MIN_RUN, penalty=HLINE_PENALTY)
 
+    # normalize layer weights
     lw = np.array(layer_weights, dtype=np.float32)
     lw = lw / (lw.sum() + 1e-9)
 
@@ -410,17 +383,18 @@ def pooled_embedding_one_view(
         patch_emb = clip_model.visual_projection(patch_tokens)  # [1,P,E]
         patch_emb = F.normalize(patch_emb, dim=-1)[0]           # [P,E]
 
+        # valid mask + edge density (no-hline)
         valid, er = edge_valid_mask_adaptive(
             pil_224, g,
             base_thr=EDGE_BASE_THR,
             pct=EDGE_PCT,
             min_keep=max(MIN_KEEP_PATCHES, int(TOPK_RATIO * g * g))
         )
-
         er_flat = er.flatten()
         ern = er_flat / (float(er_flat.max()) + 1e-9)
         ern = np.power(ern, float(CONTENT_GLOBAL_EDGE_GAMMA)).astype(np.float32)
 
+        # build content-global from valid patches (weighted by edge density)
         mask_t = torch.tensor(valid.flatten(), device=DEVICE)
         if int(mask_t.sum().item()) <= 0:
             gfeat = patch_emb.mean(dim=0)
@@ -431,21 +405,26 @@ def pooled_embedding_one_view(
             gfeat = (patch_emb[mask_t] * w_sel.unsqueeze(-1)).sum(dim=0)
         gfeat = F.normalize(gfeat, dim=-1)  # [E]
 
+        # score per patch = cosine(patch, content-global)
         sim = (patch_emb @ gfeat).detach().float().cpu().numpy()  # [P]
         score_grid = sim.reshape(g, g).astype(np.float32)
 
+        # background subtract (use invalid area mean)
         inv = (~valid)
         if inv.any():
             bg_mean = float(score_grid[inv].mean())
             score_grid = score_grid - float(BG_SUBTRACT) * bg_mean
 
+        # priors
         score_grid = score_grid * prior
         score_grid = score_grid * (dens ** float(DENSITY_POWER))
 
+        # edge boost (favor real strokes)
         er_grid = er.reshape(g, g)
         er_norm = er_grid / (float(er_grid.max()) + 1e-9)
         score_grid = score_grid * np.power(er_norm + 1e-6, float(EDGE_BOOST_POWER))
 
+        # keep selection: top-k within valid
         keep0 = _topk_mask_from_grid(score_grid, TOPK_RATIO)
         keep = keep0 & valid
         if not keep.any():
@@ -457,10 +436,12 @@ def pooled_embedding_one_view(
 
         keep_union |= keep
 
+        # pooling weights inside this layer (only keep)
         flat_scores = score_grid.flatten()
         sel_scores = flat_scores[keep.flatten()].astype(np.float32)
         ww = _softmax_np(sel_scores, temp=SOFTMAX_TEMP)
 
+        # pooled vector for this layer
         keep_t = torch.tensor(keep.flatten(), device=DEVICE)
         sel_emb = patch_emb[keep_t]
         ww_t = torch.tensor(ww, device=DEVICE).unsqueeze(-1)
@@ -468,16 +449,19 @@ def pooled_embedding_one_view(
         pooled = F.normalize(pooled, dim=-1)
         pooled_layers.append(pooled)
 
+        # debug combine (kept for potential future debug)
         score_comb += float(wly) * score_grid
         w_grid = np.zeros((g, g), dtype=np.float32)
         w_grid.flatten()[keep.flatten()] = ww
         wgrid_comb += float(wly) * w_grid
 
+    # combine pooled vectors across layers
     pooled_stack = torch.stack(pooled_layers, dim=0)  # [L,E]
     lw_t = torch.tensor(lw, device=DEVICE).unsqueeze(-1)
     vec = (pooled_stack * lw_t).sum(dim=0)
     vec = F.normalize(vec, dim=-1).detach().cpu().numpy()
 
+    # normalize combined weight grid to sum=1
     s = float(wgrid_comb.sum())
     if s > 1e-9:
         wgrid_comb = wgrid_comb / s
@@ -486,27 +470,22 @@ def pooled_embedding_one_view(
 
 
 # ============================================================
-# FINAL EMBEDDING (REAL + STRUCT) (wide + zoom + focus)
+# FINAL EMBEDDING (REAL + STRUCT) (wide-only)
 # ============================================================
 def embed_chart_image(image_path: str) -> List[float]:
+    # IMPORTANT: image_path here should be actual file path (not normalized id only)
     pil = load_rgb(image_path)
-    wide224, zoom224, focus224 = build_views(pil)
 
-    views = [wide224] if not USE_VIEWS else [wide224, zoom224, focus224]
+    # wide only (match latest)
+    wide224 = build_views(pil)
 
-    vecs_real = []
-    for v in views:
-        vec, _, _, _ = pooled_embedding_one_view(v)
-        vecs_real.append(vec)
-    v_real = np.mean(vecs_real, axis=0)
+    # REAL (wide only)
+    v_real, _, _, _ = pooled_embedding(wide224)
     v_real = v_real / (np.linalg.norm(v_real) + 1e-9)
 
-    vecs_struct = []
-    for v in views:
-        vs = make_structure_view(v)
-        vec, _, _, _ = pooled_embedding_one_view(vs)
-        vecs_struct.append(vec)
-    v_struct = np.mean(vecs_struct, axis=0)
+    # STRUCT (wide only)
+    wide_struct = make_structure_view(wide224)
+    v_struct, _, _, _ = pooled_embedding(wide_struct)
     v_struct = v_struct / (np.linalg.norm(v_struct) + 1e-9)
 
     out = float(W_REAL) * v_real + float(W_STRUCT) * v_struct
@@ -548,13 +527,12 @@ def _get_existing_ids_batched(db: Chroma, ids: List[str], batch=1000):
 
 def upsert_image_dataset(dataset_json: str):
     db = open_image_db()
-
     _, uniq_paths = dataset_unique_paths(dataset_json)
     if not uniq_paths:
         raise ValueError("dataset.json contains no image paths")
 
-    # normalize + dedupe again at module level
-    uniq_norm = []
+    # normalize + dedupe ids (store ids normalized to prevent duplicates)
+    uniq_norm: List[str] = []
     seen = set()
     for p in uniq_paths:
         pid = norm_path(p)
@@ -584,7 +562,7 @@ def rebuild_image_db(dataset_json: str):
     if not uniq_paths:
         raise ValueError("dataset.json contains no image paths")
 
-    uniq_norm = []
+    uniq_norm: List[str] = []
     seen = set()
     for p in uniq_paths:
         pid = norm_path(p)
@@ -599,5 +577,7 @@ def rebuild_image_db(dataset_json: str):
 
 
 def search_image(db: Chroma, query_image: str, k=10):
-    # normalize path string before passing into embed_query()
-    return db.similarity_search(norm_path(query_image), k=k)
+    # IMPORTANT:
+    # - similarity_search() will call embed_query(query_image) which expects a real file path
+    # - so DO NOT norm_path(query_image) here (norm_path is for ids in DB)
+    return db.similarity_search(query_image, k=k)
