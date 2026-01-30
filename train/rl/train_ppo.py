@@ -107,7 +107,8 @@ df = pd.read_csv("h1_ohlc_delta.csv")
 # FILTER: ใช้เฉพาะข้อมูลที่มี delta (2024-2025)
 # ==================================================
 df_full = df.copy()
-df = df[df['has_delta'] == 1].reset_index(drop=True)
+df['time'] = pd.to_datetime(df['time'])
+df = df[df['has_delta'] == 1].sort_values("time").reset_index(drop=True)
 
 print("="*50)
 print("📊 DATA FILTERING")
