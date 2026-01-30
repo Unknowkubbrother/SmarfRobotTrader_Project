@@ -2,11 +2,12 @@ from mt5linux import MetaTrader5
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
+from tqdm import tqdm
 
 # ==================================================
 # CONFIG
 # ==================================================
-symbol = "USDTHB"
+symbol = "EURUSD"
 timezone = pytz.UTC
 
 ohlc_start = datetime(2000, 1, 1, tzinfo=timezone)
@@ -40,20 +41,31 @@ def fetch_ohlc_h1(mt5, symbol, start, end):
     chunks = []
     current = start
 
-    while current < end:
-        chunk_end = min(current + timedelta(days=365), end)
+    # คำนวณจำนวน chunk ทั้งหมด (แต่ละ chunk = 365 วัน)
+    total_days = (end - start).days
+    total_chunks = (total_days // 365) + 1
 
-        rates = mt5.copy_rates_range(
-            symbol,
-            mt5.TIMEFRAME_H1,
-            current,
-            chunk_end
-        )
+    print(f"  📊 OHLC: จะโหลด ~{total_chunks} chunks (ปีละ 1 chunk)")
 
-        if rates is not None and len(rates) > 0:
-            chunks.append(pd.DataFrame(rates))
+    with tqdm(total=total_chunks, desc="📥 Loading OHLC", unit="chunk", ncols=80) as pbar:
+        while current < end:
+            chunk_end = min(current + timedelta(days=365), end)
 
-        current = chunk_end
+            # แสดง log ละเอียด
+            pbar.set_postfix_str(f"{current.strftime('%Y-%m-%d')} → {chunk_end.strftime('%Y-%m-%d')}")
+
+            rates = mt5.copy_rates_range(
+                symbol,
+                mt5.TIMEFRAME_H1,
+                current,
+                chunk_end
+            )
+
+            if rates is not None and len(rates) > 0:
+                chunks.append(pd.DataFrame(rates))
+
+            current = chunk_end
+            pbar.update(1)
 
     if not chunks:
         return None
@@ -71,51 +83,68 @@ def fetch_h1_delta_from_ticks(mt5, symbol, start, end):
     all_h1 = []
     current = start
 
-    while current < end:
-        chunk_end = min(current + timedelta(days=1), end)
+    # คำนวณจำนวนวันทั้งหมด
+    total_days = (end - start).days
 
-        ticks = mt5.copy_ticks_range(
-            symbol,
-            current,
-            chunk_end,
-            mt5.COPY_TICKS_ALL
-        )
+    print(f"  🎯 Tick Delta: จะโหลด {total_days} วัน (วันละ 1 chunk)")
+    print(f"  ⚠️  ส่วนนี้อาจใช้เวลานานมาก เนื่องจากต้องโหลด tick data รายวัน\n")
 
-        if ticks is not None and len(ticks) > 0:
-            df = pd.DataFrame(ticks)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
-            df = df[['time', 'bid', 'ask']]
-            df = df.sort_values('time').reset_index(drop=True)
-            df = df.set_index('time')
+    processed_days = 0
+    with tqdm(total=total_days, desc="📥 Loading Ticks", unit="day", ncols=80) as pbar:
+        while current < end:
+            chunk_end = min(current + timedelta(days=1), end)
 
-            # ===== OnTick logic =====
-            df['prev_bid'] = df['bid'].shift(1)
-            df['prev_ask'] = df['ask'].shift(1)
+            # แสดง log วันที่กำลังโหลด
+            pbar.set_postfix_str(f"{current.strftime('%Y-%m-%d')}")
 
-            buy = (df['bid'] > df['prev_bid']) | (
-                (df['bid'] == df['prev_bid']) & (df['ask'] > df['prev_ask'])
-            )
-            sell = (df['bid'] < df['prev_bid']) | (
-                (df['bid'] == df['prev_bid']) & (df['ask'] < df['prev_ask'])
+            ticks = mt5.copy_ticks_range(
+                symbol,
+                current,
+                chunk_end,
+                mt5.COPY_TICKS_ALL
             )
 
-            df['bid_diff'] = df['bid'] - df['prev_bid']
+            if ticks is not None and len(ticks) > 0:
+                df = pd.DataFrame(ticks)
+                df['time'] = pd.to_datetime(df['time'], unit='s')
+                df = df[['time', 'bid', 'ask']]
+                df = df.sort_values('time').reset_index(drop=True)
+                df = df.set_index('time')
 
-            df['delta_tick'] = 0
-            df.loc[buy, 'delta_tick'] = 1
-            df.loc[sell, 'delta_tick'] = -1
+                # ===== OnTick logic =====
+                df['prev_bid'] = df['bid'].shift(1)
+                df['prev_ask'] = df['ask'].shift(1)
 
-            df['delta_price'] = 0.0
-            df.loc[buy | sell, 'delta_price'] = df.loc[buy | sell, 'bid_diff']
+                buy = (df['bid'] > df['prev_bid']) | (
+                    (df['bid'] == df['prev_bid']) & (df['ask'] > df['prev_ask'])
+                )
+                sell = (df['bid'] < df['prev_bid']) | (
+                    (df['bid'] == df['prev_bid']) & (df['ask'] < df['prev_ask'])
+                )
 
-            h1 = df.resample('1h').agg({
-                'delta_tick': 'sum',
-                'delta_price': 'sum'
-            })
+                df['bid_diff'] = df['bid'] - df['prev_bid']
 
-            all_h1.append(h1)
+                df['delta_tick'] = 0
+                df.loc[buy, 'delta_tick'] = 1
+                df.loc[sell, 'delta_tick'] = -1
 
-        current = chunk_end
+                df['delta_price'] = 0.0
+                df.loc[buy | sell, 'delta_price'] = df.loc[buy | sell, 'bid_diff']
+
+                h1 = df.resample('1h').agg({
+                    'delta_tick': 'sum',
+                    'delta_price': 'sum'
+                })
+
+                all_h1.append(h1)
+
+            current = chunk_end
+            processed_days += 1
+            pbar.update(1)
+
+            # ทุก 100 วัน แสดงสถานะเพิ่มเติม
+            if processed_days % 100 == 0:
+                tqdm.write(f"  ✅ ประมวลผลแล้ว {processed_days}/{total_days} วัน ({(processed_days/total_days)*100:.1f}%)")
 
     if not all_h1:
         return pd.DataFrame(columns=['delta_tick', 'delta_price'])
@@ -137,13 +166,18 @@ print(f"✓ Got {len(df_ohlc)} H1 candles")
 print("OHLC range:", df_ohlc.index.min(), "→", df_ohlc.index.max())
 
 # ==================================================
-# FETCH DELTA FROM TICKS (SAFE)
+# FETCH DELTA FROM TICKS (SAFE) - โหลดแค่ 2 ปีล่าสุด
 # ==================================================
-tick_start = df_ohlc.index.min().to_pydatetime()
 tick_end   = df_ohlc.index.max().to_pydatetime()
+# โหลด tick แค่ 2 ปีล่าสุด (ประมาณ 730 วัน) เพื่อความเร็ว
+tick_start = max(
+    df_ohlc.index.min().to_pydatetime(),
+    tick_end - timedelta(days=730)  # 2 ปี
+)
 
-print("\nFetching Tick Delta (chunked)")
+print("\nFetching Tick Delta (chunked) - 2 ปีล่าสุดเท่านั้น")
 print("Tick range:", tick_start, "→", tick_end)
+print(f"⏱️  ประมาณ {(tick_end - tick_start).days} วัน (แทนที่จะโหลดทั้งหมด)")
 
 h1_delta = fetch_h1_delta_from_ticks(
     mt5,
