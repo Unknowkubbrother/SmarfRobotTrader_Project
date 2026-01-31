@@ -101,7 +101,7 @@ class TradingMetricsCallback(BaseCallback):
         if self.episode_drawdowns:
             self.logger.record("trading/max_drawdown", np.max(self.episode_drawdowns[-100:]) * 100)
 
-df = pd.read_csv("h1_ohlc_delta.csv")
+df = pd.read_csv("h1_ohlc_delta2.csv")
 
 # ==================================================
 # FILTER: ใช้เฉพาะข้อมูลที่มี delta (2024-2025)

@@ -166,18 +166,16 @@ print(f"✓ Got {len(df_ohlc)} H1 candles")
 print("OHLC range:", df_ohlc.index.min(), "→", df_ohlc.index.max())
 
 # ==================================================
-# FETCH DELTA FROM TICKS (SAFE) - โหลดแค่ 2 ปีล่าสุด
+# FETCH DELTA FROM TICKS - ดึงทั้งหมดที่มี
 # ==================================================
 tick_end   = df_ohlc.index.max().to_pydatetime()
-# โหลด tick แค่ 2 ปีล่าสุด (ประมาณ 730 วัน) เพื่อความเร็ว
-tick_start = max(
-    df_ohlc.index.min().to_pydatetime(),
-    tick_end - timedelta(days=730)  # 2 ปี
-)
+# ดึง tick ทั้งหมดที่ MT5 มี (ไม่ limit 2 ปีแล้ว)
+tick_start = df_ohlc.index.min().to_pydatetime()
 
-print("\nFetching Tick Delta (chunked) - 2 ปีล่าสุดเท่านั้น")
+print("\nFetching Tick Delta (chunked) - ALL AVAILABLE DATA")
 print("Tick range:", tick_start, "→", tick_end)
-print(f"⏱️  ประมาณ {(tick_end - tick_start).days} วัน (แทนที่จะโหลดทั้งหมด)")
+print(f"⏱️  ประมาณ {(tick_end - tick_start).days} วัน")
+print("⚠️  อาจใช้เวลานานมาก! กรุณารอ...")
 
 h1_delta = fetch_h1_delta_from_ticks(
     mt5,
