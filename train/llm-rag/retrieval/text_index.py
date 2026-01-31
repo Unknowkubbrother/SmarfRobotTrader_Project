@@ -3,70 +3,116 @@ import hashlib
 from typing import Dict, List, Any, Optional
 
 import torch
-from sentence_transformers import SentenceTransformer
+from FlagEmbedding import BGEM3FlagModel
 from langchain_community.vectorstores import Chroma
 from langchain.embeddings.base import Embeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from .dataset_utils import norm_path, load_dataset
 
 
-TEXT_MODEL_NAME = "sentence-transformers/clip-ViT-B-32-multilingual-v1"
+# BGE-M3: รองรับภาษาไทยและหลายภาษา, มี dense + sparse embeddings
+TEXT_MODEL_NAME = "BAAI/bge-m3"
 
 # base names (จะถูกเติม _{dim} อัตโนมัติ)
-TEXT_PERSIST_BASE = "chroma_store_text"
-TEXT_COLLECTION_BASE = "chart_text_multilingual"
+TEXT_PERSIST_BASE = "chroma_store_text_bge"
+TEXT_COLLECTION_BASE = "chart_text_bge_m3"
 
-_text_embedder: Optional[SentenceTransformer] = None
+# Chunking settings
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 50
+
+_text_embedder: Optional[BGEM3FlagModel] = None
 _TEXT_DIM: Optional[int] = None
+_text_splitter: Optional[RecursiveCharacterTextSplitter] = None
 
 
-def get_text_embedder() -> SentenceTransformer:
+def get_text_embedder() -> BGEM3FlagModel:
+    """โหลด BGE-M3 model (lazy singleton)"""
     global _text_embedder
     if _text_embedder is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        _text_embedder = SentenceTransformer(TEXT_MODEL_NAME, device=device)
+        _text_embedder = BGEM3FlagModel(
+            TEXT_MODEL_NAME,
+            use_fp16=True if device == "cuda" else False,
+            device=device
+        )
     return _text_embedder
 
 
 def get_text_dim() -> int:
+    """BGE-M3 dense embedding dimension = 1024"""
     global _TEXT_DIM
     if _TEXT_DIM is None:
-        _TEXT_DIM = int(get_text_embedder().get_sentence_embedding_dimension())
+        # BGE-M3 มี dense dimension 1024
+        _TEXT_DIM = 1024
     return _TEXT_DIM
+
+
+def get_text_splitter() -> RecursiveCharacterTextSplitter:
+    """สร้าง text splitter สำหรับ chunking"""
+    global _text_splitter
+    if _text_splitter is None:
+        _text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            length_function=len,
+            separators=["\n\n", "\n", "。", ".", " ", ""]
+        )
+    return _text_splitter
 
 
 def sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 
-class MultilingualTextEmbeddings(Embeddings):
-    def embed_documents(self, texts: List[str]):
-        emb = get_text_embedder().encode(
-            texts,
-            normalize_embeddings=True,
-            batch_size=64,
-            show_progress_bar=False,
-        )
-        return emb.tolist()
+def chunk_text(text: str) -> List[str]:
+    """แบ่งข้อความเป็น chunks"""
+    splitter = get_text_splitter()
+    chunks = splitter.split_text(text)
+    return chunks if chunks else [text]
 
-    def embed_query(self, text: str):
-        emb = get_text_embedder().encode(
-            [text],
-            normalize_embeddings=True,
-            batch_size=64,
-            show_progress_bar=False,
+
+class BGEM3Embeddings(Embeddings):
+    """LangChain Embeddings wrapper สำหรับ BGE-M3"""
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """สร้าง dense embeddings สำหรับเอกสาร"""
+        model = get_text_embedder()
+        # BGE-M3 encode() คืน dict ที่มี 'dense_vecs'
+        output = model.encode(
+            texts,
+            batch_size=12,
+            max_length=512,
+            return_dense=True,
+            return_sparse=False,
+            return_colbert_vecs=False,
         )
-        return emb[0].tolist()
+        return output['dense_vecs'].tolist()
+
+    def embed_query(self, text: str) -> List[float]:
+        """สร้าง dense embedding สำหรับ query"""
+        model = get_text_embedder()
+        output = model.encode(
+            [text],
+            batch_size=1,
+            max_length=512,
+            return_dense=True,
+            return_sparse=False,
+            return_colbert_vecs=False,
+        )
+        return output['dense_vecs'][0].tolist()
 
 
 def open_text_db():
+    """เปิด/สร้าง Chroma DB สำหรับ text embeddings"""
     dim = get_text_dim()
     persist_dir = f"{TEXT_PERSIST_BASE}_{dim}"
     collection = f"{TEXT_COLLECTION_BASE}_{dim}"
 
     return Chroma(
         collection_name=collection,
-        embedding_function=MultilingualTextEmbeddings(),
+        embedding_function=BGEM3Embeddings(),
         persist_directory=persist_dir,
     )
 
@@ -126,7 +172,7 @@ def upsert_text_dataset(dataset_json: str):
         return db
 
     # compute embeddings explicitly
-    embeddings = MultilingualTextEmbeddings().embed_documents(up_docs)
+    embeddings = BGEM3Embeddings().embed_documents(up_docs)
 
     db._collection.upsert(
         ids=up_ids,

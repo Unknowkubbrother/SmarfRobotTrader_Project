@@ -17,4 +17,7 @@ chromadb
 # Embeddings & Models
 sentence-transformers
 transformers
+FlagEmbedding  # BGE-M3 สำหรับ Thai language support
+langchain-core  # ChatPromptTemplate, StrOutputParser
+langchain-text-splitters  # RecursiveCharacterTextSplitter
 requests

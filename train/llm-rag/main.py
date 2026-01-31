@@ -11,6 +11,8 @@ from retrieval import (
 )
 
 from langchain_ollama import OllamaLLM
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 
 # ----------------------------
@@ -212,30 +214,42 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
     print("\n🔎 RAG Context (preview):")
     print(rag_context)
 
-    # 8) FINAL ANALYSIS (image + retrieved domain context)
-    final_prompt = f"""
-คุณคือนักเทรดผู้เชี่ยวชาญ
-
-วิเคราะห์กราฟปัจจุบันจากภาพ และนำแนวคิดการเข้าออกจากกราฟเก่าที่คล้ายกันมาประยุกต์ใช้ (ยึด logic ไม่ยึดตัวเลขจากกราฟเก่า)
+    # 8) FINAL ANALYSIS (ใช้ RAG Prompt Template)
+    # กำหนด RAG Prompt Template
+    rag_template = """
+คุณคือนักเทรดผู้เชี่ยวชาญ วิเคราะห์กราฟปัจจุบันจากภาพ โดยใช้แนวคิดจากกราฟเก่าที่คล้ายกัน
 
 บริบทจากกราฟเก่า (Pattern คล้ายกัน):
-{rag_context}
+{context}
 
 กติกา:
-- เขียนเป็นย่อหน้าเดียว
-- ไม่เกิน 3 ประโยค
-- ไม่ใช้ bullet
-- ข้อความล้วน ไม่มี Markdown ไม่มีสัญลักษณ์พิเศษ
-- ไม่พูดคำว่า แนวโน้ม โมเมนตัม โครงสร้างราคา
-- ห้ามพูดคำว่า KEYWORDS
+- เขียนเป็นย่อหน้าเดียว ไม่เกิน 3 ประโยค
+- ไม่ใช้ bullet, ไม่มี Markdown, ไม่มีสัญลักษณ์พิเศษ
+- ไม่พูดคำว่า แนวโน้ม โมเมนตัม โครงสร้างราคา KEYWORDS
 
 รูปแบบ:
 1) เปิดด้วย "PA อยู่ในช่วง..." หรือ "PA เป็นของฝั่ง..."
 2) ระบุแนวรับและแนวต้านจากภาพปัจจุบัน พร้อมบอกว่าใครเสียเปรียบ
 3) ปิดด้วยกลยุทธ์สั้น ๆ ว่าควรรอเล่นตรงไหน
-""".strip()
 
-    final_answer = vision_llm.invoke(final_prompt, images=[QUERY_IMAGE])
+คำถาม: วิเคราะห์กราฟนี้และให้คำแนะนำการเทรด
+"""
+    
+    # สร้าง ChatPromptTemplate
+    prompt = ChatPromptTemplate.from_template(rag_template)
+    
+    # สร้าง RAG Chain
+    rag_chain = (
+        {"context": lambda x: x["context"]}
+        | prompt
+        | vision_llm
+        | StrOutputParser()
+    )
+    
+    # เรียกใช้ RAG Chain พร้อมรูปภาพ
+    # หมายเหตุ: OllamaLLM กับ vision ต้องใช้ invoke โดยตรง
+    formatted_prompt = prompt.format(context=rag_context)
+    final_answer = vision_llm.invoke(formatted_prompt, images=[QUERY_IMAGE])
 
     print("\n🧠 Final Analysis:")
     print(final_answer)
