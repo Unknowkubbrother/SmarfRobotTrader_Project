@@ -228,3 +228,6 @@ if len(test_df) > 0:
     sharpe = np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252)
     print(f"Sharpe Ratio:     {sharpe:.2f}")
     print("="*50)
+
+print(f"start time = {test_df.head(1)}")
+print(f"end time = {test_df.tail(1)}")
