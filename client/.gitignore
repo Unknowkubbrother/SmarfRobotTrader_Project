@@ -21,7 +21,6 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Local environment
-.env
 .env*.local
 
 # IDE
