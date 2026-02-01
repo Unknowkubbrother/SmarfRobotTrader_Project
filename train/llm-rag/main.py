@@ -188,13 +188,13 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
         dataset_json=DATASET_JSON,
         query_image=QUERY_IMAGE,
         auto_text=query_text,
-        k_img=15,
-        k_t=15,
+        k_img=10,
+        k_t=10,
         final_k=5,
         w_img=0.85,
         w_t=0.15,
         rerank=True,
-        rerank_top_m=30,
+        rerank_top_m=20,
         w_rerank=0.45,
     )
 
@@ -232,6 +232,7 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
     
     formatted_prompt = prompt.format(context=rag_context)
     final_answer = vision_llm.invoke(formatted_prompt, images=[QUERY_IMAGE])
+    final_answer = strip_markdown(final_answer)
 
     print("\n🧠 Final Analysis:")
     print(final_answer)
