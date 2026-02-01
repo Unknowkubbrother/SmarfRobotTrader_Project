@@ -1,0 +1,140 @@
+import { useState } from "react";
+import { ChevronDown, Server, Plus, Check } from "lucide-react";
+import { cn } from "@/lib/utils";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { AddAccountDialog } from "@/components/dialogs/AddAccountDialog";
+import { useTradingAccounts, AccountWithBots } from "@/hooks/useTradingAccounts";
+import { Skeleton } from "@/components/ui/skeleton";
+
+interface AccountSelectorProps {
+  selectedAccount: AccountWithBots | null;
+  onAccountChange: (account: AccountWithBots) => void;
+}
+
+export function AccountSelector({ selectedAccount, onAccountChange }: AccountSelectorProps) {
+  const { accounts, loading, refetch, getRunningBotsCount } = useTradingAccounts();
+  const [dialogOpen, setDialogOpen] = useState(false);
+
+  const getStatusColor = (account: AccountWithBots) => {
+    const runningCount = getRunningBotsCount(account);
+    if (runningCount > 0) return "bg-success";
+    if (account.bot_configurations.length > 0) return "bg-warning";
+    return "bg-muted-foreground";
+  };
+
+  const getBotsInfo = (account: AccountWithBots) => {
+    const total = account.bot_configurations.length;
+    const running = getRunningBotsCount(account);
+    if (total === 0) return "No bots";
+    if (running > 0) return `${running}/${total} Running`;
+    return `${total} Bots`;
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-3 px-4 py-3 rounded-lg bg-card border border-border w-full md:w-auto min-w-[320px]">
+        <Skeleton className="w-10 h-10 rounded-lg" />
+        <div className="flex-1">
+          <Skeleton className="h-4 w-24 mb-1" />
+          <Skeleton className="h-3 w-32" />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-3">
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button className="flex items-center gap-3 px-4 py-3 rounded-lg bg-card border border-border hover:border-primary/50 transition-all w-full md:w-auto min-w-[320px]">
+            <div className="w-10 h-10 rounded-lg bg-secondary flex items-center justify-center">
+              <Server className="w-5 h-5 text-muted-foreground" />
+            </div>
+            <div className="flex-1 text-left">
+              {selectedAccount ? (
+                <>
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-medium">{selectedAccount.broker_name}</p>
+                    <span className={cn("w-2 h-2 rounded-full", getStatusColor(selectedAccount))} />
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {selectedAccount.server_name} • {getBotsInfo(selectedAccount)}
+                  </p>
+                </>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  {accounts.length > 0 ? "Select Account" : "No accounts yet"}
+                </p>
+              )}
+            </div>
+            <ChevronDown className="w-4 h-4 text-muted-foreground" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="w-[320px]">
+          {accounts.length === 0 ? (
+            <div className="p-4 text-center text-sm text-muted-foreground">
+              No trading accounts found. Add one to get started.
+            </div>
+          ) : (
+            accounts.map((account) => (
+              <DropdownMenuItem
+                key={account.id}
+                onClick={() => onAccountChange(account)}
+                className="flex items-center gap-3 p-3 cursor-pointer"
+              >
+                <div className="w-8 h-8 rounded-lg bg-secondary flex items-center justify-center">
+                  <Server className="w-4 h-4 text-muted-foreground" />
+                </div>
+                <div className="flex-1">
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-medium">{account.broker_name}</p>
+                    <span className={cn("w-1.5 h-1.5 rounded-full", getStatusColor(account))} />
+                  </div>
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <span>{account.server_name}</span>
+                    <span>•</span>
+                    <span>{getBotsInfo(account)}</span>
+                    <span>•</span>
+                    <span className={cn(
+                      account.total_today_pnl >= 0 ? "text-success" : "text-destructive"
+                    )}>
+                      {account.total_today_pnl >= 0 ? "+" : ""}${account.total_today_pnl.toFixed(2)}
+                    </span>
+                  </div>
+                </div>
+                {selectedAccount?.id === account.id && (
+                  <Check className="w-4 h-4 text-primary" />
+                )}
+              </DropdownMenuItem>
+            ))
+          )}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem 
+            onClick={() => setDialogOpen(true)}
+            className="flex items-center gap-3 p-3 cursor-pointer text-primary"
+          >
+            <Plus className="w-4 h-4" />
+            <span className="text-sm font-medium">Add New Account</span>
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      
+      <AddAccountDialog 
+        open={dialogOpen} 
+        onOpenChange={setDialogOpen}
+        onAccountAdded={() => {
+          refetch();
+          setDialogOpen(false);
+        }} 
+      />
+    </div>
+  );
+}
+
+export type { AccountWithBots };
