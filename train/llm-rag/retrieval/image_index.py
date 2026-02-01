@@ -1,21 +1,3 @@
-# image_index.py
-# ------------------------------------------------------------
-# Production-grade Chart Retrieval (CLIP hidden-layer) - V6 (NO PROMPT)
-# MASTER SOURCE: clip_chart_prod_v6_noprompt.py (user provided)
-#
-# Fixes:
-# ✅ content-global (from edge-rich patches) instead of global image embedding
-# ✅ edge mask removes horizontal lines BEFORE scoring/valid-mask
-# ✅ edge-boost + background-subtract to suppress background bands
-# ✅ keep mask never empty (adaptive + min_keep + fallback)
-# ✅ single pipeline = USED for VectorDB (no global/local confusion)
-#
-# Port notes for module:
-# - lazy-load CLIP model/processor to avoid double-load on import
-# - dataset_unique_paths imported from .dataset_utils
-# - dedupe/upsert by normalized path ids
-# ------------------------------------------------------------
-
 import os
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -34,62 +16,51 @@ from langchain_community.vectorstores import Chroma
 from langchain.embeddings.base import Embeddings
 from langchain_core.documents import Document
 
-from .dataset_utils import dataset_unique_paths
+from .utils import norm_path, dataset_unique_paths
 
 
 # ============================================================
-# CONFIG (match clip_chart_prod_v6_noprompt.py)
+# CONFIG
 # ============================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_NAME = "openai/clip-vit-large-patch14"
 
-# You can override via env without changing code
-PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_store_images1")
-COLLECTION = os.getenv("CHROMA_COLLECTION", "chart_clip_images1")
+PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_store_images")
+COLLECTION = os.getenv("CHROMA_COLLECTION", "chart_clip_images")
 
-# Crop UI (tune for MT5/TV)
 ROI_CUT = dict(left=0.02, top=0.06, right=0.14, bottom=0.12)
-
-# Remove big black bars inside ROI
 CONTENT_ROW_THR = 10
 CONTENT_MARGIN = 6
 
-# Multi-layer pooling (USED for VectorDB)
 LAYERS = (-6, -3, -1)
 LAYER_WEIGHTS = (0.15, 0.20, 0.65)
 
-# Patch selection
 TOPK_RATIO = 0.16
 MIN_KEEP_PATCHES = 12
 CC_MIN_AREA = 2
 CC_ASPECT_THRESH = 0.45
 
-# Spatial + density priors
 PRIOR_STRENGTH = 1.35
 DENSITY_POWER = 2.0
 DENSITY_MIN_CLIP = 0.10
 HLINE_MIN_RUN = 4
 HLINE_PENALTY = 0.08
 
-# Edge valid-mask (adaptive)
 EDGE_BASE_THR = 0.0035
 EDGE_PCT = 75.0
 
-# Suppress background
 EDGE_BOOST_POWER = 1.6
 BG_SUBTRACT = 0.45
 CONTENT_GLOBAL_EDGE_GAMMA = 1.5
 
-# Views (REAL + STRUCT)
 W_REAL = 0.60
 W_STRUCT = 0.40
 
-# Pooling
 SOFTMAX_TEMP = 1.2
 
 
 # ============================================================
-# LAZY MODEL LOADER (avoid double-load on import)
+# LAZY MODEL LOADER
 # ============================================================
 _clip_model: Optional[CLIPModel] = None
 _processor: Optional[CLIPProcessor] = None
@@ -104,17 +75,7 @@ def get_clip() -> Tuple[CLIPModel, CLIPProcessor]:
 
 
 # ============================================================
-# PATH NORMALIZATION (dedupe ids across slash/case differences)
-# ============================================================
-def norm_path(p: str) -> str:
-    p2 = os.path.normpath(p).replace("\\", "/")
-    if os.name == "nt":
-        p2 = p2.lower()
-    return p2
-
-
-# ============================================================
-# IMAGE PREP (match latest: wide-only)
+# IMAGE PREP
 # ============================================================
 def load_rgb(path: str) -> Image.Image:
     return Image.open(path).convert("RGB")
@@ -176,12 +137,10 @@ def make_structure_view(pil_224: Image.Image) -> Image.Image:
 
     edges = cv2.Canny(gray, 40, 120)
 
-    # remove horizontal lines
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (19, 1))
     h_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, h_kernel, iterations=1)
     edges = cv2.subtract(edges, h_lines)
 
-    # thicken
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     edges = cv2.dilate(edges, kernel, iterations=1)
 
@@ -291,13 +250,11 @@ def _topk_mask_from_grid(grid: np.ndarray, ratio: float) -> np.ndarray:
 
 
 def edge_density_grid_no_hline(pil_224: Image.Image, g: int) -> np.ndarray:
-    """Edge density per patch, with horizontal lines removed first."""
     img = np.array(pil_224)
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     edges = cv2.Canny(gray, 40, 120)
 
-    # remove horizontal lines
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (19, 1))
     h_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, h_kernel, iterations=1)
     edges = cv2.subtract(edges, h_lines)
@@ -335,7 +292,7 @@ def edge_valid_mask_adaptive(
 
 
 # ============================================================
-# POOLING CORE (NO PROMPT) - content-global
+# POOLING CORE
 # ============================================================
 def _softmax_np(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
     x = x.astype(np.float32) / float(max(1e-6, temp))
@@ -351,12 +308,11 @@ def pooled_embedding(
     layer_weights=LAYER_WEIGHTS,
 ):
     clip_model, processor = get_clip()
-    assert len(layers) == len(layer_weights), "LAYERS and LAYER_WEIGHTS must have same length"
+    assert len(layers) == len(layer_weights)
 
     inputs = processor(images=pil_224, return_tensors="pt").to(DEVICE)
     vision_out = clip_model.vision_model(**inputs, output_hidden_states=True)
 
-    # grid size
     first_hs = vision_out.hidden_states[layers[0]] if layers[0] != -1 else vision_out.last_hidden_state
     P = first_hs.shape[1] - 1
     g = int(round(math.sqrt(P)))
@@ -367,7 +323,6 @@ def pooled_embedding(
     dens = patch_density_mask(pil_224, g)
     dens = suppress_long_horizontal_runs(dens, min_run=HLINE_MIN_RUN, penalty=HLINE_PENALTY)
 
-    # normalize layer weights
     lw = np.array(layer_weights, dtype=np.float32)
     lw = lw / (lw.sum() + 1e-9)
 
@@ -378,12 +333,11 @@ def pooled_embedding(
 
     for ly, wly in zip(layers, lw):
         hs = vision_out.hidden_states[ly] if ly != -1 else vision_out.last_hidden_state
-        patch_tokens = hs[:, 1:, :]  # [1,P,D]
+        patch_tokens = hs[:, 1:, :]
 
-        patch_emb = clip_model.visual_projection(patch_tokens)  # [1,P,E]
-        patch_emb = F.normalize(patch_emb, dim=-1)[0]           # [P,E]
+        patch_emb = clip_model.visual_projection(patch_tokens)
+        patch_emb = F.normalize(patch_emb, dim=-1)[0]
 
-        # valid mask + edge density (no-hline)
         valid, er = edge_valid_mask_adaptive(
             pil_224, g,
             base_thr=EDGE_BASE_THR,
@@ -394,7 +348,6 @@ def pooled_embedding(
         ern = er_flat / (float(er_flat.max()) + 1e-9)
         ern = np.power(ern, float(CONTENT_GLOBAL_EDGE_GAMMA)).astype(np.float32)
 
-        # build content-global from valid patches (weighted by edge density)
         mask_t = torch.tensor(valid.flatten(), device=DEVICE)
         if int(mask_t.sum().item()) <= 0:
             gfeat = patch_emb.mean(dim=0)
@@ -403,28 +356,23 @@ def pooled_embedding(
             w_sel = w_t[mask_t].clamp(min=1e-6)
             w_sel = w_sel / (w_sel.sum() + 1e-9)
             gfeat = (patch_emb[mask_t] * w_sel.unsqueeze(-1)).sum(dim=0)
-        gfeat = F.normalize(gfeat, dim=-1)  # [E]
+        gfeat = F.normalize(gfeat, dim=-1)
 
-        # score per patch = cosine(patch, content-global)
-        sim = (patch_emb @ gfeat).detach().float().cpu().numpy()  # [P]
+        sim = (patch_emb @ gfeat).detach().float().cpu().numpy()
         score_grid = sim.reshape(g, g).astype(np.float32)
 
-        # background subtract (use invalid area mean)
         inv = (~valid)
         if inv.any():
             bg_mean = float(score_grid[inv].mean())
             score_grid = score_grid - float(BG_SUBTRACT) * bg_mean
 
-        # priors
         score_grid = score_grid * prior
         score_grid = score_grid * (dens ** float(DENSITY_POWER))
 
-        # edge boost (favor real strokes)
         er_grid = er.reshape(g, g)
         er_norm = er_grid / (float(er_grid.max()) + 1e-9)
         score_grid = score_grid * np.power(er_norm + 1e-6, float(EDGE_BOOST_POWER))
 
-        # keep selection: top-k within valid
         keep0 = _topk_mask_from_grid(score_grid, TOPK_RATIO)
         keep = keep0 & valid
         if not keep.any():
@@ -436,12 +384,10 @@ def pooled_embedding(
 
         keep_union |= keep
 
-        # pooling weights inside this layer (only keep)
         flat_scores = score_grid.flatten()
         sel_scores = flat_scores[keep.flatten()].astype(np.float32)
         ww = _softmax_np(sel_scores, temp=SOFTMAX_TEMP)
 
-        # pooled vector for this layer
         keep_t = torch.tensor(keep.flatten(), device=DEVICE)
         sel_emb = patch_emb[keep_t]
         ww_t = torch.tensor(ww, device=DEVICE).unsqueeze(-1)
@@ -449,19 +395,16 @@ def pooled_embedding(
         pooled = F.normalize(pooled, dim=-1)
         pooled_layers.append(pooled)
 
-        # debug combine (kept for potential future debug)
         score_comb += float(wly) * score_grid
         w_grid = np.zeros((g, g), dtype=np.float32)
         w_grid.flatten()[keep.flatten()] = ww
         wgrid_comb += float(wly) * w_grid
 
-    # combine pooled vectors across layers
-    pooled_stack = torch.stack(pooled_layers, dim=0)  # [L,E]
+    pooled_stack = torch.stack(pooled_layers, dim=0)
     lw_t = torch.tensor(lw, device=DEVICE).unsqueeze(-1)
     vec = (pooled_stack * lw_t).sum(dim=0)
     vec = F.normalize(vec, dim=-1).detach().cpu().numpy()
 
-    # normalize combined weight grid to sum=1
     s = float(wgrid_comb.sum())
     if s > 1e-9:
         wgrid_comb = wgrid_comb / s
@@ -470,20 +413,15 @@ def pooled_embedding(
 
 
 # ============================================================
-# FINAL EMBEDDING (REAL + STRUCT) (wide-only)
+# FINAL EMBEDDING (REAL + STRUCT)
 # ============================================================
 def embed_chart_image(image_path: str) -> List[float]:
-    # IMPORTANT: image_path here should be actual file path (not normalized id only)
     pil = load_rgb(image_path)
-
-    # wide only (match latest)
     wide224 = build_views(pil)
 
-    # REAL (wide only)
     v_real, _, _, _ = pooled_embedding(wide224)
     v_real = v_real / (np.linalg.norm(v_real) + 1e-9)
 
-    # STRUCT (wide only)
     wide_struct = make_structure_view(wide224)
     v_struct, _, _, _ = pooled_embedding(wide_struct)
     v_struct = v_struct / (np.linalg.norm(v_struct) + 1e-9)
@@ -531,7 +469,6 @@ def upsert_image_dataset(dataset_json: str):
     if not uniq_paths:
         raise ValueError("dataset.json contains no image paths")
 
-    # normalize + dedupe ids (store ids normalized to prevent duplicates)
     uniq_norm: List[str] = []
     seen = set()
     for p in uniq_paths:
@@ -577,7 +514,4 @@ def rebuild_image_db(dataset_json: str):
 
 
 def search_image(db: Chroma, query_image: str, k=10):
-    # IMPORTANT:
-    # - similarity_search() will call embed_query(query_image) which expects a real file path
-    # - so DO NOT norm_path(query_image) here (norm_path is for ids in DB)
     return db.similarity_search(query_image, k=k)

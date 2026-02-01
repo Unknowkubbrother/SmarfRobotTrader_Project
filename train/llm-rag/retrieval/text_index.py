@@ -8,17 +8,13 @@ from langchain_community.vectorstores import Chroma
 from langchain.embeddings.base import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from .dataset_utils import norm_path, load_dataset
+from .utils import norm_path, load_dataset
 
 
-# BGE-M3: รองรับภาษาไทยและหลายภาษา, มี dense + sparse embeddings
 TEXT_MODEL_NAME = "BAAI/bge-m3"
-
-# base names (จะถูกเติม _{dim} อัตโนมัติ)
 TEXT_PERSIST_BASE = "chroma_store_text_bge"
 TEXT_COLLECTION_BASE = "chart_text_bge_m3"
 
-# Chunking settings
 CHUNK_SIZE = 512
 CHUNK_OVERLAP = 50
 
@@ -28,7 +24,6 @@ _text_splitter: Optional[RecursiveCharacterTextSplitter] = None
 
 
 def get_text_embedder() -> BGEM3FlagModel:
-    """โหลด BGE-M3 model (lazy singleton)"""
     global _text_embedder
     if _text_embedder is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -41,16 +36,13 @@ def get_text_embedder() -> BGEM3FlagModel:
 
 
 def get_text_dim() -> int:
-    """BGE-M3 dense embedding dimension = 1024"""
     global _TEXT_DIM
     if _TEXT_DIM is None:
-        # BGE-M3 มี dense dimension 1024
         _TEXT_DIM = 1024
     return _TEXT_DIM
 
 
 def get_text_splitter() -> RecursiveCharacterTextSplitter:
-    """สร้าง text splitter สำหรับ chunking"""
     global _text_splitter
     if _text_splitter is None:
         _text_splitter = RecursiveCharacterTextSplitter(
@@ -67,19 +59,15 @@ def sha1_text(s: str) -> str:
 
 
 def chunk_text(text: str) -> List[str]:
-    """แบ่งข้อความเป็น chunks"""
     splitter = get_text_splitter()
     chunks = splitter.split_text(text)
     return chunks if chunks else [text]
 
 
 class BGEM3Embeddings(Embeddings):
-    """LangChain Embeddings wrapper สำหรับ BGE-M3"""
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """สร้าง dense embeddings สำหรับเอกสาร"""
         model = get_text_embedder()
-        # BGE-M3 encode() คืน dict ที่มี 'dense_vecs'
         output = model.encode(
             texts,
             batch_size=12,
@@ -91,7 +79,6 @@ class BGEM3Embeddings(Embeddings):
         return output['dense_vecs'].tolist()
 
     def embed_query(self, text: str) -> List[float]:
-        """สร้าง dense embedding สำหรับ query"""
         model = get_text_embedder()
         output = model.encode(
             [text],
@@ -105,7 +92,6 @@ class BGEM3Embeddings(Embeddings):
 
 
 def open_text_db():
-    """เปิด/สร้าง Chroma DB สำหรับ text embeddings"""
     dim = get_text_dim()
     persist_dir = f"{TEXT_PERSIST_BASE}_{dim}"
     collection = f"{TEXT_COLLECTION_BASE}_{dim}"
@@ -118,14 +104,8 @@ def open_text_db():
 
 
 def upsert_text_dataset(dataset_json: str):
-    """
-    - id = normalized image path
-    - upsert เฉพาะใหม่/เปลี่ยน
-    - ส่ง embeddings= เข้า chroma เพื่อกัน dim mismatch และให้ update จริง
-    """
     raw = load_dataset(dataset_json)
 
-    # last-write-wins per image path
     by_path: Dict[str, str] = {}
     for it in raw:
         p0 = it.get("image")
@@ -143,7 +123,6 @@ def upsert_text_dataset(dataset_json: str):
 
     db = open_text_db()
 
-    # read existing sha1
     existing_sha: Dict[str, str] = {}
     for i in range(0, len(paths), 1000):
         chunk = paths[i:i + 1000]
@@ -171,7 +150,6 @@ def upsert_text_dataset(dataset_json: str):
         print(f"✅ Text DB: no new/changed texts. count={db._collection.count()}")
         return db
 
-    # compute embeddings explicitly
     embeddings = BGEM3Embeddings().embed_documents(up_docs)
 
     db._collection.upsert(
@@ -181,7 +159,6 @@ def upsert_text_dataset(dataset_json: str):
         embeddings=embeddings,
     )
 
-    # persist (บางเวอร์ชันจำเป็น)
     if hasattr(db, "persist"):
         try:
             db.persist()

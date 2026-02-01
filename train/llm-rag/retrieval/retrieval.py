@@ -2,8 +2,9 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 from langchain_community.vectorstores import Chroma
-from .dataset_utils import norm_path, build_text_lookup
+from .utils import norm_path, build_text_lookup
 
+import torch
 from sentence_transformers import CrossEncoder
 
 # ----------------------------
@@ -11,11 +12,17 @@ from sentence_transformers import CrossEncoder
 # ----------------------------
 _reranker: Optional[CrossEncoder] = None
 
-def get_reranker(model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1") -> CrossEncoder:
+def get_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+def get_reranker(model_name: str = "BAAI/bge-reranker-v2-m3") -> CrossEncoder:
     global _reranker
     if _reranker is None or getattr(_reranker, "model_name", None) != model_name:
-        _reranker = CrossEncoder(model_name)
-        # attach for cheap identity check
+        _reranker = CrossEncoder(model_name, device=get_device())
         _reranker.model_name = model_name  # type: ignore[attr-defined]
     return _reranker
 
@@ -24,10 +31,6 @@ def get_reranker(model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
 # CHROMA SEARCH (rank only)
 # ----------------------------
 def chroma_search_rank_only(db: Chroma, query, k: int):
-    """
-    Return list[(Document, None)] โดยสนใจแค่อันดับ (rank) เพื่อใช้ RRF
-    ลดปัญหา relevance score / score negative
-    """
     if hasattr(db, "similarity_search_with_score"):
         hits = db.similarity_search_with_score(query, k=k)
         return [(doc, None) for doc, _ in hits]
@@ -47,7 +50,6 @@ def rrf_fuse_multi(
 ):
     assert len(hit_lists) == len(weights)
 
-    # normalize weights (so image can be heavier safely)
     ws = [max(0.0, float(w)) for w in weights]
     s = sum(ws)
     if s <= 1e-9:
@@ -74,19 +76,15 @@ def rrf_fuse_multi(
 
 
 # ----------------------------
-# RERANK (CrossEncoder on query_text vs candidate 'data')
+# RERANK (CrossEncoder)
 # ----------------------------
 def rerank_with_cross_encoder(
     results: List[Dict[str, Any]],
     query_text: str,
-    model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    model_name: str = "BAAI/bge-reranker-v2-m3",
     top_m: int = 30,
     w_rerank: float = 0.35,
 ) -> List[Dict[str, Any]]:
-    """
-    - rerank top_m ด้วย CrossEncoder(query_text, candidate_data)
-    - combine กับ rrf เดิม => final_score แล้ว sort
-    """
     if not results or not query_text:
         return results
 
@@ -101,14 +99,12 @@ def rerank_with_cross_encoder(
     scores = reranker.predict(pairs)
     scores = np.asarray(scores, dtype=np.float32)
 
-    # normalize rerank scores 0..1
     smin, smax = float(scores.min()), float(scores.max())
     if smax - smin < 1e-9:
         rerank_n = np.zeros_like(scores)
     else:
         rerank_n = (scores - smin) / (smax - smin)
 
-    # normalize rrf 0..1 on the same candidate set (สำคัญ เพราะ rrf เป็นเลขเล็ก)
     rrf_vals = np.asarray([float(r.get("rrf", 0.0)) for r in cand], dtype=np.float32)
     rmin, rmax = float(rrf_vals.min()), float(rrf_vals.max())
     if rmax - rmin < 1e-9:
@@ -122,7 +118,6 @@ def rerank_with_cross_encoder(
         r["rerank_text_score"] = float(s_raw)
         r["final_score"] = (1.0 - w_rerank) * float(r_norm) + w_rerank * float(s_norm)
 
-    # items beyond top_m keep final_score from normalized rrf-ish fallback
     for r in results[len(cand):]:
         r["final_score"] = float(r.get("rrf", 0.0))
 
@@ -142,20 +137,14 @@ def hybrid_search_image_query(
     k_img: int = 30,
     k_t: int = 30,
     final_k: int = 10,
-    w_img: float = 0.85,     # ✅ ให้ image หนักกว่า
+    w_img: float = 0.85,
     w_t: float = 0.15,
-
-    # ✅ rerank options
     rerank: bool = True,
-    rerank_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    rerank_model: str = "BAAI/bge-reranker-v2-m3",
     rerank_top_m: int = 30,
     w_rerank: float = 0.35,
     rrf_pool_k: Optional[int] = None,
 ):
-    """
-    IMAGE -> (chart search) + (text search via auto_text) -> RRF merge
-    แล้ว (optional) rerank ด้วย CrossEncoder บน query_text vs dataset.data
-    """
     img_hits = chroma_search_rank_only(chart_db, query_image, k=int(k_img))
 
     hit_lists = [img_hits]
@@ -166,7 +155,6 @@ def hybrid_search_image_query(
         hit_lists.append(t_hits)
         weights.append(float(w_t))
 
-    # pool candidates มากกว่า final_k เพื่อให้ rerank มีพื้นที่ทำงาน
     if rrf_pool_k is None:
         rrf_pool_k = max(int(final_k) * 5, int(rerank_top_m), int(final_k))
 
@@ -183,7 +171,6 @@ def hybrid_search_image_query(
             "data": lookup.get(key, ""),
         })
 
-    # rerank only when we actually have text query
     if rerank and auto_text:
         results = rerank_with_cross_encoder(
             results,
