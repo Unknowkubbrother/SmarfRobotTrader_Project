@@ -1,0 +1,386 @@
+// 1. Setup & Configuration
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// 2. Enums
+// ==========================================
+enum Role {
+  user
+  admin
+
+  @@map("role_enum")
+}
+
+enum Status {
+  active
+  banned
+  pending
+
+  @@map("status_enum")
+}
+
+enum TicketStatus {
+  open
+  in_progress
+  resolved
+  closed
+
+  @@map("ticket_status_enum")
+}
+
+enum OrderType {
+  buy
+  sell
+
+  @@map("order_type_enum")
+}
+
+enum RiskLevel {
+  low
+  medium
+  high
+
+  @@map("risk_enum")
+}
+
+enum ContainerStatus {
+  running
+  stopped
+  error
+  starting
+
+  @@map("container_status_enum")
+}
+
+enum FeeType {
+  percentage
+  fixed
+
+  @@map("fee_type_enum")
+}
+
+enum SubStatus {
+  active
+  past_due
+  canceled
+
+  @@map("sub_status_enum")
+}
+
+enum InvoiceStatus {
+  paid
+  pending
+  skipped
+  failed
+
+  @@map("invoice_status_enum")
+}
+
+// ==========================================
+// 3. User Management & Auth
+// ==========================================
+model User {
+  id                    String    @id @default(dbgenerated("uuid_generate_v4()")) @map("user_id") @db.Uuid
+  username              String    @db.VarChar(50)
+  email                 String    @unique @db.VarChar(100)
+  password              String?   @db.VarChar(255)
+  avatarUrl             String?   @map("avatar_url") @db.VarChar(255)
+  recoveryEmail         String?   @map("recovery_email") @db.VarChar(100)
+  googleAuthId          String?   @map("google_auth_id") @db.VarChar(100)
+  stripeCustomerId      String?   @map("stripe_customer_id") @db.VarChar(100)
+  role                  Role      @default(user)
+  status                Status    @default(active)
+  isOnboardingCompleted Boolean   @default(false) @map("is_onboarding_completed")
+  createdAt             DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt             DateTime? @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  paymentMethods     UserPaymentMethod[]
+  activityLogs       ActivityLog[]
+  notificationConfig NotificationConfig?
+  notifications      Notification[]
+  supportTickets     SupportTicket[]
+  tradingAccounts    TradingAccount[]
+  subscriptions      Subscription[]
+
+  @@map("users")
+}
+
+model UserPaymentMethod {
+  id               String  @id @default(dbgenerated("uuid_generate_v4()")) @map("method_id") @db.Uuid
+  userId           String  @map("user_id") @db.Uuid
+  providerMethodId String? @map("provider_method_id") @db.VarChar(100)
+  type             String? @db.VarChar(20)
+  cardLast4        String? @map("card_last4") @db.VarChar(4)
+  cardBrand        String? @map("card_brand") @db.VarChar(20)
+  expiryMonth      Int?    @map("expiry_month")
+  expiryYear       Int?    @map("expiry_year")
+  isActive         Boolean @default(true) @map("is_active")
+  isDefault        Boolean @default(false) @map("is_default")
+
+  // Relations
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscriptions Subscription[]
+
+  @@map("user_payment_methods")
+}
+
+model ActivityLog {
+  id         String   @id @default(dbgenerated("uuid_generate_v4()")) @map("log_id") @db.Uuid
+  userId     String?  @map("user_id") @db.Uuid
+  ipAddress  String?  @map("ip_address") @db.VarChar(45)
+  deviceInfo String?  @map("device_info") @db.VarChar(255)
+  topic      String?  @db.VarChar(100)
+  detail     String?  @db.Text
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@map("activities_logs")
+}
+
+// ==========================================
+// 4. Notification & Support
+// ==========================================
+model NotificationConfig {
+  userId                  String  @id @map("user_id") @db.Uuid
+  lineNotifyToken         String? @map("line_notify_token") @db.VarChar(255)
+  discordWebhookUrl       String? @map("discord_webhook_url") @db.VarChar(255)
+  emailNotificationEnable Boolean @default(true) @map("email_notification_enable")
+
+  // Alert Settings
+  alertMarginLevelThreshold Decimal? @map("alert_margin_level_threshold") @db.Decimal(10, 2)
+  alertProfitTarget         Decimal? @map("alert_profit_target") @db.Decimal(10, 2)
+  alertLossLimit            Decimal? @map("alert_loss_limit") @db.Decimal(10, 2)
+
+  enableWeeklySummary  Boolean  @default(true) @map("enable_weekly_summary")
+  enableMonthlySummary Boolean  @default(true) @map("enable_monthly_summary")
+  updatedAt            DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("notification_configs")
+}
+
+model Notification {
+  id          String   @id @default(dbgenerated("uuid_generate_v4()")) @map("notification_id") @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  title       String?  @db.VarChar(100)
+  message     String?  @db.Text
+  relatedLink String?  @map("related_link") @db.VarChar(255)
+  isRead      Boolean  @default(false) @map("is_read")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("notifications")
+}
+
+model SupportTicket {
+  id        String       @id @default(dbgenerated("uuid_generate_v4()")) @map("ticket_id") @db.Uuid
+  userId    String       @map("user_id") @db.Uuid
+  subject   String?      @db.VarChar(100)
+  message   String?      @db.Text
+  status    TicketStatus @default(open)
+  createdAt DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime?    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("support_tickets")
+}
+
+// ==========================================
+// 5. Trading Core
+// ==========================================
+model TradingAccount {
+  id          String  @id @default(dbgenerated("uuid_generate_v4()")) @map("account_id") @db.Uuid
+  userId      String  @map("user_id") @db.Uuid
+  brokerName  String? @map("broker_name") @db.VarChar(100)
+  serverName  String? @map("server_name") @db.VarChar(100)
+  mt5LoginId  String? @map("mt5_login_id") @db.VarChar(50)
+  mt5Password String? @map("mt5_password") @db.VarChar(255)
+
+  // Real-time Status
+  balance     Decimal? @default(0) @db.Decimal(15, 2)
+  equity      Decimal? @default(0) @db.Decimal(15, 2)
+  leverage    Int?
+  margin      Decimal? @default(0) @db.Decimal(15, 2)
+  marginFree  Decimal? @default(0) @map("margin_free") @db.Decimal(15, 2)
+  marginLevel Decimal? @default(0) @map("margin_level") @db.Decimal(10, 2)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime? @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orders            OrderHistory[]
+  dailyAggregates   DailyAggregate[]
+  botConfigurations BotConfiguration[]
+
+  @@map("trading_accounts")
+}
+
+model OrderHistory {
+  ticketId      BigInt @id @map("ticket_id")
+  accountId     String @map("account_id") @db.Uuid
+  botInstanceId Int?   @map("bot_instance_id")
+
+  symbol     String?    @db.VarChar(20)
+  type       OrderType?
+  volume     Decimal?   @db.Decimal(10, 2)
+  openPrice  Decimal?   @map("open_price") @db.Decimal(10, 5)
+  closePrice Decimal?   @map("close_price") @db.Decimal(10, 5)
+  openTime   DateTime?  @map("open_time") @db.Timestamptz
+  closeTime  DateTime?  @map("close_time") @db.Timestamptz
+
+  // Financials
+  commission Decimal? @default(0) @db.Decimal(10, 2)
+  swap       Decimal? @default(0) @db.Decimal(10, 2)
+  profit     Decimal? @default(0) @db.Decimal(10, 2)
+  status     String?  @db.VarChar(20)
+
+  // Relations
+  account        TradingAccount  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  tradingJournal TradingJournal?
+
+  @@index([accountId, botInstanceId])
+  @@map("orders_history")
+}
+
+model DailyAggregate {
+  id             String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  accountId      String   @map("account_id") @db.Uuid
+  date           DateTime @db.Date
+  dailyNetProfit Decimal? @map("daily_net_profit") @db.Decimal(15, 2)
+  totalTrades    Int?     @map("total_trades")
+
+  // Relations
+  account TradingAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, date])
+  @@map("daily_aggregates")
+}
+
+model TradingJournal {
+  id             String    @id @default(dbgenerated("uuid_generate_v4()")) @map("journal_id") @db.Uuid
+  ticketId       BigInt?   @unique @map("ticket_id")
+  tradeRationale String?   @map("trade_rationale") @db.Text
+  mistakeLesson  String?   @map("mistake_lesson") @db.Text
+  attachmentUrls Json?     @map("attachment_urls")
+  tags           Json?
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime? @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  order OrderHistory? @relation(fields: [ticketId], references: [ticketId], onDelete: Cascade)
+
+  @@map("trading_journals")
+}
+
+// ==========================================
+// 6. Bot Management & Docker
+// ==========================================
+model BotVersion {
+  modelId       Int       @id @default(autoincrement()) @map("model_id")
+  label         String?   @db.VarChar(100)
+  dockerImageId String?   @map("docker_image_id") @db.VarChar(255)
+  versionTag    String?   @map("version_tag") @db.VarChar(20)
+  symbol        String?   @db.VarChar(20)
+  timeframe     String?   @db.VarChar(10)
+  releaseNotes  String?   @map("release_notes") @db.Text
+  releaseDate   DateTime? @default(now()) @map("release_date") @db.Timestamptz
+
+  // Relations
+  configurations BotConfiguration[]
+
+  @@map("bot_versions")
+}
+
+model BotConfiguration {
+  id        String @id @default(dbgenerated("uuid_generate_v4()")) @map("config_id") @db.Uuid
+  accountId String @map("account_id") @db.Uuid
+  modelId   Int    @map("model_id")
+
+  // Multi-Bot Identifiers
+  botInstanceId Int @map("bot_instance_id")
+
+  riskLevel       RiskLevel? @map("risk_level")
+  tradingSchedule Json?      @map("trading_schedule")
+  isActive        Boolean    @default(false) @map("is_active")
+
+  // Container Control
+  dockerContainerId String?          @map("docker_container_id") @db.VarChar(100)
+  containerStatus   ContainerStatus? @map("container_status")
+  updatedAt         DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  account    TradingAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  botVersion BotVersion     @relation(fields: [modelId], references: [modelId])
+
+  @@unique([accountId, botInstanceId])
+  @@map("bot_configurations")
+}
+
+// ==========================================
+// 7. Billing & Subscriptions
+// ==========================================
+model SystemBillingConfig {
+  configId            Int      @id @default(autoincrement()) @map("config_id")
+  defaultFeeType      FeeType? @map("default_fee_type")
+  defaultFeeValue     Decimal? @map("default_fee_value") @db.Decimal(10, 2)
+  defaultMinThreshold Decimal? @map("default_min_threshold") @db.Decimal(10, 2)
+  updatedAt           DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("system_billing_config")
+}
+
+model Subscription {
+  id                     String  @id @default(dbgenerated("uuid_generate_v4()")) @map("sub_id") @db.Uuid
+  userId                 String  @map("user_id") @db.Uuid
+  defaultPaymentMethodId String? @map("default_payment_method_id") @db.Uuid
+
+  status             SubStatus?
+  feeType            FeeType?   @default(percentage) @map("fee_type")
+  feeValue           Decimal?   @default(20.00) @map("fee_value") @db.Decimal(10, 2)
+  minProfitThreshold Decimal?   @map("min_profit_threshold") @db.Decimal(10, 2)
+  nextBillingDate    DateTime?  @map("next_billing_date") @db.Date
+  createdAt          DateTime   @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  user          User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  paymentMethod UserPaymentMethod? @relation(fields: [defaultPaymentMethodId], references: [id])
+  invoices      Invoice[]
+
+  @@map("subscriptions")
+}
+
+model Invoice {
+  id                    String         @id @default(dbgenerated("uuid_generate_v4()")) @map("invoice_id") @db.Uuid
+  subId                 String         @map("sub_id") @db.Uuid
+  billingStartDate      DateTime?      @map("billing_start_date") @db.Date
+  billingEndDate        DateTime?      @map("billing_end_date") @db.Date
+  totalPeriodProfit     Decimal?       @map("total_period_profit") @db.Decimal(15, 2)
+  calculatedFee         Decimal?       @map("calculated_fee") @db.Decimal(10, 2)
+  status                InvoiceStatus?
+  paymentMethodUsed     String?        @map("payment_method_used") @db.VarChar(50)
+  stripePaymentIntentId String?        @map("stripe_payment_intent_id") @db.VarChar(100)
+  paidAt                DateTime?      @map("paid_at") @db.Timestamptz
+  createdAt             DateTime       @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  subscription Subscription @relation(fields: [subId], references: [id], onDelete: Cascade)
+
+  @@map("invoices")
+}
