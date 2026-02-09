@@ -1,6 +1,6 @@
 {
   "C_Cpp.default.forcedInclude": [
-    "/Users/unknowkubbrother/.antigravity/extensions/l-i-v.mql-tools-2.2.0/data/mql5_en.mqh"
+    "/Users/unknowkubbrother/.vscode/extensions/l-i-v.mql-tools-2.2.0/data/mql5_en.mqh"
   ],
   "C_Cpp.errorSquiggles": "disabled",
   "files.associations": {
@@ -15,6 +15,8 @@
   "C_Cpp.default.compilerPath": "",
   "C_Cpp.default.intelliSenseMode": "gcc-x64",
   "C_Cpp.autocompleteAddParentheses": true,
+  "debug.autoAttach": "disabled",
+  "debug.javascript.autoAttachFilter": "disabled",
   "files.exclude": {
     "**/*.ex4": true,
     "**/*.ex5": true,
@@ -31,4 +33,6 @@
   },
   "editor.tabSize": 3,
   "C_Cpp.clang_format_style": "file:/Users/unknowkubbrother/.antigravity/extensions/l-i-v.mql-tools-2.2.0/files/.clang-format"
+  ,
+  "Mql_tools.Metaeditor": "/Users/unknowkubbrother/Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
 }
