@@ -28,3 +28,19 @@ class ForgotPassword_Reset(BaseModel):
     email: str
     otp: str
     new_password: str
+
+class Login_Verify(BaseModel):
+    email: str
+    otp: str
+
+class Google_Register_OTP(BaseModel):
+    id_token: str
+    recovery_email: str
+
+class Google_Register_Verify(BaseModel):
+    email: str
+    otp: str
+
+class Google_Register_Complete(BaseModel):
+    email: str
+    username: str

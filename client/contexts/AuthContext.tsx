@@ -17,12 +17,18 @@ interface AuthContextType {
   user: User | null;
   loading: boolean;
   isAdmin: boolean;
-  signIn: (email: string, password: string) => Promise<{ error: Error | null }>;
-  signInWithGoogle: () => Promise<{ error: Error | null }>;
+  signIn: (email: string, password: string) => Promise<{ error: Error | null; requireOtp?: boolean; recoveryEmailHint?: string }>;
+  loginVerify: (email: string, otp: string) => Promise<{ error: Error | null }>;
+  signInWithGoogle: () => Promise<{ error: Error | null; requireOtp?: boolean; requireRegister?: boolean; recoveryEmailHint?: string; googleInfo?: any; email?: string }>;
   signOut: () => Promise<void>;
+
   registerOTP: (email: string, recoveryEmail: string, password: string) => Promise<{ error: Error | null; devOtp?: string }>;
   verifyOTP: (recoveryEmail: string, otp: string) => Promise<{ error: Error | null; userId?: string }>;
   completeRegistration: (recoveryEmail: string, username: string) => Promise<{ error: Error | null }>;
+
+  googleRegisterOTP: (idToken: string, recoveryEmail: string) => Promise<{ error: Error | null; devOtp?: string }>;
+  googleRegisterVerify: (email: string, otp: string) => Promise<{ error: Error | null; verified?: boolean }>;
+  googleRegisterComplete: (email: string, username: string) => Promise<{ error: Error | null }>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -55,28 +61,65 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       formData.append("username", email);
       formData.append("password", password);
 
-      await api.post("/auth/login", formData, {
+      const { data } = await api.post("/auth/login", formData, {
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
       });
 
+      if (data.require_otp) {
+        return {
+          error: null,
+          requireOtp: true,
+          recoveryEmailHint: data.recovery_email_hint
+        };
+      }
+
       await fetchCurrentUser();
       return { error: null };
-    } catch (error) {
-      return { error: error as Error };
+    } catch (error: any) {
+      return { error: error };
+    }
+  };
+
+  const loginVerify = async (email: string, otp: string) => {
+    try {
+      await api.post("/auth/login/verify", { email, otp });
+      await fetchCurrentUser();
+      return { error: null };
+    } catch (error: any) {
+      return { error: error };
     }
   };
 
   const signInWithGoogle = async () => {
     try {
       const result = await signInWithPopup(auth, googleProvider);
+      const email = result.user.email || undefined;
       const idToken = await result.user.getIdToken();
 
-      await api.post("/auth/google", { id_token: idToken });
+      const { data } = await api.post("/auth/google", { id_token: idToken });
+
+      if (data.require_otp) {
+        return {
+          error: null,
+          requireOtp: true,
+          recoveryEmailHint: data.recovery_email_hint,
+          email
+        };
+      }
+
+      if (data.require_register) {
+        return {
+          error: null,
+          requireRegister: true,
+          googleInfo: { ...data.google_info, idToken: idToken },
+          email
+        };
+      }
 
       await fetchCurrentUser();
-      return { error: null };
-    } catch (error) {
-      return { error: error as Error };
+      return { error: null, email };
+    } catch (error: any) {
+      return { error: error };
     }
   };
 
@@ -88,8 +131,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         password,
       });
       return { error: null, devOtp: data.dev_otp };
-    } catch (error) {
-      return { error: error as Error };
+    } catch (error: any) {
+      return { error: error };
     }
   };
 
@@ -100,8 +143,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         otp,
       });
       return { error: null, userId: data.user?.id };
-    } catch (error) {
-      return { error: error as Error };
+    } catch (error: any) {
+      return { error: error };
     }
   };
 
@@ -112,8 +155,39 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         username,
       });
       return { error: null };
-    } catch (error) {
-      return { error: error as Error };
+    } catch (error: any) {
+      return { error: error };
+    }
+  };
+
+  const googleRegisterOTP = async (idToken: string, recoveryEmail: string) => {
+    try {
+      const { data } = await api.post("/auth/google/register/otp", {
+        id_token: idToken,
+        recovery_email: recoveryEmail
+      });
+      return { error: null, devOtp: data.dev_otp };
+    } catch (error: any) {
+      return { error: error };
+    }
+  };
+
+  const googleRegisterVerify = async (email: string, otp: string) => {
+    try {
+      const { data } = await api.post("/auth/google/register/verify", { email, otp });
+      return { error: null, verified: data.verified };
+    } catch (error: any) {
+      return { error: error };
+    }
+  };
+
+  const googleRegisterComplete = async (email: string, username: string) => {
+    try {
+      await api.post("/auth/google/register/complete", { email, username });
+      await fetchCurrentUser();
+      return { error: null };
+    } catch (error: any) {
+      return { error: error };
     }
   };
 
@@ -133,11 +207,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       loading,
       isAdmin,
       signIn,
+      loginVerify,
       signInWithGoogle,
       signOut,
       registerOTP,
       verifyOTP,
       completeRegistration,
+      googleRegisterOTP,
+      googleRegisterVerify,
+      googleRegisterComplete
     }}>
       {children}
     </AuthContext.Provider>

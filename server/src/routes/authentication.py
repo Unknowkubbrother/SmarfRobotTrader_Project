@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, status, Response, Request
+from fastapi import APIRouter, HTTPException, Depends, status, Response, Request, Form
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
@@ -11,7 +11,7 @@ import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 
 from ..database.client import r_cache, db
-from ..models.authentication_model import Register_OTP, Register_Verify, Register_Complete
+from ..models.authentication_model import Register_OTP, Register_Verify, Register_Complete, Login_Verify, Google_Register_OTP, Google_Register_Verify, Google_Register_Complete
 from lib.untils import random_with_N_digits
 
 SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
@@ -98,48 +98,66 @@ async def get_current_active_user(
     return current_user
 
 
-@auth_router.post("/google", response_model=Token, tags=["auth"])
-async def google_auth(response: Response, google_auth: GoogleAuth):
-    try:
-        decoded_token = firebase_auth.verify_id_token(google_auth.id_token)
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+@auth_router.post("/login", tags=["auth"])
+async def login(
+    response: Response,
+    username: Annotated[str, Form()],
+    password: Annotated[str, Form()]
+):
+    user = await db.user.find_unique(where={"email": username})
     
-    email = decoded_token.get("email")
-    name = decoded_token.get("name", email.split("@")[0])
-    picture = decoded_token.get("picture")
-    google_uid = decoded_token.get("uid")
-    
-    if not email:
-        raise HTTPException(status_code=400, detail="Email not found in Google token")
-    
-    user = await db.user.find_unique(where={"email": email})
-    
-    if not user:
-        try:
-            user = await db.user.create(
-                data={
-                    "username": name,
-                    "email": email,
-                    "googleAuthId": google_uid,
-                    "avatarUrl": picture,
-                }
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
-    else:
-        if not user.googleAuthId:
-            await db.user.update(
-                where={"id": str(user.id)},
-                data={
-                    "googleAuthId": google_uid,
-                    "avatarUrl": picture or user.avatarUrl,
-                }
-            )
+    if not user or not bcrypt.checkpw(password.encode('utf-8'), user.password.encode('utf-8')):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     
     if user.status == "banned":
-        raise HTTPException(status_code=403, detail="Your account has been banned")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account has been banned",
+        )
+
+    if not user.recoveryEmail:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="Account security incomplete: No recovery email set. Contact support or use forgot password to recover/set it."
+        )
+
+    otp = str(random_with_N_digits(6))
     
+    r_cache.setex(f"login_pending:{user.email}", 300, otp)
+    
+    print(f"[DEV] Login OTP for {user.email} (sent to {user.recoveryEmail}): {otp}")
+
+    return {
+        "require_otp": True,
+        "message": "OTP sent to your recovery email",
+        "email": user.email,
+        "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}",
+        "dev_otp": otp
+    }
+
+
+@auth_router.post("/login/verify", response_model=Token, tags=["auth"])
+async def login_verify(response: Response, data: Login_Verify):
+    email = data.email
+    otp = data.otp
+    
+    stored_otp = r_cache.get(f"login_pending:{email}")
+    
+    if not stored_otp or stored_otp != otp:
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+    
+    user = await db.user.find_unique(where={"email": email})
+    if not user:
+         raise HTTPException(status_code=404, detail="User not found")
+
+    # Clear OTP
+    r_cache.delete(f"login_pending:{email}")
+    
+    # Issue Token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={
@@ -160,6 +178,66 @@ async def google_auth(response: Response, google_auth: GoogleAuth):
     )
     
     return Token(access_token=access_token, token_type="bearer")
+
+
+@auth_router.post("/google", tags=["auth"])
+async def google_auth(response: Response, google_auth: GoogleAuth):
+    try:
+        decoded_token = firebase_auth.verify_id_token(google_auth.id_token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+    
+    email = decoded_token.get("email")
+    name = decoded_token.get("name", email.split("@")[0])
+    picture = decoded_token.get("picture")
+    google_uid = decoded_token.get("uid")
+    
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in Google token")
+    
+    user = await db.user.find_unique(where={"email": email})
+    
+    if not user:
+        return {
+            "require_register": True,
+            "message": "New account. Please complete registration.",
+            "google_info": {
+                "email": email,
+                "name": name,
+                "picture": picture,
+                "uid": google_uid
+            }
+        }
+    else:
+        if not user.googleAuthId:
+            await db.user.update(
+                where={"id": str(user.id)},
+                data={
+                    "googleAuthId": google_uid,
+                    "avatarUrl": picture or user.avatarUrl,
+                }
+            )
+        
+        if user.status == "banned":
+             raise HTTPException(status_code=403, detail="Your account has been banned")
+        
+        if not user.recoveryEmail:
+             raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail="Account security incomplete: No recovery email set. Contact support."
+            )
+        otp = str(random_with_N_digits(6))
+        r_cache.setex(f"login_pending:{user.email}", 300, otp)
+        
+        print(f"[DEV] Google Login OTP for {user.email}: {otp}")
+        
+        return {
+            "require_otp": True,
+            "message": "OTP sent to your recovery email",
+            "email": user.email,
+            "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}",
+             "dev_otp": otp
+        }
 
 
 @auth_router.post("/register/otp", tags=["auth"])
@@ -420,3 +498,117 @@ async def forgot_password_reset(data: dict):
     r_cache.delete(f"forgot_password_otp:{email}")
     
     return {"message": "Password reset successfully"}
+
+
+@auth_router.post("/google/register/otp", tags=["auth"])
+async def google_register_otp(data: Google_Register_OTP):
+    try:
+        decoded_token = firebase_auth.verify_id_token(data.id_token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+    
+    email = decoded_token.get("email")
+    name = decoded_token.get("name", email.split("@")[0])
+    picture = decoded_token.get("picture")
+    google_uid = decoded_token.get("uid")
+    
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in Google token")
+    
+    # Check if recovery email matches account email
+    if data.recovery_email.lower() == email.lower():
+         raise HTTPException(status_code=400, detail="Recovery email must be different from your Google email")
+
+    otp = str(random_with_N_digits(6))
+    
+    # Cache Registration Info
+    reg_key = f"google_reg_pending:{email}"
+    r_cache.hset(reg_key, mapping={
+        "email": email,
+        "name": name,
+        "picture": picture if picture else "",
+        "google_uid": google_uid,
+        "recovery_email": data.recovery_email,
+        "otp": otp
+    })
+    r_cache.expire(reg_key, 600) # 10 minutes
+    
+    print(f"[DEV] Google Register OTP for {email} (sent to {data.recovery_email}): {otp}")
+    
+    return {
+        "message": "OTP sent to recovery email",
+        "dev_otp": otp
+    }
+
+
+@auth_router.post("/google/register/verify", tags=["auth"])
+async def google_register_verify(data: Google_Register_Verify):
+    email = data.email
+    otp = data.otp
+    
+    reg_key = f"google_reg_pending:{email}"
+    stored_data = r_cache.hgetall(reg_key)
+    
+    if not stored_data or stored_data.get("otp") != otp:
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+    
+    # Allow proceeding to next step (Completion)
+    # We could issue a temporary signed token, but for now relying on cache existence and passing email is ok for slight simplicity, 
+    # but strictly we should ensure the next step verifies this verification happened.
+    # To secure it, we update the cache to mark as 'verified'
+    r_cache.hset(reg_key, "verified", "true")
+    
+    return {"message": "OTP verified", "verified": True}
+
+
+@auth_router.post("/google/register/complete", response_model=Token, tags=["auth"])
+async def google_register_complete(response: Response, data: Google_Register_Complete):
+    email = data.email
+    username = data.username
+    
+    reg_key = f"google_reg_pending:{email}"
+    stored_data = r_cache.hgetall(reg_key)
+    
+    if not stored_data:
+        raise HTTPException(status_code=400, detail="Registration session expired. Please try again.")
+    
+    if stored_data.get("verified") != "true":
+         raise HTTPException(status_code=400, detail="Email not verified")
+
+    try:
+        user = await db.user.create(
+            data={
+                "username": username,
+                "email": email,
+                "recoveryEmail": stored_data.get("recovery_email"),
+                "googleAuthId": stored_data.get("google_uid"),
+                "avatarUrl": stored_data.get("picture") or None,
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
+        
+    # Clear Cache
+    r_cache.delete(reg_key)
+    
+    # Issue Token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={
+            "sub": str(user.id),
+            "email": user.email,
+            "role": user.role
+        },
+        expires_delta=access_token_expires
+    )
+    
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=access_token,
+        httponly=True,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        samesite="lax",
+        secure=False
+    )
+    
+    return Token(access_token=access_token, token_type="bearer")

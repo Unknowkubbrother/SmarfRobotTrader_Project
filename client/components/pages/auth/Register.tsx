@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { z } from "zod";
 import { useForm } from "react-hook-form";
@@ -41,14 +41,19 @@ export default function Register() {
     const [countdown, setCountdown] = useState(0);
     const [devOtp, setDevOtp] = useState<string | null>(null);
 
+    const searchParams = useSearchParams();
+    const mode = searchParams.get("mode");
+
     const [regData, setRegData] = useState({
         email: "",
         password: "",
         recoveryEmail: "",
+        isGoogle: false,
+        googleIdToken: ""
     });
 
     const router = useRouter();
-    const { user, signInWithGoogle, registerOTP, verifyOTP, completeRegistration } = useAuth();
+    const { user, signInWithGoogle, registerOTP, verifyOTP, completeRegistration, googleRegisterOTP, googleRegisterVerify, googleRegisterComplete } = useAuth();
 
     const step1Form = useForm<z.infer<typeof step1Schema>>({
         resolver: zodResolver(step1Schema),
@@ -79,38 +84,61 @@ export default function Register() {
     const handleGoogleSignUp = async () => {
         setIsLoading(true);
         try {
-            const { error } = await signInWithGoogle();
-            if (error) {
-                toast.error(error.message);
+            const result = await signInWithGoogle();
+            if (result.error) {
+                toast.error(result.error.message);
                 return;
             }
-            toast.success("Welcome!");
-            router.push("/");
+
+            if (result.requireRegister) {
+                setRegData(prev => ({
+                    ...prev,
+                    email: result.email || "",
+                    isGoogle: true,
+                    googleIdToken: result.googleInfo?.idToken
+                }));
+
+                setStep(2);
+                toast.info("Please set a recovery email to complete registration.");
+            } else if (result.requireOtp) {
+                toast.info("Account already exists. Please login.");
+                router.push("/auth/login");
+            } else {
+                toast.success("Welcome!");
+                router.push("/");
+            }
         } finally {
             setIsLoading(false);
         }
     };
 
     const handleStep1 = async (data: z.infer<typeof step1Schema>) => {
-        setRegData(prev => ({ ...prev, email: data.email, password: data.password }));
+        setRegData(prev => ({ ...prev, email: data.email, password: data.password, isGoogle: false }));
         setStep(2);
     };
 
     const handleStep2 = async (data: z.infer<typeof step2Schema>) => {
         if (data.recoveryEmail === regData.email) {
-            toast.error("Recovery email must be different from account email");
+            toast.error(regData.isGoogle ? "Recovery email must be different from your Google email" : "Recovery email must be different from account email");
             return;
         }
 
         setIsLoading(true);
         try {
-            const { error, devOtp: otp } = await registerOTP(regData.email, data.recoveryEmail, regData.password);
-            if (error) {
-                toast.error(error.message);
+            let result;
+            if (regData.isGoogle) {
+                result = await googleRegisterOTP(regData.googleIdToken, data.recoveryEmail);
+            } else {
+                result = await registerOTP(regData.email, data.recoveryEmail, regData.password);
+            }
+
+            if (result.error) {
+                toast.error(result.error.message);
                 return;
             }
+
             setRegData(prev => ({ ...prev, recoveryEmail: data.recoveryEmail }));
-            if (otp) setDevOtp(otp);
+            if (result.devOtp) setDevOtp(result.devOtp);
             setCountdown(60);
             setStep(3);
             toast.success("OTP sent to your recovery email");
@@ -127,9 +155,15 @@ export default function Register() {
 
         setIsLoading(true);
         try {
-            const { error } = await verifyOTP(regData.recoveryEmail, otp);
-            if (error) {
-                toast.error(error.message);
+            let result;
+            if (regData.isGoogle) {
+                result = await googleRegisterVerify(regData.email, otp);
+            } else {
+                result = await verifyOTP(regData.recoveryEmail, otp);
+            }
+
+            if (result.error) {
+                toast.error(result.error.message);
                 return;
             }
             setStep(4);
@@ -142,13 +176,25 @@ export default function Register() {
     const handleStep4 = async (data: z.infer<typeof step4Schema>) => {
         setIsLoading(true);
         try {
-            const { error } = await completeRegistration(regData.recoveryEmail, data.username);
-            if (error) {
-                toast.error(error.message);
+            let result;
+            if (regData.isGoogle) {
+                result = await googleRegisterComplete(regData.email, data.username);
+            } else {
+                result = await completeRegistration(regData.recoveryEmail, data.username);
+            }
+
+            if (result.error) {
+                toast.error(result.error.message);
                 return;
             }
-            toast.success("Registration complete! Please login.");
-            router.push("/auth/login");
+
+            if (regData.isGoogle) {
+                toast.success("Registration complete!");
+                router.push("/");
+            } else {
+                toast.success("Registration complete! Please login.");
+                router.push("/auth/login");
+            }
         } finally {
             setIsLoading(false);
         }
@@ -158,12 +204,18 @@ export default function Register() {
         if (countdown > 0) return;
         setIsLoading(true);
         try {
-            const { error, devOtp: otp } = await registerOTP(regData.email, regData.recoveryEmail, regData.password);
-            if (error) {
-                toast.error(error.message);
+            let result;
+            if (regData.isGoogle) {
+                result = await googleRegisterOTP(regData.googleIdToken, regData.recoveryEmail);
+            } else {
+                result = await registerOTP(regData.email, regData.recoveryEmail, regData.password);
+            }
+
+            if (result.error) {
+                toast.error(result.error.message);
                 return;
             }
-            if (otp) setDevOtp(otp);
+            if (result.devOtp) setDevOtp(result.devOtp);
             setCountdown(60);
             toast.success("OTP resent!");
         } finally {
@@ -172,7 +224,9 @@ export default function Register() {
     };
 
     const maskEmail = (email: string) => {
+        if (!email) return "";
         const [name, domain] = email.split("@");
+        if (!domain) return email;
         return `${name.slice(0, 4)}****@${domain}`;
     };
 
@@ -264,23 +318,35 @@ export default function Register() {
 
                         {step === 2 && (
                             <>
-                                <h2 className="text-2xl font-semibold text-center mb-1">Security Verification Email</h2>
+                                <h2 className="text-2xl font-semibold text-center mb-1">
+                                    {regData.isGoogle ? "Complete Registration" : "Security Verification Email"}
+                                </h2>
                                 {renderStepIndicator()}
+
+                                {regData.isGoogle && (
+                                    <p className="text-sm text-center mb-4 text-muted-foreground">
+                                        Signing up as <span className="text-foreground font-medium">{regData.email}</span>
+                                    </p>
+                                )}
 
                                 <Form {...step2Form}>
                                     <form onSubmit={step2Form.handleSubmit(handleStep2)} className="space-y-4">
                                         <FormField control={step2Form.control} name="recoveryEmail" render={({ field }) => (
                                             <FormItem>
-                                                <FormLabel>Email for verify otp</FormLabel>
-                                                <FormControl><Input type="email" className="h-11 rounded-lg bg-muted border-0" {...field} /></FormControl>
-                                                <p className="text-xs text-muted-foreground">This email will be used for login verification.</p>
+                                                <FormLabel>Recovery Email {regData.isGoogle && "(OTP)"}</FormLabel>
+                                                <FormControl><Input type="email" placeholder="Different email for security" className="h-11 rounded-lg bg-muted border-0" {...field} /></FormControl>
+                                                <p className="text-xs text-muted-foreground">This email will be used for OTP verification.</p>
                                                 <FormMessage />
                                             </FormItem>
                                         )} />
 
                                         <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 flex gap-2 items-start">
                                             <Info className="w-4 h-4 text-amber-600 mt-0.5" />
-                                            <p className="text-sm text-amber-800">Note: OTP email must be different from your account email.</p>
+                                            <p className="text-sm text-amber-800">
+                                                {regData.isGoogle
+                                                    ? "Please provide a recovery email different from your Google account email."
+                                                    : "Note: OTP email must be different from your account email."}
+                                            </p>
                                         </div>
 
                                         <Button type="submit" className="w-full h-11 rounded-full bg-gradient-to-r from-[#1e3a5f] to-[#3b82f6]" disabled={isLoading}>

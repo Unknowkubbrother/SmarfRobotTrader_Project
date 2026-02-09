@@ -25,6 +25,10 @@ PUBLIC_PATHS = [
     "/auth/forgot-password/request",
     "/auth/forgot-password/verify",
     "/auth/forgot-password/reset",
+    "/auth/login/verify",
+    "/auth/google/register/otp",
+    "/auth/google/register/verify",
+    "/auth/google/register/complete",
 ]
 
 
