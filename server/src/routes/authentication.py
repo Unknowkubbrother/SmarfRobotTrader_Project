@@ -1,13 +1,95 @@
-from fastapi import APIRouter, HTTPException
-from ..database.client import r_cache, db
-from ..models.authentication_model import Register_OTP, Register_Verify, Register_Complete, Login
-from lib.untils import random_with_N_digits
+from fastapi import APIRouter, HTTPException, Depends, status, Response, Request
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Optional
+from pydantic import BaseModel
+import jwt
+from jwt.exceptions import InvalidTokenError
 import bcrypt
+import os
+
+from ..database.client import r_cache, db
+from ..models.authentication_model import Register_OTP, Register_Verify, Register_Complete
+from lib.untils import random_with_N_digits
+
+SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+COOKIE_NAME = "access_token"
 
 auth_router = APIRouter()
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
 
 
-@auth_router.post("/register/otp", tags=["users"])
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class TokenData(BaseModel):
+    user_id: str | None = None
+    email: str | None = None
+    role: str | None = None
+
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+async def get_current_user(
+    request: Request,
+    token: Annotated[Optional[str], Depends(oauth2_scheme)] = None
+):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    token_to_use = request.cookies.get(COOKIE_NAME) or token
+    
+    if not token_to_use:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    try:
+        payload = jwt.decode(token_to_use, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+        token_data = TokenData(
+            user_id=user_id, 
+            email=payload.get("email"),
+            role=payload.get("role")
+        )
+    except InvalidTokenError:
+        raise credentials_exception
+    
+    user = await db.user.find_unique(where={"id": token_data.user_id})
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+async def get_current_active_user(
+    current_user: Annotated[any, Depends(get_current_user)],
+):
+    if current_user.status == "banned":
+        raise HTTPException(status_code=400, detail="User is banned")
+    return current_user
+
+
+@auth_router.post("/register/otp", tags=["auth"])
 async def register_otp(register_otp: Register_OTP):
     existing_user = await db.user.find_unique(where={"email": register_otp.email})
     if existing_user:
@@ -25,21 +107,21 @@ async def register_otp(register_otp: Register_OTP):
         "recovery_email": register_otp.recovery_email,
         "password": hashed_password
     })
-    r_cache.expire(f"reg_detail_{recovery_email_key}", 60 * 10)  # หมดอายุใน 10 นาที
+    r_cache.expire(f"reg_detail_{recovery_email_key}", 60 * 10)
     
     otp = str(random_with_N_digits(6))
-    r_cache.set(f"reg_otp_{recovery_email_key}", otp, ex=60 * 5)  # หมดอายุใน 5 นาที
+    r_cache.set(f"reg_otp_{recovery_email_key}", otp, ex=60 * 5)
     
     print(f"[DEV] OTP for {register_otp.recovery_email}: {otp}")
     
     return {
         "status_code": 200,
         "message": "OTP sent to your recovery email",
-        "dev_otp": otp  # ลบออกใน production
+        "dev_otp": otp
     }
 
 
-@auth_router.post("/register/verify_otp", tags=["users"])
+@auth_router.post("/register/verify_otp", tags=["auth"])
 async def register_verify_otp(register_verify: Register_Verify):
     recovery_email_key = register_verify.recovery_email.split('@')[0]
     
@@ -71,7 +153,7 @@ async def register_verify_otp(register_verify: Register_Verify):
         raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
         
     r_cache.delete(f"reg_otp_{recovery_email_key}")
-    r_cache.set(f"reg_user_{recovery_email_key}", str(user.id), ex=60 * 30)  # หมดอายุใน 30 นาที
+    r_cache.set(f"reg_user_{recovery_email_key}", str(user.id), ex=60 * 30)
     
     return {
         "status_code": 201,
@@ -83,7 +165,7 @@ async def register_verify_otp(register_verify: Register_Verify):
     }
 
 
-@auth_router.post("/register/complete", tags=["users"])
+@auth_router.post("/register/complete", tags=["auth"])
 async def register_complete(register_complete: Register_Complete):
     recovery_email_key = register_complete.recovery_email.split('@')[0]
     
@@ -95,7 +177,6 @@ async def register_complete(register_complete: Register_Complete):
     if existing_username and str(existing_username.id) != user_id:
         raise HTTPException(status_code=400, detail="Username already taken")
     
-    # อัพเดท username
     try:
         user = await db.user.update(
             where={"id": user_id},
@@ -118,48 +199,70 @@ async def register_complete(register_complete: Register_Complete):
     }
 
 
-@auth_router.post("/login", tags=["users"])
-async def login(login_data: Login):
-    from jose import jwt
-    from datetime import datetime, timedelta
-    import os
-    
-    user = await db.user.find_unique(where={"email": login_data.email})
+@auth_router.post("/login", response_model=Token, tags=["auth"])
+async def login(response: Response, form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
+    user = await db.user.find_unique(where={"email": form_data.username})
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     
     if not user.password:
-        raise HTTPException(status_code=401, detail="Please login with Google")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Please login with Google",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     
-    if not bcrypt.checkpw(login_data.password.encode('utf-8'), user.password.encode('utf-8')):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not bcrypt.checkpw(form_data.password.encode('utf-8'), user.password.encode('utf-8')):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     
     if user.status == "banned":
-        raise HTTPException(status_code=403, detail="Your account has been banned")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account has been banned",
+        )
     
-    SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
-    ALGORITHM = "HS256"
-    ACCESS_TOKEN_EXPIRE_HOURS = 1
-    
-    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
-    token_data = {
-        "sub": str(user.id),
-        "email": user.email,
-        "role": user.role,
-        "exp": expire
-    }
-    access_token = jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
-    
-    return {
-        "status_code": 200,
-        "message": "Login successful",
-        "access_token": access_token,
-        "token_type": "bearer",
-        "user": {
-            "id": str(user.id),
-            "username": user.username,
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={
+            "sub": str(user.id),
             "email": user.email,
-            "role": user.role,
-            "status": user.status
-        }
+            "role": user.role
+        },
+        expires_delta=access_token_expires
+    )
+    
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=access_token,
+        httponly=True,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        samesite="lax",
+        secure=False
+    )
+    
+    return Token(access_token=access_token, token_type="bearer")
+
+
+@auth_router.post("/logout", tags=["auth"])
+async def logout(response: Response):
+    response.delete_cookie(key=COOKIE_NAME)
+    return {"message": "Logged out successfully"}
+
+
+@auth_router.get("/me", tags=["auth"])
+async def get_me(current_user: Annotated[any, Depends(get_current_active_user)]):
+    return {
+        "id": str(current_user.id),
+        "username": current_user.username,
+        "email": current_user.email,
+        "role": current_user.role,
+        "status": current_user.status
     }
