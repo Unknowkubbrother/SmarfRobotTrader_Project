@@ -1,7 +1,7 @@
 "use client";
 
-import Auth from "@/components/pages/Auth";
+import { redirect } from "next/navigation";
 
 export default function AuthPage() {
-    return <Auth />;
+    redirect("/auth/login");
 }

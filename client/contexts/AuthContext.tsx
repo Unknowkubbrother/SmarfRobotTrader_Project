@@ -3,8 +3,7 @@
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";
 import { signInWithPopup } from "firebase/auth";
 import { auth, googleProvider } from "@/lib/firebase";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { api } from "@/lib/api";
 
 interface User {
   id: string;
@@ -21,6 +20,9 @@ interface AuthContextType {
   signIn: (email: string, password: string) => Promise<{ error: Error | null }>;
   signInWithGoogle: () => Promise<{ error: Error | null }>;
   signOut: () => Promise<void>;
+  registerOTP: (email: string, recoveryEmail: string, password: string) => Promise<{ error: Error | null; devOtp?: string }>;
+  verifyOTP: (recoveryEmail: string, otp: string) => Promise<{ error: Error | null; userId?: string }>;
+  completeRegistration: (recoveryEmail: string, username: string) => Promise<{ error: Error | null }>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -32,18 +34,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const fetchCurrentUser = async () => {
     try {
-      const response = await fetch(`${API_URL}/auth/me`, {
-        credentials: "include",
-      });
-      if (response.ok) {
-        const userData = await response.json();
-        setUser(userData);
-        setIsAdmin(userData.role === "admin");
-      } else {
-        setUser(null);
-        setIsAdmin(false);
-      }
-    } catch (error) {
+      const { data } = await api.get("/auth/me");
+      setUser(data);
+      setIsAdmin(data.role === "admin");
+    } catch {
       setUser(null);
       setIsAdmin(false);
     } finally {
@@ -61,17 +55,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       formData.append("username", email);
       formData.append("password", password);
 
-      const response = await fetch(`${API_URL}/auth/login`, {
-        method: "POST",
+      await api.post("/auth/login", formData, {
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: formData,
-        credentials: "include",
       });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        return { error: new Error(errorData.detail || "Login failed") };
-      }
 
       await fetchCurrentUser();
       return { error: null };
@@ -85,17 +71,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const result = await signInWithPopup(auth, googleProvider);
       const idToken = await result.user.getIdToken();
 
-      const response = await fetch(`${API_URL}/auth/google`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id_token: idToken }),
-        credentials: "include",
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        return { error: new Error(errorData.detail || "Google login failed") };
-      }
+      await api.post("/auth/google", { id_token: idToken });
 
       await fetchCurrentUser();
       return { error: null };
@@ -104,12 +80,46 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const registerOTP = async (email: string, recoveryEmail: string, password: string) => {
+    try {
+      const { data } = await api.post("/auth/register/otp", {
+        email,
+        recovery_email: recoveryEmail,
+        password,
+      });
+      return { error: null, devOtp: data.dev_otp };
+    } catch (error) {
+      return { error: error as Error };
+    }
+  };
+
+  const verifyOTP = async (recoveryEmail: string, otp: string) => {
+    try {
+      const { data } = await api.post("/auth/register/verify_otp", {
+        recovery_email: recoveryEmail,
+        otp,
+      });
+      return { error: null, userId: data.user?.id };
+    } catch (error) {
+      return { error: error as Error };
+    }
+  };
+
+  const completeRegistration = async (recoveryEmail: string, username: string) => {
+    try {
+      await api.post("/auth/register/complete", {
+        recovery_email: recoveryEmail,
+        username,
+      });
+      return { error: null };
+    } catch (error) {
+      return { error: error as Error };
+    }
+  };
+
   const signOut = async () => {
     try {
-      await fetch(`${API_URL}/auth/logout`, {
-        method: "POST",
-        credentials: "include",
-      });
+      await api.post("/auth/logout");
       setUser(null);
       setIsAdmin(false);
     } catch (error) {
@@ -118,7 +128,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, isAdmin, signIn, signInWithGoogle, signOut }}>
+    <AuthContext.Provider value={{
+      user,
+      loading,
+      isAdmin,
+      signIn,
+      signInWithGoogle,
+      signOut,
+      registerOTP,
+      verifyOTP,
+      completeRegistration,
+    }}>
       {children}
     </AuthContext.Provider>
   );
