@@ -23,7 +23,7 @@ const loginSchema = z.object({
 export default function Login() {
     const [showPassword, setShowPassword] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
-    const [step, setStep] = useState<1 | 2 | 3 | 4>(1); // 1: Email, 2: Password, 3: OTP, 4: Set Password
+    const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
     const [otp, setOtp] = useState("");

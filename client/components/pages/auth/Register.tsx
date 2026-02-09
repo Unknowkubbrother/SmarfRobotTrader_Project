@@ -115,6 +115,11 @@ export default function Register() {
     };
 
     const handleStep1 = async (data: z.infer<typeof step1Schema>) => {
+        if (!cfToken) {
+            toast.error("Please complete the security check");
+            return;
+        }
+
         setRegData(prev => ({ ...prev, email: data.email, password: data.password, isGoogle: false }));
         setStep(2);
     };
@@ -319,6 +324,7 @@ export default function Register() {
                                                 <FormMessage />
                                             </FormItem>
                                         )} />
+                                        <TurnstileWidget onVerify={setCfToken} />
                                         <Button type="submit" className="w-full h-11 rounded-full bg-gradient-to-r from-[#1e3a5f] to-[#3b82f6]">NEXT</Button>
                                     </form>
                                 </Form>
@@ -358,10 +364,10 @@ export default function Register() {
                                             </p>
                                         </div>
 
+                                        {!cfToken && <TurnstileWidget onVerify={setCfToken} />}
                                         <Button type="submit" className="w-full h-11 rounded-full bg-gradient-to-r from-[#1e3a5f] to-[#3b82f6]" disabled={isLoading}>
                                             {isLoading ? "Sending..." : "NEXT"}
                                         </Button>
-                                        <TurnstileWidget onVerify={setCfToken} />
                                     </form>
                                 </Form>
                             </>
@@ -434,6 +440,6 @@ export default function Register() {
                     </div>
                 </div>
             </div>
-        </div>
+        </div >
     );
 }
