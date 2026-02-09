@@ -5,15 +5,6 @@ import pytz
 from tqdm import tqdm
 
 # ==================================================
-# CONFIG
-# ==================================================
-symbol = "EURUSD"
-timezone = pytz.UTC
-
-ohlc_start = datetime(2000, 1, 1, tzinfo=timezone)
-ohlc_end   = datetime(2025, 12, 31, 23, 59, 59, tzinfo=timezone)
-
-# ==================================================
 # CONNECT MT5
 # ==================================================
 mt5 = MetaTrader5(host="localhost", port=8001)
@@ -22,6 +13,32 @@ if not mt5.initialize():
     raise RuntimeError("MT5 init failed")
 
 print("✓ MT5 initialized")
+
+# ==================================================
+# CONFIG
+# ==================================================
+symbol = "EURUSD"
+timezone = pytz.UTC
+
+# TIMEFRAME CONFIGURATION
+TIMEFRAME_CONFIG = {
+    "M1":  {"mt5": mt5.TIMEFRAME_M1,  "resample": "1min"},
+    "M5":  {"mt5": mt5.TIMEFRAME_M5,  "resample": "5min"},
+    "M15": {"mt5": mt5.TIMEFRAME_M15, "resample": "15min"},
+    "M30": {"mt5": mt5.TIMEFRAME_M30, "resample": "30min"},
+    "H1":  {"mt5": mt5.TIMEFRAME_H1,  "resample": "1h"},
+    "H4":  {"mt5": mt5.TIMEFRAME_H4,  "resample": "4h"},
+    "D1":  {"mt5": mt5.TIMEFRAME_D1,  "resample": "1D"},
+}
+
+# SELECT TIMEFRAME HERE
+SELECTED_TIMEFRAME = "M5"  # Change this to "M5", "M15", etc.
+tf_config = TIMEFRAME_CONFIG[SELECTED_TIMEFRAME]
+
+ohlc_start = datetime(2000, 1, 1, tzinfo=timezone)
+ohlc_end   = datetime(2025, 12, 31, 23, 59, 59, tzinfo=timezone)
+
+
 
 # ==================================================
 # CHECK SYMBOL
@@ -35,9 +52,9 @@ if not symbol_info.visible:
     mt5.symbol_select(symbol, True)
 
 # ==================================================
-# FUNCTION: FETCH OHLC H1 (CHUNK SAFE)
+# FUNCTION: FETCH OHLC (CHUNK SAFE)
 # ==================================================
-def fetch_ohlc_h1(mt5, symbol, start, end):
+def fetch_ohlc(mt5, symbol, start, end, timeframe_mt5):
     chunks = []
     current = start
 
@@ -45,7 +62,7 @@ def fetch_ohlc_h1(mt5, symbol, start, end):
     total_days = (end - start).days
     total_chunks = (total_days // 365) + 1
 
-    print(f"  📊 OHLC: จะโหลด ~{total_chunks} chunks (ปีละ 1 chunk)")
+    print(f"  📊 OHLC ({SELECTED_TIMEFRAME}): จะโหลด ~{total_chunks} chunks (ปีละ 1 chunk)")
 
     with tqdm(total=total_chunks, desc="📥 Loading OHLC", unit="chunk", ncols=80) as pbar:
         while current < end:
@@ -56,7 +73,7 @@ def fetch_ohlc_h1(mt5, symbol, start, end):
 
             rates = mt5.copy_rates_range(
                 symbol,
-                mt5.TIMEFRAME_H1,
+                timeframe_mt5,
                 current,
                 chunk_end
             )
@@ -77,16 +94,16 @@ def fetch_ohlc_h1(mt5, symbol, start, end):
     return df[['open', 'high', 'low', 'close']].sort_index()
 
 # ==================================================
-# FUNCTION: FETCH H1 DELTA FROM TICKS (CHUNK DAILY)
+# FUNCTION: FETCH DELTA FROM TICKS (CHUNK DAILY)
 # ==================================================
-def fetch_h1_delta_from_ticks(mt5, symbol, start, end):
-    all_h1 = []
+def fetch_delta_from_ticks(mt5, symbol, start, end, resample_rule):
+    all_deltas = []
     current = start
 
     # คำนวณจำนวนวันทั้งหมด
     total_days = (end - start).days
 
-    print(f"  🎯 Tick Delta: จะโหลด {total_days} วัน (วันละ 1 chunk)")
+    print(f"  🎯 Tick Delta ({SELECTED_TIMEFRAME}): จะโหลด {total_days} วัน (วันละ 1 chunk)")
     print(f"  ⚠️  ส่วนนี้อาจใช้เวลานานมาก เนื่องจากต้องโหลด tick data รายวัน\n")
 
     processed_days = 0
@@ -131,12 +148,12 @@ def fetch_h1_delta_from_ticks(mt5, symbol, start, end):
                 df['delta_price'] = 0.0
                 df.loc[buy | sell, 'delta_price'] = df.loc[buy | sell, 'bid_diff']
 
-                h1 = df.resample('1h').agg({
+                delta_resampled = df.resample(resample_rule).agg({
                     'delta_tick': 'sum',
                     'delta_price': 'sum'
                 })
 
-                all_h1.append(h1)
+                all_deltas.append(delta_resampled)
 
             current = chunk_end
             processed_days += 1
@@ -146,23 +163,23 @@ def fetch_h1_delta_from_ticks(mt5, symbol, start, end):
             if processed_days % 100 == 0:
                 tqdm.write(f"  ✅ ประมวลผลแล้ว {processed_days}/{total_days} วัน ({(processed_days/total_days)*100:.1f}%)")
 
-    if not all_h1:
+    if not all_deltas:
         return pd.DataFrame(columns=['delta_tick', 'delta_price'])
 
-    # รวมซ้ำ H1 (กรณี tick วันต่อวัน)
-    return pd.concat(all_h1).groupby(level=0).sum()
+    # รวมซ้ำ (กรณี tick วันต่อวัน)
+    return pd.concat(all_deltas).groupby(level=0).sum()
 
 # ==================================================
 # FETCH OHLC
 # ==================================================
-print(f"Fetching OHLC H1 for {symbol}")
-df_ohlc = fetch_ohlc_h1(mt5, symbol, ohlc_start, ohlc_end)
+print(f"Fetching OHLC {SELECTED_TIMEFRAME} for {symbol}")
+df_ohlc = fetch_ohlc(mt5, symbol, ohlc_start, ohlc_end, tf_config["mt5"])
 
 if df_ohlc is None or len(df_ohlc) == 0:
     mt5.shutdown()
     raise RuntimeError("No OHLC data available")
 
-print(f"✓ Got {len(df_ohlc)} H1 candles")
+print(f"✓ Got {len(df_ohlc)} {SELECTED_TIMEFRAME} candles")
 print("OHLC range:", df_ohlc.index.min(), "→", df_ohlc.index.max())
 
 # ==================================================
@@ -177,35 +194,37 @@ print("Tick range:", tick_start, "→", tick_end)
 print(f"⏱️  ประมาณ {(tick_end - tick_start).days} วัน")
 print("⚠️  อาจใช้เวลานานมาก! กรุณารอ...")
 
-h1_delta = fetch_h1_delta_from_ticks(
+df_delta = fetch_delta_from_ticks(
     mt5,
     symbol,
     tick_start,
-    tick_end
+    tick_end,
+    tf_config["resample"]
 )
 
 mt5.shutdown()
 
 print("✓ Tick delta done")
-print(h1_delta.tail())
+print(df_delta.tail())
 
 # ==================================================
 # MERGE HYBRID DATASET
 # ==================================================
-df_h1 = df_ohlc.join(h1_delta, how='left')
+df_merged = df_ohlc.join(df_delta, how='left')
 
-df_h1['delta_tick'] = df_h1['delta_tick'].fillna(0)
-df_h1['delta_price'] = df_h1['delta_price'].fillna(0.0)
+df_merged['delta_tick'] = df_merged['delta_tick'].fillna(0)
+df_merged['delta_price'] = df_merged['delta_price'].fillna(0.0)
 
-df_h1['has_delta'] = (
-    (df_h1['delta_tick'] != 0) | (df_h1['delta_price'] != 0)
+df_merged['has_delta'] = (
+    (df_merged['delta_tick'] != 0) | (df_merged['delta_price'] != 0)
 ).astype(int)
 
 print("\nFinal dataset sample:")
-print(df_h1.tail())
+print(df_merged.tail())
 
 # ==================================================
 # SAVE
 # ==================================================
-df_h1.to_csv("h1_ohlc_delta2.csv")
-print("\n✓ Saved: h1_ohlc_delta.csv")
+filename = f"{SELECTED_TIMEFRAME.lower()}_ohlc_delta.csv"
+df_merged.to_csv(filename)
+print(f"\n✓ Saved: {filename}")
