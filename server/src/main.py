@@ -29,11 +29,16 @@ PUBLIC_PATHS = [
     "/auth/google/register/otp",
     "/auth/google/register/verify",
     "/auth/google/register/complete",
+    "/auth/check-user",
+    "/auth/login/otp-init",
 ]
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+            
         if request.url.path in PUBLIC_PATHS:
             return await call_next(request)
         

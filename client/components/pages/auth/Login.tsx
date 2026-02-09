@@ -22,36 +22,120 @@ const loginSchema = z.object({
 export default function Login() {
     const [showPassword, setShowPassword] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
-    const [step, setStep] = useState<1 | 2>(1); // 1: Credentials, 2: OTP
+    const [step, setStep] = useState<1 | 2 | 3 | 4>(1); // 1: Email, 2: Password, 3: OTP, 4: Set Password
     const [email, setEmail] = useState("");
+    const [password, setPassword] = useState("");
     const [otp, setOtp] = useState("");
     const [recoveryHint, setRecoveryHint] = useState("");
+    const [isGoogleUser, setIsGoogleUser] = useState(false);
+    const [hasPassword, setHasPassword] = useState(false);
+    const [countdown, setCountdown] = useState(0);
+    const [devOtp, setDevOtp] = useState<string | null>(null);
 
     const router = useRouter();
-    const { user, signIn, signInWithGoogle, loginVerify } = useAuth();
-
-    const form = useForm<z.infer<typeof loginSchema>>({
-        resolver: zodResolver(loginSchema),
-        defaultValues: { email: "", password: "" },
-    });
+    const { user, signIn, signInWithGoogle, loginVerify, checkUser, loginOtpInit, setPassword: setAuthPassword } = useAuth();
 
     useEffect(() => {
         if (user) router.push("/");
     }, [user, router]);
 
-    const handleLogin = async (data: z.infer<typeof loginSchema>) => {
+    useEffect(() => {
+        if (countdown > 0) {
+            const timer = setTimeout(() => setCountdown(countdown - 1), 1000);
+            return () => clearTimeout(timer);
+        }
+    }, [countdown]);
+
+    const handleGoogleLogin = async () => {
         setIsLoading(true);
         try {
-            const result = await signIn(data.email, data.password);
+            const result = await signInWithGoogle();
             if (result.error) {
                 toast.error(result.error.message);
                 return;
             }
 
             if (result.requireOtp) {
-                setEmail(data.email);
+                if (result.email) setEmail(result.email);
                 setRecoveryHint(result.recoveryEmailHint || "");
+                setIsGoogleUser(true); // Treat as google user flow
+                setStep(3); // Go to OTP
+                toast.success("OTP sent to your recovery email");
+            } else if (result.requireRegister) {
+                const params = new URLSearchParams();
+                params.set("mode", "google");
+                toast.info("New account. Please complete registration.", { duration: 4000 });
+                router.push(`/auth/register?${params.toString()}`);
+            } else {
+                toast.success("Welcome!");
+                router.push("/");
+            }
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const handleEmailSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!email) return;
+
+        // Basic email validation
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            toast.error("Invalid email address");
+            return;
+        }
+
+        setIsLoading(true);
+        try {
+            const result = await checkUser(email);
+            if (result.error) {
+                toast.error(result.error.message);
+                return;
+            }
+
+            if (!result.exists) {
+                toast.info("Account not found. Redirecting to registration.");
+                router.push("/auth/register");
+                return;
+            }
+
+            setHasPassword(!!result.hasPassword);
+            setIsGoogleUser(!!result.isGoogle);
+
+            if (result.isGoogle && !result.hasPassword) {
+                // Google user without password -> OTP Login
+                const otpInit = await loginOtpInit(email);
+                if (otpInit.error) {
+                    toast.error(otpInit.error.message);
+                    return;
+                }
+                setRecoveryHint(result.recoveryEmailHint || "");
+                if (otpInit.devOtp) setDevOtp(otpInit.devOtp);
+                setCountdown(60);
+                setStep(3); // Go to OTP directly
+                toast.success("OTP sent to your recovery email");
+            } else {
+                // User has password (normal or google+password) -> Password Login
                 setStep(2);
+            }
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const handlePasswordLogin = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setIsLoading(true);
+        try {
+            const result = await signIn(email, password);
+            if (result.error) {
+                toast.error(result.error.message);
+                return;
+            }
+
+            if (result.requireOtp) {
+                setRecoveryHint(result.recoveryEmailHint || "");
+                setStep(3);
                 toast.success("OTP sent to your recovery email");
             } else {
                 toast.success("Welcome back!");
@@ -74,36 +158,59 @@ export default function Login() {
                 toast.error(error.message);
                 return;
             }
-            toast.success("Login verified!");
+
+            // Check if we need to set password
+            if (isGoogleUser && !hasPassword) {
+                setStep(4);
+                toast.success("Login verified! Please set a password.");
+            } else {
+                toast.success("Login verified!");
+                router.push("/");
+            }
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const handleSetPassword = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (password.length < 6) {
+            toast.error("Password must be at least 6 characters");
+            return;
+        }
+
+        setIsLoading(true);
+        try {
+            const { error } = await setAuthPassword(password);
+            if (error) {
+                toast.error(error.message);
+                return;
+            }
+            toast.success("Password set successfully! Welcome.");
             router.push("/");
         } finally {
             setIsLoading(false);
         }
     };
 
-    const handleGoogleLogin = async () => {
+    const resendOTP = async () => {
+        if (countdown > 0) return;
         setIsLoading(true);
         try {
-            const result = await signInWithGoogle();
+            // Re-initiate OTP based on flow. 
+            // If we are here, it's either Password->OTP (standard) or Google->OTP (passwordless check passed earlier).
+            // However, standard login also does internal OTP send. 
+            // Let's use otp-init for simplicity if it supports it, 
+            // BUT `login` endpoint sends OTP internally if needed.
+            // We can just call `loginOtpInit` as it effectively sends an OTP to user if they exist.
+            const result = await loginOtpInit(email);
             if (result.error) {
                 toast.error(result.error.message);
                 return;
             }
-
-            if (result.requireOtp) {
-                if (result.email) setEmail(result.email);
-                setRecoveryHint(result.recoveryEmailHint || "");
-                setStep(2);
-                toast.success("OTP sent to your recovery email");
-            } else if (result.requireRegister) {
-                const params = new URLSearchParams();
-                params.set("mode", "google");
-                toast.info("New account. Please complete registration.", { duration: 4000 });
-                router.push(`/auth/register?${params.toString()}`);
-            } else {
-                toast.success("Welcome!");
-                router.push("/");
-            }
+            if (result.devOtp) setDevOtp(result.devOtp);
+            setCountdown(60);
+            toast.success("OTP resent!");
         } finally {
             setIsLoading(false);
         }
@@ -159,43 +266,26 @@ export default function Login() {
                                 <div className="relative mb-6">
                                     <div className="absolute inset-0 flex items-center"><div className="w-full border-t" /></div>
                                     <div className="relative flex justify-center text-xs">
-                                        <span className="px-2 bg-card text-muted-foreground">Or</span>
+                                        <span className="px-2 bg-card text-muted-foreground">Or sign in with email</span>
                                     </div>
                                 </div>
 
-                                <Form {...form}>
-                                    <form onSubmit={form.handleSubmit(handleLogin)} className="space-y-4">
-                                        <FormField control={form.control} name="email" render={({ field }) => (
-                                            <FormItem>
-                                                <FormLabel>Email / Username</FormLabel>
-                                                <FormControl><Input className="h-11 rounded-lg bg-muted border-0" {...field} /></FormControl>
-                                                <FormMessage />
-                                            </FormItem>
-                                        )} />
-                                        <FormField control={form.control} name="password" render={({ field }) => (
-                                            <FormItem>
-                                                <div className="flex justify-between">
-                                                    <FormLabel>Password</FormLabel>
-                                                    <Link href="/auth/forgot-password" className="text-xs text-muted-foreground hover:text-foreground">
-                                                        Forgot Password?
-                                                    </Link>
-                                                </div>
-                                                <FormControl>
-                                                    <div className="relative">
-                                                        <Input type={showPassword ? "text" : "password"} className="h-11 rounded-lg bg-muted border-0 pr-10" {...field} />
-                                                        <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground">
-                                                            {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                                                        </button>
-                                                    </div>
-                                                </FormControl>
-                                                <FormMessage />
-                                            </FormItem>
-                                        )} />
-                                        <Button type="submit" className="w-full h-11 rounded-full bg-gradient-to-r from-[#1e3a5f] to-[#3b82f6]" disabled={isLoading}>
-                                            {isLoading ? "Loading..." : "Sign In"}
-                                        </Button>
-                                    </form>
-                                </Form>
+                                <form onSubmit={handleEmailSubmit} className="space-y-4">
+                                    <div className="space-y-2">
+                                        <label className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">Email</label>
+                                        <Input
+                                            type="email"
+                                            placeholder="name@example.com"
+                                            value={email}
+                                            onChange={(e) => setEmail(e.target.value)}
+                                            className="h-11 rounded-lg bg-muted border-0"
+                                            required
+                                        />
+                                    </div>
+                                    <Button type="submit" className="w-full h-11 rounded-full bg-gradient-to-r from-[#1e3a5f] to-[#3b82f6]" disabled={isLoading}>
+                                        {isLoading ? "Checking..." : "Next"}
+                                    </Button>
+                                </form>
 
                                 <p className="mt-6 text-center text-sm text-muted-foreground">
                                     Don't have an account?{" "}
@@ -205,11 +295,49 @@ export default function Login() {
                         )}
 
                         {step === 2 && (
+                            <>
+                                <h2 className="text-2xl font-semibold text-center mb-1">Enter Password</h2>
+                                <p className="text-sm text-muted-foreground text-center mb-6">for {email}</p>
+
+                                <form onSubmit={handlePasswordLogin} className="space-y-4">
+                                    <div className="space-y-2">
+                                        <div className="flex justify-between">
+                                            <label className="text-sm font-medium leading-none">Password</label>
+                                            <Link href="/auth/forgot-password" className="text-xs text-muted-foreground hover:text-foreground">
+                                                Forgot Password?
+                                            </Link>
+                                        </div>
+                                        <div className="relative">
+                                            <Input
+                                                type={showPassword ? "text" : "password"}
+                                                value={password}
+                                                onChange={(e) => setPassword(e.target.value)}
+                                                className="h-11 rounded-lg bg-muted border-0 pr-10"
+                                                required
+                                            />
+                                            <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground">
+                                                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <Button type="submit" className="w-full h-11 rounded-full bg-gradient-to-r from-[#1e3a5f] to-[#3b82f6]" disabled={isLoading}>
+                                        {isLoading ? "Signing In..." : "Sign In"}
+                                    </Button>
+                                    <button type="button" onClick={() => setStep(1)} className="w-full text-sm text-muted-foreground hover:underline">Back</button>
+                                </form>
+                            </>
+                        )}
+
+                        {step === 3 && (
                             <div className="flex flex-col items-center space-y-4">
                                 <h2 className="text-2xl font-semibold text-center mb-1">Verify Login</h2>
                                 <p className="text-sm text-muted-foreground text-center">
                                     Enter OTP sent to <span className="text-primary">{recoveryHint}</span>
                                 </p>
+
+                                {devOtp && (
+                                    <p className="text-xs text-amber-600 bg-amber-50 px-3 py-1 rounded">[DEV] OTP: {devOtp}</p>
+                                )}
 
                                 <InputOTP maxLength={6} value={otp} onChange={setOtp}>
                                     <InputOTPGroup>
@@ -226,8 +354,44 @@ export default function Login() {
                                     {isLoading ? "Verifying..." : "Verify Login"}
                                 </Button>
 
+                                <button onClick={resendOTP} disabled={countdown > 0} className="text-sm text-muted-foreground hover:text-foreground disabled:opacity-50">
+                                    {countdown > 0 ? `Resend OTP in ${countdown}s` : "Resend OTP"}
+                                </button>
+
                                 <button onClick={() => setStep(1)} className="text-sm text-muted-foreground hover:underline">Back to Login</button>
                             </div>
+                        )}
+
+                        {step === 4 && (
+                            <>
+                                <h2 className="text-2xl font-semibold text-center mb-1">Set Password</h2>
+                                <p className="text-sm text-muted-foreground text-center mb-6">Create a password for your account</p>
+
+                                <form onSubmit={handleSetPassword} className="space-y-4">
+                                    <div className="space-y-2">
+                                        <label className="text-sm font-medium leading-none">New Password</label>
+                                        <div className="relative">
+                                            <Input
+                                                type={showPassword ? "text" : "password"}
+                                                value={password} // Reuse password state
+                                                onChange={(e) => setPassword(e.target.value)}
+                                                className="h-11 rounded-lg bg-muted border-0 pr-10"
+                                                required
+                                                minLength={6}
+                                            />
+                                            <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground">
+                                                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <Button type="submit" className="w-full h-11 rounded-full bg-gradient-to-r from-[#1e3a5f] to-[#3b82f6]" disabled={isLoading}>
+                                        {isLoading ? "Setting Password..." : "Set Password & Continue"}
+                                    </Button>
+                                    <div className="text-center">
+                                        <Link href="/" className="text-sm text-muted-foreground hover:underline">Skip (Not Recommended)</Link>
+                                    </div>
+                                </form>
+                            </>
                         )}
 
                     </div>

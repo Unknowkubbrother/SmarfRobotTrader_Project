@@ -11,7 +11,7 @@ import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 
 from ..database.client import r_cache, db
-from ..models.authentication_model import Register_OTP, Register_Verify, Register_Complete, Login_Verify, Google_Register_OTP, Google_Register_Verify, Google_Register_Complete
+from ..models.authentication_model import Register_OTP, Register_Verify, Register_Complete, Login_Verify, Google_Register_OTP, Google_Register_Verify, Google_Register_Complete, CheckUser_Request, Login_OTP_Init, SetPassword_Request
 from lib.untils import random_with_N_digits
 
 SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
@@ -552,10 +552,6 @@ async def google_register_verify(data: Google_Register_Verify):
     if not stored_data or stored_data.get("otp") != otp:
         raise HTTPException(status_code=400, detail="Invalid or expired OTP")
     
-    # Allow proceeding to next step (Completion)
-    # We could issue a temporary signed token, but for now relying on cache existence and passing email is ok for slight simplicity, 
-    # but strictly we should ensure the next step verifies this verification happened.
-    # To secure it, we update the cache to mark as 'verified'
     r_cache.hset(reg_key, "verified", "true")
     
     return {"message": "OTP verified", "verified": True}
@@ -612,3 +608,63 @@ async def google_register_complete(response: Response, data: Google_Register_Com
     )
     
     return Token(access_token=access_token, token_type="bearer")
+
+
+@auth_router.post("/check-user", tags=["auth"])
+async def check_user(data: CheckUser_Request):
+    user = await db.user.find_unique(where={"email": data.email})
+    
+    if not user:
+        return {"exists": False}
+        
+    return {
+        "exists": True,
+        "has_password": bool(user.password),
+        "is_google": bool(user.googleAuthId),
+        "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}" if user.recoveryEmail else None
+    }
+
+
+@auth_router.post("/login/otp-init", tags=["auth"])
+async def login_otp_init(data: Login_OTP_Init):
+    user = await db.user.find_unique(where={"email": data.email})
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Security check: Only allow if user has Google Auth ID (implied trusted email) OR if we implement email login without password strictly.
+    # The requirement is: "if login with google... allow otp to recovery". 
+    if not user.googleAuthId and not user.password:
+         # Edge case: No password and no google auth? Should not happen if registered correctly.
+         raise HTTPException(status_code=400, detail="Account setup incomplete. Please contact support.")
+
+    if not user.recoveryEmail:
+        raise HTTPException(status_code=400, detail="No recovery email set.")
+
+    otp = str(random_with_N_digits(6))
+    r_cache.setex(f"login_pending:{user.email}", 300, otp)
+    
+    print(f"[DEV] Login OTP for {user.email}: {otp}")
+    
+    return {
+        "message": "OTP sent to recovery email",
+        "dev_otp": otp
+    }
+
+
+@auth_router.post("/set-password", tags=["auth"])
+async def set_password(
+    data: SetPassword_Request,
+    current_user: Annotated[any, Depends(get_current_active_user)]
+):
+    if len(data.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+        
+    hashed_password = bcrypt.hashpw(data.new_password.encode("utf-8"), bcrypt.gensalt())
+    
+    await db.user.update(
+        where={"id": str(current_user.id)},
+        data={"password": hashed_password.decode("utf-8")}
+    )
+    
+    return {"message": "Password update successfully"}

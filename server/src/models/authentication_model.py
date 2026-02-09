@@ -44,3 +44,12 @@ class Google_Register_Verify(BaseModel):
 class Google_Register_Complete(BaseModel):
     email: str
     username: str
+
+class CheckUser_Request(BaseModel):
+    email: str
+
+class Login_OTP_Init(BaseModel):
+    email: str
+
+class SetPassword_Request(BaseModel):
+    new_password: str

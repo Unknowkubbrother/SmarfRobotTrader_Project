@@ -29,6 +29,10 @@ interface AuthContextType {
   googleRegisterOTP: (idToken: string, recoveryEmail: string) => Promise<{ error: Error | null; devOtp?: string }>;
   googleRegisterVerify: (email: string, otp: string) => Promise<{ error: Error | null; verified?: boolean }>;
   googleRegisterComplete: (email: string, username: string) => Promise<{ error: Error | null }>;
+
+  checkUser: (email: string) => Promise<{ exists: boolean; hasPassword?: boolean; isGoogle?: boolean; recoveryEmailHint?: string; error?: Error }>;
+  loginOtpInit: (email: string) => Promise<{ error: Error | null; devOtp?: string }>;
+  setPassword: (password: string) => Promise<{ error: Error | null }>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -191,6 +195,38 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const checkUser = async (email: string) => {
+    try {
+      const { data } = await api.post("/auth/check-user", { email });
+      return {
+        exists: data.exists,
+        hasPassword: data.has_password,
+        isGoogle: data.is_google,
+        recoveryEmailHint: data.recovery_email_hint
+      };
+    } catch (error: any) {
+      return { exists: false, error: error };
+    }
+  };
+
+  const loginOtpInit = async (email: string) => {
+    try {
+      const { data } = await api.post("/auth/login/otp-init", { email });
+      return { error: null, devOtp: data.dev_otp };
+    } catch (error: any) {
+      return { error: error };
+    }
+  };
+
+  const setPassword = async (password: string) => {
+    try {
+      await api.post("/auth/set-password", { new_password: password });
+      return { error: null };
+    } catch (error: any) {
+      return { error: error };
+    }
+  };
+
   const signOut = async () => {
     try {
       await api.post("/auth/logout");
@@ -215,7 +251,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       completeRegistration,
       googleRegisterOTP,
       googleRegisterVerify,
-      googleRegisterComplete
+      googleRegisterComplete,
+      checkUser,
+      loginOtpInit,
+      setPassword
     }}>
       {children}
     </AuthContext.Provider>
