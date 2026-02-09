@@ -15,7 +15,6 @@ PUBLIC_PATHS = [
     "/",
     "/docs",
     "/openapi.json",
-    "/redoc",
     "/auth/login",
     "/auth/logout",
     "/auth/register/otp",
@@ -70,17 +69,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
 
-
 @app.get("/")
 def read_root():
     return {"Hello": "World"}
-
-@app.get("/profile")
-async def profile(request: Request):
-    user_id = request.state.user_id
-    email = request.state.email
-    role = request.state.role
-    return {"user_id": user_id, "email": email, "role": role}
 
 app.include_router(authentication.auth_router, prefix="/auth")
 
