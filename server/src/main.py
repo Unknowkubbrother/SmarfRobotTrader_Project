@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 import jwt
 import os
@@ -17,6 +18,7 @@ PUBLIC_PATHS = [
     "/openapi.json",
     "/auth/login",
     "/auth/logout",
+    "/auth/google",
     "/auth/register/otp",
     "/auth/register/verify_otp",
     "/auth/register/complete",
@@ -67,6 +69,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.add_middleware(AuthMiddleware)
 
 @app.get("/")

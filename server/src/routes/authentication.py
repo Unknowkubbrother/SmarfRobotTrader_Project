@@ -7,6 +7,8 @@ import jwt
 from jwt.exceptions import InvalidTokenError
 import bcrypt
 import os
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth
 
 from ..database.client import r_cache, db
 from ..models.authentication_model import Register_OTP, Register_Verify, Register_Complete
@@ -16,6 +18,9 @@ SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 COOKIE_NAME = "access_token"
+
+cred = credentials.Certificate("smarfrobottrade-firebase.json")
+firebase_admin.initialize_app(cred)
 
 auth_router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
@@ -30,6 +35,10 @@ class TokenData(BaseModel):
     user_id: str | None = None
     email: str | None = None
     role: str | None = None
+
+
+class GoogleAuth(BaseModel):
+    id_token: str
 
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
@@ -87,6 +96,70 @@ async def get_current_active_user(
     if current_user.status == "banned":
         raise HTTPException(status_code=400, detail="User is banned")
     return current_user
+
+
+@auth_router.post("/google", response_model=Token, tags=["auth"])
+async def google_auth(response: Response, google_auth: GoogleAuth):
+    try:
+        decoded_token = firebase_auth.verify_id_token(google_auth.id_token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+    
+    email = decoded_token.get("email")
+    name = decoded_token.get("name", email.split("@")[0])
+    picture = decoded_token.get("picture")
+    google_uid = decoded_token.get("uid")
+    
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in Google token")
+    
+    user = await db.user.find_unique(where={"email": email})
+    
+    if not user:
+        try:
+            user = await db.user.create(
+                data={
+                    "username": name,
+                    "email": email,
+                    "googleAuthId": google_uid,
+                    "avatarUrl": picture,
+                }
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
+    else:
+        if not user.googleAuthId:
+            await db.user.update(
+                where={"id": str(user.id)},
+                data={
+                    "googleAuthId": google_uid,
+                    "avatarUrl": picture or user.avatarUrl,
+                }
+            )
+    
+    if user.status == "banned":
+        raise HTTPException(status_code=403, detail="Your account has been banned")
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={
+            "sub": str(user.id),
+            "email": user.email,
+            "role": user.role
+        },
+        expires_delta=access_token_expires
+    )
+    
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=access_token,
+        httponly=True,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        samesite="lax",
+        secure=False
+    )
+    
+    return Token(access_token=access_token, token_type="bearer")
 
 
 @auth_router.post("/register/otp", tags=["auth"])
@@ -266,3 +339,4 @@ async def get_me(current_user: Annotated[any, Depends(get_current_active_user)])
         "role": current_user.role,
         "status": current_user.status
     }
+
