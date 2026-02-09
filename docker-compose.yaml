@@ -1,6 +1,15 @@
 version: '3.8'
 
 services:
+  redis_cache:
+    image: redis:7.4-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --save 20 1 --loglevel warning --requirepass yourpassword
+    volumes:
+      - redis_cache:/data
+
   postgres:
     image: postgres:15-alpine
     container_name: smarf_db_postgres
@@ -20,9 +29,13 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    depends_on:
+      - redis_cache
 
 volumes:
   postgres_data:
+    driver: local
+  redis_cache:
     driver: local
 
 networks:
