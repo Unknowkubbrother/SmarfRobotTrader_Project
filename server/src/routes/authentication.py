@@ -340,3 +340,83 @@ async def get_me(current_user: Annotated[any, Depends(get_current_active_user)])
         "status": current_user.status
     }
 
+
+@auth_router.post("/forgot-password/request", tags=["auth"])
+async def forgot_password_request(data: dict):
+    email = data.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+    
+    user = await db.user.find_unique(where={"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Email not found in system")
+    
+    if not user.recoveryEmail:
+        raise HTTPException(status_code=400, detail="No recovery email found for this account")
+    
+    otp = random_with_N_digits(6)
+    
+    r_cache.setex(
+        f"forgot_password_otp:{email}",
+        300,
+        otp
+    )
+    
+    return {
+        "message": f"OTP sent to recovery email",
+        "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}",
+        "dev_otp": otp
+    }
+
+
+@auth_router.post("/forgot-password/verify", tags=["auth"])
+async def forgot_password_verify(data: dict):
+    email = data.get("email")
+    otp = data.get("otp")
+    
+    if not email or not otp:
+        raise HTTPException(status_code=400, detail="Email and OTP are required")
+    
+    stored_otp = r_cache.get(f"forgot_password_otp:{email}")
+    if not stored_otp:
+        raise HTTPException(status_code=400, detail="OTP expired or not found")
+    
+    if stored_otp != otp:
+        raise HTTPException(status_code=400, detail="Invalid OTP")
+    
+    return {"message": "OTP verified", "verified": True}
+
+
+@auth_router.post("/forgot-password/reset", tags=["auth"])
+async def forgot_password_reset(data: dict):
+    email = data.get("email")
+    otp = data.get("otp")
+    new_password = data.get("new_password")
+    
+    if not email or not otp or not new_password:
+        raise HTTPException(status_code=400, detail="Email, OTP, and new password are required")
+    
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    
+    stored_otp = r_cache.get(f"forgot_password_otp:{email}")
+    if not stored_otp:
+        raise HTTPException(status_code=400, detail="OTP expired or not found")
+    
+    if stored_otp != otp:
+        raise HTTPException(status_code=400, detail="Invalid OTP")
+    
+    user = await db.user.find_unique(where={"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    hashed_password = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt())
+    
+    await db.user.update(
+        where={"id": user.id},
+        data={"password": hashed_password.decode("utf-8")}
+    )
+    
+    r_cache.delete(f"forgot_password_otp:{email}")
+    
+    return {"message": "Password reset successfully"}

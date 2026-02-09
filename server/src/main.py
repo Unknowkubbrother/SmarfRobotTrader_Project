@@ -22,6 +22,9 @@ PUBLIC_PATHS = [
     "/auth/register/otp",
     "/auth/register/verify_otp",
     "/auth/register/complete",
+    "/auth/forgot-password/request",
+    "/auth/forgot-password/verify",
+    "/auth/forgot-password/reset",
 ]
 
 

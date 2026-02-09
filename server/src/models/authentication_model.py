@@ -16,3 +16,15 @@ class Register_Complete(BaseModel):
 class Login(BaseModel):
     email: str
     password: str
+
+class ForgotPassword_Request(BaseModel):
+    email: str
+
+class ForgotPassword_Verify(BaseModel):
+    email: str
+    otp: str
+
+class ForgotPassword_Reset(BaseModel):
+    email: str
+    otp: str
+    new_password: str
