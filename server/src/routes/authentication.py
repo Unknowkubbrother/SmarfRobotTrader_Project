@@ -250,22 +250,22 @@ async def register_otp(register_otp: Register_OTP):
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     
-    recovery_email_key = register_otp.recovery_email.split('@')[0]
     
     hashed_password = bcrypt.hashpw(
         register_otp.password.encode('utf-8'), 
         bcrypt.gensalt()
     ).decode('utf-8')
     
-    r_cache.hset(f"reg_detail_{recovery_email_key}", mapping={
+    # Store registration details
+    r_cache.hset(f"register_pending:{register_otp.recovery_email}", mapping={
         "email": register_otp.email,
         "recovery_email": register_otp.recovery_email,
         "password": hashed_password
     })
-    r_cache.expire(f"reg_detail_{recovery_email_key}", 60 * 10)
+    r_cache.expire(f"register_pending:{register_otp.recovery_email}", 60 * 10)
     
     otp = str(random_with_N_digits(6))
-    r_cache.set(f"reg_otp_{recovery_email_key}", otp, ex=60 * 5)
+    r_cache.set(f"register_otp:{register_otp.recovery_email}", otp, ex=60 * 5)
     
     print(f"[DEV] OTP for {register_otp.recovery_email}: {otp}")
     
@@ -278,16 +278,15 @@ async def register_otp(register_otp: Register_OTP):
 
 @auth_router.post("/register/verify_otp", tags=["auth"])
 async def register_verify_otp(register_verify: Register_Verify):
-    recovery_email_key = register_verify.recovery_email.split('@')[0]
     
-    stored_otp = r_cache.get(f"reg_otp_{recovery_email_key}")
+    stored_otp = r_cache.get(f"register_otp:{register_verify.recovery_email}")
     if not stored_otp:
         raise HTTPException(status_code=400, detail="OTP expired or not found")
     
     if stored_otp != register_verify.otp:
         raise HTTPException(status_code=400, detail="Invalid OTP")
     
-    user_detail = r_cache.hgetall(f"reg_detail_{recovery_email_key}")
+    user_detail = r_cache.hgetall(f"register_pending:{register_verify.recovery_email}")
     if not user_detail:
         raise HTTPException(status_code=400, detail="Registration data expired. Please start over.")
     
@@ -307,8 +306,8 @@ async def register_verify_otp(register_verify: Register_Verify):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
         
-    r_cache.delete(f"reg_otp_{recovery_email_key}")
-    r_cache.set(f"reg_user_{recovery_email_key}", str(user.id), ex=60 * 30)
+    r_cache.delete(f"register_otp:{register_verify.recovery_email}")
+    r_cache.set(f"register_verified_user_id:{register_verify.recovery_email}", str(user.id), ex=60 * 30)
     
     return {
         "status_code": 201,
@@ -322,9 +321,8 @@ async def register_verify_otp(register_verify: Register_Verify):
 
 @auth_router.post("/register/complete", tags=["auth"])
 async def register_complete(register_complete: Register_Complete):
-    recovery_email_key = register_complete.recovery_email.split('@')[0]
     
-    user_id = r_cache.get(f"reg_user_{recovery_email_key}")
+    user_id = r_cache.get(f"register_verified_user_id:{register_complete.recovery_email}")
     if not user_id:
         raise HTTPException(status_code=400, detail="Session expired. Please login and update username.")
     
@@ -340,8 +338,8 @@ async def register_complete(register_complete: Register_Complete):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update username: {str(e)}")
     
-    r_cache.delete(f"reg_user_{recovery_email_key}")
-    r_cache.delete(f"reg_detail_{recovery_email_key}")
+    r_cache.delete(f"register_verified_user_id:{register_complete.recovery_email}")
+    r_cache.delete(f"register_pending:{register_complete.recovery_email}")
     
     return {
         "status_code": 200,
