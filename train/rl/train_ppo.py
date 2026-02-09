@@ -183,6 +183,7 @@ print("="*50 + "\n")
 # ลด timesteps เพื่อไม่ให้ overfit
 model.learn(total_timesteps=300_000, callback=trading_callback)
 model.save("ppo_trading")
+train_env.save("vec_normalize.pkl")
 
 # Sync normalization stats from train to test
 test_env.obs_rms = train_env.obs_rms

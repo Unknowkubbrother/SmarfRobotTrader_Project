@@ -1,4 +1,4 @@
-import gym
+import gymnasium as gym
 import numpy as np
 
 
@@ -56,7 +56,8 @@ class TradingEnv(gym.Env):
         np.random.seed(seed)
         return [seed]
     
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
         self.step_idx = self.window_size
         self.position = 0       # -1: Short, 0: Flat, 1: Long
         self.equity = self.initial_balance
@@ -76,7 +77,7 @@ class TradingEnv(gym.Env):
         self.correct_predictions = 0
         self.total_predictions = 0
         
-        return self._get_obs()
+        return self._get_obs(), {}
     
     def _get_obs(self):
         start = self.step_idx - self.window_size
@@ -190,11 +191,12 @@ class TradingEnv(gym.Env):
         # ===== DONE CONDITIONS =====
         drawdown = (self.max_equity - self.equity) / self.max_equity if self.max_equity > 0 else 0
         
-        done = (
-            self.step_idx >= self.max_step
-            or drawdown >= self.max_dd
+        truncated = self.step_idx >= self.max_step
+        terminated = (
+            drawdown >= self.max_dd
             or self.equity <= 0
         )
+        done = terminated or truncated
         
         # Simple end bonus
         if done:
@@ -223,7 +225,7 @@ class TradingEnv(gym.Env):
             "action": action,
         }
         
-        return self._get_obs(), reward, done, info
+        return self._get_obs(), reward, terminated, truncated, info
     
     def _open_position(self, direction, price):
         """เปิด position ใหม่"""
