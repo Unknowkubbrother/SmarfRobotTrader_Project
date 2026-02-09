@@ -4,6 +4,7 @@ class Register_OTP(BaseModel):
     email: str
     recovery_email: str
     password: str
+    cf_token: str | None = None
 
 class Register_Verify(BaseModel):
     recovery_email: str
@@ -36,6 +37,7 @@ class Login_Verify(BaseModel):
 class Google_Register_OTP(BaseModel):
     id_token: str
     recovery_email: str
+    cf_token: str | None = None
 
 class Google_Register_Verify(BaseModel):
     email: str
@@ -47,9 +49,11 @@ class Google_Register_Complete(BaseModel):
 
 class CheckUser_Request(BaseModel):
     email: str
+    cf_token: str | None = None
 
 class Login_OTP_Init(BaseModel):
     email: str
+    cf_token: str | None = None
 
 class SetPassword_Request(BaseModel):
     new_password: str

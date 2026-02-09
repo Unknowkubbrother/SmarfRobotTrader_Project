@@ -13,6 +13,7 @@ import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
+import TurnstileWidget from "@/components/ui/TurnstileWidget";
 
 type RegisterStep = 1 | 2 | 3 | 4;
 
@@ -40,6 +41,7 @@ export default function Register() {
     const [otp, setOtp] = useState("");
     const [countdown, setCountdown] = useState(0);
     const [devOtp, setDevOtp] = useState<string | null>(null);
+    const [cfToken, setCfToken] = useState<string>("");
 
     const searchParams = useSearchParams();
     const mode = searchParams.get("mode");
@@ -123,14 +125,21 @@ export default function Register() {
             return;
         }
 
+        if (!cfToken) {
+            toast.error("Please complete the security check");
+            return;
+        }
+
         setIsLoading(true);
         try {
             let result;
             if (regData.isGoogle) {
-                result = await googleRegisterOTP(regData.googleIdToken, data.recoveryEmail);
+                result = await googleRegisterOTP(regData.googleIdToken, data.recoveryEmail, cfToken);
             } else {
-                result = await registerOTP(regData.email, data.recoveryEmail, regData.password);
+                result = await registerOTP(regData.email, data.recoveryEmail, regData.password, cfToken);
             }
+
+            setCfToken(""); // Reset token
 
             if (result.error) {
                 toast.error(result.error.message);
@@ -352,6 +361,7 @@ export default function Register() {
                                         <Button type="submit" className="w-full h-11 rounded-full bg-gradient-to-r from-[#1e3a5f] to-[#3b82f6]" disabled={isLoading}>
                                             {isLoading ? "Sending..." : "NEXT"}
                                         </Button>
+                                        <TurnstileWidget onVerify={setCfToken} />
                                     </form>
                                 </Form>
                             </>

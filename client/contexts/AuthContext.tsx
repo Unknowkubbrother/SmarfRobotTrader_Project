@@ -17,21 +17,21 @@ interface AuthContextType {
   user: User | null;
   loading: boolean;
   isAdmin: boolean;
-  signIn: (email: string, password: string) => Promise<{ error: Error | null; requireOtp?: boolean; recoveryEmailHint?: string }>;
+  signIn: (email: string, password: string, cfToken?: string) => Promise<{ error: Error | null; requireOtp?: boolean; recoveryEmailHint?: string }>;
   loginVerify: (email: string, otp: string) => Promise<{ error: Error | null }>;
   signInWithGoogle: () => Promise<{ error: Error | null; requireOtp?: boolean; requireRegister?: boolean; recoveryEmailHint?: string; googleInfo?: any; email?: string }>;
   signOut: () => Promise<void>;
 
-  registerOTP: (email: string, recoveryEmail: string, password: string) => Promise<{ error: Error | null; devOtp?: string }>;
+  registerOTP: (email: string, recoveryEmail: string, password: string, cfToken?: string) => Promise<{ error: Error | null; devOtp?: string }>;
   verifyOTP: (recoveryEmail: string, otp: string) => Promise<{ error: Error | null; userId?: string }>;
   completeRegistration: (recoveryEmail: string, username: string) => Promise<{ error: Error | null }>;
 
-  googleRegisterOTP: (idToken: string, recoveryEmail: string) => Promise<{ error: Error | null; devOtp?: string }>;
+  googleRegisterOTP: (idToken: string, recoveryEmail: string, cfToken?: string) => Promise<{ error: Error | null; devOtp?: string }>;
   googleRegisterVerify: (email: string, otp: string) => Promise<{ error: Error | null; verified?: boolean }>;
   googleRegisterComplete: (email: string, username: string) => Promise<{ error: Error | null }>;
 
-  checkUser: (email: string) => Promise<{ exists: boolean; hasPassword?: boolean; isGoogle?: boolean; recoveryEmailHint?: string; error?: Error }>;
-  loginOtpInit: (email: string) => Promise<{ error: Error | null; devOtp?: string }>;
+  checkUser: (email: string, cfToken?: string) => Promise<{ exists: boolean; hasPassword?: boolean; isGoogle?: boolean; recoveryEmailHint?: string; otpSent?: boolean; devOtp?: string; error?: Error }>;
+  loginOtpInit: (email: string, cfToken?: string) => Promise<{ error: Error | null; devOtp?: string }>;
   setPassword: (password: string) => Promise<{ error: Error | null }>;
 }
 
@@ -59,11 +59,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     fetchCurrentUser();
   }, []);
 
-  const signIn = async (email: string, password: string) => {
+  const signIn = async (email: string, password: string, cfToken?: string) => {
     try {
       const formData = new URLSearchParams();
       formData.append("username", email);
       formData.append("password", password);
+      if (cfToken) formData.append("cf_token", cfToken);
 
       const { data } = await api.post("/auth/login", formData, {
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -127,12 +128,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  const registerOTP = async (email: string, recoveryEmail: string, password: string) => {
+  const registerOTP = async (email: string, recoveryEmail: string, password: string, cfToken?: string) => {
     try {
       const { data } = await api.post("/auth/register/otp", {
         email,
         recovery_email: recoveryEmail,
         password,
+        cf_token: cfToken,
       });
       return { error: null, devOtp: data.dev_otp };
     } catch (error: any) {
@@ -164,11 +166,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  const googleRegisterOTP = async (idToken: string, recoveryEmail: string) => {
+  const googleRegisterOTP = async (idToken: string, recoveryEmail: string, cfToken?: string) => {
     try {
       const { data } = await api.post("/auth/google/register/otp", {
         id_token: idToken,
-        recovery_email: recoveryEmail
+        recovery_email: recoveryEmail,
+        cf_token: cfToken
       });
       return { error: null, devOtp: data.dev_otp };
     } catch (error: any) {
@@ -195,23 +198,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  const checkUser = async (email: string) => {
+  const checkUser = async (email: string, cfToken?: string) => {
     try {
-      const { data } = await api.post("/auth/check-user", { email });
+      const { data } = await api.post("/auth/check-user", { email, cf_token: cfToken });
       return {
         exists: data.exists,
         hasPassword: data.has_password,
         isGoogle: data.is_google,
-        recoveryEmailHint: data.recovery_email_hint
+        recoveryEmailHint: data.recovery_email_hint,
+        otpSent: data.otp_sent,
+        devOtp: data.dev_otp
       };
     } catch (error: any) {
       return { exists: false, error: error };
     }
   };
 
-  const loginOtpInit = async (email: string) => {
+  const loginOtpInit = async (email: string, cfToken?: string) => {
     try {
-      const { data } = await api.post("/auth/login/otp-init", { email });
+      const { data } = await api.post("/auth/login/otp-init", { email, cf_token: cfToken });
       return { error: null, devOtp: data.dev_otp };
     } catch (error: any) {
       return { error: error };

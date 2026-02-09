@@ -4,15 +4,16 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { z } from "zod";
-import { useForm } from "react-hook-form";
-import { zodResolver } from "@hookform/resolvers/zod";
+// import { useForm } from "react-hook-form";
+// import { zodResolver } from "@hookform/resolvers/zod";
 import { Eye, EyeOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+// import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
+import TurnstileWidget from "@/components/ui/TurnstileWidget";
 
 const loginSchema = z.object({
     email: z.string().trim().email({ message: "Invalid email address" }),
@@ -31,6 +32,7 @@ export default function Login() {
     const [hasPassword, setHasPassword] = useState(false);
     const [countdown, setCountdown] = useState(0);
     const [devOtp, setDevOtp] = useState<string | null>(null);
+    const [cfToken, setCfToken] = useState<string>("");
 
     const router = useRouter();
     const { user, signIn, signInWithGoogle, loginVerify, checkUser, loginOtpInit, setPassword: setAuthPassword } = useAuth();
@@ -85,9 +87,14 @@ export default function Login() {
             return;
         }
 
+        if (!cfToken) {
+            toast.error("Please complete the security check");
+            return;
+        }
+
         setIsLoading(true);
         try {
-            const result = await checkUser(email);
+            const result = await checkUser(email, cfToken);
             if (result.error) {
                 toast.error(result.error.message);
                 return;
@@ -103,19 +110,19 @@ export default function Login() {
             setIsGoogleUser(!!result.isGoogle);
 
             if (result.isGoogle && !result.hasPassword) {
-                // Google user without password -> OTP Login
-                const otpInit = await loginOtpInit(email);
-                if (otpInit.error) {
-                    toast.error(otpInit.error.message);
-                    return;
-                }
                 setRecoveryHint(result.recoveryEmailHint || "");
-                if (otpInit.devOtp) setDevOtp(otpInit.devOtp);
-                setCountdown(60);
-                setStep(3); // Go to OTP directly
-                toast.success("OTP sent to your recovery email");
+
+                if (result.otpSent) {
+                    if (result.devOtp) setDevOtp(result.devOtp);
+                    setCountdown(60);
+                    setStep(3);
+                    toast.success("OTP sent to your recovery email");
+                } else {
+                    setStep(3);
+                    toast.info("Please request a verification code.");
+                }
             } else {
-                // User has password (normal or google+password) -> Password Login
+
                 setStep(2);
             }
         } finally {
@@ -125,9 +132,15 @@ export default function Login() {
 
     const handlePasswordLogin = async (e: React.FormEvent) => {
         e.preventDefault();
+
+        if (!cfToken) {
+            toast.error("Please complete the security check");
+            return;
+        }
+
         setIsLoading(true);
         try {
-            const result = await signIn(email, password);
+            const result = await signIn(email, password, cfToken);
             if (result.error) {
                 toast.error(result.error.message);
                 return;
@@ -139,6 +152,7 @@ export default function Login() {
                 toast.success("OTP sent to your recovery email");
             } else {
                 toast.success("Welcome back!");
+                setCfToken(""); // Reset token
                 router.push("/");
             }
         } finally {
@@ -193,17 +207,20 @@ export default function Login() {
         }
     };
 
-    const resendOTP = async () => {
+    const resendOTP = async (token?: string) => {
         if (countdown > 0) return;
+
+        // If we require token and none provided (unless we want to allow one-click retry if backend allows? No, backend enforces it)
+        if (!token) {
+            // In this design, we use Turnstile onVerify to trigger this, so token should differ.
+            // But if we call it from button click?
+            // We won't have a button, we have the widget.
+            return;
+        }
+
         setIsLoading(true);
         try {
-            // Re-initiate OTP based on flow. 
-            // If we are here, it's either Password->OTP (standard) or Google->OTP (passwordless check passed earlier).
-            // However, standard login also does internal OTP send. 
-            // Let's use otp-init for simplicity if it supports it, 
-            // BUT `login` endpoint sends OTP internally if needed.
-            // We can just call `loginOtpInit` as it effectively sends an OTP to user if they exist.
-            const result = await loginOtpInit(email);
+            const result = await loginOtpInit(email, token);
             if (result.error) {
                 toast.error(result.error.message);
                 return;
@@ -282,6 +299,7 @@ export default function Login() {
                                             required
                                         />
                                     </div>
+                                    <TurnstileWidget onVerify={setCfToken} />
                                     <Button type="submit" className="w-full h-11 rounded-full bg-gradient-to-r from-[#1e3a5f] to-[#3b82f6]" disabled={isLoading}>
                                         {isLoading ? "Checking..." : "Next"}
                                     </Button>
@@ -354,9 +372,9 @@ export default function Login() {
                                     {isLoading ? "Verifying..." : "Verify Login"}
                                 </Button>
 
-                                <button onClick={resendOTP} disabled={countdown > 0} className="text-sm text-muted-foreground hover:text-foreground disabled:opacity-50">
-                                    {countdown > 0 ? `Resend OTP in ${countdown}s` : "Resend OTP"}
-                                </button>
+                                {countdown > 0 && (
+                                    <p className="text-sm text-muted-foreground text-center">Resend OTP in {countdown}s</p>
+                                )}
 
                                 <button onClick={() => setStep(1)} className="text-sm text-muted-foreground hover:underline">Back to Login</button>
                             </div>
