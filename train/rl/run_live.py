@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import time
 import os
+import sys
 from datetime import datetime, timedelta
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -275,14 +276,16 @@ class LiveTradingBot:
                 current_rate = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 1)
                 
                 if current_rate is not None and len(current_rate) > 0:
-                    candle_start_ts = current_rate[0]['time'] # int timestamp
+                    candle_start_ts = current_rate[0]['time'] # Broker Server Timestamp
                     candle_start_dt = datetime.fromtimestamp(candle_start_ts)
-                    now = datetime.now()
                     
-                    # Fetch ticks from candle start until now
-                    ticks = mt5.copy_ticks_range(SYMBOL, candle_start_dt, now, mt5.COPY_TICKS_ALL)
+                    # Use copy_ticks_from to get all ticks from candle start
+                    # This avoids timezone issues between local datetime.now() and broker server time
+                    ticks = mt5.copy_ticks_from(SYMBOL, candle_start_dt, 10000, mt5.COPY_TICKS_ALL)
                     
                     current_delta = 0
+                    current_delta_price = 0.0
+                    
                     if ticks is not None and len(ticks) > 0:
                         tdf = pd.DataFrame(ticks)
                         tdf['prev_bid'] = tdf['bid'].shift(1)
@@ -291,9 +294,17 @@ class LiveTradingBot:
                         buy = (tdf['bid'] > tdf['prev_bid']) | ((tdf['bid'] == tdf['prev_bid']) & (tdf['ask'] > tdf['prev_ask']))
                         sell = (tdf['bid'] < tdf['prev_bid']) | ((tdf['bid'] == tdf['prev_bid']) & (tdf['ask'] < tdf['prev_ask']))
                         current_delta = buy.sum() - sell.sum()
+                        
+                        # Calculate Delta Price (Total price movement from start)
+                        current_delta_price = (tdf['bid'].iloc[-1] - tdf['bid'].iloc[0]) + (tdf['ask'].iloc[-1] - tdf['ask'].iloc[0])
 
-                    # Display status on the same line
-                    print(f"\r📊 Price: {tick.bid:.{self.digits}f} | 🌊 DeltaTick: {current_delta} | ⏳ Time: {now.strftime('%H:%M:%S')}", end="", flush=True)
+                                        # Display status on the same line with padding to clear old text
+                    # Shortened to avoid terminal wrapping issues
+                    server_time_str = datetime.fromtimestamp(tick.time).strftime('%H:%M:%S')
+                    local_time_str = datetime.now().strftime('%H:%M')
+                    status_line = f"📊 Pr: {tick.bid:.{self.digits}f} | 🌊 DT: {current_delta} | 💰 DP: {current_delta_price:.{self.digits}f} | ⏳ {server_time_str} ({local_time_str})      "
+                    sys.stdout.write(f"\r{status_line}")
+                    sys.stdout.flush()
 
             time.sleep(1)
 
