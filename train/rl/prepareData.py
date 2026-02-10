@@ -32,7 +32,7 @@ TIMEFRAME_CONFIG = {
 }
 
 # SELECT TIMEFRAME HERE
-SELECTED_TIMEFRAME = "M5"  # Change this to "M5", "M15", etc.
+SELECTED_TIMEFRAME = "H1"  # Change this to "M5", "M15", etc.
 tf_config = TIMEFRAME_CONFIG[SELECTED_TIMEFRAME]
 
 ohlc_start = datetime(2000, 1, 1, tzinfo=timezone)
