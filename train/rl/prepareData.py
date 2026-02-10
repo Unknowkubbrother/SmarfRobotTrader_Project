@@ -35,9 +35,8 @@ TIMEFRAME_CONFIG = {
 SELECTED_TIMEFRAME = "H1"  # Change this to "M5", "M15", etc.
 tf_config = TIMEFRAME_CONFIG[SELECTED_TIMEFRAME]
 
-ohlc_start = datetime(2000, 1, 1, tzinfo=timezone)
-ohlc_end   = datetime(2025, 12, 31, 23, 59, 59, tzinfo=timezone)
-
+ohlc_start = datetime(2026, 2, 1, tzinfo=timezone)
+ohlc_end   = datetime(2026, 2, 8, 23, 59, 59, tzinfo=timezone)
 
 
 # ==================================================
@@ -225,6 +224,6 @@ print(df_merged.tail())
 # ==================================================
 # SAVE
 # ==================================================
-filename = f"{SELECTED_TIMEFRAME.lower()}_ohlc_delta.csv"
+filename = f"{SELECTED_TIMEFRAME.lower()}_ohlc_delta1.csv"
 df_merged.to_csv(filename)
 print(f"\n✓ Saved: {filename}")

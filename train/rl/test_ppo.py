@@ -4,7 +4,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from env_trading import TradingEnv
 
-df = pd.read_csv("h1_ohlc_delta.csv")
+df = pd.read_csv("h1_ohlc_delta1.csv")
 
 # ==================================================
 # FILTER: ใช้เฉพาะข้อมูลที่มี delta (2024-2025)
@@ -41,13 +41,8 @@ df['momentum'] = df['return'].rolling(window=5).sum().fillna(0)
 print(f"✅ Features: return, range, delta_tick, delta_price, has_delta, body_ratio, momentum")
 print("="*50 + "\n")
 
-# split 70/30
-split = int(len(df) * 0.7)
-train_df = df.iloc[:split].copy()
-test_df  = df.iloc[split:].copy()
 
-print(f"📈 Train: {len(test_df):,} rows | Test: {len(test_df):,} rows\n")
-test_env  = DummyVecEnv([lambda: TradingEnv(test_df)])
+test_env  = DummyVecEnv([lambda: TradingEnv(df)])
 test_env = VecNormalize.load("vec_normalize.pkl", test_env)
 test_env.training = False
 test_env.norm_reward = False
@@ -91,11 +86,11 @@ print(f"Total Fees Paid:  ${info[0]['fees']:.2f}")
 print("="*50)
 
 # Sharpe Ratio calculation
-if len(test_df) > 0:
-    returns = test_df['return'].values
+if len(df) > 0:
+    returns = df['return'].values
     sharpe = np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252)
     print(f"Sharpe Ratio:     {sharpe:.2f}")
     print("="*50)
 
-print(f"start time = {test_df.head(1)}")
-print(f"end time = {test_df.tail(1)}")
+print(f"start time = {df.head(1)}")
+print(f"end time = {df.tail(1)}")
