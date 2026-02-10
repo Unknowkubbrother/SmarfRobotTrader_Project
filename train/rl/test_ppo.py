@@ -4,7 +4,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from env_trading import TradingEnv
 
-df = pd.read_csv("h1_ohlc_delta_eurusd.csv")
+df = pd.read_csv("h1_ohlc_delta.csv")
 
 # ==================================================
 # FILTER: ใช้เฉพาะข้อมูลที่มี delta (2024-2025)
