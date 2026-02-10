@@ -640,7 +640,6 @@ async def check_user(data: CheckUser_Request):
         "otp_sent": False
     }
 
-    # If user is passwordless Google user, send OTP immediately (since we have a valid turnstile token here)
     if user.googleAuthId and not user.password:
          if user.recoveryEmail:
              otp = str(random_with_N_digits(6))
@@ -655,12 +654,6 @@ async def check_user(data: CheckUser_Request):
 @auth_router.post("/login/otp-init", tags=["auth"])
 async def login_otp_init(data: Login_OTP_Init):
     if not await verify_turnstile(data.cf_token):
-         # raise HTTPException(status_code=400, detail="Invalid security token")
-         # Pass for now if we don't strictly enforce it here? 
-         # No, the model has it, and plan says strictly enforce.
-         # But in Frontend I decided to maybe skip it for this step if checkUser passed?
-         # No, I decided to NOT auto-call and require a button with token.
-         # So I MUST verify it here.
          raise HTTPException(status_code=400, detail="Invalid security token")
 
     user = await db.user.find_unique(where={"email": data.email})
@@ -668,10 +661,7 @@ async def login_otp_init(data: Login_OTP_Init):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Security check: Only allow if user has Google Auth ID (implied trusted email) OR if we implement email login without password strictly.
-    # The requirement is: "if login with google... allow otp to recovery". 
     if not user.googleAuthId and not user.password:
-         # Edge case: No password and no google auth? Should not happen if registered correctly.
          raise HTTPException(status_code=400, detail="Account setup incomplete. Please contact support.")
 
     if not user.recoveryEmail:

@@ -99,3 +99,4 @@ def read_root():
 app.include_router(authentication.auth_router, prefix="/auth")
 
 # uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+# cloudflared tunnel --url http://localhost:8000
