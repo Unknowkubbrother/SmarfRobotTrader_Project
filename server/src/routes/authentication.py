@@ -17,7 +17,7 @@ from ..utils.turnstile import verify_turnstile
 
 SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 120
 COOKIE_NAME = "access_token"
 
 cred = credentials.Certificate("smarfrobottrade-firebase.json")
@@ -107,7 +107,7 @@ async def login(
 ):
     user = await db.user.find_unique(where={"email": username})
     
-    if not user or not bcrypt.checkpw(password.encode('utf-8'), user.password.encode('utf-8')):
+    if not user or not user.password or not bcrypt.checkpw(password.encode('utf-8'), user.password.encode('utf-8')):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
