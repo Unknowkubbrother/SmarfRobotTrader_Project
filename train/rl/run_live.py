@@ -262,7 +262,39 @@ class LiveTradingBot:
                 
                 # 4. Execute
                 self.execute_trade(action, current_pos)
+            
+            # ==========================================
+            # REAL-TIME PRICE & DELTA DISPLAY
+            # ==========================================
+            tick = mt5.symbol_info_tick(SYMBOL)
+            if tick and len(rates) > 0: # Ensure we have rates
+                # Calculate Delta for CURRENT forming candle (Index 0)
+                # Note: copy_rates_from_pos(..., 1, ...) returns PREVIOUS candle at index 0
+                # We need CURRENT candle start time.
+                # Let's fetch current candle rate for timestamp
+                current_rate = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 1)
                 
+                if current_rate is not None and len(current_rate) > 0:
+                    candle_start_ts = current_rate[0]['time'] # int timestamp
+                    candle_start_dt = datetime.fromtimestamp(candle_start_ts)
+                    now = datetime.now()
+                    
+                    # Fetch ticks from candle start until now
+                    ticks = mt5.copy_ticks_range(SYMBOL, candle_start_dt, now, mt5.COPY_TICKS_ALL)
+                    
+                    current_delta = 0
+                    if ticks is not None and len(ticks) > 0:
+                        tdf = pd.DataFrame(ticks)
+                        tdf['prev_bid'] = tdf['bid'].shift(1)
+                        tdf['prev_ask'] = tdf['ask'].shift(1)
+                        
+                        buy = (tdf['bid'] > tdf['prev_bid']) | ((tdf['bid'] == tdf['prev_bid']) & (tdf['ask'] > tdf['prev_ask']))
+                        sell = (tdf['bid'] < tdf['prev_bid']) | ((tdf['bid'] == tdf['prev_bid']) & (tdf['ask'] < tdf['prev_ask']))
+                        current_delta = buy.sum() - sell.sum()
+
+                    # Display status on the same line
+                    print(f"\r📊 Price: {tick.bid:.{self.digits}f} | 🌊 DeltaTick: {current_delta} | ⏳ Time: {now.strftime('%H:%M:%S')}", end="", flush=True)
+
             time.sleep(1)
 
     def execute_trade(self, action, current_pos):
@@ -282,6 +314,19 @@ class LiveTradingBot:
         elif action == 2: # SELL
             if current_pos == 1: self.close_all()
             if current_pos == 0: self.send_order(mt5.ORDER_TYPE_SELL)
+
+    def get_filling_mode(self):
+        symbol_info = mt5.symbol_info(SYMBOL)
+        if symbol_info is None:
+            return mt5.ORDER_FILLING_FOK
+        
+        filling_mode = symbol_info.filling_mode
+        if filling_mode & 1: # SYMBOL_FILLING_FOK = 1
+            return mt5.ORDER_FILLING_FOK
+        elif filling_mode & 2: # SYMBOL_FILLING_IOC = 2
+            return mt5.ORDER_FILLING_IOC
+        else:
+            return mt5.ORDER_FILLING_RETURNAL
 
     def close_all(self):
         positions = mt5.positions_get(symbol=SYMBOL)
