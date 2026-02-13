@@ -12,7 +12,7 @@ from firebase_admin import credentials, auth as firebase_auth
 
 from ..database.client import r_cache, db
 from ..models.authentication_model import Register_OTP, Register_Verify, Register_Complete, Login_Verify, Google_Register_OTP, Google_Register_Verify, Google_Register_Complete, CheckUser_Request, Login_OTP_Init, SetPassword_Request
-from lib.untils import random_with_N_digits
+from lib.untils import random_with_N_digits, send_otp_email
 from ..utils.turnstile import verify_turnstile
 
 SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
@@ -130,14 +130,13 @@ async def login(
     
     r_cache.setex(f"login_pending:{user.email}", 300, otp)
     
-    print(f"[DEV] Login OTP for {user.email} (sent to {user.recoveryEmail}): {otp}")
+    send_otp_email(user.recoveryEmail, otp, purpose="login")
 
     return {
         "require_otp": True,
         "message": "OTP sent to your recovery email",
         "email": user.email,
-        "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}",
-        "dev_otp": otp
+        "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}"
     }
 
 
@@ -230,14 +229,13 @@ async def google_auth(response: Response, google_auth: GoogleAuth):
         otp = str(random_with_N_digits(6))
         r_cache.setex(f"login_pending:{user.email}", 300, otp)
         
-        print(f"[DEV] Google Login OTP for {user.email}: {otp}")
+        send_otp_email(user.recoveryEmail, otp, purpose="login")
         
         return {
             "require_otp": True,
             "message": "OTP sent to your recovery email",
             "email": user.email,
-            "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}",
-             "dev_otp": otp
+            "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}"
         }
 
 
@@ -267,12 +265,11 @@ async def register_otp(register_otp: Register_OTP):
     otp = str(random_with_N_digits(6))
     r_cache.set(f"register_otp:{register_otp.recovery_email}", otp, ex=60 * 5)
     
-    print(f"[DEV] OTP for {register_otp.recovery_email}: {otp}")
+    send_otp_email(register_otp.recovery_email, otp, purpose="register")
     
     return {
         "status_code": 200,
-        "message": "OTP sent to your recovery email",
-        "dev_otp": otp
+        "message": "OTP sent to your recovery email"
     }
 
 
@@ -441,7 +438,7 @@ async def forgot_password_request(data: dict):
     if not user.recoveryEmail:
         raise HTTPException(status_code=400, detail="No recovery email found for this account")
     
-    otp = random_with_N_digits(6)
+    otp = str(random_with_N_digits(6))
     
     r_cache.setex(
         f"forgot_password_otp:{email}",
@@ -449,10 +446,11 @@ async def forgot_password_request(data: dict):
         otp
     )
     
+    send_otp_email(user.recoveryEmail, otp, purpose="forgot_password")
+    
     return {
         "message": f"OTP sent to recovery email",
-        "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}",
-        "dev_otp": otp
+        "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}"
     }
 
 
@@ -545,11 +543,10 @@ async def google_register_otp(data: Google_Register_OTP):
     })
     r_cache.expire(reg_key, 600) # 10 minutes
     
-    print(f"[DEV] Google Register OTP for {email} (sent to {data.recovery_email}): {otp}")
+    send_otp_email(data.recovery_email, otp, purpose="register")
     
     return {
-        "message": "OTP sent to recovery email",
-        "dev_otp": otp
+        "message": "OTP sent to recovery email"
     }
 
 
@@ -644,9 +641,8 @@ async def check_user(data: CheckUser_Request):
          if user.recoveryEmail:
              otp = str(random_with_N_digits(6))
              r_cache.setex(f"login_pending:{user.email}", 300, otp)
-             print(f"[DEV] Login OTP for {user.email}: {otp}")
+             send_otp_email(user.recoveryEmail, otp, purpose="login")
              response_data["otp_sent"] = True
-             response_data["dev_otp"] = otp
 
     return response_data
 
@@ -670,11 +666,10 @@ async def login_otp_init(data: Login_OTP_Init):
     otp = str(random_with_N_digits(6))
     r_cache.setex(f"login_pending:{user.email}", 300, otp)
     
-    print(f"[DEV] Login OTP for {user.email}: {otp}")
+    send_otp_email(user.recoveryEmail, otp, purpose="login")
     
     return {
-        "message": "OTP sent to recovery email",
-        "dev_otp": otp
+        "message": "OTP sent to recovery email"
     }
 
 
