@@ -8,6 +8,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 // ==========================================
@@ -295,13 +296,13 @@ model TradingJournal {
 // 6. Bot Management & Docker
 // ==========================================
 model BotVersion {
-  modelId       Int       @id @default(autoincrement()) @map("model_id")
+  modelId       String    @id @default(dbgenerated("uuid_generate_v4()")) @map("model_id") @db.Uuid
   label         String?   @db.VarChar(100)
   dockerImageId String?   @map("docker_image_id") @db.VarChar(255)
   versionTag    String?   @map("version_tag") @db.VarChar(20)
   symbol        String?   @db.VarChar(20)
   timeframe     String?   @db.VarChar(10)
-  releaseNotes  String?   @map("release_notes") @db.Text
+  releaseNotes  String[]  @map("release_notes") @db.Text
   releaseDate   DateTime? @default(now()) @map("release_date") @db.Timestamptz
 
   // Relations
@@ -313,7 +314,7 @@ model BotVersion {
 model BotConfiguration {
   id        String @id @default(dbgenerated("uuid_generate_v4()")) @map("config_id") @db.Uuid
   accountId String @map("account_id") @db.Uuid
-  modelId   Int    @map("model_id")
+  modelId   String @map("model_id") @db.Uuid
 
   // Multi-Bot Identifiers
   botInstanceId Int @map("bot_instance_id")

@@ -102,3 +102,5 @@ app.include_router(trading.trading_router, prefix="/trading")
 
 # uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 # cloudflared tunnel --url http://localhost:8000
+# prisma db push --schema=src/database/schema.prisma
+# prisma generate --schema=src/database/schema.prisma
