@@ -116,6 +116,33 @@ export function useSettings() {
         }
     };
 
+    const uploadAvatar = async (file: File) => {
+        try {
+            setLoading(true);
+            const formData = new FormData();
+            formData.append("file", file);
+
+            const { data } = await api.post("/settings/profile/avatar", formData, {
+                headers: {
+                    "Content-Type": "multipart/form-data",
+                },
+            });
+
+            if (profile) {
+                setProfile({ ...profile, avatarUrl: data.avatarUrl });
+            }
+
+            toast.success("Profile photo updated");
+            return true;
+        } catch (error: any) {
+            console.error(error);
+            toast.error(error.response?.data?.detail || "Failed to upload profile photo");
+            return false;
+        } finally {
+            setLoading(false);
+        }
+    };
+
     return {
         loading,
         profile,
@@ -124,6 +151,7 @@ export function useSettings() {
         fetchActivityLogs,
         updateProfile,
         updatePassword,
-        updateNotifications
+        updateNotifications,
+        uploadAvatar
     };
 }

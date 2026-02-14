@@ -1,9 +1,11 @@
-import { useState, useEffect } from "react";
-import { User, Shield, Bell, Monitor, Globe, Key, Loader2, MessageSquare, Gamepad2 } from "lucide-react";
+import { useState, useEffect, useRef } from "react";
+import { User, Shield, Bell, Monitor, Globe, Key, Loader2, MessageSquare, Gamepad2, Camera } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { useSettings, UserProfile, NotificationConfig } from "@/hooks/useSettings";
+import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 export default function Settings() {
   const {
@@ -14,8 +16,18 @@ export default function Settings() {
     fetchActivityLogs,
     updateProfile,
     updatePassword,
-    updateNotifications
+    updateNotifications,
+    uploadAvatar
   } = useSettings();
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      await uploadAvatar(file);
+    }
+  };
 
   const [activeTab, setActiveTab] = useState<"profile" | "security" | "notifications">("profile");
 
@@ -37,6 +49,15 @@ export default function Settings() {
     discordWebhookUrl: ""
   });
 
+  const [avatarUrlInput, setAvatarUrlInput] = useState("");
+
+  const getAvatarSrc = (url: string | null | undefined) => {
+    if (!url) return "";
+    if (url.startsWith("http") || url.startsWith("data:")) return url;
+    if (url.startsWith("/static")) return `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}${url}`;
+    return url;
+  };
+
   const [thresholds, setThresholds] = useState({
     alertProfitTarget: "100",
     alertLossLimit: "-50",
@@ -57,6 +78,11 @@ export default function Settings() {
         email: profile.email,
         recoveryEmail: profile.recoveryEmail || ""
       });
+
+      // Only set input if it's an external URL
+      const currentAvatar = profile.avatarUrl || "";
+      setAvatarUrlInput((currentAvatar.startsWith('http') || currentAvatar.startsWith('data:')) ? currentAvatar : "");
+
       if (profile.notificationConfig) {
         setTokenForm({
           lineNotifyToken: profile.notificationConfig.lineNotifyToken || "",
@@ -70,6 +96,12 @@ export default function Settings() {
       }
     }
   }, [profile]);
+
+  const handleAvatarUrlSave = async () => {
+    await updateProfile({
+      avatarUrl: avatarUrlInput || null
+    });
+  };
 
   const handleProfileSave = async () => {
     await updateProfile({
@@ -129,7 +161,7 @@ export default function Settings() {
     const currentConfig = profile.notificationConfig;
     const isEnabled = !!currentConfig[key];
 
-    // Toggle logic: 
+    // Toggle logic:
     // For booleans, just negate.
     // For numbers (thresholds), if null -> set default, if exists -> set null.
 
@@ -242,18 +274,60 @@ export default function Settings() {
 
           <div className="glass-card p-6 animate-slide-up" style={{ animationDelay: "100ms" }}>
             <h3 className="text-lg font-semibold mb-6">Profile Photo</h3>
-            <div className="flex flex-col items-center">
-              <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary to-accent flex items-center justify-center mb-4 overflow-hidden">
-                {profile?.avatarUrl ? (
-                  <img src={profile.avatarUrl} alt="Avatar" className="w-full h-full object-cover" />
-                ) : (
-                  <User className="w-10 h-10 text-primary-foreground" />
-                )}
-              </div>
-              <Button variant="outline" size="sm" disabled>
-                Upload Photo (Coming Soon)
-              </Button>
-            </div>
+
+            <Tabs defaultValue={profile?.avatarUrl?.startsWith('http') ? 'url' : 'upload'} className="w-full">
+              <TabsList className="grid w-full grid-cols-2 mb-6">
+                <TabsTrigger value="upload">Upload Photo</TabsTrigger>
+                <TabsTrigger value="url">Image URL</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="upload" className="flex flex-col items-center mt-0">
+                <div className="relative group cursor-pointer" onClick={() => fileInputRef.current?.click()}>
+                  <Avatar className="w-32 h-32 border-4 border-background shadow-xl">
+                    <AvatarImage src={getAvatarSrc(profile?.avatarUrl)} className="object-cover" />
+                    <AvatarFallback className="text-4xl bg-primary/20 text-primary">
+                      {profile?.username?.[0]?.toUpperCase()}
+                    </AvatarFallback>
+                  </Avatar>
+                  <div className="absolute inset-0 bg-black/50 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                    <Camera className="w-10 h-10 text-white" />
+                  </div>
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    className="hidden"
+                    accept="image/*"
+                    onChange={handleFileChange}
+                  />
+                  <div className="absolute bottom-1 right-1 w-8 h-8 bg-green-500 rounded-full border-4 border-background"></div>
+                </div>
+                <p className="text-sm text-muted-foreground mt-4">
+                  Click the avatar to upload a new photo
+                </p>
+              </TabsContent>
+
+              <TabsContent value="url" className="flex flex-col items-center mt-0">
+                <Avatar className="w-32 h-32 border-4 border-background shadow-xl mb-6">
+                  <AvatarImage src={getAvatarSrc(profile?.avatarUrl)} className="object-cover" />
+                  <AvatarFallback className="text-4xl bg-primary/20 text-primary">
+                    {profile?.username?.[0]?.toUpperCase()}
+                  </AvatarFallback>
+                </Avatar>
+
+                <div className="w-full max-w-sm flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={avatarUrlInput}
+                    onChange={(e) => setAvatarUrlInput(e.target.value)}
+                    placeholder="Paste image URL (https://...)"
+                    className="flex-1 h-9 px-3 rounded-md border border-input bg-transparent text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  />
+                  <Button size="sm" onClick={handleAvatarUrlSave} disabled={loading} variant="default">
+                    Save
+                  </Button>
+                </div>
+              </TabsContent>
+            </Tabs>
           </div>
         </div>
       )}

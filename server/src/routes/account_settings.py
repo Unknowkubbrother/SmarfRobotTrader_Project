@@ -1,6 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from typing import Annotated, List, Optional
 import bcrypt
+import os
+import shutil
+import time
 
 from ..database.client import db
 from ..models.settings import (
@@ -12,6 +15,10 @@ from ..models.settings import (
     ActivityLogResponse
 )
 from .authentication import get_current_active_user
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+UPLOADS_DIR = os.path.join(BASE_DIR, "uploads", "avatars")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 settings_router = APIRouter()
 
@@ -49,6 +56,43 @@ async def get_profile(
         notificationConfig=notify_response
     )
 
+@settings_router.post("/profile/avatar")
+async def upload_avatar(
+    file: Annotated[UploadFile, File()],
+    current_user: Annotated[any, Depends(get_current_active_user)]
+):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+    
+    # Generate unique filename
+    extension = os.path.splitext(file.filename)[1]
+    filename = f"user_{current_user.id}_{int(time.time())}{extension}"
+    file_path = os.path.join(UPLOADS_DIR, filename)
+    
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to save image")
+        
+    # Construct URL (assuming server is at root/static)
+    avatar_url = f"/static/avatars/{filename}"
+    
+    # Delete old avatar if exists and is local
+    if current_user.avatarUrl and current_user.avatarUrl.startswith("/static/avatars/"):
+        old_filename = current_user.avatarUrl.split("/")[-1]
+        old_path = os.path.join(UPLOADS_DIR, old_filename)
+        if os.path.exists(old_path):
+            os.remove(old_path)
+
+    # Update user record
+    await db.user.update(
+        where={"id": str(current_user.id)},
+        data={"avatarUrl": avatar_url}
+    )
+    
+    return {"avatarUrl": avatar_url}
+
 @settings_router.patch("/profile", response_model=UserProfileResponse)
 async def update_profile(
     update_data: UpdateProfileRequest,
@@ -81,6 +125,9 @@ async def update_profile(
         
     if update_data.recoveryEmail:
         data_to_update["recoveryEmail"] = update_data.recoveryEmail
+
+    if update_data.avatarUrl is not None:
+        data_to_update["avatarUrl"] = update_data.avatarUrl
 
     if not data_to_update:
          return await get_profile(current_user)

@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 import jwt
 import os
+from fastapi.staticfiles import StaticFiles
 
 from .routes import authentication, bot, trading, account_settings
 from .database.client import db
@@ -81,6 +82,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Mount static files
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+app.mount("/static", StaticFiles(directory=UPLOADS_DIR), name="static")
 
 app.add_middleware(
     CORSMiddleware,
