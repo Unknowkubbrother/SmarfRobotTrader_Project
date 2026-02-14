@@ -50,7 +50,7 @@ export function AIConsole({ botName = "Bot" }: AIConsoleProps) {
       const randomLog = newLogMessages[Math.floor(Math.random() * newLogMessages.length)];
       const now = new Date();
       const timestamp = `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}:${now.getSeconds().toString().padStart(2, "0")}`;
-      
+
       setLogs((prev) => [
         ...prev.slice(-8),
         {
@@ -65,7 +65,7 @@ export function AIConsole({ botName = "Bot" }: AIConsoleProps) {
   }, [botName]);
 
   return (
-    <div className="glass-card p-6 animate-slide-up" style={{ animationDelay: "150ms" }}>
+    <div className="bg-white border rounded-xl shadow-sm p-6 animate-slide-up h-full flex flex-col" style={{ animationDelay: "150ms" }}>
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
           <Terminal className="w-4 h-4 text-muted-foreground" />
@@ -77,7 +77,7 @@ export function AIConsole({ botName = "Bot" }: AIConsoleProps) {
         </div>
       </div>
 
-      <div className="bg-secondary/50 rounded-lg p-3 h-[200px] overflow-y-auto scrollbar-thin">
+      <div className="bg-secondary/50 rounded-lg p-3 flex-1 overflow-y-auto scrollbar-thin min-h-[200px]">
         {logs.map((log, index) => {
           const config = typeConfig[log.type];
           const Icon = config.icon;

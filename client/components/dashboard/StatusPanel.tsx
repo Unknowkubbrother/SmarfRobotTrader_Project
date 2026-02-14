@@ -20,7 +20,7 @@ export function StatusPanel({ account }: StatusPanelProps) {
   ];
 
   return (
-    <div className="glass-card p-6 animate-slide-up" style={{ animationDelay: "150ms" }}>
+    <div className="bg-white border rounded-xl shadow-sm p-6 animate-slide-up h-full flex flex-col" style={{ animationDelay: "150ms" }}>
       <div className="flex items-center justify-between mb-4">
         <h3 className="text-lg font-semibold text-foreground">Account Status</h3>
         {account && (
@@ -33,7 +33,7 @@ export function StatusPanel({ account }: StatusPanelProps) {
         {statusItems.map((item) => (
           <div key={item.label} className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-lg bg-secondary flex items-center justify-center">
+              <div className="w-8 h-8 rounded-lg bg-secondary/50 flex items-center justify-center">
                 <item.icon className="w-4 h-4 text-muted-foreground" />
               </div>
               <span className="text-sm text-muted-foreground">{item.label}</span>

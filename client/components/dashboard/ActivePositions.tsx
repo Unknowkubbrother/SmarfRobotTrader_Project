@@ -66,14 +66,14 @@ interface ActivePositionsProps {
 }
 
 export function ActivePositions({ accountId }: ActivePositionsProps) {
-  const positions = accountId 
+  const positions = accountId
     ? allPositions.filter(p => p.accountId === accountId)
     : allPositions;
 
   const totalProfit = positions.reduce((sum, p) => sum + p.profit, 0);
 
   return (
-    <div className="glass-card p-6 animate-slide-up" style={{ animationDelay: "200ms" }}>
+    <div className="bg-white border rounded-xl shadow-sm p-6 animate-slide-up" style={{ animationDelay: "200ms" }}>
       <div className="flex items-center justify-between mb-4">
         <h3 className="font-semibold text-foreground">Active Positions</h3>
         <div className="flex items-center gap-3">

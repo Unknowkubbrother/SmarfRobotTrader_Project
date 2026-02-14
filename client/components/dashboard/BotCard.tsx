@@ -88,8 +88,8 @@ export function BotCard({
     <>
       <div
         className={cn(
-          "glass-card p-4 transition-all cursor-pointer hover:border-primary/50",
-          isSelected && "border-primary ring-1 ring-primary/20"
+          "bg-white border rounded-xl shadow-sm p-5 transition-all cursor-pointer relative overflow-hidden group hover:shadow-md",
+          isSelected ? "ring-2 ring-primary border-primary" : "hover:border-primary/50"
         )}
         onClick={() => onSelect?.(bot.id)}
       >

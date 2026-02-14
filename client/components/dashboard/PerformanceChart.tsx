@@ -15,17 +15,17 @@ const generateData = () => {
   const data = [];
   let balance = 10000;
   let equity = 10000;
-  
+
   for (let i = 0; i < 30; i++) {
     const date = new Date();
     date.setDate(date.getDate() - (29 - i));
-    
+
     const balanceChange = (Math.random() - 0.4) * 200;
     const equityChange = (Math.random() - 0.4) * 250;
-    
+
     balance += balanceChange;
     equity = balance + (Math.random() - 0.5) * 500;
-    
+
     data.push({
       date: date.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
       balance: Math.round(balance * 100) / 100,
@@ -43,7 +43,7 @@ export function PerformanceChart() {
   const [selectedTimeframe, setSelectedTimeframe] = useState("1M");
 
   return (
-    <div className="glass-card p-6 animate-slide-up">
+    <div className="bg-white border rounded-xl shadow-sm p-6 animate-slide-up">
       <div className="flex items-center justify-between mb-6">
         <div>
           <h3 className="font-semibold text-foreground">Portfolio Performance</h3>

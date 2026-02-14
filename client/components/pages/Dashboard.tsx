@@ -6,6 +6,7 @@ import { ActivePositions } from "@/components/dashboard/ActivePositions";
 import { AIConsole } from "@/components/dashboard/AIConsole";
 import { AccountSelector, AccountWithBots } from "@/components/dashboard/AccountSelector";
 import { BotCard } from "@/components/dashboard/BotCard";
+import TradingViewWidget from "@/components/dashboard/TradingViewWidget";
 import { AddBotDialog } from "@/components/dialogs/AddBotDialog";
 import { AddAccountDialog } from "@/components/dialogs/AddAccountDialog";
 import { Button } from "@/components/ui/button";
@@ -68,6 +69,8 @@ export default function Dashboard() {
   ];
 
   const bots = selectedAccount?.bot_configurations || [];
+  const currentBot = bots.find(b => b.id === selectedBotId);
+  const currentSymbol = currentBot?.bot_version?.symbol || "XAUUSD";
 
   return (
     <div className="space-y-6">
@@ -101,8 +104,9 @@ export default function Dashboard() {
       </div>
 
       {/* Main Content Area */}
+      {/* Main Content Area */}
       {!selectedAccount ? (
-        <div className="glass-card p-12 text-center animate-slide-up flex flex-col items-center justify-center min-h-[400px]">
+        <div className="bg-white border rounded-xl shadow-sm p-12 text-center animate-slide-up flex flex-col items-center justify-center min-h-[400px]">
           <div className="w-16 h-16 bg-secondary rounded-2xl flex items-center justify-center mb-6">
             <Wallet className="w-8 h-8 text-muted-foreground" />
           </div>
@@ -128,7 +132,7 @@ export default function Dashboard() {
           </div>
 
           {bots.length === 0 ? (
-            <div className="glass-card p-12 text-center flex flex-col items-center justify-center min-h-[300px]">
+            <div className="bg-white border rounded-xl shadow-sm p-12 text-center flex flex-col items-center justify-center min-h-[300px]">
               <div className="w-16 h-16 bg-secondary rounded-2xl flex items-center justify-center mb-6">
                 <Activity className="w-8 h-8 text-muted-foreground" />
               </div>
@@ -173,7 +177,7 @@ export default function Dashboard() {
             {stats.map((stat, index) => (
               <div
                 key={stat.label}
-                className="glass-card p-4 animate-slide-up"
+                className="bg-white border rounded-xl shadow-sm p-4 animate-slide-up hover:shadow-md transition-shadow"
                 style={{ animationDelay: `${index * 50}ms` }}
               >
                 <div className="flex items-center justify-between mb-2">
@@ -185,30 +189,40 @@ export default function Dashboard() {
                     {stat.change}
                   </span>
                 </div>
-                <p className="text-xl font-bold font-mono">{stat.value}</p>
+                <p className="text-xl font-bold font-mono text-foreground">{stat.value}</p>
                 <p className="text-xs text-muted-foreground mt-1">{stat.label}</p>
               </div>
             ))}
           </div>
 
-          {/* Charts Row */}
+          {/* Main Grid: Chart & Status */}
           <div className="grid lg:grid-cols-3 gap-6">
-            <div className="lg:col-span-2">
-              <PerformanceChart />
+            {/* TradingView Chart (2/3) */}
+            <div className="lg:col-span-2 bg-white border rounded-xl shadow-sm p-1 overflow-hidden animate-slide-up h-[500px]">
+              <TradingViewWidget symbol={currentSymbol} theme="light" />
             </div>
-            <div>
+
+            {/* Account Status (1/3) */}
+            <div className="lg:col-span-1">
               <StatusPanel account={selectedAccount} />
             </div>
           </div>
 
-          {/* Second Row - Activity Log */}
+          {/* Performance & Activity Grid */}
           <div className="grid lg:grid-cols-3 gap-6">
+            {/* Portfolio Performance (2/3) */}
             <div className="lg:col-span-2">
-              <ActivePositions accountId={selectedAccount?.id} />
+              <PerformanceChart />
             </div>
-            <div>
+            {/* Activity Log (1/3) */}
+            <div className="lg:col-span-1">
               <AIConsole botName={bots.find(b => b.id === selectedBotId)?.bot_version?.label || "Trading Bot"} />
             </div>
+          </div>
+
+          {/* Active Positions (Full width at bottom) */}
+          <div className="bg-white border rounded-xl shadow-sm overflow-hidden">
+            <ActivePositions accountId={selectedAccount?.id} />
           </div>
         </div>
       )}
