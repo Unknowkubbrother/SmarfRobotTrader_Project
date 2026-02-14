@@ -1,7 +1,18 @@
-import { Power, Play, Activity, TrendingUp, Trash2 } from "lucide-react";
+import { useState } from "react";
+import { Power, Play, Activity, TrendingUp, Trash2, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { BotConfigWithVersion } from "@/hooks/useTradingAccounts";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 interface BotCardProps {
   bot: BotConfigWithVersion;
@@ -12,18 +23,33 @@ interface BotCardProps {
   showDelete?: boolean;
 }
 
-export function BotCard({ 
-  bot, 
-  onToggleStatus, 
-  onDelete, 
+export function BotCard({
+  bot,
+  onToggleStatus,
+  onDelete,
   onSelect,
   isSelected = false,
-  showDelete = true 
+  showDelete = true
 }: BotCardProps) {
+  const [showStopConfirm, setShowStopConfirm] = useState(false);
   const status = bot.status || "stopped";
   const symbol = bot.bot_version?.symbol || "N/A";
   const label = bot.bot_version?.label || "No Model";
   const riskLevel = bot.risk_level || "medium";
+
+  const handleToggleClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (status === "running") {
+      setShowStopConfirm(true);
+    } else {
+      onToggleStatus(bot.id, "running");
+    }
+  };
+
+  const handleConfirmStop = () => {
+    onToggleStatus(bot.id, "stopped");
+    setShowStopConfirm(false);
+  };
 
   const getStatusBadge = (status: string | null) => {
     switch (status) {
@@ -59,84 +85,108 @@ export function BotCard({
   };
 
   return (
-    <div 
-      className={cn(
-        "glass-card p-4 transition-all cursor-pointer hover:border-primary/50",
-        isSelected && "border-primary ring-1 ring-primary/20"
-      )}
-      onClick={() => onSelect?.(bot.id)}
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex items-center gap-3 flex-1 min-w-0">
-          <div className={cn(
-            "w-10 h-10 rounded-xl flex items-center justify-center shrink-0",
-            status === "running" ? "bg-success/10" : "bg-secondary"
-          )}>
-            <Activity className={cn(
-              "w-5 h-5",
-              status === "running" ? "text-success" : "text-muted-foreground"
-            )} />
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2 flex-wrap">
-              <h4 className="font-medium text-sm truncate">{label}</h4>
-              {getStatusBadge(status)}
-            </div>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              <span className="font-mono">{symbol}</span>
-              <span className="mx-1.5">•</span>
-              <span className={getRiskColor(riskLevel)}>{riskLevel} risk</span>
-            </p>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2">
-          {bot.today_pnl !== 0 && (
-            <div className="flex items-center gap-1 px-2 py-1 rounded-md bg-secondary">
-              <TrendingUp className={cn(
-                "w-3 h-3",
-                bot.today_pnl >= 0 ? "text-success" : "text-destructive"
+    <>
+      <div
+        className={cn(
+          "glass-card p-4 transition-all cursor-pointer hover:border-primary/50",
+          isSelected && "border-primary ring-1 ring-primary/20"
+        )}
+        onClick={() => onSelect?.(bot.id)}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-3 flex-1 min-w-0">
+            <div className={cn(
+              "w-10 h-10 rounded-xl flex items-center justify-center shrink-0",
+              status === "running" ? "bg-success/10" : "bg-secondary"
+            )}>
+              <Activity className={cn(
+                "w-5 h-5",
+                status === "running" ? "text-success" : "text-muted-foreground"
               )} />
-              <span className={cn(
-                "text-xs font-mono font-medium",
-                bot.today_pnl >= 0 ? "text-success" : "text-destructive"
-              )}>
-                {bot.today_pnl >= 0 ? "+" : ""}${bot.today_pnl.toFixed(2)}
-              </span>
             </div>
-          )}
-          
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-8 w-8 p-0"
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggleStatus(bot.id, status === "running" ? "stopped" : "running");
-            }}
-          >
-            {status === "running" ? (
-              <Power className="w-4 h-4 text-destructive" />
-            ) : (
-              <Play className="w-4 h-4 text-success" />
-            )}
-          </Button>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h4 className="font-medium text-sm truncate">{label}</h4>
+                {getStatusBadge(status)}
+              </div>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                <span className="font-mono">{symbol}</span>
+                <span className="mx-1.5">•</span>
+                <span className={getRiskColor(riskLevel)}>{riskLevel} risk</span>
+              </p>
+            </div>
+          </div>
 
-          {showDelete && onDelete && (
+          <div className="flex items-center gap-2">
+            {bot.today_pnl !== 0 && (
+              <div className="flex items-center gap-1 px-2 py-1 rounded-md bg-secondary">
+                <TrendingUp className={cn(
+                  "w-3 h-3",
+                  bot.today_pnl >= 0 ? "text-success" : "text-destructive"
+                )} />
+                <span className={cn(
+                  "text-xs font-mono font-medium",
+                  bot.today_pnl >= 0 ? "text-success" : "text-destructive"
+                )}>
+                  {bot.today_pnl >= 0 ? "+" : ""}${bot.today_pnl.toFixed(2)}
+                </span>
+              </div>
+            )}
+
             <Button
               variant="ghost"
               size="sm"
-              className="h-8 w-8 p-0 hover:bg-destructive/10"
-              onClick={(e) => {
-                e.stopPropagation();
-                onDelete(bot.id);
-              }}
+              className="h-8 w-8 p-0"
+              onClick={handleToggleClick}
             >
-              <Trash2 className="w-4 h-4 text-muted-foreground hover:text-destructive" />
+              {status === "running" ? (
+                <Power className="w-4 h-4 text-destructive" />
+              ) : (
+                <Play className="w-4 h-4 text-success" />
+              )}
             </Button>
-          )}
+
+            {showDelete && onDelete && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 w-8 p-0 hover:bg-destructive/10"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDelete(bot.id);
+                }}
+              >
+                <Trash2 className="w-4 h-4 text-muted-foreground hover:text-destructive" />
+              </Button>
+            )}
+          </div>
         </div>
       </div>
-    </div>
+
+      <AlertDialog open={showStopConfirm} onOpenChange={setShowStopConfirm}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Stop Bot?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to stop this bot? It will stop processing new signals.
+              <br />
+              Open positions will need to be managed manually.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={(e) => e.stopPropagation()}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.stopPropagation();
+                handleConfirmStop();
+              }}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Stop Bot
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   );
 }

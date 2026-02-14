@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Power, AlertOctagon, Clock, Shield, Play, Activity, TrendingUp, RefreshCw, Sparkles, Plus, Trash2 } from "lucide-react";
+import { Power, AlertOctagon, Clock, Shield, Play, Activity, TrendingUp, RefreshCw, Sparkles, Plus, Trash2, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -57,7 +57,18 @@ export default function BotControl() {
   const [schedule, setSchedule] = useState(defaultSchedule);
   const [showModelDialog, setShowModelDialog] = useState(false);
   const [addBotOpen, setAddBotOpen] = useState(false);
+
+  // Confirmation States
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [stopConfirmOpen, setStopConfirmOpen] = useState(false);
+  const [panicConfirmOpen, setPanicConfirmOpen] = useState(false);
+  const [riskConfirmOpen, setRiskConfirmOpen] = useState(false);
+  const [pendingRiskId, setPendingRiskId] = useState<string | null>(null);
+  const [modelConfirmOpen, setModelConfirmOpen] = useState(false);
+  const [pendingModelId, setPendingModelId] = useState<string | null>(null);
+  const [scheduleConfirmOpen, setScheduleConfirmOpen] = useState(false);
+  const [pendingDay, setPendingDay] = useState<string | null>(null);
+
   const [availableModels, setAvailableModels] = useState<BotVersion[]>([]);
 
   // Load available bot versions on mount
@@ -117,42 +128,94 @@ export default function BotControl() {
     }
   }, [selectedBot]);
 
-  const handleToggleBot = async () => {
+  const handleToggleBotClick = () => {
     if (!selectedBot) return;
     const currentStatus = selectedBot.status || "stopped";
-    const newStatus = currentStatus === "running" ? "stopped" : "running";
+    if (currentStatus === "running") {
+      setStopConfirmOpen(true);
+    } else {
+      performBotToggle("running");
+    }
+  };
+
+  const performBotToggle = async (newStatus: "running" | "stopped") => {
+    if (!selectedBot) return;
     const success = await updateBotStatus(selectedBot.id, newStatus);
     if (success) {
       toast.success(newStatus === "running" ? "Bot started successfully" : "Bot stopped successfully");
     }
+    setStopConfirmOpen(false);
   };
 
-  const handlePanicButton = async () => {
+  const handlePanicClick = () => {
+    setPanicConfirmOpen(true);
+  };
+
+  const performPanicStop = async () => {
     if (!selectedBot) return;
     await updateBotStatus(selectedBot.id, "stopped");
     toast.error("Emergency: Bot stopped and closing all positions...");
+    setPanicConfirmOpen(false);
   };
 
-  const toggleDay = async (day: string) => {
+  const matchDay = (dayName: string) => {
+    // Helper to match localized day names if needed, but here simple match
+    return dayName;
+  }
+
+  const handleDayClick = (day: string) => {
     if (!selectedBot) return;
-    const newSchedule = schedule.map(s => s.day === day ? { ...s, enabled: !s.enabled } : s);
+    setPendingDay(day);
+    setScheduleConfirmOpen(true);
+  };
+
+  const performScheduleToggle = async () => {
+    if (!selectedBot || !pendingDay) return;
+
+    const newSchedule = schedule.map(s => s.day === pendingDay ? { ...s, enabled: !s.enabled } : s);
     setSchedule(newSchedule);
+
+    // Convert to lowercase for API: "Mon" -> "mon"
     const scheduleObj = Object.fromEntries(newSchedule.map(s => [s.day.toLowerCase(), s.enabled]));
     await updateBotSchedule(selectedBot.id, scheduleObj);
+
+    const isEnabled = newSchedule.find(s => s.day === pendingDay)?.enabled;
+    toast.success(`Trading for ${pendingDay} is now ${isEnabled ? "enabled" : "disabled"}`);
+
+    setScheduleConfirmOpen(false);
+    setPendingDay(null);
   };
 
-  const handleRiskChange = async (riskId: string) => {
-    if (!selectedBot) return;
-    setSelectedRisk(riskId);
-    await updateBotRisk(selectedBot.id, riskId);
+  const handleRiskClick = (riskId: string) => {
+    if (riskId === selectedRisk) return;
+    setPendingRiskId(riskId);
+    setRiskConfirmOpen(true);
   };
 
-  const handleChangeModel = async (modelId: string) => {
-    if (!selectedBot) return;
-    const success = await changeModel(selectedBot.id, modelId);
+  const performRiskChange = async () => {
+    if (!selectedBot || !pendingRiskId) return;
+    setSelectedRisk(pendingRiskId);
+    await updateBotRisk(selectedBot.id, pendingRiskId);
+    toast.success(`Risk level updated to ${pendingRiskId}`);
+    setRiskConfirmOpen(false);
+    setPendingRiskId(null);
+  };
+
+  const handleModelSelect = (modelId: string) => {
+    if (modelId === selectedBot?.model_id) return;
+    setPendingModelId(modelId);
+    setModelConfirmOpen(true);
+  };
+
+  const performModelChange = async () => {
+    if (!selectedBot || !pendingModelId) return;
+    const success = await changeModel(selectedBot.id, pendingModelId);
     if (success) {
+      toast.success("Trading model updated successfully");
       setShowModelDialog(false);
     }
+    setModelConfirmOpen(false);
+    setPendingModelId(null);
   };
 
   const handleDeleteBot = async () => {
@@ -178,6 +241,9 @@ export default function BotControl() {
         return <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-muted text-muted-foreground"><span className="w-1.5 h-1.5 rounded-full bg-muted-foreground" />Stopped</span>;
     }
   };
+
+  const pendingRiskLabel = riskLevels.find(r => r.id === pendingRiskId)?.label;
+  const pendingModelLabel = availableModels.find(m => m.model_id === pendingModelId)?.label;
 
   return (
     <div className="space-y-6">
@@ -247,10 +313,10 @@ export default function BotControl() {
                       <RefreshCw className="w-4 h-4" />
                       Change Model
                     </Button>
-                    <Button variant="outline" className="gap-2" onClick={handleToggleBot}>
+                    <Button variant="outline" className="gap-2" onClick={handleToggleBotClick}>
                       {botStatus === "running" ? <><Power className="w-4 h-4" />Stop</> : <><Play className="w-4 h-4" />Start</>}
                     </Button>
-                    <Button variant="destructive" onClick={handlePanicButton} className="gap-2">
+                    <Button variant="destructive" onClick={handlePanicClick} className="gap-2">
                       <AlertOctagon className="w-4 h-4" />
                       Emergency Stop
                     </Button>
@@ -287,7 +353,7 @@ export default function BotControl() {
                   {riskLevels.map((level) => (
                     <button
                       key={level.id}
-                      onClick={() => handleRiskChange(level.id)}
+                      onClick={() => handleRiskClick(level.id)}
                       className={cn(
                         "w-full p-4 rounded-xl border text-left transition-all",
                         selectedRisk === level.id
@@ -317,7 +383,7 @@ export default function BotControl() {
                   {schedule.map((day) => (
                     <button
                       key={day.day}
-                      onClick={() => toggleDay(day.day)}
+                      onClick={() => handleDayClick(day.day)}
                       className={cn(
                         "py-3 rounded-xl text-sm font-medium transition-all",
                         day.enabled
@@ -360,7 +426,7 @@ export default function BotControl() {
                   "rounded-2xl border border-border overflow-hidden hover:border-primary transition-colors cursor-pointer",
                   selectedBot?.model_id === model.model_id && "ring-2 ring-primary border-primary"
                 )}
-                onClick={() => handleChangeModel(model.model_id)}
+                onClick={() => handleModelSelect(model.model_id)}
               >
                 <div className="bg-gradient-to-r from-[#0f3460] to-[#16537e] p-4 text-white">
                   <div className="flex items-center justify-between mb-1">
@@ -404,7 +470,7 @@ export default function BotControl() {
                     className="w-full gap-2"
                     onClick={(e) => {
                       e.stopPropagation();
-                      handleChangeModel(model.model_id);
+                      handleModelSelect(model.model_id);
                     }}
                     variant={selectedBot?.model_id === model.model_id ? "secondary" : "default"}
                     disabled={selectedBot?.model_id === model.model_id}
@@ -447,6 +513,113 @@ export default function BotControl() {
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={handleDeleteBot} className="bg-destructive text-destructive-foreground hover:bg-destructive/90">
               Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Stop Confirmation */}
+      <AlertDialog open={stopConfirmOpen} onOpenChange={setStopConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Stop Bot?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to stop this bot? It will stop processing new signals immediately.
+              <br />
+              Existing positions will need to be managed manually.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => performBotToggle("stopped")}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Stop Bot
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Emergency Stop Confirmation */}
+      <AlertDialog open={panicConfirmOpen} onOpenChange={setPanicConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2 text-destructive">
+              <AlertTriangle className="w-5 h-5" />
+              EMERGENCY STOP
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This will immediately STOP the bot and attempt to CLOSE ALL OPEN POSITIONS.
+              <br />
+              Use this only in emergency situations. Are you sure?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={performPanicStop}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              CONFIRM EMERGENCY STOP
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Risk Change Confirmation */}
+      <AlertDialog open={riskConfirmOpen} onOpenChange={setRiskConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Change Risk Level</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to change the risk level to <strong>{pendingRiskLabel}</strong>?
+              <br />
+              This will affect position sizing and stop-loss parameters for future trades.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setPendingRiskId(null)}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={performRiskChange}>
+              Confirm Change
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Model Change Confirmation */}
+      <AlertDialog open={modelConfirmOpen} onOpenChange={setModelConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Change Trading Model</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to switch to <strong>{pendingModelLabel}</strong>?
+              <br />
+              The bot will be updated with the new model's logic and parameters.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setPendingModelId(null)}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={performModelChange}>
+              Confirm Switch
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Schedule Change Confirmation */}
+      <AlertDialog open={scheduleConfirmOpen} onOpenChange={setScheduleConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Update Trading Schedule</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to <strong>{schedule.find(s => s.day === pendingDay)?.enabled ? "disable" : "enable"}</strong> trading on <strong>{pendingDay}</strong>?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setPendingDay(null)}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={performScheduleToggle}>
+              Confirm Update
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
