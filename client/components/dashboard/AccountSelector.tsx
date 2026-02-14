@@ -9,17 +9,23 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AddAccountDialog } from "@/components/dialogs/AddAccountDialog";
-import { useTradingAccounts, AccountWithBots } from "@/hooks/useTradingAccounts";
+import { AccountWithBots } from "@/hooks/useTradingAccounts";
 import { Skeleton } from "@/components/ui/skeleton";
 
 interface AccountSelectorProps {
   selectedAccount: AccountWithBots | null;
   onAccountChange: (account: AccountWithBots) => void;
+  accounts: AccountWithBots[];
+  isLoading: boolean;
+  onRefresh: () => void;
 }
 
-export function AccountSelector({ selectedAccount, onAccountChange }: AccountSelectorProps) {
-  const { accounts, loading, refetch, getRunningBotsCount } = useTradingAccounts();
+export function AccountSelector({ selectedAccount, onAccountChange, accounts, isLoading, onRefresh }: AccountSelectorProps) {
   const [dialogOpen, setDialogOpen] = useState(false);
+
+  const getRunningBotsCount = (account: AccountWithBots) => {
+    return account.bot_configurations.filter((b) => b.container_status === "running").length;
+  };
 
   const getStatusColor = (account: AccountWithBots) => {
     const runningCount = getRunningBotsCount(account);
@@ -36,7 +42,7 @@ export function AccountSelector({ selectedAccount, onAccountChange }: AccountSel
     return `${total} Bots`;
   };
 
-  if (loading) {
+  if (isLoading) {
     return (
       <div className="flex items-center gap-3 px-4 py-3 rounded-lg bg-card border border-border w-full md:w-auto min-w-[320px]">
         <Skeleton className="w-10 h-10 rounded-lg" />
@@ -115,7 +121,7 @@ export function AccountSelector({ selectedAccount, onAccountChange }: AccountSel
             ))
           )}
           <DropdownMenuSeparator />
-          <DropdownMenuItem 
+          <DropdownMenuItem
             onClick={() => setDialogOpen(true)}
             className="flex items-center gap-3 p-3 cursor-pointer text-primary"
           >
@@ -124,14 +130,14 @@ export function AccountSelector({ selectedAccount, onAccountChange }: AccountSel
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      
-      <AddAccountDialog 
-        open={dialogOpen} 
+
+      <AddAccountDialog
+        open={dialogOpen}
         onOpenChange={setDialogOpen}
         onAccountAdded={() => {
-          refetch();
+          onRefresh();
           setDialogOpen(false);
-        }} 
+        }}
       />
     </div>
   );

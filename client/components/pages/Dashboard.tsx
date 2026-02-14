@@ -7,15 +7,19 @@ import { AIConsole } from "@/components/dashboard/AIConsole";
 import { AccountSelector, AccountWithBots } from "@/components/dashboard/AccountSelector";
 import { BotCard } from "@/components/dashboard/BotCard";
 import { AddBotDialog } from "@/components/dialogs/AddBotDialog";
+import { AddAccountDialog } from "@/components/dialogs/AddAccountDialog";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { useTradingAccounts, BotConfigWithVersion } from "@/hooks/useTradingAccounts";
+import { BotSelector } from "@/components/dashboard/BotSelector";
 
 export default function Dashboard() {
-  const { accounts, updateBotStatus, deleteBot, refetch } = useTradingAccounts();
+  const { accounts, loading, updateBotStatus, deleteBot, refetch } = useTradingAccounts();
   const [selectedAccount, setSelectedAccount] = useState<AccountWithBots | null>(null);
+  const [selectedBotId, setSelectedBotId] = useState<string | null>(null);
   const [addBotOpen, setAddBotOpen] = useState(false);
+  const [addAccountOpen, setAddAccountOpen] = useState(false);
 
   // Auto-select first account when accounts load
   useEffect(() => {
@@ -33,6 +37,11 @@ export default function Dashboard() {
       }
     }
   }, [accounts, selectedAccount]);
+
+  // Reset bot selection when account changes
+  useEffect(() => {
+    setSelectedBotId(null);
+  }, [selectedAccount?.id]);
 
   const handleToggleBotStatus = async (botId: string, newStatus: "running" | "stopped") => {
     const success = await updateBotStatus(botId, newStatus);
@@ -68,49 +77,75 @@ export default function Dashboard() {
           <h1 className="text-xl font-semibold text-foreground">Dashboard</h1>
           <p className="text-sm text-muted-foreground">Monitor your trading performance</p>
         </div>
-        
-        {/* Account Selector */}
-        <AccountSelector 
-          selectedAccount={selectedAccount} 
-          onAccountChange={setSelectedAccount} 
-        />
+
+        {/* Selectors Row */}
+        <div className="flex flex-col md:flex-row gap-4">
+          <AccountSelector
+            selectedAccount={selectedAccount}
+            onAccountChange={setSelectedAccount}
+            accounts={accounts}
+            isLoading={loading}
+            onRefresh={refetch}
+          />
+
+          {selectedAccount && (
+            <BotSelector
+              bots={selectedAccount.bot_configurations}
+              selectedBotId={selectedBotId}
+              onBotSelect={setSelectedBotId}
+              accountId={selectedAccount.id}
+              onBotAdded={refetch}
+            />
+          )}
+        </div>
       </div>
 
-      {/* Bot Cards Grid */}
-      {selectedAccount && (
-        <div className="space-y-3">
+      {/* Main Content Area */}
+      {!selectedAccount ? (
+        <div className="glass-card p-12 text-center animate-slide-up flex flex-col items-center justify-center min-h-[400px]">
+          <div className="w-16 h-16 bg-secondary rounded-2xl flex items-center justify-center mb-6">
+            <Wallet className="w-8 h-8 text-muted-foreground" />
+          </div>
+          <h2 className="text-xl font-semibold mb-2">Connect Your Trading Account</h2>
+          <p className="text-muted-foreground max-w-md mx-auto mb-8">
+            Link your MT5 broker account to start trading with our AI-powered bots.
+          </p>
+          <Button onClick={() => setAddAccountOpen(true)} className="gap-2">
+            <Plus className="w-4 h-4" />
+            Add Trading Account
+          </Button>
+        </div>
+      ) : !selectedBotId ? (
+        <div className="space-y-6 animate-slide-up">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-medium text-muted-foreground">
-              Active Bots ({bots.length})
+            <h2 className="text-lg font-semibold text-foreground">
+              Select a Bot to View Dashboard
             </h2>
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-2"
-              onClick={() => setAddBotOpen(true)}
-            >
+            <Button onClick={() => setAddBotOpen(true)} className="gap-2">
               <Plus className="w-4 h-4" />
-              Add Bot
+              Create New Bot
             </Button>
           </div>
-          
+
           {bots.length === 0 ? (
-            <div className="glass-card p-8 text-center animate-slide-up">
-              <Activity className="w-12 h-12 text-muted-foreground mx-auto mb-3" />
-              <h3 className="font-medium mb-1">No bots configured</h3>
-              <p className="text-sm text-muted-foreground mb-4">
-                Add a bot to start automated trading
+            <div className="glass-card p-12 text-center flex flex-col items-center justify-center min-h-[300px]">
+              <div className="w-16 h-16 bg-secondary rounded-2xl flex items-center justify-center mb-6">
+                <Activity className="w-8 h-8 text-muted-foreground" />
+              </div>
+              <h3 className="text-xl font-medium mb-2">No bots configured</h3>
+              <p className="text-muted-foreground mb-6">
+                Create a bot to start automated trading and view performance analytics.
               </p>
               <Button onClick={() => setAddBotOpen(true)} className="gap-2">
                 <Plus className="w-4 h-4" />
-                Add Your First Bot
+                Create Your First Bot
               </Button>
             </div>
           ) : (
             <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
               {bots.map((bot, index) => (
-                <div 
-                  key={bot.id} 
+                <div
+                  key={bot.id}
                   className="animate-slide-up"
                   style={{ animationDelay: `${index * 50}ms` }}
                 >
@@ -118,56 +153,65 @@ export default function Dashboard() {
                     bot={bot}
                     onToggleStatus={handleToggleBotStatus}
                     onDelete={handleDeleteBot}
+                    onSelect={setSelectedBotId}
+                    showDelete={true}
                   />
                 </div>
               ))}
             </div>
           )}
         </div>
-      )}
-
-      {/* Stats Grid - 6 cards matching design */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-        {stats.map((stat, index) => (
-          <div 
-            key={stat.label} 
-            className="glass-card p-4 animate-slide-up"
-            style={{ animationDelay: `${index * 50}ms` }}
-          >
-            <div className="flex items-center justify-between mb-2">
-              <stat.icon className="w-5 h-5 text-muted-foreground" />
-              <span className={cn(
-                "text-xs font-medium",
-                stat.changeType === "positive" ? "text-success" : "text-destructive"
-              )}>
-                {stat.change}
-              </span>
-            </div>
-            <p className="text-xl font-bold font-mono">{stat.value}</p>
-            <p className="text-xs text-muted-foreground mt-1">{stat.label}</p>
+      ) : (
+        <div className="space-y-6 animate-fade-in">
+          <div className="flex items-center gap-2 mb-2">
+            <Button variant="ghost" size="sm" onClick={() => setSelectedBotId(null)} className="text-muted-foreground hover:text-foreground">
+              ← Back to Bots
+            </Button>
           </div>
-        ))}
-      </div>
+          {/* Stats Grid */}
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+            {stats.map((stat, index) => (
+              <div
+                key={stat.label}
+                className="glass-card p-4 animate-slide-up"
+                style={{ animationDelay: `${index * 50}ms` }}
+              >
+                <div className="flex items-center justify-between mb-2">
+                  <stat.icon className="w-5 h-5 text-muted-foreground" />
+                  <span className={cn(
+                    "text-xs font-medium",
+                    stat.changeType === "positive" ? "text-success" : "text-destructive"
+                  )}>
+                    {stat.change}
+                  </span>
+                </div>
+                <p className="text-xl font-bold font-mono">{stat.value}</p>
+                <p className="text-xs text-muted-foreground mt-1">{stat.label}</p>
+              </div>
+            ))}
+          </div>
 
-      {/* Charts Row */}
-      <div className="grid lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-2">
-          <PerformanceChart />
-        </div>
-        <div>
-          <StatusPanel account={selectedAccount} />
-        </div>
-      </div>
+          {/* Charts Row */}
+          <div className="grid lg:grid-cols-3 gap-6">
+            <div className="lg:col-span-2">
+              <PerformanceChart />
+            </div>
+            <div>
+              <StatusPanel account={selectedAccount} />
+            </div>
+          </div>
 
-      {/* Second Row - Activity Log */}
-      <div className="grid lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-2">
-          <ActivePositions accountId={selectedAccount?.id} />
+          {/* Second Row - Activity Log */}
+          <div className="grid lg:grid-cols-3 gap-6">
+            <div className="lg:col-span-2">
+              <ActivePositions accountId={selectedAccount?.id} />
+            </div>
+            <div>
+              <AIConsole botName={bots.find(b => b.id === selectedBotId)?.bot_version?.label || "Trading Bot"} />
+            </div>
+          </div>
         </div>
-        <div>
-          <AIConsole botName={bots[0]?.bot_version?.label || "Trading Bot"} />
-        </div>
-      </div>
+      )}
 
       {/* Add Bot Dialog */}
       {selectedAccount && (
@@ -178,6 +222,12 @@ export default function Dashboard() {
           onBotAdded={refetch}
         />
       )}
+
+      <AddAccountDialog
+        open={addAccountOpen}
+        onOpenChange={setAddAccountOpen}
+        onAccountAdded={refetch}
+      />
     </div>
   );
 }

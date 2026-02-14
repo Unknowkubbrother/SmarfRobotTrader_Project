@@ -41,6 +41,7 @@ const defaultSchedule = [
 export default function BotControl() {
   const {
     accounts,
+    loading,
     updateBotStatus,
     updateBotRisk,
     updateBotSchedule,
@@ -188,13 +189,23 @@ export default function BotControl() {
 
         {/* Account & Bot Selectors */}
         <div className="flex flex-wrap items-center gap-3">
-          <AccountSelector selectedAccount={selectedAccount} onAccountChange={setSelectedAccount} />
+          <AccountSelector
+            selectedAccount={selectedAccount}
+            onAccountChange={setSelectedAccount}
+            accounts={accounts}
+            isLoading={loading}
+            onRefresh={refetch}
+          />
           {selectedAccount && (
             <BotSelector
               bots={bots}
-              selectedBot={selectedBot}
-              onBotChange={setSelectedBot}
-              onAddBot={() => setAddBotOpen(true)}
+              selectedBotId={selectedBot?.id || null}
+              onBotSelect={(botId) => {
+                const bot = bots.find(b => b.id === botId);
+                if (bot) setSelectedBot(bot);
+              }}
+              accountId={selectedAccount.id}
+              onBotAdded={refetch}
             />
           )}
         </div>
