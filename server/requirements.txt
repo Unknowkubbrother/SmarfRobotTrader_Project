@@ -9,3 +9,4 @@ python-dotenv
 pydantic
 firebase-admin
 resend
+stripe

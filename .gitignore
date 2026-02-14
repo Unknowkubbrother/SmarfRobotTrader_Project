@@ -5,3 +5,4 @@ EURUSD_ticks_2009_to_2025.csv
 EURUSD_1sec_bars.csv
 features_for_rl.csv
 tensorboard
+.codex

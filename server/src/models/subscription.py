@@ -1,0 +1,60 @@
+from typing import List, Optional
+
+from pydantic import BaseModel
+
+
+class CreateSetupIntentResponse(BaseModel):
+    client_secret: str
+
+
+class AttachPaymentMethodRequest(BaseModel):
+    paymentMethodId: str
+    setAsDefault: bool = False
+
+
+class PaymentMethodResponse(BaseModel):
+    id: str
+    type: Optional[str] = None
+    card_last4: Optional[str] = None
+    card_brand: Optional[str] = None
+    expiry_month: Optional[int] = None
+    expiry_year: Optional[int] = None
+    is_default: bool = False
+
+
+class InvoiceResponse(BaseModel):
+    id: str
+    billing_start_date: Optional[str] = None
+    billing_end_date: Optional[str] = None
+    total_period_profit: float = 0.0
+    calculated_fee: float = 0.0
+    status: Optional[str] = None
+    payment_method_used: Optional[str] = None
+    paid_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class SubscriptionResponse(BaseModel):
+    id: str
+    status: str
+    fee_type: str
+    fee_value: float
+    min_profit_threshold: float
+    next_billing_date: Optional[str] = None
+    default_payment_method_id: Optional[str] = None
+
+
+class WeeklyPreviewResponse(BaseModel):
+    week_start: str
+    week_end: str
+    gross_profit: float
+    gross_loss: float
+    net_profit: float
+    estimated_fee: float
+
+
+class SubscriptionSummaryResponse(BaseModel):
+    subscription: SubscriptionResponse
+    invoices: List[InvoiceResponse]
+    payment_methods: List[PaymentMethodResponse]
+    weekly_preview: WeeklyPreviewResponse
