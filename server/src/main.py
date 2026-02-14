@@ -7,7 +7,7 @@ import jwt
 import os
 from fastapi.staticfiles import StaticFiles
 
-from .routes import authentication, bot, trading, account_settings
+from .routes import authentication, bot, trading, account_settings, notification, search
 from .database.client import db
 
 SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
@@ -106,6 +106,8 @@ app.include_router(authentication.auth_router, prefix="/auth")
 app.include_router(bot.bot_router, prefix="/bot")
 app.include_router(trading.trading_router, prefix="/trading")
 app.include_router(account_settings.settings_router, prefix="/settings")
+app.include_router(notification.notification_router, prefix="/notifications")
+app.include_router(search.search_router, prefix="/search")
 
 # uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 # cloudflared tunnel --url http://localhost:8000

@@ -10,6 +10,60 @@ from ..database.client import db
 
 trading_router = APIRouter()
 
+@trading_router.get("/calendar", tags=["trading"])
+async def get_trading_calendar(request: Request, year: int, month: int):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+    
+    # Calculate start and end date for the month
+    try:
+        start_date = date(year, month, 1)
+        if month == 12:
+            end_date = date(year + 1, 1, 1)
+        else:
+            end_date = date(year, month + 1, 1)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid year or month")
+    
+    # Fetch aggregates for all user's accounts within the date range
+    aggregates = await db.dailyaggregate.find_many(
+        where={
+            "account": {
+                "userId": request.state.user_id
+            },
+            "date": {
+                "gte": datetime.combine(start_date, datetime.min.time()),
+                "lt": datetime.combine(end_date, datetime.min.time())
+            }
+        }
+    )
+    
+    # Group by date and sum profits
+    calendar_data = {}
+    for agg in aggregates:
+        # agg.date might be datetime or date, normalize to day number
+        day = agg.date.day
+        if day not in calendar_data:
+            calendar_data[day] = {
+                "date": day,
+                "profit": 0.0,
+                "trades": 0,
+                "winRate": 0.0 # Placeholder, would need detailed trade data for real winrate
+            }
+        
+        # safely add values
+        profit = float(agg.dailyNetProfit) if agg.dailyNetProfit else 0.0
+        trades = agg.totalTrades if agg.totalTrades else 0
+        
+        calendar_data[day]["profit"] += profit
+        calendar_data[day]["trades"] += trades
+        
+    # Convert to list
+    return {
+        "status_code": 200,
+        "data": list(calendar_data.values())
+    }
+
 @trading_router.get("/accounts_with_bots", tags=["trading"])
 async def get_accounts_with_bots(request: Request):
     if not request.state.user_id:
