@@ -29,6 +29,7 @@ class UserProfileResponse(BaseModel):
     avatarUrl: Optional[str] = None
     # Settings that are part of profile
     notificationConfig: Optional[NotificationConfigResponse] = None
+    hasPassword: bool = False
 
 class UpdateProfileRequest(BaseModel):
     username: Optional[str] = Field(None, min_length=2, max_length=50)
@@ -37,7 +38,7 @@ class UpdateProfileRequest(BaseModel):
     avatarUrl: Optional[str] = None
 
 class UpdatePasswordRequest(BaseModel):
-    currentPassword: str
+    otp: str
     newPassword: str = Field(..., min_length=6)
 
 class UpdateNotificationsRequest(BaseModel):

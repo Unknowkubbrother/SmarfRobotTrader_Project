@@ -176,7 +176,7 @@ export default function Login() {
             // Check if we need to set password
             if (isGoogleUser && !hasPassword) {
                 // setStep(4);
-                toast.success("Login verified! Please set a password.");
+                toast.success("Login verified!");
             } else {
                 toast.success("Login verified!");
                 router.push("/");

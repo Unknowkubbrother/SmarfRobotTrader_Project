@@ -5,7 +5,8 @@ import os
 import shutil
 import time
 
-from ..database.client import db
+from ..database.client import db, r_cache
+from lib.untils import random_with_N_digits, send_otp_email
 from ..models.settings import (
     UserProfileResponse, 
     NotificationConfigResponse, 
@@ -53,8 +54,26 @@ async def get_profile(
         email=current_user.email,
         recoveryEmail=current_user.recoveryEmail,
         avatarUrl=current_user.avatarUrl,
-        notificationConfig=notify_response
+        notificationConfig=notify_response,
+        hasPassword=bool(current_user.password)
     )
+
+@settings_router.post("/security/otp")
+async def request_security_otp(
+    current_user: Annotated[any, Depends(get_current_active_user)]
+):
+    if not current_user.recoveryEmail:
+        raise HTTPException(status_code=400, detail="No recovery email set")
+
+    otp = str(random_with_N_digits(6))
+    r_cache.setex(f"security_otp:{current_user.id}", 300, otp)
+    
+    send_otp_email(current_user.recoveryEmail, otp, purpose="password_change")
+
+    return {
+        "message": "OTP sent to recovery email",
+        "recovery_email_hint": f"{current_user.recoveryEmail[:4]}****@{current_user.recoveryEmail.split('@')[1]}"
+    }
 
 @settings_router.post("/profile/avatar")
 async def upload_avatar(
@@ -145,18 +164,23 @@ async def update_password(
     data: UpdatePasswordRequest,
     current_user: Annotated[any, Depends(get_current_active_user)]
 ):
-    if not current_user.password:
-        raise HTTPException(status_code=400, detail="Please set a password first via forgot password or login flow")
+    # Verify OTP
+    stored_otp = r_cache.get(f"security_otp:{current_user.id}")
+    if not stored_otp:
+        raise HTTPException(status_code=400, detail="OTP expired or not requested")
+    
+    if stored_otp != data.otp:
+        raise HTTPException(status_code=400, detail="Invalid OTP")
 
-    if not bcrypt.checkpw(data.currentPassword.encode('utf-8'), current_user.password.encode('utf-8')):
-         raise HTTPException(status_code=400, detail="Current password incorrect")
-         
     hashed = bcrypt.hashpw(data.newPassword.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     
     await db.user.update(
         where={"id": str(current_user.id)},
         data={"password": hashed}
     )
+    
+    # Clear OTP
+    r_cache.delete(f"security_otp:{current_user.id}")
     
     return {"message": "Password updated successfully"}
 

@@ -168,6 +168,20 @@ async def login_verify(response: Response, data: Login_Verify):
         expires_delta=access_token_expires
     )
     
+se    # Log Activity
+    try:
+        await db.activitylog.create(
+            data={
+                "userId": str(user.id),
+                "topic": "Login",
+                "detail": "User logged in via Email/OTP",
+                "ipAddress": "0.0.0.0", 
+                "deviceInfo": "Unknown" 
+            }
+        )
+    except Exception as e:
+        print(f"Failed to log activity: {e}")
+
     response.set_cookie(
         key=COOKIE_NAME,
         value=access_token,
@@ -610,7 +624,21 @@ async def google_register_complete(response: Response, data: Google_Register_Com
         },
         expires_delta=access_token_expires
     )
-    
+
+    # Log Activity
+    try:
+        await db.activitylog.create(
+            data={
+                "userId": str(user.id),
+                "topic": "Login",
+                "detail": "User registered and logged in via Google",
+                "ipAddress": "0.0.0.0", 
+                "deviceInfo": "Unknown" 
+            }
+        )
+    except Exception as e:
+        print(f"Failed to log activity: {e}")
+
     response.set_cookie(
         key=COOKIE_NAME,
         value=access_token,

@@ -20,6 +20,7 @@ export interface UserProfile {
     recoveryEmail: string | null;
     avatarUrl: string | null;
     notificationConfig: NotificationConfig;
+    hasPassword: boolean;
 }
 
 export interface ActivityLog {
@@ -74,11 +75,31 @@ export function useSettings() {
         }
     };
 
-    const updatePassword = async (currentPassword: string, newPassword: string) => {
+    const requestSecurityOtp = async () => {
         try {
             setLoading(true);
-            await api.patch("/settings/password", { currentPassword, newPassword });
+            const { data } = await api.post("/settings/security/otp");
+            toast.success(data.message);
+            return data;
+        } catch (error: any) {
+            console.error("Failed to request OTP:", error);
+            toast.error(error.response?.data?.detail || "Failed to send OTP");
+            return null;
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const updatePassword = async (newPassword: string, otp: string) => {
+        try {
+            setLoading(true);
+            await api.patch("/settings/password", { newPassword, otp });
             toast.success("Password updated successfully");
+
+            if (profile) {
+                setProfile({ ...profile, hasPassword: true });
+            }
+
             return true;
         } catch (error: any) {
             console.error("Failed to update password:", error);
@@ -151,6 +172,7 @@ export function useSettings() {
         fetchActivityLogs,
         updateProfile,
         updatePassword,
+        requestSecurityOtp,
         updateNotifications,
         uploadAvatar
     };

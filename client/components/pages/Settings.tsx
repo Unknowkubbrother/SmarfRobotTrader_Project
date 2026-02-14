@@ -16,6 +16,7 @@ export default function Settings() {
     fetchActivityLogs,
     updateProfile,
     updatePassword,
+    requestSecurityOtp,
     updateNotifications,
     uploadAvatar
   } = useSettings();
@@ -39,10 +40,12 @@ export default function Settings() {
   });
 
   const [passwordForm, setPasswordForm] = useState({
-    currentPassword: "",
     newPassword: "",
     confirmPassword: ""
   });
+
+  const [showOtpInput, setShowOtpInput] = useState(false);
+  const [otp, setOtp] = useState("");
 
   const [tokenForm, setTokenForm] = useState({
     lineNotifyToken: "",
@@ -121,9 +124,22 @@ export default function Settings() {
       return;
     }
 
-    const success = await updatePassword(passwordForm.currentPassword, passwordForm.newPassword);
+    const res = await requestSecurityOtp();
+    if (res) {
+      setShowOtpInput(true);
+    }
+  };
+
+  const handleOtpSubmit = async () => {
+    if (!otp || otp.length < 6) {
+      toast.error("Please enter a valid OTP");
+      return;
+    }
+    const success = await updatePassword(passwordForm.newPassword, otp);
     if (success) {
-      setPasswordForm({ currentPassword: "", newPassword: "", confirmPassword: "" });
+      setPasswordForm({ newPassword: "", confirmPassword: "" });
+      setOtp("");
+      setShowOtpInput(false);
     }
   };
 
@@ -338,41 +354,65 @@ export default function Settings() {
           <div className="glass-card p-6 animate-slide-up">
             <div className="flex items-center gap-2 mb-6">
               <Key className="w-5 h-5 text-primary" />
-              <h3 className="text-lg font-semibold">Password & Authentication</h3>
+              <h3 className="text-lg font-semibold">
+                {profile?.hasPassword ? "Change Password" : "Set Password"}
+              </h3>
             </div>
-            <div className="space-y-4 max-w-md">
-              <div>
-                <label className="block text-sm text-muted-foreground mb-2">Current Password</label>
-                <input
-                  type="password"
-                  value={passwordForm.currentPassword}
-                  onChange={(e) => setPasswordForm({ ...passwordForm, currentPassword: e.target.value })}
-                  className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
-                />
+
+            {!showOtpInput ? (
+              <div className="space-y-4 max-w-md">
+                <div>
+                  <label className="block text-sm text-muted-foreground mb-2">New Password</label>
+                  <input
+                    type="password"
+                    value={passwordForm.newPassword}
+                    onChange={(e) => setPasswordForm({ ...passwordForm, newPassword: e.target.value })}
+                    className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
+                    placeholder="Min 6 characters"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm text-muted-foreground mb-2">Confirm New Password</label>
+                  <input
+                    type="password"
+                    value={passwordForm.confirmPassword}
+                    onChange={(e) => setPasswordForm({ ...passwordForm, confirmPassword: e.target.value })}
+                    className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
+                    placeholder="Re-enter password"
+                  />
+                </div>
+                <Button onClick={handlePasswordSave} disabled={loading}>
+                  {loading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
+                  {profile?.hasPassword ? "Update Password" : "Set Password"}
+                </Button>
               </div>
-              <div>
-                <label className="block text-sm text-muted-foreground mb-2">New Password</label>
-                <input
-                  type="password"
-                  value={passwordForm.newPassword}
-                  onChange={(e) => setPasswordForm({ ...passwordForm, newPassword: e.target.value })}
-                  className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
-                />
+            ) : (
+              <div className="space-y-4 max-w-md animate-fade-in">
+                <div className="bg-primary/10 p-3 rounded-lg border border-primary/20 text-sm text-primary mb-4">
+                  Please enter the OTP sent to your recovery email to confirm this change.
+                </div>
+                <div>
+                  <label className="block text-sm text-muted-foreground mb-2">One-Time Password (OTP)</label>
+                  <input
+                    type="text"
+                    value={otp}
+                    onChange={(e) => setOtp(e.target.value)}
+                    className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50 text-center tracking-widest font-mono"
+                    placeholder="000000"
+                    maxLength={6}
+                  />
+                </div>
+                <div className="flex gap-2">
+                  <Button onClick={handleOtpSubmit} disabled={loading} className="flex-1">
+                    {loading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
+                    Confirm & Save
+                  </Button>
+                  <Button variant="outline" onClick={() => setShowOtpInput(false)} disabled={loading}>
+                    Cancel
+                  </Button>
+                </div>
               </div>
-              <div>
-                <label className="block text-sm text-muted-foreground mb-2">Confirm New Password</label>
-                <input
-                  type="password"
-                  value={passwordForm.confirmPassword}
-                  onChange={(e) => setPasswordForm({ ...passwordForm, confirmPassword: e.target.value })}
-                  className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
-                />
-              </div>
-              <Button onClick={handlePasswordSave} disabled={loading}>
-                {loading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
-                Update Password
-              </Button>
-            </div>
+            )}
           </div>
 
           <div className="glass-card p-6 animate-slide-up" style={{ animationDelay: "100ms" }}>
