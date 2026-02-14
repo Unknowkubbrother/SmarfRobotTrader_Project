@@ -418,7 +418,7 @@ export default function Settings() {
           <div className="glass-card p-6 animate-slide-up" style={{ animationDelay: "100ms" }}>
             <div className="flex items-center gap-2 mb-6">
               <Monitor className="w-5 h-5 text-primary" />
-              <h3 className="text-lg font-semibold">Login History</h3>
+              <h3 className="text-lg font-semibold">Activity History</h3>
             </div>
             <div className="space-y-3">
               {activityLogs.length > 0 ? (
