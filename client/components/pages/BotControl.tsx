@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Power, AlertOctagon, Clock, Shield, Play, Activity, TrendingUp, RefreshCw, Sparkles, Plus, Trash2, AlertTriangle } from "lucide-react";
+import { Power, AlertOctagon, Clock, Shield, Play, Activity, TrendingUp, RefreshCw, Sparkles, Plus, Trash2, AlertTriangle, DownloadCloud } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -46,6 +46,7 @@ export default function BotControl() {
     updateBotRisk,
     updateBotSchedule,
     changeModel,
+    applyBotUpdate,
     deleteBot,
     refetch,
     getBotVersions
@@ -68,6 +69,7 @@ export default function BotControl() {
   const [pendingModelId, setPendingModelId] = useState<string | null>(null);
   const [scheduleConfirmOpen, setScheduleConfirmOpen] = useState(false);
   const [pendingDay, setPendingDay] = useState<string | null>(null);
+  const [updateConfirmOpen, setUpdateConfirmOpen] = useState(false);
 
   const [availableModels, setAvailableModels] = useState<BotVersion[]>([]);
 
@@ -218,6 +220,14 @@ export default function BotControl() {
     setPendingModelId(null);
   };
 
+  const handleApplyUpdate = async () => {
+    if (!selectedBot) return;
+    const success = await applyBotUpdate(selectedBot.id);
+    if (success) {
+      setUpdateConfirmOpen(false);
+    }
+  };
+
   const handleDeleteBot = async () => {
     if (!selectedBot) return;
     const success = await deleteBot(selectedBot.id);
@@ -299,6 +309,15 @@ export default function BotControl() {
               <div className="flex items-center gap-3 flex-wrap">
                 {selectedBot && (
                   <>
+                    {selectedBot.has_pending_update && (
+                      <Button
+                        className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
+                        onClick={() => setUpdateConfirmOpen(true)}
+                      >
+                        <DownloadCloud className="w-4 h-4" />
+                        Update Bot
+                      </Button>
+                    )}
                     <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-secondary">
                       <TrendingUp className="w-4 h-4 text-success" />
                       <span className={cn("font-mono font-medium text-success")}>
@@ -343,6 +362,32 @@ export default function BotControl() {
           {/* Risk Level & Schedule */}
           {selectedBot && (
             <div className="grid lg:grid-cols-2 gap-6">
+              {selectedBot.has_pending_update && (
+                <div className="lg:col-span-2 rounded-xl border border-primary/30 bg-primary/5 p-4">
+                  <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                    <div>
+                      <p className="text-sm font-semibold text-primary">New bot image available</p>
+                      <p className="text-xs text-muted-foreground">
+                        Installed: {selectedBot.installed_docker_image_id || "-"} | Latest: {selectedBot.latest_docker_image_id || "-"}
+                      </p>
+                      {selectedBot.latest_release_notes.length > 0 && (
+                        <ul className="mt-2 space-y-1 text-xs text-muted-foreground">
+                          {selectedBot.latest_release_notes.slice(0, 3).map((note, index) => (
+                            <li key={`${selectedBot.id}-update-note-${index}`} className="flex items-start gap-2">
+                              <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
+                              <span>{note}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                    <Button className="gap-2" onClick={() => setUpdateConfirmOpen(true)}>
+                      <DownloadCloud className="w-4 h-4" />
+                      Apply Update
+                    </Button>
+                  </div>
+                </div>
+              )}
               {/* Risk Level */}
               <div className="glass-card p-6 animate-slide-up" style={{ animationDelay: "50ms" }}>
                 <div className="flex items-center gap-2 mb-6">
@@ -620,6 +665,26 @@ export default function BotControl() {
             <AlertDialogCancel onClick={() => setPendingDay(null)}>Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={performScheduleToggle}>
               Confirm Update
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Bot Update Confirmation */}
+      <AlertDialog open={updateConfirmOpen} onOpenChange={setUpdateConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Apply Bot Update</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will stop the bot, pull the latest docker image, and restart automatically.
+              <br />
+              Latest image: <strong>{selectedBot?.latest_docker_image_id || "-"}</strong>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleApplyUpdate}>
+              Update Bot
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

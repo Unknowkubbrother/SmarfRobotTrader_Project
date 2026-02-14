@@ -39,3 +39,7 @@ class Change_Bot_Model(BaseModel):
 
 class Delete_Bot(BaseModel):
     botConfigId: str
+
+
+class Apply_Bot_Update(BaseModel):
+    botConfigId: str

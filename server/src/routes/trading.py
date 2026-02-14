@@ -90,8 +90,16 @@ async def get_accounts_with_bots(request: Request):
             bot_configs = []
             for config in account.botConfigurations:
                 bot_version = None
+                latest_image_id = None
+                latest_release_notes = []
+                latest_release_date = None
+                latest_version_tag = None
                 if config.botVersion:
                     bv = config.botVersion
+                    latest_image_id = bv.dockerImageId
+                    latest_release_notes = bv.releaseNotes or []
+                    latest_release_date = str(bv.releaseDate) if bv.releaseDate else None
+                    latest_version_tag = bv.versionTag
                     bot_version = {
                         "model_id": str(bv.modelId),
                         "label": bv.label,
@@ -101,7 +109,15 @@ async def get_accounts_with_bots(request: Request):
                         "timeframe": bv.timeframe,
                         "release_notes": bv.releaseNotes,
                     }
-                
+
+                installed_image_id = getattr(config, "installedDockerImageId", None)
+                effective_installed_image_id = installed_image_id or latest_image_id
+                has_pending_update = bool(
+                    latest_image_id
+                    and effective_installed_image_id
+                    and latest_image_id != effective_installed_image_id
+                )
+
                 bot_configs.append({
                     "id": str(config.id),
                     "account_id": str(config.accountId),
@@ -111,7 +127,13 @@ async def get_accounts_with_bots(request: Request):
                     "trading_schedule": config.tradingSchedule,
                     "is_active": config.isActive,
                     "docker_container_id": config.dockerContainerId,
+                    "installed_docker_image_id": effective_installed_image_id,
                     "container_status": config.containerStatus if config.containerStatus else None,
+                    "has_pending_update": has_pending_update,
+                    "latest_docker_image_id": latest_image_id,
+                    "latest_version_tag": latest_version_tag,
+                    "latest_release_notes": latest_release_notes if has_pending_update else [],
+                    "latest_release_date": latest_release_date if has_pending_update else None,
                     "bot_version": bot_version,
                 })
 

@@ -145,3 +145,10 @@ class CreateAdminBotVersionRequest(BaseModel):
     docker_image_id: Optional[str] = None
     is_active: bool = True
     release_notes: List[str] = Field(default_factory=list)
+
+
+class PublishAdminBotUpdateRequest(BaseModel):
+    docker_image_id: str
+    version_tag: Optional[str] = None
+    release_notes: List[str] = Field(default_factory=list)
+    notify_users: bool = True

@@ -4,7 +4,7 @@ from prisma import Json
 from ..models.bot import (
     Create_Bot_Version, Create_Bot_Configuration, RiskLevelEnum,
     Update_Bot_Status, Update_Bot_Risk, Update_Bot_Schedule,
-    Change_Bot_Model, Delete_Bot
+    Change_Bot_Model, Delete_Bot, Apply_Bot_Update
 )
 from ..database.client import db
 
@@ -111,6 +111,7 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
             "tradingSchedule": Json(tradingSchedule),
             "isActive": False,
             "containerStatus": "stopped",
+            "installedDockerImageId": bot_version.dockerImageId,
             "botInstanceId": botInstanceId
         }
     )
@@ -239,10 +240,15 @@ async def change_bot_model(request: Request, data: Change_Bot_Model):
     )
     if not new_version:
         raise HTTPException(status_code=404, detail="Bot version not found")
+    if not getattr(new_version, "isActive", True):
+        raise HTTPException(status_code=400, detail="Selected bot version is inactive")
 
     await db.botconfiguration.update(
         where={"id": data.botConfigId},
-        data={"botVersion": {"connect": {"modelId": data.newModelId}}}
+        data={
+            "botVersion": {"connect": {"modelId": data.newModelId}},
+            "installedDockerImageId": new_version.dockerImageId,
+        }
     )
 
     # Log Activity
@@ -262,6 +268,100 @@ async def change_bot_model(request: Request, data: Change_Bot_Model):
         print(f"Failed to log activity: {e}")
 
     return {"status_code": 200, "message": "Bot model changed successfully"}
+
+
+@bot_router.patch('/apply_update', tags=["bot"])
+async def apply_bot_update(request: Request, data: Apply_Bot_Update):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    config = await verify_bot_ownership(data.botConfigId, request.state.user_id)
+
+    bot_version = getattr(config, "botVersion", None)
+    if not bot_version:
+        raise HTTPException(status_code=404, detail="Bot version not found")
+
+    latest_image_id = bot_version.dockerImageId
+    if not latest_image_id:
+        raise HTTPException(status_code=400, detail="Bot version has no docker image configured")
+
+    installed_image_id = getattr(config, "installedDockerImageId", None)
+    if not installed_image_id:
+        await db.botconfiguration.update(
+            where={"id": data.botConfigId},
+            data={"installedDockerImageId": latest_image_id},
+        )
+        return {
+            "status_code": 200,
+            "message": "Bot is already on latest image",
+            "status": "up_to_date",
+            "docker_image_id": latest_image_id,
+        }
+
+    if installed_image_id == latest_image_id:
+        return {
+            "status_code": 200,
+            "message": "Bot is already on latest image",
+            "status": "up_to_date",
+            "docker_image_id": latest_image_id,
+        }
+
+    current_status = config.containerStatus.value if hasattr(config.containerStatus, "value") else config.containerStatus
+    was_running = current_status == "running" or bool(config.isActive)
+
+    # Simulate lifecycle: stop container before pulling new image.
+    await db.botconfiguration.update(
+        where={"id": data.botConfigId},
+        data={
+            "containerStatus": "stopped",
+            "isActive": False,
+        },
+    )
+
+    # Simulate pull + restart (restart only if bot was running before update).
+    final_status = "running" if was_running else "stopped"
+    await db.botconfiguration.update(
+        where={"id": data.botConfigId},
+        data={
+            "installedDockerImageId": latest_image_id,
+            "containerStatus": final_status,
+            "isActive": was_running,
+        },
+    )
+
+    bot_label = bot_version.label or "Trading Bot"
+    version_tag = bot_version.versionTag or "-"
+    await db.notification.create(
+        data={
+            "userId": request.state.user_id,
+            "title": f"Bot updated: {bot_label}",
+            "message": f"{bot_label} is now on {version_tag}.",
+            "relatedLink": "/bot-control",
+        }
+    )
+
+    try:
+        user_agent = request.headers.get("user-agent", "Unknown")
+        ip_address = request.client.host if request.client else "0.0.0.0"
+        await db.activitylog.create(
+            data={
+                "userId": request.state.user_id,
+                "topic": "Bot Update",
+                "detail": f"Bot {data.botConfigId} updated image from {installed_image_id} to {latest_image_id}",
+                "ipAddress": ip_address,
+                "deviceInfo": user_agent[:255],
+            }
+        )
+    except Exception as e:
+        print(f"Failed to log activity: {e}")
+
+    return {
+        "status_code": 200,
+        "message": "Bot updated successfully",
+        "previous_image_id": installed_image_id,
+        "latest_image_id": latest_image_id,
+        "container_status": final_status,
+    }
 
 
 @bot_router.delete('/delete', tags=["bot"])

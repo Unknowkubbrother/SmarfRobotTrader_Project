@@ -194,6 +194,7 @@ CREATE TABLE "bot_configurations" (
   
   -- Container Control
   "docker_container_id" VARCHAR(100),
+  "installed_docker_image_id" VARCHAR(255),
   "container_status" container_status_enum,
   
   "updated_at" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,

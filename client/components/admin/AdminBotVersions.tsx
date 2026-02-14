@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Boxes, Clock, PenSquare, Plus, Power, Rocket, Tag, Trash2, Upload } from "lucide-react";
+import { BellRing, Boxes, Clock, PenSquare, Plus, Power, Rocket, Tag, Trash2, Upload } from "lucide-react";
 import { toast } from "sonner";
 
 import { api } from "@/lib/api";
@@ -40,6 +40,13 @@ interface VersionForm {
   release_notes: string;
 }
 
+interface PublishUpdateForm {
+  docker_image_id: string;
+  version_tag: string;
+  release_notes: string;
+  notify_users: boolean;
+}
+
 const EMPTY_FORM: VersionForm = {
   label: "",
   version_tag: "",
@@ -49,21 +56,32 @@ const EMPTY_FORM: VersionForm = {
   release_notes: "",
 };
 
+const EMPTY_PUBLISH_FORM: PublishUpdateForm = {
+  docker_image_id: "",
+  version_tag: "",
+  release_notes: "",
+  notify_users: true,
+};
+
 export function AdminBotVersions() {
   const [versions, setVersions] = useState<BotVersion[]>([]);
   const [loading, setLoading] = useState(true);
 
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [showEditDialog, setShowEditDialog] = useState(false);
+  const [showPublishDialog, setShowPublishDialog] = useState(false);
 
   const [addSubmitting, setAddSubmitting] = useState(false);
   const [editSubmitting, setEditSubmitting] = useState(false);
+  const [publishSubmitting, setPublishSubmitting] = useState(false);
 
   const [actionKey, setActionKey] = useState<string | null>(null);
   const [editingVersion, setEditingVersion] = useState<BotVersion | null>(null);
+  const [publishingVersion, setPublishingVersion] = useState<BotVersion | null>(null);
 
   const [addForm, setAddForm] = useState<VersionForm>(EMPTY_FORM);
   const [editForm, setEditForm] = useState<VersionForm>(EMPTY_FORM);
+  const [publishForm, setPublishForm] = useState<PublishUpdateForm>(EMPTY_PUBLISH_FORM);
 
   useEffect(() => {
     fetchVersions();
@@ -158,6 +176,50 @@ export function AdminBotVersions() {
       toast.error(error?.message || "Failed to update bot version");
     } finally {
       setEditSubmitting(false);
+    }
+  };
+
+  const openPublishDialog = (version: BotVersion) => {
+    setPublishingVersion(version);
+    setPublishForm({
+      docker_image_id: version.docker_image_id || "",
+      version_tag: version.version_tag || "",
+      release_notes: (version.release_notes || []).join("\n"),
+      notify_users: true,
+    });
+    setShowPublishDialog(true);
+  };
+
+  const handlePublishUpdate = async () => {
+    if (!publishingVersion) return;
+    if (!publishForm.docker_image_id.trim()) {
+      toast.error("Please provide docker image id");
+      return;
+    }
+
+    setPublishSubmitting(true);
+    try {
+      const { data } = await api.post(`/admin/bot-versions/${publishingVersion.id}/publish-update`, {
+        docker_image_id: publishForm.docker_image_id.trim(),
+        version_tag: publishForm.version_tag.trim() || null,
+        release_notes: toReleaseNotes(publishForm.release_notes),
+        notify_users: publishForm.notify_users,
+      });
+
+      const usersNotified = Number(data?.users_notified || 0);
+      const emailsSent = Number(data?.emails_sent || 0);
+      toast.success(
+        `Update published. Notified ${usersNotified} user(s), sent ${emailsSent} email(s).`
+      );
+      setShowPublishDialog(false);
+      setPublishingVersion(null);
+      setPublishForm(EMPTY_PUBLISH_FORM);
+      await fetchVersions();
+    } catch (error: any) {
+      console.error("Error publishing bot update:", error);
+      toast.error(error?.message || "Failed to publish bot update");
+    } finally {
+      setPublishSubmitting(false);
     }
   };
 
@@ -411,6 +473,79 @@ export function AdminBotVersions() {
         </DialogContent>
       </Dialog>
 
+      <Dialog
+        open={showPublishDialog}
+        onOpenChange={(open) => {
+          setShowPublishDialog(open);
+          if (!open) {
+            setPublishingVersion(null);
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Publish Bot Update</DialogTitle>
+            <DialogDescription>
+              Push a new docker image + release notes and notify users to update from Bot Control.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div>
+              <Label htmlFor="publish-image">Docker Image ID *</Label>
+              <Input
+                id="publish-image"
+                value={publishForm.docker_image_id}
+                onChange={(event) => setPublishForm({ ...publishForm, docker_image_id: event.target.value })}
+                placeholder="registry/repo:tag"
+              />
+            </div>
+
+            <div>
+              <Label htmlFor="publish-version">Version Tag (optional)</Label>
+              <Input
+                id="publish-version"
+                value={publishForm.version_tag}
+                onChange={(event) => setPublishForm({ ...publishForm, version_tag: event.target.value })}
+                placeholder="e.g., v2.1.4"
+              />
+            </div>
+
+            <div>
+              <Label htmlFor="publish-notes">Release Notes</Label>
+              <Textarea
+                id="publish-notes"
+                value={publishForm.release_notes}
+                onChange={(event) => setPublishForm({ ...publishForm, release_notes: event.target.value })}
+                placeholder="One change per line"
+              />
+            </div>
+
+            <label className="flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm">
+              <input
+                type="checkbox"
+                checked={publishForm.notify_users}
+                onChange={(event) => setPublishForm({ ...publishForm, notify_users: event.target.checked })}
+              />
+              Notify users (web notifications + primary email if allowed in settings)
+            </label>
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setShowPublishDialog(false)}
+              disabled={publishSubmitting}
+            >
+              Cancel
+            </Button>
+            <Button onClick={handlePublishUpdate} disabled={publishSubmitting}>
+              {publishSubmitting ? "Publishing..." : "Publish Update"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <div className="grid gap-4">
         {versions.length === 0 ? (
           <div className="glass-card p-8 text-center">
@@ -472,6 +607,11 @@ export function AdminBotVersions() {
                     Edit
                   </Button>
 
+                  <Button size="sm" onClick={() => openPublishDialog(version)}>
+                    <BellRing className="w-4 h-4 mr-1" />
+                    Update Bot
+                  </Button>
+
                   <Button
                     size="sm"
                     variant="outline"
@@ -479,7 +619,7 @@ export function AdminBotVersions() {
                     onClick={() => rolloutVersion(version)}
                   >
                     <Rocket className="w-4 h-4 mr-1" />
-                    {actionKey === `rollout-${version.id}` ? "Updating..." : "Update Bots"}
+                    {actionKey === `rollout-${version.id}` ? "Rolling out..." : "Rollout Model"}
                   </Button>
 
                   <Button

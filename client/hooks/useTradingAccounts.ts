@@ -20,6 +20,15 @@ export interface BotVersion {
   release_notes: string[];
 }
 
+export interface PendingBotUpdate {
+  has_pending_update: boolean;
+  installed_docker_image_id: string | null;
+  latest_docker_image_id: string | null;
+  latest_version_tag: string | null;
+  latest_release_notes: string[];
+  latest_release_date: string | null;
+}
+
 export interface BotConfigWithVersion {
   id: string;
   account_id: string;
@@ -31,6 +40,12 @@ export interface BotConfigWithVersion {
   docker_container_id: string | null;
   container_status: string | null;
   status: string | null;
+  has_pending_update: boolean;
+  installed_docker_image_id: string | null;
+  latest_docker_image_id: string | null;
+  latest_version_tag: string | null;
+  latest_release_notes: string[];
+  latest_release_date: string | null;
   bot_version: BotVersion | null;
   today_pnl: number;
 }
@@ -86,6 +101,12 @@ export function useTradingAccounts() {
         bot_configurations: (account.bot_configurations || []).map((config: any) => ({
           ...config,
           status: config.container_status || "stopped",
+          has_pending_update: Boolean(config.has_pending_update),
+          installed_docker_image_id: config.installed_docker_image_id || null,
+          latest_docker_image_id: config.latest_docker_image_id || null,
+          latest_version_tag: config.latest_version_tag || null,
+          latest_release_notes: Array.isArray(config.latest_release_notes) ? config.latest_release_notes : [],
+          latest_release_date: config.latest_release_date || null,
           today_pnl: 0,
         })),
       }));
@@ -158,6 +179,20 @@ export function useTradingAccounts() {
     }
   };
 
+  // Apply pending bot image update
+  const applyBotUpdate = async (botConfigId: string) => {
+    try {
+      await api.patch("/bot/apply_update", { botConfigId });
+      await fetchAccounts();
+      toast.success("Bot update applied successfully");
+      return true;
+    } catch (error) {
+      console.error("Error applying bot update:", error);
+      toast.error("Failed to apply bot update");
+      return false;
+    }
+  };
+
   // Create a new bot configuration for an account
   const createBot = async (
     accountId: string,
@@ -214,6 +249,10 @@ export function useTradingAccounts() {
     return account.bot_configurations.filter((b) => b.container_status === "running").length;
   };
 
+  const getPendingUpdatesCount = (account: AccountWithBots) => {
+    return account.bot_configurations.filter((b) => b.has_pending_update).length;
+  };
+
   // Get all available bot versions
   const getBotVersions = async () => {
     try {
@@ -234,9 +273,11 @@ export function useTradingAccounts() {
     updateBotRisk,
     updateBotSchedule,
     changeModel,
+    applyBotUpdate,
     createBot,
     deleteBot,
     getBotVersions,
     getRunningBotsCount,
+    getPendingUpdatesCount,
   };
 }

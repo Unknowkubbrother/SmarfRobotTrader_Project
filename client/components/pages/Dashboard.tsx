@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Power, Play, TrendingUp, TrendingDown, Activity, Wallet, Target, BarChart3, Calculator, Plus } from "lucide-react";
+import { Power, Play, TrendingUp, TrendingDown, Activity, Wallet, Target, BarChart3, Calculator, Plus, BellRing, DownloadCloud } from "lucide-react";
 import { PerformanceChart } from "@/components/dashboard/PerformanceChart";
 import { StatusPanel } from "@/components/dashboard/StatusPanel";
 import { ActivePositions } from "@/components/dashboard/ActivePositions";
@@ -14,9 +14,10 @@ import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { useTradingAccounts, BotConfigWithVersion } from "@/hooks/useTradingAccounts";
 import { BotSelector } from "@/components/dashboard/BotSelector";
+import Link from "next/link";
 
 export default function Dashboard() {
-  const { accounts, loading, updateBotStatus, deleteBot, refetch } = useTradingAccounts();
+  const { accounts, loading, updateBotStatus, deleteBot, refetch, getPendingUpdatesCount } = useTradingAccounts();
   const [selectedAccount, setSelectedAccount] = useState<AccountWithBots | null>(null);
   const [selectedBotId, setSelectedBotId] = useState<string | null>(null);
   const [addBotOpen, setAddBotOpen] = useState(false);
@@ -71,6 +72,8 @@ export default function Dashboard() {
   const bots = selectedAccount?.bot_configurations || [];
   const currentBot = bots.find(b => b.id === selectedBotId);
   const currentSymbol = currentBot?.bot_version?.symbol || "XAUUSD";
+  const selectedAccountPendingUpdates = selectedAccount ? getPendingUpdatesCount(selectedAccount) : 0;
+  const totalPendingUpdates = accounts.reduce((sum, account) => sum + getPendingUpdatesCount(account), 0);
 
   return (
     <div className="space-y-6">
@@ -78,7 +81,10 @@ export default function Dashboard() {
       <div className="flex flex-col gap-4">
         <div>
           <h1 className="text-xl font-semibold text-foreground">Dashboard</h1>
-          <p className="text-sm text-muted-foreground">Monitor your trading performance</p>
+          <p className="text-sm text-muted-foreground">
+            Monitor your trading performance
+            {totalPendingUpdates > 0 ? ` • ${totalPendingUpdates} bot update${totalPendingUpdates > 1 ? "s" : ""} available` : ""}
+          </p>
         </div>
 
         {/* Selectors Row */}
@@ -102,6 +108,25 @@ export default function Dashboard() {
           )}
         </div>
       </div>
+
+      {selectedAccountPendingUpdates > 0 && (
+        <div className="rounded-xl border border-primary/30 bg-primary/5 px-4 py-3">
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div className="flex items-center gap-2 text-sm">
+              <BellRing className="w-4 h-4 text-primary" />
+              <span className="font-medium text-primary">
+                {selectedAccountPendingUpdates} bot update{selectedAccountPendingUpdates > 1 ? "s" : ""} waiting in this account
+              </span>
+            </div>
+            <Button asChild size="sm" className="gap-2">
+              <Link href="/bot-control">
+                <DownloadCloud className="w-4 h-4" />
+                Open Bot Control
+              </Link>
+            </Button>
+          </div>
+        </div>
+      )}
 
       {/* Main Content Area */}
       {/* Main Content Area */}

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Power, Play, Activity, TrendingUp, Trash2, AlertTriangle } from "lucide-react";
+import { Power, Play, Activity, TrendingUp, Trash2, AlertTriangle, DownloadCloud } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { BotConfigWithVersion } from "@/hooks/useTradingAccounts";
@@ -108,6 +108,12 @@ export function BotCard({
               <div className="flex items-center gap-2 flex-wrap">
                 <h4 className="font-medium text-sm truncate">{label}</h4>
                 {getStatusBadge(status)}
+                {bot.has_pending_update && (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-primary/10 text-primary">
+                    <DownloadCloud className="w-3 h-3" />
+                    Update Available
+                  </span>
+                )}
               </div>
               <p className="text-xs text-muted-foreground mt-0.5">
                 <span className="font-mono">{symbol}</span>

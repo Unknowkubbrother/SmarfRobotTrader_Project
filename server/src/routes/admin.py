@@ -3,6 +3,7 @@ from decimal import Decimal
 from typing import Annotated, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from lib.untils import send_email
 
 from ..database.client import db
 from ..models.admin import (
@@ -16,6 +17,7 @@ from ..models.admin import (
     AdminUserSubscriptionItemResponse,
     AdminUserTradingAccountItemResponse,
     CreateAdminBotVersionRequest,
+    PublishAdminBotUpdateRequest,
     UpdateAdminBotConfigurationStatusRequest,
     UpdateAdminBotVersionActiveRequest,
     UpdateAdminBotVersionRequest,
@@ -99,6 +101,116 @@ def _map_bot_version(version, usage_count: int) -> AdminBotVersionItemResponse:
         release_date=_to_datetime_string(version.releaseDate),
         usage_count=usage_count,
     )
+
+
+def _is_notification_allowed(notification_config) -> bool:
+    if not notification_config:
+        return True
+    value = getattr(notification_config, "emailNotificationEnable", None)
+    if value is None:
+        return True
+    return bool(value)
+
+
+def _build_bot_update_email_html(
+    bot_label: str,
+    version_tag: str,
+    docker_image_id: str,
+    release_notes: List[str],
+) -> str:
+    notes_html = "".join(f"<li>{note}</li>" for note in release_notes) if release_notes else "<li>General improvements</li>"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bot update available</title>
+</head>
+<body style="font-family: Arial, sans-serif; background:#f5f7fb; padding:24px;">
+  <div style="max-width:620px; margin:0 auto; background:#ffffff; border-radius:12px; padding:24px; border:1px solid #e5e7eb;">
+    <h2 style="margin:0 0 10px 0; color:#0f172a;">Bot update available</h2>
+    <p style="margin:0 0 14px 0; color:#334155;">
+      {bot_label} has a new release <strong>{version_tag}</strong>.
+    </p>
+    <p style="margin:0 0 10px 0; color:#334155;">Docker image: <code>{docker_image_id}</code></p>
+    <p style="margin:0 0 8px 0; color:#0f172a;"><strong>Release notes</strong></p>
+    <ul style="margin:0 0 18px 16px; color:#334155;">
+      {notes_html}
+    </ul>
+    <p style="margin:0; color:#334155;">
+      Go to Bot Control to apply the update. The system will stop, pull, and restart your bot automatically.
+    </p>
+  </div>
+</body>
+</html>"""
+
+
+async def _notify_users_for_bot_update(model_id: str, version, release_notes: List[str]) -> tuple[int, int]:
+    bot_configurations = await db.botconfiguration.find_many(
+        where={"modelId": model_id},
+        include={
+            "account": {
+                "include": {
+                    "user": {
+                        "include": {
+                            "notificationConfig": True,
+                        }
+                    }
+                }
+            }
+        },
+    )
+
+    user_map = {}
+    for config in bot_configurations:
+        account = getattr(config, "account", None)
+        user = getattr(account, "user", None) if account else None
+        if not user:
+            continue
+        if not _is_notification_allowed(getattr(user, "notificationConfig", None)):
+            continue
+        user_map[str(user.id)] = user
+
+    if not user_map:
+        return 0, 0
+
+    bot_label = version.label or "Trading Bot"
+    version_tag = version.versionTag or "-"
+    note_excerpt = release_notes[0] if release_notes else "A new bot update is ready."
+    notification_title = f"Bot update: {bot_label}"
+    notification_message = (
+        f"New version {version_tag} is available. {note_excerpt} "
+        f"Open Bot Control and click Update Bot."
+    )
+
+    emails_sent = 0
+    for user in user_map.values():
+        await db.notification.create(
+            data={
+                "userId": str(user.id),
+                "title": notification_title,
+                "message": notification_message,
+                "relatedLink": "/bot-control",
+            }
+        )
+
+        try:
+            if getattr(user, "email", None):
+                send_email(
+                    to_email=user.email,
+                    subject=f"Bot update available ({version_tag}) - SmarfRobotTrade",
+                    html_content=_build_bot_update_email_html(
+                        bot_label=bot_label,
+                        version_tag=version_tag,
+                        docker_image_id=version.dockerImageId or "-",
+                        release_notes=release_notes,
+                    ),
+                )
+                emails_sent += 1
+        except Exception as exc:
+            print(f"[admin] failed to send bot update email to {getattr(user, 'email', None)}: {exc}")
+
+    return len(user_map), emails_sent
 
 
 async def _stop_active_bots_using_version(model_id: str) -> int:
@@ -601,7 +713,20 @@ async def update_admin_bot_version(
         update_payload["timeframe"] = data.timeframe.strip() if data.timeframe else None
 
     if data.docker_image_id is not None:
-        update_payload["dockerImageId"] = data.docker_image_id.strip() if data.docker_image_id else None
+        next_docker_image_id = data.docker_image_id.strip() if data.docker_image_id else None
+        if (
+            existing.dockerImageId
+            and next_docker_image_id
+            and next_docker_image_id != existing.dockerImageId
+        ):
+            await db.botconfiguration.update_many(
+                where={
+                    "modelId": model_id,
+                    "installedDockerImageId": None,
+                },
+                data={"installedDockerImageId": existing.dockerImageId},
+            )
+        update_payload["dockerImageId"] = next_docker_image_id
 
     if data.release_notes is not None:
         update_payload["releaseNotes"] = _clean_release_notes(data.release_notes)
@@ -622,6 +747,79 @@ async def update_admin_bot_version(
 
     usage_count = await db.botconfiguration.count(where={"modelId": model_id})
     return _map_bot_version(updated, usage_count=usage_count)
+
+
+@admin_router.post("/bot-versions/{model_id}/publish-update")
+async def publish_admin_bot_update(
+    model_id: str,
+    data: PublishAdminBotUpdateRequest,
+    current_user: Annotated[Any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    existing = await db.botversion.find_unique(where={"modelId": model_id})
+    if not existing:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot version not found")
+
+    docker_image_id = data.docker_image_id.strip() if data.docker_image_id else ""
+    if not docker_image_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="docker_image_id is required",
+        )
+
+    release_notes = _clean_release_notes(data.release_notes)
+
+    if existing.dockerImageId:
+        await db.botconfiguration.update_many(
+            where={
+                "modelId": model_id,
+                "installedDockerImageId": None,
+            },
+            data={"installedDockerImageId": existing.dockerImageId},
+        )
+
+    update_payload = {
+        "dockerImageId": docker_image_id,
+        "releaseDate": datetime.utcnow(),
+    }
+
+    if data.version_tag is not None:
+        version_tag = data.version_tag.strip()
+        if not version_tag:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="version_tag cannot be empty",
+            )
+        update_payload["versionTag"] = version_tag
+
+    if data.release_notes is not None:
+        update_payload["releaseNotes"] = release_notes
+
+    updated_version = await db.botversion.update(
+        where={"modelId": model_id},
+        data=update_payload,
+    )
+
+    affected_bots = await db.botconfiguration.count(where={"modelId": model_id})
+    users_notified = 0
+    emails_sent = 0
+    if bool(data.notify_users) and affected_bots > 0:
+        users_notified, emails_sent = await _notify_users_for_bot_update(
+            model_id=model_id,
+            version=updated_version,
+            release_notes=updated_version.releaseNotes or [],
+        )
+
+    return {
+        "message": "Bot update published",
+        "model_id": model_id,
+        "docker_image_id": updated_version.dockerImageId,
+        "version_tag": updated_version.versionTag,
+        "affected_bots": affected_bots,
+        "users_notified": users_notified,
+        "emails_sent": emails_sent,
+    }
 
 
 @admin_router.patch("/bot-versions/{model_id}/active")
@@ -700,7 +898,10 @@ async def rollout_admin_bot_version(
     if affected_bots > 0:
         await db.botconfiguration.update_many(
             where={"modelId": {"in": source_model_ids}},
-            data={"modelId": model_id},
+            data={
+                "modelId": model_id,
+                "installedDockerImageId": target_version.dockerImageId,
+            },
         )
 
     return {
