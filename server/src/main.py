@@ -7,7 +7,7 @@ import jwt
 import os
 from fastapi.staticfiles import StaticFiles
 
-from .routes import authentication, bot, trading, account_settings, notification, search, subscription, admin
+from .routes import authentication, bot, trading, settings, notification, search, subscription, admin
 from .database.client import db
 
 SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
@@ -105,7 +105,7 @@ def read_root():
 app.include_router(authentication.auth_router, prefix="/auth")
 app.include_router(bot.bot_router, prefix="/bot")
 app.include_router(trading.trading_router, prefix="/trading")
-app.include_router(account_settings.settings_router, prefix="/settings")
+app.include_router(settings.settings_router, prefix="/settings")
 app.include_router(notification.notification_router, prefix="/notifications")
 app.include_router(search.search_router, prefix="/search")
 app.include_router(subscription.subscription_router, prefix="/subscription")
