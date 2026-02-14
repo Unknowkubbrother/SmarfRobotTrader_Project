@@ -4,9 +4,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { supabase } from "@/lib/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
+import { useTradingAccounts } from "@/hooks/useTradingAccounts";
 
 interface AddAccountDialogProps {
   onAccountAdded?: () => void;
@@ -19,10 +19,11 @@ export function AddAccountDialog({ onAccountAdded, open, onOpenChange, trigger }
   const [internalOpen, setInternalOpen] = useState(false);
   const isControlled = open !== undefined;
   const isOpen = isControlled ? open : internalOpen;
-  const setIsOpen = isControlled ? (onOpenChange || (() => {})) : setInternalOpen;
-  
+  const setIsOpen = isControlled ? (onOpenChange || (() => { })) : setInternalOpen;
+
   const [loading, setLoading] = useState(false);
   const { user } = useAuth();
+  const { createAccount } = useTradingAccounts();
   const [formData, setFormData] = useState({
     broker_name: "",
     server_name: "",
@@ -43,29 +44,20 @@ export function AddAccountDialog({ onAccountAdded, open, onOpenChange, trigger }
 
     setLoading(true);
     try {
-      const { data: account, error } = await supabase
-        .from("trading_accounts")
-        .insert({
-          user_id: user.id,
-          broker_name: formData.broker_name,
-          server_name: formData.server_name,
-          mt5_login_id: formData.mt5_login_id,
-          mt5_password: formData.mt5_password,
-        })
-        .select()
-        .single();
+      const result = await createAccount({
+        brokerName: formData.broker_name,
+        serverName: formData.server_name,
+        mt5LoginId: formData.mt5_login_id,
+        mt5Password: formData.mt5_password,
+      });
 
-      if (error) throw error;
+      if (!result.success) throw new Error(result.error);
 
-      // No longer create default bot - users will add bots manually
-
-      toast.success("Trading account added successfully. Add a bot to start trading.");
       setIsOpen(false);
       setFormData({ broker_name: "", server_name: "", mt5_login_id: "", mt5_password: "" });
       onAccountAdded?.();
     } catch (error) {
       console.error("Error adding account:", error);
-      toast.error("Failed to add account");
     } finally {
       setLoading(false);
     }

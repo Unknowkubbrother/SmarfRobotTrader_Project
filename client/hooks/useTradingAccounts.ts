@@ -2,25 +2,64 @@ import { useState, useEffect, useCallback } from "react";
 import { supabase } from "@/lib/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
-import type { Database } from "@/lib/integrations/supabase/types";
+import { api } from "@/lib/api";
 
-type TradingAccount = Database["public"]["Tables"]["trading_accounts"]["Row"];
-type BotConfiguration = Database["public"]["Tables"]["bot_configurations"]["Row"];
-type BotVersion = Database["public"]["Tables"]["bot_versions"]["Row"];
+export interface Create_Trading_Account {
+  brokerName: string;
+  serverName: string;
+  mt5LoginId: string;
+  mt5Password: string;
+}
 
-export interface BotConfigWithVersion extends BotConfiguration {
+export interface BotVersion {
+  model_id: string;
+  label: string | null;
+  docker_image_id: string | null;
+  version_tag: string | null;
+  symbol: string | null;
+  timeframe: string | null;
+  release_notes: string[];
+}
+
+export interface BotConfigWithVersion {
+  id: string;
+  account_id: string;
+  model_id: string;
+  bot_instance_id: number;
+  risk_level: string | null;
+  trading_schedule: any;
+  is_active: boolean;
+  docker_container_id: string | null;
+  container_status: string | null;
+  status: string | null;
   bot_version: BotVersion | null;
   today_pnl: number;
 }
 
-export interface AccountWithBots extends TradingAccount {
+export interface AccountWithBots {
+  id: string;
+  user_id: string;
+  broker_name: string | null;
+  server_name: string | null;
+  mt5_login_id: string | null;
+  balance: number;
+  equity: number;
+  leverage: number | null;
+  margin: number;
+  margin_free: number;
+  margin_level: number;
+  created_at: string | null;
   bot_configurations: BotConfigWithVersion[];
   total_today_pnl: number;
 }
 
 // Legacy interface for backward compatibility
-export interface AccountWithBot extends TradingAccount {
-  bot_configuration: (BotConfiguration & { bot_version: BotVersion | null }) | null;
+export interface AccountWithBot {
+  id: string;
+  broker_name: string | null;
+  server_name: string | null;
+  mt5_login_id: string | null;
+  bot_configuration: (BotConfigWithVersion & { bot_version: BotVersion | null }) | null;
   today_pnl: number;
 }
 
@@ -37,56 +76,18 @@ export function useTradingAccounts() {
     }
 
     try {
-      // Fetch trading accounts
-      const { data: accountsData, error: accountsError } = await supabase
-        .from("trading_accounts")
-        .select("*")
-        .eq("user_id", user.id);
+      const result = await api.get("/trading/accounts_with_bots");
 
-      if (accountsError) throw accountsError;
-
-      if (!accountsData || accountsData.length === 0) {
-        setAccounts([]);
-        setLoading(false);
-        return;
-      }
-
-      // Fetch all bot configurations for these accounts (multiple per account)
-      const accountIds = accountsData.map((a) => a.id);
-      const { data: botConfigs } = await supabase
-        .from("bot_configurations")
-        .select("*, bot_versions(*)")
-        .in("account_id", accountIds);
-
-      // Fetch today's daily aggregates
-      const today = new Date().toISOString().split("T")[0];
-      const { data: dailyAggregates } = await supabase
-        .from("daily_aggregates")
-        .select("*")
-        .in("account_id", accountIds)
-        .eq("date", today);
-
-      // Combine data - now supporting multiple bots per account
-      const accountsWithBots: AccountWithBots[] = accountsData.map((account) => {
-        // Get all bot configs for this account
-        const accountBotConfigs = botConfigs?.filter((c) => c.account_id === account.id) || [];
-        const todayAgg = dailyAggregates?.find((d) => d.account_id === account.id);
-
-        // Map bot configs with their versions
-        const botConfigsWithVersion: BotConfigWithVersion[] = accountBotConfigs.map((config) => ({
+      const accountsData: AccountWithBots[] = (result.data?.data || []).map((account: any) => ({
+        ...account,
+        bot_configurations: (account.bot_configurations || []).map((config: any) => ({
           ...config,
-          bot_version: config.bot_versions as BotVersion | null,
-          today_pnl: 0, // TODO: Calculate per-bot P&L when bot_instance_id is used in daily_aggregates
-        }));
+          status: config.container_status || "stopped",
+          today_pnl: 0,
+        })),
+      }));
 
-        return {
-          ...account,
-          bot_configurations: botConfigsWithVersion,
-          total_today_pnl: todayAgg?.daily_net_profit || 0,
-        };
-      });
-
-      setAccounts(accountsWithBots);
+      setAccounts(accountsData);
     } catch (error) {
       console.error("Error fetching accounts:", error);
       toast.error("Failed to fetch trading accounts");
@@ -99,15 +100,15 @@ export function useTradingAccounts() {
     fetchAccounts();
   }, [fetchAccounts]);
 
-  // Update bot status by bot config ID (not account ID)
+  // Update bot status by bot config ID (still uses Supabase — backend endpoint TBD)
   const updateBotStatus = async (
     botConfigId: string,
-    status: Database["public"]["Enums"]["bot_status"]
+    status: string
   ) => {
     try {
       const { error } = await supabase
         .from("bot_configurations")
-        .update({ status, is_active: status === "running" })
+        .update({ status: status as any, is_active: status === "running" })
         .eq("id", botConfigId);
 
       if (error) throw error;
@@ -121,10 +122,10 @@ export function useTradingAccounts() {
     }
   };
 
-  // Update bot config by bot config ID (not account ID)
+  // Update bot config by bot config ID (still uses Supabase — backend endpoint TBD)
   const updateBotConfig = async (
     botConfigId: string,
-    updates: Partial<BotConfiguration>
+    updates: Record<string, any>
   ) => {
     try {
       const { error } = await supabase
@@ -144,39 +145,30 @@ export function useTradingAccounts() {
     }
   };
 
-  // Create a new bot configuration for an account
+  // Create a new bot configuration for an account via FastAPI
   const createBot = async (
     accountId: string,
     modelId: string,
     riskLevel: string = "medium"
   ) => {
     try {
-      // Generate unique bot instance ID
-      const botInstanceId = `bot_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-      const { error } = await supabase.from("bot_configurations").insert({
-        account_id: accountId,
-        model_id: modelId,
-        risk_level: riskLevel,
-        is_active: false,
-        status: "stopped",
-        bot_instance_id: botInstanceId,
-        container_status: "stopped",
+      await api.post("/bot/create_bot_configuration", {
+        accountId,
+        modelId,
+        riskLevel,
       });
-
-      if (error) throw error;
 
       await fetchAccounts();
       toast.success("Bot added successfully");
       return true;
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error creating bot:", error);
-      toast.error("Failed to add bot");
+      toast.error(error.message || "Failed to add bot");
       return false;
     }
   };
 
-  // Delete a bot configuration
+  // Delete a bot configuration (still uses Supabase — backend endpoint TBD)
   const deleteBot = async (botConfigId: string) => {
     try {
       const { error } = await supabase
@@ -196,15 +188,30 @@ export function useTradingAccounts() {
     }
   };
 
+  // Create a new trading account via FastAPI
+  const createAccount = async (data: Create_Trading_Account) => {
+    try {
+      const response = await api.post("/trading/create_account", data);
+      await fetchAccounts();
+      toast.success("Trading account added successfully. Add a bot to start trading.");
+      return { success: true, data: response.data };
+    } catch (error: any) {
+      console.error("Error creating account:", error);
+      toast.error(error.message || "Failed to add account");
+      return { success: false, error: error.message };
+    }
+  };
+
   // Helper to get running bots count for an account
   const getRunningBotsCount = (account: AccountWithBots) => {
-    return account.bot_configurations.filter((b) => b.status === "running").length;
+    return account.bot_configurations.filter((b) => b.container_status === "running").length;
   };
 
   return {
     accounts,
     loading,
     refetch: fetchAccounts,
+    createAccount,
     updateBotStatus,
     updateBotConfig,
     createBot,

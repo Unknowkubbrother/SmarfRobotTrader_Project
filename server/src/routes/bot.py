@@ -40,6 +40,35 @@ async def create_bot_version(request: Request, data: Create_Bot_Version):
         "message": "Bot version created successfully"
     }
 
+@bot_router.get("/versions", tags=["bot"])
+async def get_bot_versions(request: Request):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+    
+    bot_versions = await db.botversion.find_many(
+        order={
+            "releaseDate": "desc"
+        }
+    )
+
+    result = []
+    for bv in bot_versions:
+        result.append({
+            "id": str(bv.modelId),
+            "model_id": str(bv.modelId),
+            "label": bv.label,
+            "version_tag": bv.versionTag,
+            "symbol": bv.symbol,
+            "timeframe": bv.timeframe,
+            "release_notes": bv.releaseNotes,
+            "release_date": bv.releaseDate.strftime("%Y-%m-%d") if bv.releaseDate else None,
+        })
+
+    return {
+        "status_code": 200,
+        "data": result
+    }
+
 # @@comment bot_configuration
 @bot_router.post('/create_bot_configuration')
 async def create_bot_configuration(request: Request, data: Create_Bot_Configuration):

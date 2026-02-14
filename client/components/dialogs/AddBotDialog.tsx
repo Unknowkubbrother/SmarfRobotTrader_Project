@@ -2,12 +2,20 @@ import { useState, useEffect } from "react";
 import { Activity, Clock, Shield, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
-import { supabase } from "@/lib/integrations/supabase/client";
+import { api } from "@/lib/api";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
-import type { Database } from "@/lib/integrations/supabase/types";
 
-type BotVersion = Database["public"]["Tables"]["bot_versions"]["Row"];
+interface BotVersion {
+  id: string;
+  model_id: string;
+  label: string | null;
+  version_tag: string | null;
+  symbol: string | null;
+  timeframe: string | null;
+  release_notes: string[];
+  release_date: string | null;
+}
 
 interface AddBotDialogProps {
   open: boolean;
@@ -35,18 +43,12 @@ export function AddBotDialog({ open, onOpenChange, accountId, onBotAdded }: AddB
   }, [open]);
 
   const fetchBotVersions = async () => {
-    const { data, error } = await supabase
-      .from("bot_versions")
-      .select("*")
-      .eq("is_active", true)
-      .order("release_date", { ascending: false });
-
-    if (error) {
+    try {
+      const { data } = await api.get("/bot/versions");
+      setBotVersions(data.data || []);
+    } catch (error) {
       console.error("Error fetching bot versions:", error);
-      return;
     }
-
-    setBotVersions(data || []);
   };
 
   const handleCreateBot = async () => {
@@ -57,28 +59,20 @@ export function AddBotDialog({ open, onOpenChange, accountId, onBotAdded }: AddB
 
     setLoading(true);
     try {
-      const botInstanceId = `bot_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-      const { error } = await supabase.from("bot_configurations").insert({
-        account_id: accountId,
-        model_id: selectedModel,
-        risk_level: selectedRisk,
-        is_active: false,
-        status: "stopped",
-        bot_instance_id: botInstanceId,
-        container_status: "stopped",
+      await api.post("/bot/create_bot_configuration", {
+        accountId,
+        modelId: selectedModel,
+        riskLevel: selectedRisk,
       });
-
-      if (error) throw error;
 
       toast.success("Bot added successfully");
       onOpenChange(false);
       onBotAdded();
       setSelectedModel(null);
       setSelectedRisk("medium");
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error creating bot:", error);
-      toast.error("Failed to add bot");
+      toast.error(error.message || "Failed to add bot");
     } finally {
       setLoading(false);
     }
@@ -129,12 +123,27 @@ export function AddBotDialog({ open, onOpenChange, accountId, onBotAdded }: AddB
                   </div>
                   <div className="p-3 bg-card space-y-2">
                     <div className="flex items-center justify-between text-xs">
+                      <span className="text-muted-foreground">Lastest update</span>
+                      <span className="font-mono">{model.release_date}</span>
+                    </div>
+                    <div className="flex items-center justify-between text-xs">
                       <span className="text-muted-foreground">Symbol</span>
                       <span className="font-mono">{model.symbol}</span>
                     </div>
                     <div className="flex items-center justify-between text-xs">
                       <span className="text-muted-foreground">Timeframe</span>
                       <span>{model.timeframe}</span>
+                    </div>
+                    <div className="flex flex-col gap-1.5 text-xs pt-2 border-t border-border/50">
+                      <span className="text-muted-foreground font-medium">Release Notes</span>
+                      <div className="max-h-20 overflow-y-auto flex flex-col gap-1 pr-1 scrollbar-thin scrollbar-thumb-muted-foreground/20 scrollbar-track-transparent">
+                        {model.release_notes.map((note, index) => (
+                          <div key={index} className="flex items-start gap-1.5">
+                            <span className="text-primary mt-1 shrink-0">•</span>
+                            <span className="text-muted-foreground/80">{note}</span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                     {selectedModel === model.id && (
                       <div className="pt-2">
