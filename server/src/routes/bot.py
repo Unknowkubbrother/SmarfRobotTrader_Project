@@ -173,6 +173,22 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
         }
     )
 
+    # Log Activity
+    try:
+        user_agent = request.headers.get("user-agent", "Unknown")
+        ip_address = request.client.host if request.client else "0.0.0.0"
+        await db.activitylog.create(
+            data={
+                "userId": request.state.user_id,
+                "topic": "Bot Control",
+                "detail": f"Bot {data.botConfigId} status updated to {data.status}",
+                "ipAddress": ip_address,
+                "deviceInfo": user_agent[:255]
+            }
+        )
+    except Exception as e:
+        print(f"Failed to log activity: {e}")
+
     return {"status_code": 200, "message": f"Bot status updated to {data.status}"}
 
 
@@ -188,6 +204,22 @@ async def update_bot_risk(request: Request, data: Update_Bot_Risk):
         data={"riskLevel": data.riskLevel.value}
     )
 
+    # Log Activity
+    try:
+        user_agent = request.headers.get("user-agent", "Unknown")
+        ip_address = request.client.host if request.client else "0.0.0.0"
+        await db.activitylog.create(
+            data={
+                "userId": request.state.user_id,
+                "topic": "Bot Config",
+                "detail": f"Bot {data.botConfigId} risk level updated to {data.riskLevel.value}",
+                "ipAddress": ip_address,
+                "deviceInfo": user_agent[:255]
+            }
+        )
+    except Exception as e:
+        print(f"Failed to log activity: {e}")
+
     return {"status_code": 200, "message": "Risk level updated"}
 
 
@@ -202,6 +234,22 @@ async def update_bot_schedule(request: Request, data: Update_Bot_Schedule):
         where={"id": data.botConfigId},
         data={"tradingSchedule": Json(data.tradingSchedule)}
     )
+
+    # Log Activity
+    try:
+        user_agent = request.headers.get("user-agent", "Unknown")
+        ip_address = request.client.host if request.client else "0.0.0.0"
+        await db.activitylog.create(
+            data={
+                "userId": request.state.user_id,
+                "topic": "Bot Config",
+                "detail": f"Bot {data.botConfigId} trading schedule updated",
+                "ipAddress": ip_address,
+                "deviceInfo": user_agent[:255]
+            }
+        )
+    except Exception as e:
+        print(f"Failed to log activity: {e}")
 
     return {"status_code": 200, "message": "Trading schedule updated"}
 
@@ -223,6 +271,22 @@ async def change_bot_model(request: Request, data: Change_Bot_Model):
         where={"id": data.botConfigId},
         data={"botVersion": {"connect": {"modelId": data.newModelId}}}
     )
+
+    # Log Activity
+    try:
+        user_agent = request.headers.get("user-agent", "Unknown")
+        ip_address = request.client.host if request.client else "0.0.0.0"
+        await db.activitylog.create(
+            data={
+                "userId": request.state.user_id,
+                "topic": "Bot Config",
+                "detail": f"Bot {data.botConfigId} model changed to {data.newModelId}",
+                "ipAddress": ip_address,
+                "deviceInfo": user_agent[:255]
+            }
+        )
+    except Exception as e:
+        print(f"Failed to log activity: {e}")
 
     return {"status_code": 200, "message": "Bot model changed successfully"}
 

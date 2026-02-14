@@ -125,6 +125,13 @@ export function Header() {
     }
   };
 
+  const getAvatarSrc = (url: string | null | undefined) => {
+    if (!url) return "";
+    if (url.startsWith("http") || url.startsWith("data:")) return url;
+    if (url.startsWith("/static")) return `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}${url}`;
+    return url;
+  };
+
   return (
     <div className="sticky top-0 z-30 bg-card border-b border-border shadow-sm">
       {/* Top Row: Search & Actions */}
@@ -259,7 +266,7 @@ export function Header() {
               <Button variant="ghost" size="icon" className="rounded-full">
                 <div className="w-8 h-8 rounded-full bg-secondary flex items-center justify-center overflow-hidden">
                   {user?.avatar_url ? (
-                    <img src={user?.avatar_url} alt="Avatar" className="w-full h-full object-cover" />
+                    <img src={getAvatarSrc(user?.avatar_url)} alt="Avatar" className="w-full h-full object-cover" />
                   ) : (
                     <User className="w-4 h-4 text-muted-foreground" />
                   )}
