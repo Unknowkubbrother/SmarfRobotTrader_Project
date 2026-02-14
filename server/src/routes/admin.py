@@ -8,8 +8,14 @@ from ..database.client import db
 from ..models.admin import (
     AdminBotVersionItemResponse,
     AdminStatsResponse,
+    AdminUserBillingSummaryResponse,
+    AdminUserBotConfigurationItemResponse,
+    AdminUserDetailResponse,
+    AdminUserInvoiceItemResponse,
     AdminUserItemResponse,
+    AdminUserTradingAccountItemResponse,
     CreateAdminBotVersionRequest,
+    UpdateAdminBotConfigurationStatusRequest,
     UpdateAdminUserRoleRequest,
     UpdateAdminUserStatusRequest,
 )
@@ -19,6 +25,7 @@ admin_router = APIRouter(tags=["Admin"])
 
 ALLOWED_USER_STATUSES = {"active", "banned", "pending"}
 ALLOWED_USER_ROLES = {"user", "admin"}
+ALLOWED_BOT_STATUSES = {"running", "stopped"}
 
 
 def _to_float(value: Optional[Decimal]) -> float:
@@ -37,6 +44,16 @@ def _to_datetime_string(value: Optional[datetime]) -> Optional[str]:
     if not value:
         return None
     return value.isoformat()
+
+
+def _to_date_string(value) -> Optional[str]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
 
 
 def _require_admin(current_user):
@@ -116,6 +133,140 @@ async def get_admin_users(
     ]
 
 
+@admin_router.get("/users/{user_id}/detail", response_model=AdminUserDetailResponse)
+async def get_admin_user_detail(
+    user_id: str,
+    current_user: Annotated[Any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    target_user = await db.user.find_unique(where={"id": user_id})
+    if not target_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    trading_accounts = await db.tradingaccount.find_many(
+        where={"userId": user_id},
+        order={"createdAt": "desc"},
+        include={
+            "botConfigurations": {
+                "include": {
+                    "botVersion": True,
+                }
+            }
+        },
+    )
+
+    mapped_accounts: List[AdminUserTradingAccountItemResponse] = []
+    total_balance = 0.0
+
+    for account in trading_accounts:
+        balance = _to_float(account.balance)
+        total_balance += balance
+
+        mapped_bots: List[AdminUserBotConfigurationItemResponse] = []
+        running_bots = 0
+        active_bots = 0
+
+        for config in account.botConfigurations:
+            container_status = _enum_value(config.containerStatus)
+            is_active = bool(config.isActive)
+
+            if container_status == "running":
+                running_bots += 1
+            if is_active:
+                active_bots += 1
+
+            mapped_bots.append(
+                AdminUserBotConfigurationItemResponse(
+                    id=str(config.id),
+                    bot_instance_id=int(config.botInstanceId),
+                    model_id=str(config.modelId),
+                    label=config.botVersion.label if config.botVersion else None,
+                    symbol=config.botVersion.symbol if config.botVersion else None,
+                    timeframe=config.botVersion.timeframe if config.botVersion else None,
+                    container_status=container_status,
+                    is_active=is_active,
+                    updated_at=_to_datetime_string(config.updatedAt),
+                )
+            )
+
+        mapped_accounts.append(
+            AdminUserTradingAccountItemResponse(
+                id=str(account.id),
+                mt5_login_id=account.mt5LoginId,
+                broker_name=account.brokerName,
+                server_name=account.serverName,
+                balance=round(balance, 2),
+                equity=round(_to_float(account.equity), 2),
+                running_bots=running_bots,
+                active_bots=active_bots,
+                bots=mapped_bots,
+            )
+        )
+
+    subscriptions = await db.subscription.find_many(where={"userId": user_id})
+    subscription_ids = [str(sub.id) for sub in subscriptions]
+
+    pending_count = 0
+    paid_count = 0
+    pending_amount = 0.0
+    paid_amount = 0.0
+    recent_invoices: List[AdminUserInvoiceItemResponse] = []
+
+    if subscription_ids:
+        pending_invoices = await db.invoice.find_many(
+            where={"subId": {"in": subscription_ids}, "status": "pending"}
+        )
+        paid_invoices = await db.invoice.find_many(
+            where={"subId": {"in": subscription_ids}, "status": "paid"}
+        )
+        latest_invoices = await db.invoice.find_many(
+            where={"subId": {"in": subscription_ids}},
+            order={"createdAt": "desc"},
+            take=12,
+        )
+
+        pending_count = len(pending_invoices)
+        paid_count = len(paid_invoices)
+        pending_amount = round(sum(_to_float(invoice.calculatedFee) for invoice in pending_invoices), 2)
+        paid_amount = round(sum(_to_float(invoice.calculatedFee) for invoice in paid_invoices), 2)
+
+        recent_invoices = [
+            AdminUserInvoiceItemResponse(
+                id=str(invoice.id),
+                subscription_id=str(invoice.subId),
+                status=_enum_value(invoice.status),
+                amount=round(_to_float(invoice.calculatedFee), 2),
+                created_at=_to_datetime_string(invoice.createdAt),
+                paid_at=_to_datetime_string(invoice.paidAt),
+                billing_start_date=_to_date_string(invoice.billingStartDate),
+                billing_end_date=_to_date_string(invoice.billingEndDate),
+            )
+            for invoice in latest_invoices
+        ]
+
+    return AdminUserDetailResponse(
+        id=str(target_user.id),
+        username=target_user.username,
+        email=target_user.email,
+        role=_enum_value(target_user.role) or "user",
+        status=_enum_value(target_user.status) or "active",
+        created_at=_to_datetime_string(target_user.createdAt) or "",
+        is_onboarding_completed=bool(target_user.isOnboardingCompleted),
+        total_accounts=len(mapped_accounts),
+        total_balance=round(total_balance, 2),
+        pending_bills=pending_count,
+        trading_accounts=mapped_accounts,
+        billing=AdminUserBillingSummaryResponse(
+            pending_count=pending_count,
+            paid_count=paid_count,
+            pending_amount=pending_amount,
+            paid_amount=paid_amount,
+            recent_invoices=recent_invoices,
+        ),
+    )
+
+
 @admin_router.patch("/users/{user_id}/status")
 async def update_admin_user_status(
     user_id: str,
@@ -168,6 +319,43 @@ async def update_admin_user_role(
     return {"message": f"User role updated to {role_value}"}
 
 
+@admin_router.patch("/users/{user_id}/bot-configurations/{bot_configuration_id}/status")
+async def update_admin_user_bot_configuration_status(
+    user_id: str,
+    bot_configuration_id: str,
+    data: UpdateAdminBotConfigurationStatusRequest,
+    current_user: Annotated[Any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    status_value = data.status.strip().lower()
+    if status_value not in ALLOWED_BOT_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="status must be running or stopped",
+        )
+
+    bot_configuration = await db.botconfiguration.find_unique(
+        where={"id": bot_configuration_id},
+        include={"account": True},
+    )
+    if not bot_configuration or str(bot_configuration.account.userId) != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Bot configuration not found for this user",
+        )
+
+    await db.botconfiguration.update(
+        where={"id": bot_configuration_id},
+        data={
+            "containerStatus": status_value,
+            "isActive": status_value == "running",
+        },
+    )
+
+    return {"message": f"Bot status updated to {status_value}"}
+
+
 @admin_router.get("/bot-versions", response_model=List[AdminBotVersionItemResponse])
 async def get_admin_bot_versions(
     current_user: Annotated[Any, Depends(get_current_active_user)],
@@ -178,9 +366,7 @@ async def get_admin_bot_versions(
     results: List[AdminBotVersionItemResponse] = []
 
     for version in versions:
-        usage_count = await db.botconfiguration.count(
-            where={"modelId": str(version.modelId)}
-        )
+        usage_count = await db.botconfiguration.count(where={"modelId": str(version.modelId)})
         results.append(
             AdminBotVersionItemResponse(
                 id=str(version.modelId),

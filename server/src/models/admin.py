@@ -31,6 +31,68 @@ class UpdateAdminUserRoleRequest(BaseModel):
     role: str
 
 
+class UpdateAdminBotConfigurationStatusRequest(BaseModel):
+    status: str
+
+
+class AdminUserBotConfigurationItemResponse(BaseModel):
+    id: str
+    bot_instance_id: int
+    model_id: str
+    label: Optional[str] = None
+    symbol: Optional[str] = None
+    timeframe: Optional[str] = None
+    container_status: Optional[str] = None
+    is_active: bool = False
+    updated_at: Optional[str] = None
+
+
+class AdminUserTradingAccountItemResponse(BaseModel):
+    id: str
+    mt5_login_id: Optional[str] = None
+    broker_name: Optional[str] = None
+    server_name: Optional[str] = None
+    balance: float = 0.0
+    equity: float = 0.0
+    running_bots: int = 0
+    active_bots: int = 0
+    bots: List[AdminUserBotConfigurationItemResponse] = Field(default_factory=list)
+
+
+class AdminUserInvoiceItemResponse(BaseModel):
+    id: str
+    subscription_id: str
+    status: Optional[str] = None
+    amount: float = 0.0
+    created_at: Optional[str] = None
+    paid_at: Optional[str] = None
+    billing_start_date: Optional[str] = None
+    billing_end_date: Optional[str] = None
+
+
+class AdminUserBillingSummaryResponse(BaseModel):
+    pending_count: int = 0
+    paid_count: int = 0
+    pending_amount: float = 0.0
+    paid_amount: float = 0.0
+    recent_invoices: List[AdminUserInvoiceItemResponse] = Field(default_factory=list)
+
+
+class AdminUserDetailResponse(BaseModel):
+    id: str
+    username: str
+    email: str
+    role: str
+    status: str
+    created_at: str
+    is_onboarding_completed: bool
+    total_accounts: int = 0
+    total_balance: float = 0.0
+    pending_bills: int = 0
+    trading_accounts: List[AdminUserTradingAccountItemResponse] = Field(default_factory=list)
+    billing: AdminUserBillingSummaryResponse
+
+
 class AdminBotVersionItemResponse(BaseModel):
     id: str
     label: Optional[str] = None
@@ -50,4 +112,3 @@ class CreateAdminBotVersionRequest(BaseModel):
     timeframe: Optional[str] = None
     docker_image_id: Optional[str] = None
     release_notes: List[str] = Field(default_factory=list)
-
