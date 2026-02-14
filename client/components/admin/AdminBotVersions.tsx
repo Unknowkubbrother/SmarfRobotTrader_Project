@@ -1,11 +1,19 @@
-import { useState, useEffect } from "react";
-import { Plus, Upload, Tag, Clock, Trash2, Boxes } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Boxes, Clock, PenSquare, Plus, Power, Rocket, Tag, Trash2, Upload } from "lucide-react";
 import { toast } from "sonner";
 
 import { api } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -17,29 +25,55 @@ interface BotVersion {
   symbol: string | null;
   timeframe: string | null;
   docker_image_id: string | null;
+  is_active: boolean;
   release_notes: string[];
   release_date: string | null;
   usage_count: number;
 }
 
+interface VersionForm {
+  label: string;
+  version_tag: string;
+  symbol: string;
+  timeframe: string;
+  docker_image_id: string;
+  release_notes: string;
+}
+
+const EMPTY_FORM: VersionForm = {
+  label: "",
+  version_tag: "",
+  symbol: "XAUUSD",
+  timeframe: "H1",
+  docker_image_id: "",
+  release_notes: "",
+};
+
 export function AdminBotVersions() {
   const [versions, setVersions] = useState<BotVersion[]>([]);
   const [loading, setLoading] = useState(true);
+
   const [showAddDialog, setShowAddDialog] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [formData, setFormData] = useState({
-    label: "",
-    version_tag: "",
-    symbol: "XAUUSD",
-    timeframe: "H1",
-    docker_image_id: "",
-    release_notes: "",
-  });
+  const [showEditDialog, setShowEditDialog] = useState(false);
+
+  const [addSubmitting, setAddSubmitting] = useState(false);
+  const [editSubmitting, setEditSubmitting] = useState(false);
+
+  const [actionKey, setActionKey] = useState<string | null>(null);
+  const [editingVersion, setEditingVersion] = useState<BotVersion | null>(null);
+
+  const [addForm, setAddForm] = useState<VersionForm>(EMPTY_FORM);
+  const [editForm, setEditForm] = useState<VersionForm>(EMPTY_FORM);
 
   useEffect(() => {
     fetchVersions();
   }, []);
+
+  const toReleaseNotes = (value: string) =>
+    value
+      .split("\n")
+      .map((note) => note.trim())
+      .filter(Boolean);
 
   const fetchVersions = async () => {
     try {
@@ -55,48 +89,134 @@ export function AdminBotVersions() {
   };
 
   const handleAddVersion = async () => {
-    if (!formData.label.trim() || !formData.version_tag.trim()) {
+    if (!addForm.label.trim() || !addForm.version_tag.trim()) {
       toast.error("Please fill in label and version tag");
       return;
     }
 
-    setSubmitting(true);
+    setAddSubmitting(true);
     try {
-      const releaseNotes = formData.release_notes
-        .split("\n")
-        .map((note) => note.trim())
-        .filter(Boolean);
-
       await api.post("/admin/bot-versions", {
-        label: formData.label.trim(),
-        version_tag: formData.version_tag.trim(),
-        symbol: formData.symbol.trim() || null,
-        timeframe: formData.timeframe.trim() || null,
-        docker_image_id: formData.docker_image_id.trim() || null,
-        release_notes: releaseNotes,
+        label: addForm.label.trim(),
+        version_tag: addForm.version_tag.trim(),
+        symbol: addForm.symbol.trim() || null,
+        timeframe: addForm.timeframe.trim() || null,
+        docker_image_id: addForm.docker_image_id.trim() || null,
+        is_active: true,
+        release_notes: toReleaseNotes(addForm.release_notes),
       });
 
       toast.success("Bot version added successfully");
       setShowAddDialog(false);
-      setFormData({
-        label: "",
-        version_tag: "",
-        symbol: "XAUUSD",
-        timeframe: "H1",
-        docker_image_id: "",
-        release_notes: "",
-      });
+      setAddForm(EMPTY_FORM);
       await fetchVersions();
     } catch (error: any) {
       console.error("Error adding version:", error);
       toast.error(error?.message || "Failed to add bot version");
     } finally {
-      setSubmitting(false);
+      setAddSubmitting(false);
+    }
+  };
+
+  const openEditDialog = (version: BotVersion) => {
+    setEditingVersion(version);
+    setEditForm({
+      label: version.label || "",
+      version_tag: version.version_tag || "",
+      symbol: version.symbol || "",
+      timeframe: version.timeframe || "",
+      docker_image_id: version.docker_image_id || "",
+      release_notes: (version.release_notes || []).join("\n"),
+    });
+    setShowEditDialog(true);
+  };
+
+  const handleUpdateVersion = async () => {
+    if (!editingVersion) return;
+    if (!editForm.label.trim() || !editForm.version_tag.trim()) {
+      toast.error("Please fill in label and version tag");
+      return;
+    }
+
+    setEditSubmitting(true);
+    try {
+      await api.patch(`/admin/bot-versions/${editingVersion.id}`, {
+        label: editForm.label.trim(),
+        version_tag: editForm.version_tag.trim(),
+        symbol: editForm.symbol.trim() || null,
+        timeframe: editForm.timeframe.trim() || null,
+        docker_image_id: editForm.docker_image_id.trim() || null,
+        release_notes: toReleaseNotes(editForm.release_notes),
+      });
+
+      toast.success("Bot version updated");
+      setShowEditDialog(false);
+      setEditingVersion(null);
+      await fetchVersions();
+    } catch (error: any) {
+      console.error("Error updating version:", error);
+      toast.error(error?.message || "Failed to update bot version");
+    } finally {
+      setEditSubmitting(false);
+    }
+  };
+
+  const toggleVersionActive = async (version: BotVersion) => {
+    const nextActive = !version.is_active;
+    setActionKey(`active-${version.id}`);
+
+    try {
+      const { data } = await api.patch(`/admin/bot-versions/${version.id}/active`, {
+        is_active: nextActive,
+      });
+
+      if (!nextActive) {
+        const stopped = Number(data?.stopped_bots || 0);
+        toast.success(
+          stopped > 0
+            ? `Version deactivated and stopped ${stopped} running bot(s)`
+            : "Version deactivated"
+        );
+      } else {
+        toast.success("Version activated");
+      }
+
+      await fetchVersions();
+    } catch (error: any) {
+      console.error("Error toggling version active state:", error);
+      toast.error(error?.message || "Failed to toggle version status");
+    } finally {
+      setActionKey(null);
+    }
+  };
+
+  const rolloutVersion = async (version: BotVersion) => {
+    if (!version.is_active) {
+      toast.error("Please activate this version before rollout");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Rollout ${version.label || version.version_tag || "this version"} to existing bots?`
+    );
+    if (!confirmed) return;
+
+    setActionKey(`rollout-${version.id}`);
+    try {
+      const { data } = await api.post(`/admin/bot-versions/${version.id}/rollout`);
+      const updatedBots = Number(data?.updated_bots || 0);
+      toast.success(`Rollout complete. Updated ${updatedBots} bot(s).`);
+      await fetchVersions();
+    } catch (error: any) {
+      console.error("Error rolling out version:", error);
+      toast.error(error?.message || "Failed to rollout bot version");
+    } finally {
+      setActionKey(null);
     }
   };
 
   const deleteVersion = async (id: string) => {
-    setDeletingId(id);
+    setActionKey(`delete-${id}`);
     try {
       await api.delete(`/admin/bot-versions/${id}`);
       toast.success("Version deleted");
@@ -105,7 +225,7 @@ export function AdminBotVersions() {
       console.error("Error deleting version:", error);
       toast.error(error?.message || "Failed to delete version");
     } finally {
-      setDeletingId(null);
+      setActionKey(null);
     }
   };
 
@@ -121,6 +241,7 @@ export function AdminBotVersions() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold">Bot Versions</h2>
+
         <Dialog open={showAddDialog} onOpenChange={setShowAddDialog}>
           <DialogTrigger asChild>
             <Button>
@@ -131,77 +252,164 @@ export function AdminBotVersions() {
           <DialogContent>
             <DialogHeader>
               <DialogTitle>Add New Bot Version</DialogTitle>
-              <DialogDescription>
-                Create a new bot version for deployment
-              </DialogDescription>
+              <DialogDescription>Create a new bot version for deployment</DialogDescription>
             </DialogHeader>
+
             <div className="space-y-4">
               <div>
-                <Label htmlFor="label">Label *</Label>
+                <Label htmlFor="add-label">Label *</Label>
                 <Input
-                  id="label"
+                  id="add-label"
                   placeholder="e.g., Gold Scalper v2"
-                  value={formData.label}
-                  onChange={(event) => setFormData({ ...formData, label: event.target.value })}
+                  value={addForm.label}
+                  onChange={(event) => setAddForm({ ...addForm, label: event.target.value })}
                 />
               </div>
+
               <div>
-                <Label htmlFor="version_tag">Version Tag *</Label>
+                <Label htmlFor="add-version">Version Tag *</Label>
                 <Input
-                  id="version_tag"
+                  id="add-version"
                   placeholder="e.g., v2.0.0"
-                  value={formData.version_tag}
-                  onChange={(event) => setFormData({ ...formData, version_tag: event.target.value })}
+                  value={addForm.version_tag}
+                  onChange={(event) => setAddForm({ ...addForm, version_tag: event.target.value })}
                 />
               </div>
+
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <Label htmlFor="symbol">Symbol</Label>
+                  <Label htmlFor="add-symbol">Symbol</Label>
                   <Input
-                    id="symbol"
-                    value={formData.symbol}
-                    onChange={(event) => setFormData({ ...formData, symbol: event.target.value })}
+                    id="add-symbol"
+                    value={addForm.symbol}
+                    onChange={(event) => setAddForm({ ...addForm, symbol: event.target.value })}
                   />
                 </div>
                 <div>
-                  <Label htmlFor="timeframe">Timeframe</Label>
+                  <Label htmlFor="add-timeframe">Timeframe</Label>
                   <Input
-                    id="timeframe"
-                    value={formData.timeframe}
-                    onChange={(event) => setFormData({ ...formData, timeframe: event.target.value })}
+                    id="add-timeframe"
+                    value={addForm.timeframe}
+                    onChange={(event) => setAddForm({ ...addForm, timeframe: event.target.value })}
                   />
                 </div>
               </div>
+
               <div>
-                <Label htmlFor="docker_image_id">Docker Image ID</Label>
+                <Label htmlFor="add-image">Docker Image ID</Label>
                 <Input
-                  id="docker_image_id"
+                  id="add-image"
                   placeholder="registry/repo:tag"
-                  value={formData.docker_image_id}
-                  onChange={(event) => setFormData({ ...formData, docker_image_id: event.target.value })}
+                  value={addForm.docker_image_id}
+                  onChange={(event) => setAddForm({ ...addForm, docker_image_id: event.target.value })}
                 />
               </div>
+
               <div>
-                <Label htmlFor="release_notes">Release Notes (one line each)</Label>
+                <Label htmlFor="add-notes">Release Notes (one line each)</Label>
                 <Textarea
-                  id="release_notes"
+                  id="add-notes"
                   placeholder="Improved signal filters&#10;Lower drawdown"
-                  value={formData.release_notes}
-                  onChange={(event) => setFormData({ ...formData, release_notes: event.target.value })}
+                  value={addForm.release_notes}
+                  onChange={(event) => setAddForm({ ...addForm, release_notes: event.target.value })}
                 />
               </div>
             </div>
+
             <DialogFooter>
-              <Button variant="outline" onClick={() => setShowAddDialog(false)} disabled={submitting}>
+              <Button variant="outline" onClick={() => setShowAddDialog(false)} disabled={addSubmitting}>
                 Cancel
               </Button>
-              <Button onClick={handleAddVersion} disabled={submitting}>
-                {submitting ? "Adding..." : "Add Version"}
+              <Button onClick={handleAddVersion} disabled={addSubmitting}>
+                {addSubmitting ? "Adding..." : "Add Version"}
               </Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
       </div>
+
+      <Dialog
+        open={showEditDialog}
+        onOpenChange={(open) => {
+          setShowEditDialog(open);
+          if (!open) {
+            setEditingVersion(null);
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Bot Version</DialogTitle>
+            <DialogDescription>Update metadata and release notes for this version</DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div>
+              <Label htmlFor="edit-label">Label *</Label>
+              <Input
+                id="edit-label"
+                value={editForm.label}
+                onChange={(event) => setEditForm({ ...editForm, label: event.target.value })}
+              />
+            </div>
+
+            <div>
+              <Label htmlFor="edit-version">Version Tag *</Label>
+              <Input
+                id="edit-version"
+                value={editForm.version_tag}
+                onChange={(event) => setEditForm({ ...editForm, version_tag: event.target.value })}
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label htmlFor="edit-symbol">Symbol</Label>
+                <Input
+                  id="edit-symbol"
+                  value={editForm.symbol}
+                  onChange={(event) => setEditForm({ ...editForm, symbol: event.target.value })}
+                />
+              </div>
+              <div>
+                <Label htmlFor="edit-timeframe">Timeframe</Label>
+                <Input
+                  id="edit-timeframe"
+                  value={editForm.timeframe}
+                  onChange={(event) => setEditForm({ ...editForm, timeframe: event.target.value })}
+                />
+              </div>
+            </div>
+
+            <div>
+              <Label htmlFor="edit-image">Docker Image ID</Label>
+              <Input
+                id="edit-image"
+                value={editForm.docker_image_id}
+                onChange={(event) => setEditForm({ ...editForm, docker_image_id: event.target.value })}
+              />
+            </div>
+
+            <div>
+              <Label htmlFor="edit-notes">Release Notes</Label>
+              <Textarea
+                id="edit-notes"
+                value={editForm.release_notes}
+                onChange={(event) => setEditForm({ ...editForm, release_notes: event.target.value })}
+              />
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowEditDialog(false)} disabled={editSubmitting}>
+              Cancel
+            </Button>
+            <Button onClick={handleUpdateVersion} disabled={editSubmitting}>
+              {editSubmitting ? "Saving..." : "Save Changes"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <div className="grid gap-4">
         {versions.length === 0 ? (
@@ -221,11 +429,21 @@ export function AdminBotVersions() {
                       <Tag className="w-3 h-3 mr-1" />
                       {version.version_tag || "-"}
                     </Badge>
+                    <Badge
+                      className={
+                        version.is_active
+                          ? "bg-emerald-100 text-emerald-700"
+                          : "bg-zinc-200 text-zinc-700"
+                      }
+                    >
+                      {version.is_active ? "Active" : "Inactive"}
+                    </Badge>
                     <Badge variant="secondary" className="flex items-center gap-1">
                       <Boxes className="w-3 h-3" />
                       In use {version.usage_count}
                     </Badge>
                   </div>
+
                   <div className="flex items-center gap-4 text-sm text-muted-foreground flex-wrap">
                     <span className="font-mono">{version.symbol || "-"}</span>
                     <span>{version.timeframe || "-"}</span>
@@ -234,11 +452,11 @@ export function AdminBotVersions() {
                       {version.release_date ? new Date(version.release_date).toLocaleDateString() : "N/A"}
                     </span>
                   </div>
+
                   {version.docker_image_id && (
-                    <p className="text-xs text-muted-foreground mt-2 font-mono">
-                      {version.docker_image_id}
-                    </p>
+                    <p className="text-xs text-muted-foreground mt-2 font-mono">{version.docker_image_id}</p>
                   )}
+
                   {version.release_notes.length > 0 && (
                     <ul className="text-sm text-muted-foreground mt-2 list-disc list-inside">
                       {version.release_notes.map((note, index) => (
@@ -247,12 +465,42 @@ export function AdminBotVersions() {
                     </ul>
                   )}
                 </div>
-                <div className="flex items-center gap-2">
+
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <Button size="sm" variant="outline" onClick={() => openEditDialog(version)}>
+                    <PenSquare className="w-4 h-4 mr-1" />
+                    Edit
+                  </Button>
+
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={actionKey === `rollout-${version.id}` || !version.is_active}
+                    onClick={() => rolloutVersion(version)}
+                  >
+                    <Rocket className="w-4 h-4 mr-1" />
+                    {actionKey === `rollout-${version.id}` ? "Updating..." : "Update Bots"}
+                  </Button>
+
+                  <Button
+                    size="sm"
+                    variant={version.is_active ? "secondary" : "outline"}
+                    disabled={actionKey === `active-${version.id}`}
+                    onClick={() => toggleVersionActive(version)}
+                  >
+                    <Power className="w-4 h-4 mr-1" />
+                    {actionKey === `active-${version.id}`
+                      ? "Saving..."
+                      : version.is_active
+                        ? "Set Inactive"
+                        : "Set Active"}
+                  </Button>
+
                   <Button
                     variant="ghost"
                     size="icon"
                     onClick={() => deleteVersion(version.id)}
-                    disabled={deletingId === version.id}
+                    disabled={actionKey === `delete-${version.id}`}
                     className="text-destructive hover:text-destructive"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -266,4 +514,3 @@ export function AdminBotVersions() {
     </div>
   );
 }
-

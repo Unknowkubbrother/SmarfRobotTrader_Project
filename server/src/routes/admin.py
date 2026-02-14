@@ -17,6 +17,8 @@ from ..models.admin import (
     AdminUserTradingAccountItemResponse,
     CreateAdminBotVersionRequest,
     UpdateAdminBotConfigurationStatusRequest,
+    UpdateAdminBotVersionActiveRequest,
+    UpdateAdminBotVersionRequest,
     UpdateAdminUserSubscriptionBillingRequest,
     UpdateAdminUserRoleRequest,
     UpdateAdminUserStatusRequest,
@@ -76,6 +78,56 @@ def _map_user_subscription(subscription) -> AdminUserSubscriptionItemResponse:
         next_billing_date=_to_date_string(subscription.nextBillingDate),
         created_at=_to_datetime_string(subscription.createdAt),
     )
+
+
+def _clean_release_notes(release_notes: Optional[List[str]]) -> List[str]:
+    if not release_notes:
+        return []
+    return [note.strip() for note in release_notes if note and note.strip()]
+
+
+def _map_bot_version(version, usage_count: int) -> AdminBotVersionItemResponse:
+    return AdminBotVersionItemResponse(
+        id=str(version.modelId),
+        label=version.label,
+        version_tag=version.versionTag,
+        symbol=version.symbol,
+        timeframe=version.timeframe,
+        docker_image_id=version.dockerImageId,
+        is_active=bool(getattr(version, "isActive", True)),
+        release_notes=version.releaseNotes or [],
+        release_date=_to_datetime_string(version.releaseDate),
+        usage_count=usage_count,
+    )
+
+
+async def _stop_active_bots_using_version(model_id: str) -> int:
+    active_bots_count = await db.botconfiguration.count(
+        where={
+            "modelId": model_id,
+            "OR": [
+                {"containerStatus": "running"},
+                {"isActive": True},
+            ],
+        }
+    )
+
+    if active_bots_count > 0:
+        await db.botconfiguration.update_many(
+            where={
+                "modelId": model_id,
+                "OR": [
+                    {"containerStatus": "running"},
+                    {"isActive": True},
+                ],
+            },
+            data={
+                "containerStatus": "stopped",
+                "isActive": False,
+            },
+        )
+
+    return active_bots_count
 
 
 @admin_router.get("/stats", response_model=AdminStatsResponse)
@@ -480,19 +532,7 @@ async def get_admin_bot_versions(
 
     for version in versions:
         usage_count = await db.botconfiguration.count(where={"modelId": str(version.modelId)})
-        results.append(
-            AdminBotVersionItemResponse(
-                id=str(version.modelId),
-                label=version.label,
-                version_tag=version.versionTag,
-                symbol=version.symbol,
-                timeframe=version.timeframe,
-                docker_image_id=version.dockerImageId,
-                release_notes=version.releaseNotes or [],
-                release_date=_to_datetime_string(version.releaseDate),
-                usage_count=usage_count,
-            )
-        )
+        results.append(_map_bot_version(version, usage_count=usage_count))
 
     return results
 
@@ -520,21 +560,155 @@ async def create_admin_bot_version(
             "symbol": data.symbol.strip() if data.symbol else None,
             "timeframe": data.timeframe.strip() if data.timeframe else None,
             "dockerImageId": data.docker_image_id.strip() if data.docker_image_id else None,
-            "releaseNotes": data.release_notes,
+            "isActive": bool(data.is_active),
+            "releaseNotes": _clean_release_notes(data.release_notes),
         }
     )
 
-    return AdminBotVersionItemResponse(
-        id=str(created.modelId),
-        label=created.label,
-        version_tag=created.versionTag,
-        symbol=created.symbol,
-        timeframe=created.timeframe,
-        docker_image_id=created.dockerImageId,
-        release_notes=created.releaseNotes or [],
-        release_date=_to_datetime_string(created.releaseDate),
-        usage_count=0,
+    return _map_bot_version(created, usage_count=0)
+
+
+@admin_router.patch("/bot-versions/{model_id}", response_model=AdminBotVersionItemResponse)
+async def update_admin_bot_version(
+    model_id: str,
+    data: UpdateAdminBotVersionRequest,
+    current_user: Annotated[Any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    existing = await db.botversion.find_unique(where={"modelId": model_id})
+    if not existing:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot version not found")
+
+    update_payload = {}
+
+    if data.label is not None:
+        label = data.label.strip()
+        if not label:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="label cannot be empty")
+        update_payload["label"] = label
+
+    if data.version_tag is not None:
+        version_tag = data.version_tag.strip()
+        if not version_tag:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="version_tag cannot be empty")
+        update_payload["versionTag"] = version_tag
+
+    if data.symbol is not None:
+        update_payload["symbol"] = data.symbol.strip() if data.symbol else None
+
+    if data.timeframe is not None:
+        update_payload["timeframe"] = data.timeframe.strip() if data.timeframe else None
+
+    if data.docker_image_id is not None:
+        update_payload["dockerImageId"] = data.docker_image_id.strip() if data.docker_image_id else None
+
+    if data.release_notes is not None:
+        update_payload["releaseNotes"] = _clean_release_notes(data.release_notes)
+
+    if data.is_active is not None:
+        next_active = bool(data.is_active)
+        update_payload["isActive"] = next_active
+        if not next_active:
+            await _stop_active_bots_using_version(model_id)
+
+    if update_payload:
+        updated = await db.botversion.update(
+            where={"modelId": model_id},
+            data=update_payload,
+        )
+    else:
+        updated = existing
+
+    usage_count = await db.botconfiguration.count(where={"modelId": model_id})
+    return _map_bot_version(updated, usage_count=usage_count)
+
+
+@admin_router.patch("/bot-versions/{model_id}/active")
+async def update_admin_bot_version_active(
+    model_id: str,
+    data: UpdateAdminBotVersionActiveRequest,
+    current_user: Annotated[Any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    existing = await db.botversion.find_unique(where={"modelId": model_id})
+    if not existing:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot version not found")
+
+    next_active = bool(data.is_active)
+    stopped_bots_count = 0
+    if not next_active:
+        stopped_bots_count = await _stop_active_bots_using_version(model_id)
+
+    await db.botversion.update(
+        where={"modelId": model_id},
+        data={"isActive": next_active},
     )
+
+    return {
+        "message": f"Bot version {'activated' if next_active else 'deactivated'}",
+        "is_active": next_active,
+        "stopped_bots": stopped_bots_count,
+    }
+
+
+@admin_router.post("/bot-versions/{model_id}/rollout")
+async def rollout_admin_bot_version(
+    model_id: str,
+    current_user: Annotated[Any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    target_version = await db.botversion.find_unique(where={"modelId": model_id})
+    if not target_version:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot version not found")
+
+    if not bool(getattr(target_version, "isActive", True)):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot rollout an inactive bot version",
+        )
+
+    source_where = {"modelId": {"not": model_id}}
+    if target_version.symbol:
+        source_where["symbol"] = target_version.symbol
+    if target_version.timeframe:
+        source_where["timeframe"] = target_version.timeframe
+    if not target_version.symbol and not target_version.timeframe and target_version.label:
+        source_where["label"] = target_version.label
+    if not target_version.symbol and not target_version.timeframe and not target_version.label:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Target version needs symbol/timeframe or label to rollout safely",
+        )
+
+    source_versions = await db.botversion.find_many(where=source_where)
+    source_model_ids = [str(version.modelId) for version in source_versions]
+
+    if not source_model_ids:
+        return {
+            "message": "No older bot versions found for rollout",
+            "updated_bots": 0,
+            "source_versions": 0,
+        }
+
+    affected_bots = await db.botconfiguration.count(
+        where={"modelId": {"in": source_model_ids}}
+    )
+
+    if affected_bots > 0:
+        await db.botconfiguration.update_many(
+            where={"modelId": {"in": source_model_ids}},
+            data={"modelId": model_id},
+        )
+
+    return {
+        "message": "Bot rollout completed",
+        "updated_bots": affected_bots,
+        "source_versions": len(source_model_ids),
+        "target_version": model_id,
+    }
 
 
 @admin_router.delete("/bot-versions/{model_id}")

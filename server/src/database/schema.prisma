@@ -302,6 +302,7 @@ model BotVersion {
   versionTag    String?   @map("version_tag") @db.VarChar(20)
   symbol        String?   @db.VarChar(20)
   timeframe     String?   @db.VarChar(10)
+  isActive      Boolean   @default(true) @map("is_active")
   releaseNotes  String[]  @map("release_notes") @db.Text
   releaseDate   DateTime? @default(now()) @map("release_date") @db.Timestamptz
 

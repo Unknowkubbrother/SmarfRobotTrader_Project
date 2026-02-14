@@ -41,6 +41,20 @@ class UpdateAdminUserSubscriptionBillingRequest(BaseModel):
     min_profit_threshold: float
 
 
+class UpdateAdminBotVersionActiveRequest(BaseModel):
+    is_active: bool
+
+
+class UpdateAdminBotVersionRequest(BaseModel):
+    label: Optional[str] = None
+    version_tag: Optional[str] = None
+    symbol: Optional[str] = None
+    timeframe: Optional[str] = None
+    docker_image_id: Optional[str] = None
+    release_notes: Optional[List[str]] = None
+    is_active: Optional[bool] = None
+
+
 class AdminUserBotConfigurationItemResponse(BaseModel):
     id: str
     bot_instance_id: int
@@ -117,6 +131,7 @@ class AdminBotVersionItemResponse(BaseModel):
     symbol: Optional[str] = None
     timeframe: Optional[str] = None
     docker_image_id: Optional[str] = None
+    is_active: bool = True
     release_notes: List[str] = Field(default_factory=list)
     release_date: Optional[str] = None
     usage_count: int = 0
@@ -128,4 +143,5 @@ class CreateAdminBotVersionRequest(BaseModel):
     symbol: Optional[str] = None
     timeframe: Optional[str] = None
     docker_image_id: Optional[str] = None
+    is_active: bool = True
     release_notes: List[str] = Field(default_factory=list)

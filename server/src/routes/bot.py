@@ -15,7 +15,7 @@ bot_router = APIRouter()
 async def verify_bot_ownership(bot_config_id: str, user_id: str):
     config = await db.botconfiguration.find_unique(
         where={"id": bot_config_id},
-        include={"account": True}
+        include={"account": True, "botVersion": True}
     )
     if not config:
         raise HTTPException(status_code=404, detail="Bot configuration not found")
@@ -30,6 +30,9 @@ async def get_bot_versions(request: Request):
         raise HTTPException(status_code=400, detail="User ID is required")
     
     bot_versions = await db.botversion.find_many(
+        where={
+            "isActive": True
+        },
         order={
             "releaseDate": "desc"
         }
@@ -79,6 +82,8 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
 
     if not bot_version:
         raise HTTPException(status_code=404, detail="Bot version not found")
+    if not getattr(bot_version, "isActive", True):
+        raise HTTPException(status_code=400, detail="This bot version is inactive")
 
     bot_configuration_count = await db.botconfiguration.count(
         where={
@@ -126,10 +131,12 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
 
-    await verify_bot_ownership(data.botConfigId, request.state.user_id)
+    config = await verify_bot_ownership(data.botConfigId, request.state.user_id)
 
     if data.status not in ("running", "stopped"):
         raise HTTPException(status_code=400, detail="Status must be 'running' or 'stopped'")
+    if data.status == "running" and config.botVersion and not getattr(config.botVersion, "isActive", True):
+        raise HTTPException(status_code=400, detail="Cannot run bot. Its version is inactive.")
 
     await db.botconfiguration.update(
         where={"id": data.botConfigId},
