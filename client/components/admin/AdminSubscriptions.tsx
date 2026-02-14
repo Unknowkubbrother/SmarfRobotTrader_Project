@@ -1,40 +1,48 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import { DollarSign, Percent, Settings, Save } from "lucide-react";
+import { toast } from "sonner";
+
+import { api } from "@/lib/api";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Badge } from "@/components/ui/badge";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { supabase } from "@/lib/integrations/supabase/client";
-import { toast } from "sonner";
 
-interface Subscription {
-  id: string;
-  user_id: string;
-  status: string | null;
-  fee_type: string | null;
-  fee_value: number | null;
-  next_billing_date: string | null;
-  profiles: {
-    email: string;
-  } | null;
+interface AdminBillingConfig {
+  config_id: number | null;
+  default_fee_type: "percentage" | "fixed";
+  default_fee_value: number;
+  default_min_threshold: number;
+  updated_at: string | null;
 }
 
-interface BillingConfig {
+interface AdminSubscriptionItem {
   id: string;
-  default_fee_type: string | null;
-  default_fee_value: number | null;
-  default_min_threshold: number | null;
+  user_id: string;
+  user_email: string | null;
+  status: "active" | "past_due" | "canceled";
+  fee_type: "percentage" | "fixed";
+  fee_value: number;
+  min_profit_threshold: number;
+  next_billing_date: string | null;
+  created_at: string | null;
+}
+
+interface AdminSubscriptionManagementResponse {
+  billing_config: AdminBillingConfig;
+  subscriptions: AdminSubscriptionItem[];
 }
 
 export function AdminSubscriptions() {
-  const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
-  const [billingConfig, setBillingConfig] = useState<BillingConfig | null>(null);
+  const [subscriptions, setSubscriptions] = useState<AdminSubscriptionItem[]>([]);
+  const [billingConfig, setBillingConfig] = useState<AdminBillingConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [savingConfig, setSavingConfig] = useState(false);
+  const [updatingSubId, setUpdatingSubId] = useState<string | null>(null);
   const [configForm, setConfigForm] = useState({
-    fee_type: "percentage",
+    fee_type: "percentage" as "percentage" | "fixed",
     fee_value: 20,
     min_threshold: 0,
   });
@@ -45,47 +53,18 @@ export function AdminSubscriptions() {
 
   const fetchData = async () => {
     try {
-      // Fetch subscriptions
-      const { data: subs, error: subsError } = await supabase
-        .from("subscriptions")
-        .select("*")
-        .order("created_at", { ascending: false });
-
-      if (subsError) throw subsError;
-
-      // Fetch profiles for each subscription
-      const subsWithProfiles = await Promise.all(
-        (subs || []).map(async (sub) => {
-          const { data: profile } = await supabase
-            .from("profiles")
-            .select("email")
-            .eq("id", sub.user_id)
-            .maybeSingle();
-          return { ...sub, profiles: profile };
-        })
-      );
-      setSubscriptions(subsWithProfiles);
-
-      // Fetch billing config
-      const { data: config, error: configError } = await supabase
-        .from("system_billing_config")
-        .select("*")
-        .limit(1)
-        .maybeSingle();
-
-      if (configError && !configError.message.includes("No rows")) throw configError;
-
-      if (config) {
-        setBillingConfig(config);
-        setConfigForm({
-          fee_type: config.default_fee_type ?? "percentage",
-          fee_value: config.default_fee_value ?? 20,
-          min_threshold: config.default_min_threshold ?? 0,
-        });
-      }
-    } catch (error) {
-      console.error("Error fetching data:", error);
-      toast.error("Failed to load subscription data");
+      setLoading(true);
+      const { data } = await api.get<AdminSubscriptionManagementResponse>("/subscription/admin/management");
+      setSubscriptions(data.subscriptions || []);
+      setBillingConfig(data.billing_config || null);
+      setConfigForm({
+        fee_type: (data.billing_config?.default_fee_type ?? "percentage") as "percentage" | "fixed",
+        fee_value: data.billing_config?.default_fee_value ?? 20,
+        min_threshold: data.billing_config?.default_min_threshold ?? 0,
+      });
+    } catch (error: any) {
+      console.error("Error fetching admin subscription data:", error);
+      toast.error(error?.message || "Failed to load subscription data");
     } finally {
       setLoading(false);
     }
@@ -94,62 +73,47 @@ export function AdminSubscriptions() {
   const saveBillingConfig = async () => {
     setSavingConfig(true);
     try {
-      if (billingConfig) {
-        const { error } = await supabase
-          .from("system_billing_config")
-          .update({
-            default_fee_type: configForm.fee_type as "percentage" | "fixed",
-            default_fee_value: configForm.fee_value,
-            default_min_threshold: configForm.min_threshold,
-          })
-          .eq("id", billingConfig.id);
-
-        if (error) throw error;
-      } else {
-        const { error } = await supabase.from("system_billing_config").insert({
-          default_fee_type: configForm.fee_type as "percentage" | "fixed",
-          default_fee_value: configForm.fee_value,
-          default_min_threshold: configForm.min_threshold,
-        });
-
-        if (error) throw error;
-      }
+      const { data } = await api.put<AdminBillingConfig>("/subscription/admin/config", {
+        default_fee_type: configForm.fee_type,
+        default_fee_value: configForm.fee_value,
+        default_min_threshold: configForm.min_threshold,
+      });
+      setBillingConfig(data);
       toast.success("Billing config saved");
-      fetchData();
-    } catch (error) {
-      console.error("Error saving config:", error);
-      toast.error("Failed to save billing config");
+      await fetchData();
+    } catch (error: any) {
+      console.error("Error saving billing config:", error);
+      toast.error(error?.message || "Failed to save billing config");
     } finally {
       setSavingConfig(false);
     }
   };
 
-  const updateSubscriptionStatus = async (subId: string, status: string) => {
+  const updateSubscriptionStatus = async (
+    subId: string,
+    status: "active" | "past_due" | "canceled"
+  ) => {
+    setUpdatingSubId(subId);
     try {
-      const { error } = await supabase
-        .from("subscriptions")
-        .update({ status: status as "active" | "trial" | "suspended" | "expired" })
-        .eq("id", subId);
-
-      if (error) throw error;
-      toast.success(`Subscription ${status}`);
-      fetchData();
-    } catch (error) {
+      await api.patch(`/subscription/admin/subscriptions/${subId}/status`, { status });
+      toast.success(`Subscription updated to ${status}`);
+      await fetchData();
+    } catch (error: any) {
       console.error("Error updating subscription:", error);
-      toast.error("Failed to update subscription");
+      toast.error(error?.message || "Failed to update subscription");
+    } finally {
+      setUpdatingSubId(null);
     }
   };
 
-  const getStatusBadge = (status: string) => {
+  const getStatusBadge = (status: AdminSubscriptionItem["status"]) => {
     switch (status) {
       case "active":
         return <Badge className="bg-success/10 text-success">Active</Badge>;
-      case "trial":
-        return <Badge className="bg-primary/10 text-primary">Trial</Badge>;
-      case "suspended":
-        return <Badge className="bg-destructive/10 text-destructive">Suspended</Badge>;
-      case "expired":
-        return <Badge variant="secondary">Expired</Badge>;
+      case "past_due":
+        return <Badge className="bg-warning/10 text-warning">Past Due</Badge>;
+      case "canceled":
+        return <Badge className="bg-destructive/10 text-destructive">Canceled</Badge>;
       default:
         return <Badge variant="outline">{status}</Badge>;
     }
@@ -165,7 +129,6 @@ export function AdminSubscriptions() {
 
   return (
     <div className="space-y-6">
-      {/* Billing Configuration */}
       <div className="glass-card p-6">
         <div className="flex items-center gap-2 mb-4">
           <Settings className="w-5 h-5 text-primary" />
@@ -177,7 +140,7 @@ export function AdminSubscriptions() {
             <Label className="mb-3 block">Fee Type</Label>
             <RadioGroup
               value={configForm.fee_type}
-              onValueChange={(value) => setConfigForm({ ...configForm, fee_type: value })}
+              onValueChange={(value) => setConfigForm({ ...configForm, fee_type: value as "percentage" | "fixed" })}
               className="flex gap-4"
             >
               <div className="flex items-center space-x-2">
@@ -204,8 +167,11 @@ export function AdminSubscriptions() {
             <Input
               id="fee_value"
               type="number"
+              min={0}
               value={configForm.fee_value}
-              onChange={(e) => setConfigForm({ ...configForm, fee_value: parseFloat(e.target.value) || 0 })}
+              onChange={(event) =>
+                setConfigForm({ ...configForm, fee_value: parseFloat(event.target.value) || 0 })
+              }
               className="mt-2"
             />
           </div>
@@ -215,11 +181,20 @@ export function AdminSubscriptions() {
             <Input
               id="min_threshold"
               type="number"
+              min={0}
               value={configForm.min_threshold}
-              onChange={(e) => setConfigForm({ ...configForm, min_threshold: parseFloat(e.target.value) || 0 })}
+              onChange={(event) =>
+                setConfigForm({ ...configForm, min_threshold: parseFloat(event.target.value) || 0 })
+              }
               className="mt-2"
             />
           </div>
+        </div>
+
+        <div className="mt-4 text-xs text-muted-foreground">
+          {billingConfig?.updated_at
+            ? `Last updated: ${new Date(billingConfig.updated_at).toLocaleString()}`
+            : "Using system defaults"}
         </div>
 
         <Button onClick={saveBillingConfig} disabled={savingConfig} className="mt-4">
@@ -228,7 +203,6 @@ export function AdminSubscriptions() {
         </Button>
       </div>
 
-      {/* Subscriptions List */}
       <div className="glass-card overflow-hidden">
         <div className="p-4 border-b border-border">
           <h3 className="font-semibold">User Subscriptions</h3>
@@ -239,6 +213,7 @@ export function AdminSubscriptions() {
               <TableHead>User</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Fee</TableHead>
+              <TableHead>Threshold</TableHead>
               <TableHead>Next Billing</TableHead>
               <TableHead>Actions</TableHead>
             </TableRow>
@@ -246,11 +221,12 @@ export function AdminSubscriptions() {
           <TableBody>
             {subscriptions.map((sub) => (
               <TableRow key={sub.id}>
-                <TableCell>{sub.profiles?.email || "Unknown"}</TableCell>
-                <TableCell>{getStatusBadge(sub.status ?? 'unknown')}</TableCell>
+                <TableCell>{sub.user_email || "Unknown"}</TableCell>
+                <TableCell>{getStatusBadge(sub.status)}</TableCell>
                 <TableCell>
-                  {sub.fee_type === "percentage" ? `${sub.fee_value ?? 0}%` : `$${sub.fee_value ?? 0}`}
+                  {sub.fee_type === "percentage" ? `${sub.fee_value}%` : `$${sub.fee_value}`}
                 </TableCell>
+                <TableCell>${sub.min_profit_threshold}</TableCell>
                 <TableCell>
                   {sub.next_billing_date
                     ? new Date(sub.next_billing_date).toLocaleDateString()
@@ -258,23 +234,30 @@ export function AdminSubscriptions() {
                 </TableCell>
                 <TableCell>
                   <div className="flex gap-2">
-                    {sub.status === "suspended" ? (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => updateSubscriptionStatus(sub.id, "active")}
-                      >
-                        Activate
-                      </Button>
-                    ) : (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => updateSubscriptionStatus(sub.id, "suspended")}
-                      >
-                        Suspend
-                      </Button>
-                    )}
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={updatingSubId === sub.id || sub.status === "active"}
+                      onClick={() => updateSubscriptionStatus(sub.id, "active")}
+                    >
+                      Activate
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={updatingSubId === sub.id || sub.status === "past_due"}
+                      onClick={() => updateSubscriptionStatus(sub.id, "past_due")}
+                    >
+                      Mark Past Due
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={updatingSubId === sub.id || sub.status === "canceled"}
+                      onClick={() => updateSubscriptionStatus(sub.id, "canceled")}
+                    >
+                      Cancel
+                    </Button>
                   </div>
                 </TableCell>
               </TableRow>
@@ -285,3 +268,4 @@ export function AdminSubscriptions() {
     </div>
   );
 }
+

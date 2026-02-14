@@ -1,10 +1,10 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { Users, Bot, CreditCard, Activity, AlertTriangle, Settings, TrendingUp, TrendingDown } from "lucide-react";
+import { Users, Bot, CreditCard, Activity, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useAuth } from "@/contexts/AuthContext";
-import { supabase } from "@/lib/integrations/supabase/client";
+import { api } from "@/lib/api";
 import { toast } from "sonner";
 import { AdminUserManagement } from "@/components/admin/AdminUserManagement";
 import { AdminBotVersions } from "@/components/admin/AdminBotVersions";
@@ -19,9 +19,8 @@ export default function Admin() {
   const [activeTab, setActiveTab] = useState<AdminTab>("overview");
   const [stats, setStats] = useState({
     totalUsers: 0,
-    activeUsers: 0,
+    activeSubscriptions: 0,
     totalBots: 0,
-    activeBots: 0,
     totalRevenue: 0,
     pendingTickets: 0,
   });
@@ -41,38 +40,18 @@ export default function Admin() {
 
   const fetchStats = async () => {
     try {
-      // Fetch user count
-      const { count: userCount } = await supabase
-        .from("profiles")
-        .select("*", { count: "exact", head: true });
-
-      // Fetch active subscriptions
-      const { count: activeSubCount } = await supabase
-        .from("subscriptions")
-        .select("*", { count: "exact", head: true })
-        .eq("status", "active");
-
-      // Fetch bot versions
-      const { count: botCount } = await supabase
-        .from("bot_versions")
-        .select("*", { count: "exact", head: true });
-
-      // Fetch pending tickets
-      const { count: ticketCount } = await supabase
-        .from("support_tickets")
-        .select("*", { count: "exact", head: true })
-        .eq("status", "open");
+      const { data } = await api.get("/subscription/admin/stats");
 
       setStats({
-        totalUsers: userCount || 0,
-        activeUsers: activeSubCount || 0,
-        totalBots: botCount || 0,
-        activeBots: 0,
-        totalRevenue: 0,
-        pendingTickets: ticketCount || 0,
+        totalUsers: data?.total_users || 0,
+        activeSubscriptions: data?.active_subscriptions || 0,
+        totalBots: data?.total_bot_versions || 0,
+        totalRevenue: data?.monthly_revenue || 0,
+        pendingTickets: data?.pending_tickets || 0,
       });
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error fetching stats:", error);
+      toast.error(error?.message || "Failed to fetch admin stats");
     }
   };
 
@@ -142,8 +121,8 @@ export default function Admin() {
                 <Bot className="w-5 h-5 text-success" />
                 <Badge variant="outline">Active</Badge>
               </div>
-              <p className="text-2xl font-bold mt-2">{stats.totalBots}</p>
-              <p className="text-sm text-muted-foreground">Bot Versions</p>
+              <p className="text-2xl font-bold mt-2">{stats.activeSubscriptions}</p>
+              <p className="text-sm text-muted-foreground">Subscriptions</p>
             </div>
             <div className="glass-card p-4">
               <div className="flex items-center justify-between">

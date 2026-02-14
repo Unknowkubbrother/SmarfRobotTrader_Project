@@ -58,3 +58,46 @@ class SubscriptionSummaryResponse(BaseModel):
     invoices: List[InvoiceResponse]
     payment_methods: List[PaymentMethodResponse]
     weekly_preview: WeeklyPreviewResponse
+
+
+class AdminBillingConfigResponse(BaseModel):
+    config_id: Optional[int] = None
+    default_fee_type: str = "percentage"
+    default_fee_value: float = 20.0
+    default_min_threshold: float = 0.0
+    updated_at: Optional[str] = None
+
+
+class AdminSubscriptionItemResponse(BaseModel):
+    id: str
+    user_id: str
+    user_email: Optional[str] = None
+    status: str
+    fee_type: str
+    fee_value: float
+    min_profit_threshold: float
+    next_billing_date: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class AdminSubscriptionManagementResponse(BaseModel):
+    billing_config: AdminBillingConfigResponse
+    subscriptions: List[AdminSubscriptionItemResponse]
+
+
+class UpdateBillingConfigRequest(BaseModel):
+    default_fee_type: str
+    default_fee_value: float
+    default_min_threshold: float
+
+
+class UpdateSubscriptionStatusRequest(BaseModel):
+    status: str
+
+
+class AdminSubscriptionStatsResponse(BaseModel):
+    total_users: int
+    active_subscriptions: int
+    total_bot_versions: int
+    pending_tickets: int
+    monthly_revenue: float

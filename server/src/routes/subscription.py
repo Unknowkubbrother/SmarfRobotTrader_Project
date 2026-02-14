@@ -8,12 +8,18 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from ..database.client import db
 from ..models.subscription import (
+    AdminBillingConfigResponse,
+    AdminSubscriptionItemResponse,
+    AdminSubscriptionManagementResponse,
+    AdminSubscriptionStatsResponse,
     AttachPaymentMethodRequest,
     CreateSetupIntentResponse,
     InvoiceResponse,
     PaymentMethodResponse,
     SubscriptionResponse,
     SubscriptionSummaryResponse,
+    UpdateBillingConfigRequest,
+    UpdateSubscriptionStatusRequest,
     WeeklyPreviewResponse,
 )
 from .authentication import get_current_active_user
@@ -28,6 +34,8 @@ if stripe is not None and STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
 subscription_router = APIRouter(tags=["Subscription"])
+ADMIN_FEE_TYPES = {"percentage", "fixed"}
+ADMIN_SUB_STATUSES = {"active", "past_due", "canceled"}
 
 
 def _to_float(value: Optional[Decimal]) -> float:
@@ -80,6 +88,12 @@ def _calculate_estimated_fee(
         return max(fee_value, 0.0)
 
     return max((net_profit * fee_value) / 100.0, 0.0)
+
+
+def _require_admin(current_user):
+    role = _enum_value(getattr(current_user, "role", None))
+    if role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
 
 
 def _stripe_enabled() -> bool:
@@ -535,3 +549,140 @@ async def remove_payment_method(
 
     return {"message": "Payment method removed"}
 
+
+def _map_billing_config(config) -> AdminBillingConfigResponse:
+    return AdminBillingConfigResponse(
+        config_id=int(config.configId) if config else None,
+        default_fee_type=_enum_value(config.defaultFeeType) if config and config.defaultFeeType else "percentage",
+        default_fee_value=round(_to_float(config.defaultFeeValue), 2) if config else 20.0,
+        default_min_threshold=round(_to_float(config.defaultMinThreshold), 2) if config else 0.0,
+        updated_at=_to_datetime_string(config.updatedAt) if config else None,
+    )
+
+
+@subscription_router.get("/admin/management", response_model=AdminSubscriptionManagementResponse)
+async def get_admin_subscription_management(
+    current_user: Annotated[any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    config = await db.systembillingconfig.find_first(order={"updatedAt": "desc"})
+    subscriptions = await db.subscription.find_many(
+        order={"createdAt": "desc"},
+        include={"user": True},
+    )
+
+    mapped_subscriptions = [
+        AdminSubscriptionItemResponse(
+            id=str(sub.id),
+            user_id=str(sub.userId),
+            user_email=sub.user.email if sub.user else None,
+            status=_enum_value(sub.status) or "active",
+            fee_type=_enum_value(sub.feeType) or "percentage",
+            fee_value=round(_to_float(sub.feeValue), 2),
+            min_profit_threshold=round(_to_float(sub.minProfitThreshold), 2),
+            next_billing_date=_to_date_string(sub.nextBillingDate),
+            created_at=_to_datetime_string(sub.createdAt),
+        )
+        for sub in subscriptions
+    ]
+
+    return AdminSubscriptionManagementResponse(
+        billing_config=_map_billing_config(config),
+        subscriptions=mapped_subscriptions,
+    )
+
+
+@subscription_router.put("/admin/config", response_model=AdminBillingConfigResponse)
+async def update_admin_billing_config(
+    data: UpdateBillingConfigRequest,
+    current_user: Annotated[any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    fee_type = data.default_fee_type.strip().lower()
+    if fee_type not in ADMIN_FEE_TYPES:
+        raise HTTPException(status_code=400, detail="default_fee_type must be percentage or fixed")
+    if data.default_fee_value < 0:
+        raise HTTPException(status_code=400, detail="default_fee_value must be greater than or equal to 0")
+    if data.default_min_threshold < 0:
+        raise HTTPException(status_code=400, detail="default_min_threshold must be greater than or equal to 0")
+
+    config = await db.systembillingconfig.find_first(order={"updatedAt": "desc"})
+    payload = {
+        "defaultFeeType": fee_type,
+        "defaultFeeValue": Decimal(str(data.default_fee_value)),
+        "defaultMinThreshold": Decimal(str(data.default_min_threshold)),
+    }
+
+    if config:
+        updated_config = await db.systembillingconfig.update(
+            where={"configId": int(config.configId)},
+            data=payload,
+        )
+    else:
+        updated_config = await db.systembillingconfig.create(data=payload)
+
+    return _map_billing_config(updated_config)
+
+
+@subscription_router.patch("/admin/subscriptions/{subscription_id}/status")
+async def update_admin_subscription_status(
+    subscription_id: str,
+    data: UpdateSubscriptionStatusRequest,
+    current_user: Annotated[any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    next_status = data.status.strip().lower()
+    if next_status not in ADMIN_SUB_STATUSES:
+        raise HTTPException(status_code=400, detail="status must be active, past_due, or canceled")
+
+    subscription = await db.subscription.find_unique(where={"id": subscription_id})
+    if not subscription:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    await db.subscription.update(
+        where={"id": subscription_id},
+        data={"status": next_status},
+    )
+    return {"message": f"Subscription updated to {next_status}"}
+
+
+@subscription_router.get("/admin/stats", response_model=AdminSubscriptionStatsResponse)
+async def get_admin_subscription_stats(
+    current_user: Annotated[any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    total_users = await db.user.count()
+    active_subscriptions = await db.subscription.count(where={"status": "active"})
+    total_bot_versions = await db.botversion.count()
+    pending_tickets = await db.supportticket.count(where={"status": "open"})
+
+    today = date.today()
+    month_start = datetime.combine(today.replace(day=1), datetime.min.time())
+    if today.month == 12:
+        next_month_date = date(today.year + 1, 1, 1)
+    else:
+        next_month_date = date(today.year, today.month + 1, 1)
+    next_month_start = datetime.combine(next_month_date, datetime.min.time())
+
+    paid_invoices = await db.invoice.find_many(
+        where={
+            "status": "paid",
+            "paidAt": {
+                "gte": month_start,
+                "lt": next_month_start,
+            },
+        }
+    )
+    monthly_revenue = round(sum(_to_float(invoice.calculatedFee) for invoice in paid_invoices), 2)
+
+    return AdminSubscriptionStatsResponse(
+        total_users=total_users,
+        active_subscriptions=active_subscriptions,
+        total_bot_versions=total_bot_versions,
+        pending_tickets=pending_tickets,
+        monthly_revenue=monthly_revenue,
+    )
