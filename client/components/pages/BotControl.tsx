@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import { AccountSelector, AccountWithBots } from "@/components/dashboard/AccountSelector";
 import { BotSelector } from "@/components/dashboard/BotSelector";
 import { AddBotDialog } from "@/components/dialogs/AddBotDialog";
-import { useTradingAccounts, BotConfigWithVersion } from "@/hooks/useTradingAccounts";
+import { useTradingAccounts, BotConfigWithVersion, BotVersion } from "@/hooks/useTradingAccounts";
 import {
   Dialog,
   DialogContent,
@@ -36,18 +36,20 @@ const defaultSchedule = [
   { day: "Wed", enabled: true },
   { day: "Thu", enabled: true },
   { day: "Fri", enabled: true },
-  { day: "Sat", enabled: false },
-  { day: "Sun", enabled: false },
-];
-
-const botModels = [
-  { id: "1", name: "Model RL Gold V.2", symbol: "XAUUSD", timeframe: "1H", version: "V2", users: 3, releaseNotes: ["The best Model in XAUUSD WinRate 100%", "The best Model in XAUUSD WinRate 90%"] },
-  { id: "2", name: "Model RL Gold V.2", symbol: "XAUUSD", timeframe: "1H", version: "V2", users: 3, releaseNotes: ["The best Model in XAUUSD WinRate 100%", "The best Model in XAUUSD WinRate 90%"] },
-  { id: "3", name: "Model RL Gold V.2", symbol: "XAUUSD", timeframe: "1H", version: "V2", users: 3, releaseNotes: ["The best Model in XAUUSD WinRate 100%", "The best Model in XAUUSD WinRate 90%"] },
 ];
 
 export default function BotControl() {
-  const { accounts, updateBotStatus, updateBotConfig, deleteBot, refetch } = useTradingAccounts();
+  const {
+    accounts,
+    updateBotStatus,
+    updateBotRisk,
+    updateBotSchedule,
+    changeModel,
+    deleteBot,
+    refetch,
+    getBotVersions
+  } = useTradingAccounts();
+
   const [selectedAccount, setSelectedAccount] = useState<AccountWithBots | null>(null);
   const [selectedBot, setSelectedBot] = useState<BotConfigWithVersion | null>(null);
   const [selectedRisk, setSelectedRisk] = useState("medium");
@@ -55,6 +57,12 @@ export default function BotControl() {
   const [showModelDialog, setShowModelDialog] = useState(false);
   const [addBotOpen, setAddBotOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [availableModels, setAvailableModels] = useState<BotVersion[]>([]);
+
+  // Load available bot versions on mount
+  useEffect(() => {
+    getBotVersions().then(setAvailableModels);
+  }, []);
 
   // Auto-select first account when accounts load
   useEffect(() => {
@@ -129,14 +137,21 @@ export default function BotControl() {
     const newSchedule = schedule.map(s => s.day === day ? { ...s, enabled: !s.enabled } : s);
     setSchedule(newSchedule);
     const scheduleObj = Object.fromEntries(newSchedule.map(s => [s.day.toLowerCase(), s.enabled]));
-    await updateBotConfig(selectedBot.id, { trading_schedule: scheduleObj });
+    await updateBotSchedule(selectedBot.id, scheduleObj);
   };
 
   const handleRiskChange = async (riskId: string) => {
     if (!selectedBot) return;
     setSelectedRisk(riskId);
-    await updateBotConfig(selectedBot.id, { risk_level: riskId });
-    toast.success("Risk level updated");
+    await updateBotRisk(selectedBot.id, riskId);
+  };
+
+  const handleChangeModel = async (modelId: string) => {
+    if (!selectedBot) return;
+    const success = await changeModel(selectedBot.id, modelId);
+    if (success) {
+      setShowModelDialog(false);
+    }
   };
 
   const handleDeleteBot = async () => {
@@ -170,7 +185,7 @@ export default function BotControl() {
           <h1 className="text-xl font-semibold text-foreground">Bot Control</h1>
           <p className="text-sm text-muted-foreground">Configure your trading bot settings</p>
         </div>
-        
+
         {/* Account & Bot Selectors */}
         <div className="flex flex-wrap items-center gap-3">
           <AccountSelector selectedAccount={selectedAccount} onAccountChange={setSelectedAccount} />
@@ -213,8 +228,8 @@ export default function BotControl() {
                         +${selectedBot.today_pnl.toFixed(2)}
                       </span>
                     </div>
-                    <Button 
-                      variant="outline" 
+                    <Button
+                      variant="outline"
                       className="gap-2 bg-warning/10 text-warning border-warning/30 hover:bg-warning/20"
                       onClick={() => setShowModelDialog(true)}
                     >
@@ -228,8 +243,8 @@ export default function BotControl() {
                       <AlertOctagon className="w-4 h-4" />
                       Emergency Stop
                     </Button>
-                    <Button 
-                      variant="ghost" 
+                    <Button
+                      variant="ghost"
                       className="gap-2 text-destructive hover:text-destructive hover:bg-destructive/10"
                       onClick={() => setDeleteConfirmOpen(true)}
                     >
@@ -259,13 +274,13 @@ export default function BotControl() {
                 </div>
                 <div className="space-y-3">
                   {riskLevels.map((level) => (
-                    <button 
-                      key={level.id} 
-                      onClick={() => handleRiskChange(level.id)} 
+                    <button
+                      key={level.id}
+                      onClick={() => handleRiskChange(level.id)}
                       className={cn(
                         "w-full p-4 rounded-xl border text-left transition-all",
-                        selectedRisk === level.id 
-                          ? "border-primary bg-primary/5" 
+                        selectedRisk === level.id
+                          ? "border-primary bg-primary/5"
                           : "border-border hover:border-primary/50 hover:bg-secondary/50"
                       )}
                     >
@@ -287,15 +302,15 @@ export default function BotControl() {
                   <Clock className="w-5 h-5 text-primary" />
                   <h3 className="font-semibold">Trading Schedule</h3>
                 </div>
-                <div className="grid grid-cols-7 gap-2 mb-6">
+                <div className="grid grid-cols-5 gap-2 mb-6">
                   {schedule.map((day) => (
-                    <button 
-                      key={day.day} 
-                      onClick={() => toggleDay(day.day)} 
+                    <button
+                      key={day.day}
+                      onClick={() => toggleDay(day.day)}
                       className={cn(
                         "py-3 rounded-xl text-sm font-medium transition-all",
-                        day.enabled 
-                          ? "bg-primary text-primary-foreground" 
+                        day.enabled
+                          ? "bg-primary text-primary-foreground"
                           : "bg-secondary text-muted-foreground hover:text-foreground"
                       )}
                     >
@@ -326,21 +341,25 @@ export default function BotControl() {
             <DialogTitle className="text-2xl">MODEL Robot Trading</DialogTitle>
             <p className="text-muted-foreground">Select your automated trading companion</p>
           </DialogHeader>
-          <div className="grid md:grid-cols-3 gap-4 mt-4">
-            {botModels.map((model) => (
-              <div 
-                key={model.id} 
-                className="rounded-2xl border border-border overflow-hidden hover:border-primary transition-colors"
+          <div className="grid md:grid-cols-3 gap-4 mt-4 max-h-[60vh] overflow-y-auto">
+            {availableModels.map((model) => (
+              <div
+                key={model.model_id}
+                className={cn(
+                  "rounded-2xl border border-border overflow-hidden hover:border-primary transition-colors cursor-pointer",
+                  selectedBot?.model_id === model.model_id && "ring-2 ring-primary border-primary"
+                )}
+                onClick={() => handleChangeModel(model.model_id)}
               >
                 <div className="bg-gradient-to-r from-[#0f3460] to-[#16537e] p-4 text-white">
                   <div className="flex items-center justify-between mb-1">
                     <div className="flex items-center gap-2">
                       <Activity className="w-5 h-5" />
-                      <span className="font-semibold">{model.name}</span>
+                      <span className="font-semibold truncate">{model.label}</span>
                     </div>
                     <div className="flex items-center gap-1">
                       <span className="text-xs">{model.timeframe}</span>
-                      <span className="px-2 py-0.5 rounded-full bg-white/20 text-xs">{model.version}</span>
+                      <span className="px-2 py-0.5 rounded-full bg-white/20 text-xs">{model.version_tag}</span>
                     </div>
                   </div>
                 </div>
@@ -349,7 +368,7 @@ export default function BotControl() {
                     <span className="text-muted-foreground flex items-center gap-2">
                       <Clock className="w-4 h-4" /> Latest update
                     </span>
-                    <span>30 Dec 2568 21:47</span>
+                    <span>30 Dec 2568</span>
                   </div>
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-muted-foreground">Symbol</span>
@@ -359,14 +378,10 @@ export default function BotControl() {
                     <span className="text-muted-foreground">Timeframe</span>
                     <span>{model.timeframe}</span>
                   </div>
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-muted-foreground">Number of people using</span>
-                    <span>{model.users}</span>
-                  </div>
                   <div className="bg-primary/10 rounded-lg p-3 mt-3">
                     <p className="text-xs font-medium text-primary mb-2">Release Notes</p>
                     <ul className="space-y-1">
-                      {model.releaseNotes.map((note, i) => (
+                      {model.release_notes.map((note, i) => (
                         <li key={i} className="text-xs text-muted-foreground flex items-start gap-2">
                           <span className="w-1 h-1 rounded-full bg-primary mt-1.5 shrink-0" />
                           {note}
@@ -374,13 +389,26 @@ export default function BotControl() {
                       ))}
                     </ul>
                   </div>
-                  <Button className="w-full gap-2" onClick={() => setShowModelDialog(false)}>
+                  <Button
+                    className="w-full gap-2"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleChangeModel(model.model_id);
+                    }}
+                    variant={selectedBot?.model_id === model.model_id ? "secondary" : "default"}
+                    disabled={selectedBot?.model_id === model.model_id}
+                  >
                     <Activity className="w-4 h-4" />
-                    Select Model
+                    {selectedBot?.model_id === model.model_id ? "Current Model" : "Select Model"}
                   </Button>
                 </div>
               </div>
             ))}
+            {availableModels.length === 0 && (
+              <div className="col-span-3 text-center py-10 text-muted-foreground">
+                No trading models available.
+              </div>
+            )}
           </div>
         </DialogContent>
       </Dialog>

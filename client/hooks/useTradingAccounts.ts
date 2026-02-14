@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback } from "react";
-import { supabase } from "@/lib/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
@@ -104,19 +103,10 @@ export function useTradingAccounts() {
     fetchAccounts();
   }, [fetchAccounts]);
 
-  // Update bot status by bot config ID (still uses Supabase — backend endpoint TBD)
-  const updateBotStatus = async (
-    botConfigId: string,
-    status: string
-  ) => {
+  // Update bot status (start/stop)
+  const updateBotStatus = async (botConfigId: string, status: string) => {
     try {
-      const { error } = await supabase
-        .from("bot_configurations")
-        .update({ status: status as any, is_active: status === "running" })
-        .eq("id", botConfigId);
-
-      if (error) throw error;
-
+      await api.patch("/bot/update_status", { botConfigId, status });
       await fetchAccounts();
       return true;
     } catch (error) {
@@ -126,30 +116,49 @@ export function useTradingAccounts() {
     }
   };
 
-  // Update bot config by bot config ID (still uses Supabase — backend endpoint TBD)
-  const updateBotConfig = async (
-    botConfigId: string,
-    updates: Record<string, any>
-  ) => {
+  // Update bot risk level
+  const updateBotRisk = async (botConfigId: string, riskLevel: string) => {
     try {
-      const { error } = await supabase
-        .from("bot_configurations")
-        .update(updates)
-        .eq("id", botConfigId);
-
-      if (error) throw error;
-
+      await api.patch("/bot/update_risk", { botConfigId, riskLevel });
       await fetchAccounts();
-      toast.success("Bot configuration updated");
+      toast.success("Risk level updated");
       return true;
     } catch (error) {
-      console.error("Error updating bot config:", error);
-      toast.error("Failed to update configuration");
+      console.error("Error updating risk level:", error);
+      toast.error("Failed to update risk level");
       return false;
     }
   };
 
-  // Create a new bot configuration for an account via FastAPI
+  // Update bot trading schedule
+  const updateBotSchedule = async (botConfigId: string, tradingSchedule: Record<string, boolean>) => {
+    try {
+      await api.patch("/bot/update_schedule", { botConfigId, tradingSchedule });
+      await fetchAccounts();
+      toast.success("Trading schedule updated");
+      return true;
+    } catch (error) {
+      console.error("Error updating schedule:", error);
+      toast.error("Failed to update trading schedule");
+      return false;
+    }
+  };
+
+  // Change bot model
+  const changeModel = async (botConfigId: string, newModelId: string) => {
+    try {
+      await api.patch("/bot/change_model", { botConfigId, newModelId });
+      await fetchAccounts();
+      toast.success("Bot model changed successfully");
+      return true;
+    } catch (error) {
+      console.error("Error changing model:", error);
+      toast.error("Failed to change bot model");
+      return false;
+    }
+  };
+
+  // Create a new bot configuration for an account
   const createBot = async (
     accountId: string,
     modelId: string,
@@ -172,16 +181,10 @@ export function useTradingAccounts() {
     }
   };
 
-  // Delete a bot configuration (still uses Supabase — backend endpoint TBD)
+  // Delete a bot configuration
   const deleteBot = async (botConfigId: string) => {
     try {
-      const { error } = await supabase
-        .from("bot_configurations")
-        .delete()
-        .eq("id", botConfigId);
-
-      if (error) throw error;
-
+      await api.delete("/bot/delete", { data: { botConfigId } });
       await fetchAccounts();
       toast.success("Bot removed successfully");
       return true;
@@ -192,7 +195,7 @@ export function useTradingAccounts() {
     }
   };
 
-  // Create a new trading account via FastAPI
+  // Create a new trading account
   const createAccount = async (data: Create_Trading_Account) => {
     try {
       const response = await api.post("/trading/create_account", data);
@@ -211,15 +214,29 @@ export function useTradingAccounts() {
     return account.bot_configurations.filter((b) => b.container_status === "running").length;
   };
 
+  // Get all available bot versions
+  const getBotVersions = async () => {
+    try {
+      const response = await api.get("/bot/versions");
+      return response.data.data;
+    } catch (error) {
+      console.error("Error fetching bot versions:", error);
+      return [];
+    }
+  };
+
   return {
     accounts,
     loading,
     refetch: fetchAccounts,
     createAccount,
     updateBotStatus,
-    updateBotConfig,
+    updateBotRisk,
+    updateBotSchedule,
+    changeModel,
     createBot,
     deleteBot,
+    getBotVersions,
     getRunningBotsCount,
   };
 }

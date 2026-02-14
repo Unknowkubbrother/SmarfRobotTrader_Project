@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict, Optional
 from enum import Enum
 
 class Create_Bot_Version(BaseModel):
@@ -11,7 +11,6 @@ class Create_Bot_Version(BaseModel):
     releaseNotes: List[str]
 
 
-
 class RiskLevelEnum(Enum):
     LOW = "low"
     MEDIUM = "medium"
@@ -21,5 +20,22 @@ class Create_Bot_Configuration(BaseModel):
     accountId: str
     modelId: str
     riskLevel: RiskLevelEnum
-    
-    
+
+class Update_Bot_Status(BaseModel):
+    botConfigId: str
+    status: str  # "running" or "stopped"
+
+class Update_Bot_Risk(BaseModel):
+    botConfigId: str
+    riskLevel: RiskLevelEnum
+
+class Update_Bot_Schedule(BaseModel):
+    botConfigId: str
+    tradingSchedule: Dict[str, bool]
+
+class Change_Bot_Model(BaseModel):
+    botConfigId: str
+    newModelId: str
+
+class Delete_Bot(BaseModel):
+    botConfigId: str

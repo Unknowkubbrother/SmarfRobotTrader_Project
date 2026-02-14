@@ -1,10 +1,28 @@
 from fastapi import APIRouter, HTTPException, Depends, status, Response, Request, Form
 from pydantic import BaseModel
 from prisma import Json
-from ..models.bot import Create_Bot_Version,Create_Bot_Configuration, RiskLevelEnum
+from ..models.bot import (
+    Create_Bot_Version, Create_Bot_Configuration, RiskLevelEnum,
+    Update_Bot_Status, Update_Bot_Risk, Update_Bot_Schedule,
+    Change_Bot_Model, Delete_Bot
+)
 from ..database.client import db
 
 bot_router = APIRouter()
+
+
+# === Helper: verify bot config ownership ===
+async def verify_bot_ownership(bot_config_id: str, user_id: str):
+    config = await db.botconfiguration.find_unique(
+        where={"id": bot_config_id},
+        include={"account": True}
+    )
+    if not config:
+        raise HTTPException(status_code=404, detail="Bot configuration not found")
+    if config.account.userId != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    return config
+
 
 ## @@comment bot version
 @bot_router.post("/create_bot_version", tags=["bot"])
@@ -107,13 +125,11 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
     botInstanceId = 1000 + bot_configuration_count
     
     tradingSchedule = {
-        "fri": True,
         "mon": True,
-        "sat": False,
-        "sun": False,
-        "thu": True,
         "tue": True,
-        "wed": True
+        "wed": True,
+        "thu": True,
+        "fri": True
     }
 
     bot_configuration = await db.botconfiguration.create(
@@ -135,4 +151,91 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
         "status_code": 200,
         "message": "Bot configuration created successfully"
     }
-    
+
+
+# === Bot Control Endpoints ===
+
+@bot_router.patch('/update_status', tags=["bot"])
+async def update_bot_status(request: Request, data: Update_Bot_Status):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    await verify_bot_ownership(data.botConfigId, request.state.user_id)
+
+    if data.status not in ("running", "stopped"):
+        raise HTTPException(status_code=400, detail="Status must be 'running' or 'stopped'")
+
+    await db.botconfiguration.update(
+        where={"id": data.botConfigId},
+        data={
+            "containerStatus": data.status,
+            "isActive": data.status == "running"
+        }
+    )
+
+    return {"status_code": 200, "message": f"Bot status updated to {data.status}"}
+
+
+@bot_router.patch('/update_risk', tags=["bot"])
+async def update_bot_risk(request: Request, data: Update_Bot_Risk):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    await verify_bot_ownership(data.botConfigId, request.state.user_id)
+
+    await db.botconfiguration.update(
+        where={"id": data.botConfigId},
+        data={"riskLevel": data.riskLevel.value}
+    )
+
+    return {"status_code": 200, "message": "Risk level updated"}
+
+
+@bot_router.patch('/update_schedule', tags=["bot"])
+async def update_bot_schedule(request: Request, data: Update_Bot_Schedule):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    await verify_bot_ownership(data.botConfigId, request.state.user_id)
+
+    await db.botconfiguration.update(
+        where={"id": data.botConfigId},
+        data={"tradingSchedule": Json(data.tradingSchedule)}
+    )
+
+    return {"status_code": 200, "message": "Trading schedule updated"}
+
+
+@bot_router.patch('/change_model', tags=["bot"])
+async def change_bot_model(request: Request, data: Change_Bot_Model):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    await verify_bot_ownership(data.botConfigId, request.state.user_id)
+
+    new_version = await db.botversion.find_unique(
+        where={"modelId": data.newModelId}
+    )
+    if not new_version:
+        raise HTTPException(status_code=404, detail="Bot version not found")
+
+    await db.botconfiguration.update(
+        where={"id": data.botConfigId},
+        data={"botVersion": {"connect": {"modelId": data.newModelId}}}
+    )
+
+    return {"status_code": 200, "message": "Bot model changed successfully"}
+
+
+@bot_router.delete('/delete', tags=["bot"])
+async def delete_bot(request: Request, data: Delete_Bot):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    await verify_bot_ownership(data.botConfigId, request.state.user_id)
+
+    await db.botconfiguration.delete(
+        where={"id": data.botConfigId}
+    )
+
+    return {"status_code": 200, "message": "Bot configuration deleted"}
