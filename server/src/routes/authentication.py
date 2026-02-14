@@ -141,7 +141,7 @@ async def login(
 
 
 @auth_router.post("/login/verify", response_model=Token, tags=["auth"])
-async def login_verify(response: Response, data: Login_Verify):
+async def login_verify(response: Response, request: Request, data: Login_Verify):
     email = data.email
     otp = data.otp
     
@@ -168,15 +168,18 @@ async def login_verify(response: Response, data: Login_Verify):
         expires_delta=access_token_expires
     )
     
-se    # Log Activity
+    # Log Activity
     try:
+        user_agent = request.headers.get("user-agent", "Unknown")
+        ip_address = request.client.host if request.client else "0.0.0.0"
+        
         await db.activitylog.create(
             data={
                 "userId": str(user.id),
                 "topic": "Login",
                 "detail": "User logged in via Email/OTP",
-                "ipAddress": "0.0.0.0", 
-                "deviceInfo": "Unknown" 
+                "ipAddress": ip_address,
+                "deviceInfo": user_agent[:255] # Truncate to fit DB
             }
         )
     except Exception as e:
@@ -583,7 +586,7 @@ async def google_register_verify(data: Google_Register_Verify):
 
 
 @auth_router.post("/google/register/complete", response_model=Token, tags=["auth"])
-async def google_register_complete(response: Response, data: Google_Register_Complete):
+async def google_register_complete(response: Response, request: Request, data: Google_Register_Complete):
     email = data.email
     username = data.username
     
@@ -627,13 +630,16 @@ async def google_register_complete(response: Response, data: Google_Register_Com
 
     # Log Activity
     try:
+        user_agent = request.headers.get("user-agent", "Unknown")
+        ip_address = request.client.host if request.client else "0.0.0.0"
+        
         await db.activitylog.create(
             data={
                 "userId": str(user.id),
                 "topic": "Login",
                 "detail": "User registered and logged in via Google",
-                "ipAddress": "0.0.0.0", 
-                "deviceInfo": "Unknown" 
+                "ipAddress": ip_address, 
+                "deviceInfo": user_agent[:255]
             }
         )
     except Exception as e:
