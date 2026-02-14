@@ -6,7 +6,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 import jwt
 import os
 
-from .routes import authentication, bot, trading
+from .routes import authentication, bot, trading, account_settings
 from .database.client import db
 
 SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
@@ -99,6 +99,7 @@ def read_root():
 app.include_router(authentication.auth_router, prefix="/auth")
 app.include_router(bot.bot_router, prefix="/bot")
 app.include_router(trading.trading_router, prefix="/trading")
+app.include_router(account_settings.settings_router, prefix="/settings")
 
 # uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 # cloudflared tunnel --url http://localhost:8000

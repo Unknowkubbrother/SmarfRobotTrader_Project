@@ -1,21 +1,165 @@
-import { useState } from "react";
-import { User, Shield, Bell, Monitor, Globe, Key } from "lucide-react";
+import { useState, useEffect } from "react";
+import { User, Shield, Bell, Monitor, Globe, Key, Loader2, MessageSquare, Gamepad2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-
-const loginHistory = [
-  { id: 1, date: "Jan 15, 2024 14:32", ip: "192.168.1.1", device: "Chrome on MacOS", location: "Bangkok, Thailand" },
-  { id: 2, date: "Jan 14, 2024 09:15", ip: "192.168.1.1", device: "Safari on iPhone", location: "Bangkok, Thailand" },
-  { id: 3, date: "Jan 13, 2024 18:45", ip: "203.150.52.1", device: "Chrome on Windows", location: "Singapore" },
-];
+import { useSettings, UserProfile, NotificationConfig } from "@/hooks/useSettings";
 
 export default function Settings() {
+  const {
+    loading,
+    profile,
+    activityLogs,
+    fetchProfile,
+    fetchActivityLogs,
+    updateProfile,
+    updatePassword,
+    updateNotifications
+  } = useSettings();
+
   const [activeTab, setActiveTab] = useState<"profile" | "security" | "notifications">("profile");
 
-  const handleSave = () => {
-    toast.success("Settings saved successfully");
+  // Local state for forms
+  const [profileForm, setProfileForm] = useState({
+    username: "",
+    email: "",
+    recoveryEmail: ""
+  });
+
+  const [passwordForm, setPasswordForm] = useState({
+    currentPassword: "",
+    newPassword: "",
+    confirmPassword: ""
+  });
+
+  const [tokenForm, setTokenForm] = useState({
+    lineNotifyToken: "",
+    discordWebhookUrl: ""
+  });
+
+  const [thresholds, setThresholds] = useState({
+    alertProfitTarget: "100",
+    alertLossLimit: "-50",
+    alertMarginLevelThreshold: "50"
+  });
+
+  // Load data on mount
+  useEffect(() => {
+    fetchProfile();
+    fetchActivityLogs();
+  }, [fetchProfile, fetchActivityLogs]);
+
+  // Update form state when profile loads
+  useEffect(() => {
+    if (profile) {
+      setProfileForm({
+        username: profile.username,
+        email: profile.email,
+        recoveryEmail: profile.recoveryEmail || ""
+      });
+      if (profile.notificationConfig) {
+        setTokenForm({
+          lineNotifyToken: profile.notificationConfig.lineNotifyToken || "",
+          discordWebhookUrl: profile.notificationConfig.discordWebhookUrl || ""
+        });
+        setThresholds(prev => ({
+          alertProfitTarget: profile.notificationConfig.alertProfitTarget?.toString() ?? prev.alertProfitTarget,
+          alertLossLimit: profile.notificationConfig.alertLossLimit?.toString() ?? prev.alertLossLimit,
+          alertMarginLevelThreshold: profile.notificationConfig.alertMarginLevelThreshold?.toString() ?? prev.alertMarginLevelThreshold
+        }));
+      }
+    }
+  }, [profile]);
+
+  const handleProfileSave = async () => {
+    await updateProfile({
+      username: profileForm.username,
+      email: profileForm.email,
+      recoveryEmail: profileForm.recoveryEmail
+    });
   };
+
+  const handlePasswordSave = async () => {
+    if (passwordForm.newPassword !== passwordForm.confirmPassword) {
+      toast.error("New passwords do not match");
+      return;
+    }
+    if (passwordForm.newPassword.length < 6) {
+      toast.error("Password must be at least 6 characters");
+      return;
+    }
+
+    const success = await updatePassword(passwordForm.currentPassword, passwordForm.newPassword);
+    if (success) {
+      setPasswordForm({ currentPassword: "", newPassword: "", confirmPassword: "" });
+    }
+  };
+
+  const handleTokenSave = async () => {
+    await updateNotifications({
+      lineNotifyToken: tokenForm.lineNotifyToken || null,
+      discordWebhookUrl: tokenForm.discordWebhookUrl || null
+    });
+  };
+
+  const handleThresholdChange = (key: string, value: string) => {
+    setThresholds(prev => ({ ...prev, [key]: value }));
+  };
+
+  const saveThreshold = async (key: keyof NotificationConfig) => {
+    const val = parseFloat(thresholds[key as keyof typeof thresholds]);
+    if (isNaN(val)) return;
+    await updateNotifications({ [key]: val });
+  };
+
+  const toggleThreshold = async (key: keyof NotificationConfig) => {
+    if (!profile?.notificationConfig) return;
+    const currentVal = profile.notificationConfig[key];
+    if (currentVal !== null && currentVal !== undefined) {
+      await updateNotifications({ [key]: null });
+    } else {
+      const val = parseFloat(thresholds[key as keyof typeof thresholds]);
+      await updateNotifications({ [key]: isNaN(val) ? 0 : val });
+    }
+  };
+
+  const toggleNotification = async (key: keyof NotificationConfig) => {
+    if (!profile?.notificationConfig) return;
+
+    const currentConfig = profile.notificationConfig;
+    const isEnabled = !!currentConfig[key];
+
+    // Toggle logic: 
+    // For booleans, just negate.
+    // For numbers (thresholds), if null -> set default, if exists -> set null.
+
+    let newValue: any;
+
+    if (typeof currentConfig[key] === 'boolean') {
+      newValue = !currentConfig[key];
+    } else {
+      // It's a number/decimal field
+      if (isEnabled) {
+        newValue = null; // Disable
+      } else {
+        // Enable with defaults
+        if (key === 'alertProfitTarget') newValue = 100;
+        else if (key === 'alertLossLimit') newValue = -50;
+        else if (key === 'alertMarginLevelThreshold') newValue = 50;
+        else newValue = 0;
+      }
+    }
+
+    await updateNotifications({ [key]: newValue });
+  };
+
+  if (loading && !profile) {
+    return (
+      <div className="flex items-center justify-center h-[50vh]">
+        <Loader2 className="w-8 h-8 animate-spin text-primary" />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -56,10 +200,11 @@ export default function Settings() {
               <h3 className="text-lg font-semibold mb-6">Account Information</h3>
               <div className="grid md:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm text-muted-foreground mb-2">Full Name</label>
+                  <label className="block text-sm text-muted-foreground mb-2">Username</label>
                   <input
                     type="text"
-                    defaultValue="John Trader"
+                    value={profileForm.username}
+                    onChange={(e) => setProfileForm({ ...profileForm, username: e.target.value })}
                     className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
                   />
                 </div>
@@ -67,28 +212,29 @@ export default function Settings() {
                   <label className="block text-sm text-muted-foreground mb-2">Email</label>
                   <input
                     type="email"
-                    defaultValue="john@trader.com"
+                    value={profileForm.email}
+                    onChange={(e) => setProfileForm({ ...profileForm, email: e.target.value })}
                     className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
                   />
                 </div>
                 <div>
-                  <label className="block text-sm text-muted-foreground mb-2">Timezone</label>
-                  <select className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50">
-                    <option>Asia/Bangkok (UTC+7)</option>
-                    <option>America/New_York (UTC-5)</option>
-                    <option>Europe/London (UTC+0)</option>
-                  </select>
+                  <label className="block text-sm text-muted-foreground mb-2">Recovery Email</label>
+                  <input
+                    type="email"
+                    value={profileForm.recoveryEmail}
+                    onChange={(e) => setProfileForm({ ...profileForm, recoveryEmail: e.target.value })}
+                    className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
+                  />
                 </div>
                 <div>
                   <label className="block text-sm text-muted-foreground mb-2">Language</label>
-                  <select className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50">
+                  <select disabled className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50 opacity-50 cursor-not-allowed">
                     <option>English</option>
-                    <option>Thai</option>
-                    <option>Japanese</option>
                   </select>
                 </div>
               </div>
-              <Button onClick={handleSave} className="mt-6">
+              <Button onClick={handleProfileSave} className="mt-6">
+                {loading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
                 Save Changes
               </Button>
             </div>
@@ -97,11 +243,15 @@ export default function Settings() {
           <div className="glass-card p-6 animate-slide-up" style={{ animationDelay: "100ms" }}>
             <h3 className="text-lg font-semibold mb-6">Profile Photo</h3>
             <div className="flex flex-col items-center">
-              <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary to-accent flex items-center justify-center mb-4">
-                <User className="w-10 h-10 text-primary-foreground" />
+              <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary to-accent flex items-center justify-center mb-4 overflow-hidden">
+                {profile?.avatarUrl ? (
+                  <img src={profile.avatarUrl} alt="Avatar" className="w-full h-full object-cover" />
+                ) : (
+                  <User className="w-10 h-10 text-primary-foreground" />
+                )}
               </div>
-              <Button variant="outline" size="sm">
-                Upload Photo
+              <Button variant="outline" size="sm" disabled>
+                Upload Photo (Coming Soon)
               </Button>
             </div>
           </div>
@@ -121,6 +271,8 @@ export default function Settings() {
                 <label className="block text-sm text-muted-foreground mb-2">Current Password</label>
                 <input
                   type="password"
+                  value={passwordForm.currentPassword}
+                  onChange={(e) => setPasswordForm({ ...passwordForm, currentPassword: e.target.value })}
                   className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
                 />
               </div>
@@ -128,6 +280,8 @@ export default function Settings() {
                 <label className="block text-sm text-muted-foreground mb-2">New Password</label>
                 <input
                   type="password"
+                  value={passwordForm.newPassword}
+                  onChange={(e) => setPasswordForm({ ...passwordForm, newPassword: e.target.value })}
                   className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
                 />
               </div>
@@ -135,10 +289,15 @@ export default function Settings() {
                 <label className="block text-sm text-muted-foreground mb-2">Confirm New Password</label>
                 <input
                   type="password"
+                  value={passwordForm.confirmPassword}
+                  onChange={(e) => setPasswordForm({ ...passwordForm, confirmPassword: e.target.value })}
                   className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
                 />
               </div>
-              <Button onClick={handleSave}>Update Password</Button>
+              <Button onClick={handlePasswordSave} disabled={loading}>
+                {loading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
+                Update Password
+              </Button>
             </div>
           </div>
 
@@ -148,49 +307,156 @@ export default function Settings() {
               <h3 className="text-lg font-semibold">Login History</h3>
             </div>
             <div className="space-y-3">
-              {loginHistory.map((login) => (
-                <div key={login.id} className="flex items-center justify-between p-3 rounded-lg bg-secondary/30">
-                  <div>
-                    <p className="font-medium">{login.device}</p>
-                    <p className="text-sm text-muted-foreground">
-                      {login.location} • {login.ip}
-                    </p>
+              {activityLogs.length > 0 ? (
+                activityLogs.map((login) => (
+                  <div key={login.id} className="flex items-center justify-between p-3 rounded-lg bg-secondary/30">
+                    <div>
+                      <p className="font-medium">{login.device || "Unknown Device"}</p>
+                      <p className="text-sm text-muted-foreground">
+                        {login.ip || "Unknown IP"} • {login.topic || "Login"}
+                      </p>
+                    </div>
+                    <span className="text-sm text-muted-foreground">
+                      {new Date(login.date).toLocaleString()}
+                    </span>
                   </div>
-                  <span className="text-sm text-muted-foreground">{login.date}</span>
-                </div>
-              ))}
+                ))
+              ) : (
+                <p className="text-muted-foreground">No recent login history found.</p>
+              )}
             </div>
           </div>
         </div>
       )}
 
       {/* Notifications Tab */}
-      {activeTab === "notifications" && (
-        <div className="glass-card p-6 animate-slide-up">
-          <h3 className="text-lg font-semibold mb-6">Notification Preferences</h3>
-          <div className="space-y-6">
-            {[
-              { id: "email", label: "Email Notifications", description: "Receive updates via email" },
-              { id: "profit", label: "Profit Alerts", description: "Get notified when daily profit exceeds threshold" },
-              { id: "loss", label: "Loss Alerts", description: "Get notified when losses exceed threshold" },
-              { id: "bot", label: "Bot Status", description: "Alerts for bot stops or errors" },
-              { id: "weekly", label: "Weekly Summary", description: "Weekly performance report" },
-            ].map((item) => (
-              <div key={item.id} className="flex items-center justify-between">
-                <div>
-                  <p className="font-medium">{item.label}</p>
-                  <p className="text-sm text-muted-foreground">{item.description}</p>
+      {activeTab === "notifications" && profile?.notificationConfig && (
+        <div className="space-y-6">
+          <div className="glass-card p-6 animate-slide-up">
+            <h3 className="text-lg font-semibold mb-6">Notification Preferences</h3>
+            <div className="space-y-6">
+              {/* General Toggles */}
+              {[
+                {
+                  id: "emailNotificationEnable" as keyof NotificationConfig,
+                  label: "Email Notifications",
+                  description: "Receive updates via email",
+                  checked: profile.notificationConfig.emailNotificationEnable
+                },
+                {
+                  id: "enableWeeklySummary" as keyof NotificationConfig,
+                  label: "Weekly Summary",
+                  description: "Weekly performance report",
+                  checked: profile.notificationConfig.enableWeeklySummary
+                },
+                {
+                  id: "enableMonthlySummary" as keyof NotificationConfig,
+                  label: "Monthly Summary",
+                  description: "Monthly performance report",
+                  checked: profile.notificationConfig.enableMonthlySummary
+                },
+              ].map((item) => (
+                <div key={item.id} className="flex items-center justify-between">
+                  <div>
+                    <p className="font-medium">{item.label}</p>
+                    <p className="text-sm text-muted-foreground">{item.description}</p>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={item.checked as boolean}
+                      onChange={() => toggleNotification(item.id)}
+                      className="sr-only peer"
+                      disabled={loading}
+                    />
+                    <div className="w-11 h-6 bg-secondary rounded-full peer peer-checked:bg-primary transition-colors after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-full"></div>
+                  </label>
                 </div>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input type="checkbox" defaultChecked className="sr-only peer" />
-                  <div className="w-11 h-6 bg-secondary rounded-full peer peer-checked:bg-primary transition-colors after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-full"></div>
-                </label>
-              </div>
-            ))}
+              ))}
+
+              <div className="border-t border-border my-4 pt-4"></div>
+
+              {/* Threshold Toggles */}
+              {[
+                { id: "alertProfitTarget", label: "Profit Alerts", desc: "Get notified when daily profit exceeds threshold", unit: "USD" },
+                { id: "alertLossLimit", label: "Loss Alerts", desc: "Get notified when losses exceed threshold", unit: "USD" },
+                { id: "alertMarginLevelThreshold", label: "Margin Level Alerts", desc: "Get notified when margin level exceeds threshold", unit: "%" },
+              ].map(item => {
+                const configKey = item.id as keyof NotificationConfig;
+                const isEnabled = profile.notificationConfig[configKey] !== null;
+                return (
+                  <div key={item.id} className="flex items-center justify-between">
+                    <div className="flex-1">
+                      <p className="font-medium">{item.label}</p>
+                      <p className="text-sm text-muted-foreground">{item.desc}</p>
+                    </div>
+
+                    <div className="flex items-center gap-4">
+                      {isEnabled && (
+                        <div className="relative">
+                          <input
+                            type="number"
+                            value={thresholds[item.id as keyof typeof thresholds]}
+                            onChange={(e) => handleThresholdChange(item.id, e.target.value)}
+                            onBlur={() => saveThreshold(configKey)}
+                            className="w-24 h-8 px-2 rounded bg-secondary border border-border text-sm text-right pr-8 focus:outline-none focus:border-primary/50"
+                          />
+                          <span className="absolute right-2 top-1.5 text-xs text-muted-foreground">{item.unit}</span>
+                        </div>
+                      )}
+
+                      <label className="relative inline-flex items-center cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={isEnabled}
+                          onChange={() => toggleThreshold(configKey)}
+                          className="sr-only peer"
+                          disabled={loading}
+                        />
+                        <div className="w-11 h-6 bg-secondary rounded-full peer peer-checked:bg-primary transition-colors after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-full"></div>
+                      </label>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
           </div>
-          <Button onClick={handleSave} className="mt-6">
-            Save Preferences
-          </Button>
+
+          <div className="glass-card p-6 animate-slide-up" style={{ animationDelay: "100ms" }}>
+            <h3 className="text-lg font-semibold mb-6">Notification Token Preferences</h3>
+            <div className="grid md:grid-cols-2 gap-6">
+              <div>
+                <div className="flex items-center gap-2 mb-2">
+                  <MessageSquare className="w-4 h-4 text-[#00B900]" />
+                  <label className="text-sm font-medium">Line Notify Token</label>
+                </div>
+                <input
+                  type="text"
+                  value={tokenForm.lineNotifyToken}
+                  onChange={(e) => setTokenForm({ ...tokenForm, lineNotifyToken: e.target.value })}
+                  className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
+                  placeholder="Enter Line Notify Token"
+                />
+              </div>
+              <div>
+                <div className="flex items-center gap-2 mb-2">
+                  <Gamepad2 className="w-4 h-4 text-[#5865F2]" />
+                  <label className="text-sm font-medium">Discord Webhook</label>
+                </div>
+                <input
+                  type="text"
+                  value={tokenForm.discordWebhookUrl}
+                  onChange={(e) => setTokenForm({ ...tokenForm, discordWebhookUrl: e.target.value })}
+                  className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
+                  placeholder="Enter Discord Webhook URL"
+                />
+              </div>
+            </div>
+            <Button onClick={handleTokenSave} className="mt-6">
+              {loading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
+              Save Preferences
+            </Button>
+          </div>
         </div>
       )}
     </div>

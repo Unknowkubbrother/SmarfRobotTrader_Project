@@ -303,6 +303,8 @@ async def register_verify_otp(register_verify: Register_Verify):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
         
+    await db.notificationconfig.create(data={"userId": str(user.id)})
+        
     r_cache.delete(f"register_otp:{register_verify.recovery_email}")
     r_cache.set(f"register_verified_user_id:{register_verify.recovery_email}", str(user.id), ex=60 * 30)
     
@@ -592,6 +594,8 @@ async def google_register_complete(response: Response, data: Google_Register_Com
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
+        
+    await db.notificationconfig.create(data={"userId": str(user.id)})
         
     # Clear Cache
     r_cache.delete(reg_key)
