@@ -13,9 +13,11 @@ from ..models.admin import (
     AdminUserDetailResponse,
     AdminUserInvoiceItemResponse,
     AdminUserItemResponse,
+    AdminUserSubscriptionItemResponse,
     AdminUserTradingAccountItemResponse,
     CreateAdminBotVersionRequest,
     UpdateAdminBotConfigurationStatusRequest,
+    UpdateAdminUserSubscriptionBillingRequest,
     UpdateAdminUserRoleRequest,
     UpdateAdminUserStatusRequest,
 )
@@ -26,6 +28,8 @@ admin_router = APIRouter(tags=["Admin"])
 ALLOWED_USER_STATUSES = {"active", "banned", "pending"}
 ALLOWED_USER_ROLES = {"user", "admin"}
 ALLOWED_BOT_STATUSES = {"running", "stopped"}
+ALLOWED_SUB_STATUSES = {"active", "past_due", "canceled"}
+ALLOWED_FEE_TYPES = {"percentage", "fixed"}
 
 
 def _to_float(value: Optional[Decimal]) -> float:
@@ -60,6 +64,18 @@ def _require_admin(current_user):
     role = _enum_value(getattr(current_user, "role", None))
     if role != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+
+def _map_user_subscription(subscription) -> AdminUserSubscriptionItemResponse:
+    return AdminUserSubscriptionItemResponse(
+        id=str(subscription.id),
+        status=_enum_value(subscription.status) or "active",
+        fee_type=_enum_value(subscription.feeType) or "percentage",
+        fee_value=round(_to_float(subscription.feeValue), 2),
+        min_profit_threshold=round(_to_float(subscription.minProfitThreshold), 2),
+        next_billing_date=_to_date_string(subscription.nextBillingDate),
+        created_at=_to_datetime_string(subscription.createdAt),
+    )
 
 
 @admin_router.get("/stats", response_model=AdminStatsResponse)
@@ -204,7 +220,11 @@ async def get_admin_user_detail(
             )
         )
 
-    subscriptions = await db.subscription.find_many(where={"userId": user_id})
+    subscriptions = await db.subscription.find_many(
+        where={"userId": user_id},
+        order={"createdAt": "desc"},
+    )
+    mapped_subscriptions = [_map_user_subscription(subscription) for subscription in subscriptions]
     subscription_ids = [str(sub.id) for sub in subscriptions]
 
     pending_count = 0
@@ -257,6 +277,7 @@ async def get_admin_user_detail(
         total_balance=round(total_balance, 2),
         pending_bills=pending_count,
         trading_accounts=mapped_accounts,
+        subscriptions=mapped_subscriptions,
         billing=AdminUserBillingSummaryResponse(
             pending_count=pending_count,
             paid_count=paid_count,
@@ -317,6 +338,98 @@ async def update_admin_user_role(
         data={"role": role_value},
     )
     return {"message": f"User role updated to {role_value}"}
+
+
+@admin_router.patch(
+    "/users/{user_id}/subscriptions/{subscription_id}/billing",
+    response_model=AdminUserSubscriptionItemResponse,
+)
+async def update_admin_user_subscription_billing(
+    user_id: str,
+    subscription_id: str,
+    data: UpdateAdminUserSubscriptionBillingRequest,
+    current_user: Annotated[Any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    fee_type = data.fee_type.strip().lower()
+    if fee_type not in ALLOWED_FEE_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="fee_type must be percentage or fixed",
+        )
+    if data.fee_value < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="fee_value must be greater than or equal to 0",
+        )
+    if data.min_profit_threshold < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="min_profit_threshold must be greater than or equal to 0",
+        )
+
+    subscription = await db.subscription.find_first(
+        where={"id": subscription_id, "userId": user_id}
+    )
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subscription not found for this user",
+        )
+
+    current_status = _enum_value(subscription.status) or "active"
+    if current_status not in ALLOWED_SUB_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Subscription status is invalid for update",
+        )
+
+    updated_subscription = await db.subscription.update(
+        where={"id": subscription_id},
+        data={
+            "feeType": fee_type,
+            "feeValue": Decimal(str(data.fee_value)),
+            "minProfitThreshold": Decimal(str(data.min_profit_threshold)),
+        },
+    )
+
+    return _map_user_subscription(updated_subscription)
+
+
+@admin_router.patch("/users/{user_id}/invoices/{invoice_id}/skip")
+async def skip_admin_user_invoice(
+    user_id: str,
+    invoice_id: str,
+    current_user: Annotated[Any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    invoice = await db.invoice.find_unique(
+        where={"id": invoice_id},
+        include={"subscription": True},
+    )
+    if not invoice or str(invoice.subscription.userId) != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invoice not found for this user",
+        )
+
+    invoice_status = _enum_value(invoice.status)
+    if invoice_status == "paid":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Paid invoice cannot be skipped",
+        )
+
+    if invoice_status == "skipped":
+        return {"message": "Invoice already skipped"}
+
+    await db.invoice.update(
+        where={"id": invoice_id},
+        data={"status": "skipped"},
+    )
+    return {"message": "Invoice skipped"}
 
 
 @admin_router.patch("/users/{user_id}/bot-configurations/{bot_configuration_id}/status")

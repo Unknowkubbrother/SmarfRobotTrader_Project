@@ -35,6 +35,12 @@ class UpdateAdminBotConfigurationStatusRequest(BaseModel):
     status: str
 
 
+class UpdateAdminUserSubscriptionBillingRequest(BaseModel):
+    fee_type: str
+    fee_value: float
+    min_profit_threshold: float
+
+
 class AdminUserBotConfigurationItemResponse(BaseModel):
     id: str
     bot_instance_id: int
@@ -57,6 +63,16 @@ class AdminUserTradingAccountItemResponse(BaseModel):
     running_bots: int = 0
     active_bots: int = 0
     bots: List[AdminUserBotConfigurationItemResponse] = Field(default_factory=list)
+
+
+class AdminUserSubscriptionItemResponse(BaseModel):
+    id: str
+    status: str
+    fee_type: str
+    fee_value: float = 0.0
+    min_profit_threshold: float = 0.0
+    next_billing_date: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 class AdminUserInvoiceItemResponse(BaseModel):
@@ -90,6 +106,7 @@ class AdminUserDetailResponse(BaseModel):
     total_balance: float = 0.0
     pending_bills: int = 0
     trading_accounts: List[AdminUserTradingAccountItemResponse] = Field(default_factory=list)
+    subscriptions: List[AdminUserSubscriptionItemResponse] = Field(default_factory=list)
     billing: AdminUserBillingSummaryResponse
 
 

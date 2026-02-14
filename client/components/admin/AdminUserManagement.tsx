@@ -2,11 +2,11 @@ import { useState, useEffect } from "react";
 import {
   Activity,
   AlertCircle,
-  Bot,
   Eye,
   Landmark,
   MoreVertical,
   RefreshCw,
+  Save,
   Search,
   Shield,
   UserCheck,
@@ -35,6 +35,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 interface AdminUser {
   id: string;
@@ -89,6 +90,16 @@ interface AdminUserBillingSummary {
   recent_invoices: AdminUserInvoice[];
 }
 
+interface AdminUserSubscription {
+  id: string;
+  status: "active" | "past_due" | "canceled";
+  fee_type: "percentage" | "fixed";
+  fee_value: number;
+  min_profit_threshold: number;
+  next_billing_date: string | null;
+  created_at: string | null;
+}
+
 interface AdminUserDetail {
   id: string;
   username: string;
@@ -101,7 +112,14 @@ interface AdminUserDetail {
   total_balance: number;
   pending_bills: number;
   trading_accounts: AdminUserTradingAccount[];
+  subscriptions: AdminUserSubscription[];
   billing: AdminUserBillingSummary;
+}
+
+interface SubscriptionDraft {
+  fee_type: "percentage" | "fixed";
+  fee_value: string;
+  min_profit_threshold: string;
 }
 
 const currencyFormatter = new Intl.NumberFormat("en-US", {
@@ -133,6 +151,9 @@ export function AdminUserManagement() {
 
   const [updatingUserId, setUpdatingUserId] = useState<string | null>(null);
   const [updatingBotId, setUpdatingBotId] = useState<string | null>(null);
+  const [savingSubscriptionId, setSavingSubscriptionId] = useState<string | null>(null);
+  const [skippingInvoiceId, setSkippingInvoiceId] = useState<string | null>(null);
+  const [subscriptionDrafts, setSubscriptionDrafts] = useState<Record<string, SubscriptionDraft>>({});
 
   useEffect(() => {
     fetchUsers();
@@ -156,6 +177,15 @@ export function AdminUserManagement() {
       setDetailLoading(true);
       const { data } = await api.get<AdminUserDetail>(`/admin/users/${userId}/detail`);
       setUserDetail(data);
+      const nextDrafts: Record<string, SubscriptionDraft> = {};
+      (data.subscriptions || []).forEach((subscription) => {
+        nextDrafts[subscription.id] = {
+          fee_type: subscription.fee_type,
+          fee_value: String(subscription.fee_value ?? 0),
+          min_profit_threshold: String(subscription.min_profit_threshold ?? 0),
+        };
+      });
+      setSubscriptionDrafts(nextDrafts);
     } catch (error: any) {
       console.error("Error fetching user detail:", error);
       toast.error(error?.message || "Failed to load user details");
@@ -219,6 +249,73 @@ export function AdminUserManagement() {
       toast.error(error?.message || "Failed to update bot status");
     } finally {
       setUpdatingBotId(null);
+    }
+  };
+
+  const updateSubscriptionDraft = (
+    subscriptionId: string,
+    field: keyof SubscriptionDraft,
+    value: string
+  ) => {
+    setSubscriptionDrafts((prev) => {
+      const current = prev[subscriptionId] || {
+        fee_type: "percentage",
+        fee_value: "0",
+        min_profit_threshold: "0",
+      };
+      return {
+        ...prev,
+        [subscriptionId]: {
+          ...current,
+          [field]: value,
+        },
+      };
+    });
+  };
+
+  const saveSubscriptionBilling = async (subscriptionId: string) => {
+    if (!selectedUser) return;
+
+    const draft = subscriptionDrafts[subscriptionId];
+    if (!draft) return;
+
+    const feeValue = Number(draft.fee_value);
+    const minProfitThreshold = Number(draft.min_profit_threshold);
+    if (Number.isNaN(feeValue) || Number.isNaN(minProfitThreshold) || feeValue < 0 || minProfitThreshold < 0) {
+      toast.error("Fee value and minimum threshold must be valid non-negative numbers");
+      return;
+    }
+
+    setSavingSubscriptionId(subscriptionId);
+    try {
+      await api.patch(`/admin/users/${selectedUser.id}/subscriptions/${subscriptionId}/billing`, {
+        fee_type: draft.fee_type,
+        fee_value: feeValue,
+        min_profit_threshold: minProfitThreshold,
+      });
+      toast.success("Subscription billing updated");
+      await fetchUserDetail(selectedUser.id);
+    } catch (error: any) {
+      console.error("Error updating subscription billing:", error);
+      toast.error(error?.message || "Failed to update subscription billing");
+    } finally {
+      setSavingSubscriptionId(null);
+    }
+  };
+
+  const skipInvoice = async (invoiceId: string) => {
+    if (!selectedUser) return;
+
+    setSkippingInvoiceId(invoiceId);
+    try {
+      await api.patch(`/admin/users/${selectedUser.id}/invoices/${invoiceId}/skip`);
+      toast.success("Invoice skipped");
+      await fetchUserDetail(selectedUser.id);
+    } catch (error: any) {
+      console.error("Error skipping invoice:", error);
+      toast.error(error?.message || "Failed to skip invoice");
+    } finally {
+      setSkippingInvoiceId(null);
     }
   };
 
@@ -361,10 +458,13 @@ export function AdminUserManagement() {
           if (!open) {
             setSelectedUser(null);
             setUserDetail(null);
+            setSubscriptionDrafts({});
+            setSavingSubscriptionId(null);
+            setSkippingInvoiceId(null);
           }
         }}
       >
-        <DialogContent className="max-w-4xl overflow-hidden p-0 [&>button]:text-white [&>button]:opacity-90">
+        <DialogContent className="max-w-4xl max-h-[90vh] overflow-hidden p-0 [&>button]:text-white [&>button]:opacity-90">
           <DialogHeader className="sr-only">
             <DialogTitle>User Details</DialogTitle>
             <DialogDescription>Admin user management detail modal</DialogDescription>
@@ -438,147 +538,300 @@ export function AdminUserManagement() {
             </div>
           )}
 
-          <div className="space-y-5 p-6">
+          <div className="p-6 pt-4">
             {detailLoading ? (
               <div className="flex h-40 items-center justify-center">
                 <div className="animate-spin w-6 h-6 border-2 border-primary border-t-transparent rounded-full" />
               </div>
             ) : userDetail ? (
-              <>
-                <div className="grid gap-3 md:grid-cols-3">
-                  <div className="rounded-lg border border-border bg-secondary/30 p-4">
-                    <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-muted-foreground">
-                      <Landmark className="w-4 h-4" />
-                      Total Accounts
-                    </div>
-                    <p className="mt-2 text-2xl font-semibold">{userDetail.total_accounts}</p>
-                  </div>
-                  <div className="rounded-lg border border-border bg-secondary/30 p-4">
-                    <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-muted-foreground">
-                      <Wallet className="w-4 h-4" />
-                      Total Balance
-                    </div>
-                    <p className="mt-2 text-2xl font-semibold">{formatCurrency(userDetail.total_balance)}</p>
-                  </div>
-                  <div className="rounded-lg border border-border bg-secondary/30 p-4">
-                    <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-muted-foreground">
-                      <AlertCircle className="w-4 h-4" />
-                      Pending Bills
-                    </div>
-                    <p className="mt-2 text-2xl font-semibold">{userDetail.pending_bills}</p>
-                  </div>
-                </div>
+              <Tabs defaultValue="overview" className="space-y-4">
+                <TabsList className="grid h-auto w-full grid-cols-2 gap-1 p-1 md:grid-cols-4">
+                  <TabsTrigger value="overview">Overview</TabsTrigger>
+                  <TabsTrigger value="accounts">Accounts</TabsTrigger>
+                  <TabsTrigger value="subscriptions">Subscriptions</TabsTrigger>
+                  <TabsTrigger value="billing">Billing</TabsTrigger>
+                </TabsList>
 
-                <section className="space-y-3">
-                  <div className="flex items-center justify-between border-b border-border pb-2">
-                    <h3 className="text-base font-semibold">Trading Accounts</h3>
-                    <span className="text-xs text-muted-foreground">{userDetail.trading_accounts.length} accounts</span>
-                  </div>
-
-                  {userDetail.trading_accounts.length === 0 ? (
-                    <div className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-                      No trading accounts for this user.
+                <div className="max-h-[54vh] overflow-y-auto pr-1">
+                  <TabsContent value="overview" className="space-y-4">
+                    <div className="grid gap-3 md:grid-cols-3">
+                      <div className="rounded-lg border border-border bg-secondary/30 p-4">
+                        <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-muted-foreground">
+                          <Landmark className="w-4 h-4" />
+                          Total Accounts
+                        </div>
+                        <p className="mt-2 text-2xl font-semibold">{userDetail.total_accounts}</p>
+                      </div>
+                      <div className="rounded-lg border border-border bg-secondary/30 p-4">
+                        <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-muted-foreground">
+                          <Wallet className="w-4 h-4" />
+                          Total Balance
+                        </div>
+                        <p className="mt-2 text-2xl font-semibold">{formatCurrency(userDetail.total_balance)}</p>
+                      </div>
+                      <div className="rounded-lg border border-border bg-secondary/30 p-4">
+                        <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-muted-foreground">
+                          <AlertCircle className="w-4 h-4" />
+                          Pending Bills
+                        </div>
+                        <p className="mt-2 text-2xl font-semibold">{userDetail.pending_bills}</p>
+                      </div>
                     </div>
-                  ) : (
+
                     <div className="grid gap-3 md:grid-cols-2">
-                      {userDetail.trading_accounts.map((account) => (
-                        <div key={account.id} className="rounded-lg border border-border bg-secondary/20 p-4">
-                          <div className="flex items-center justify-between">
-                            <div>
-                              <p className="font-semibold">#{account.mt5_login_id || shortId(account.id)}</p>
-                              <p className="text-xs text-muted-foreground">{account.broker_name || "Unknown Broker"} {account.server_name ? `· ${account.server_name}` : ""}</p>
-                            </div>
-                            <Badge className={account.running_bots > 0 ? "bg-emerald-100 text-emerald-700" : "bg-zinc-100 text-zinc-700"}>
-                              {account.running_bots > 0 ? "Running" : "Stopped"}
-                            </Badge>
-                          </div>
+                      <div className="rounded-lg border border-border bg-secondary/20 p-4">
+                        <p className="text-xs uppercase tracking-wide text-muted-foreground">Account Summary</p>
+                        <p className="mt-2 text-sm">
+                          Running bots:{" "}
+                          <span className="font-semibold">
+                            {userDetail.trading_accounts.reduce((total, account) => total + account.running_bots, 0)}
+                          </span>
+                        </p>
+                        <p className="mt-1 text-sm">
+                          Active bots:{" "}
+                          <span className="font-semibold">
+                            {userDetail.trading_accounts.reduce((total, account) => total + account.active_bots, 0)}
+                          </span>
+                        </p>
+                      </div>
+                      <div className="rounded-lg border border-border bg-secondary/20 p-4">
+                        <p className="text-xs uppercase tracking-wide text-muted-foreground">Profile</p>
+                        <p className="mt-2 text-sm">
+                          Joined: <span className="font-semibold">{formatDate(userDetail.created_at)}</span>
+                        </p>
+                        <p className="mt-1 text-sm">
+                          Onboarding:{" "}
+                          <span className="font-semibold">
+                            {userDetail.is_onboarding_completed ? "Completed" : "Pending"}
+                          </span>
+                        </p>
+                      </div>
+                    </div>
+                  </TabsContent>
 
-                          <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
-                            <div className="rounded-md bg-background p-2">
-                              <p className="text-xs text-muted-foreground">Balance</p>
-                              <p className="font-semibold text-emerald-600">{formatCurrency(account.balance)}</p>
-                            </div>
-                            <div className="rounded-md bg-background p-2">
-                              <p className="text-xs text-muted-foreground">Bot Status</p>
-                              <p className="font-semibold">{account.active_bots} active / {account.running_bots} running</p>
-                            </div>
-                          </div>
+                  <TabsContent value="accounts" className="space-y-3">
+                    <div className="flex items-center justify-between border-b border-border pb-2">
+                      <h3 className="text-base font-semibold">Trading Accounts</h3>
+                      <span className="text-xs text-muted-foreground">{userDetail.trading_accounts.length} accounts</span>
+                    </div>
 
-                          {account.bots.length > 0 ? (
-                            <div className="mt-3 space-y-2">
-                              {account.bots.map((bot) => (
-                                <div key={bot.id} className="flex items-center justify-between rounded-md border border-border bg-background p-2">
-                                  <div className="min-w-0">
-                                    <p className="truncate text-sm font-medium">{bot.label || `Bot #${bot.bot_instance_id}`}</p>
-                                    <p className="text-xs text-muted-foreground">#{bot.bot_instance_id} · {bot.symbol || "-"} {bot.timeframe || ""}</p>
+                    {userDetail.trading_accounts.length === 0 ? (
+                      <div className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+                        No trading accounts for this user.
+                      </div>
+                    ) : (
+                      <div className="grid gap-3 md:grid-cols-2">
+                        {userDetail.trading_accounts.map((account) => (
+                          <div key={account.id} className="rounded-lg border border-border bg-secondary/20 p-4">
+                            <div className="flex items-center justify-between">
+                              <div>
+                                <p className="font-semibold">#{account.mt5_login_id || shortId(account.id)}</p>
+                                <p className="text-xs text-muted-foreground">{account.broker_name || "Unknown Broker"} {account.server_name ? `· ${account.server_name}` : ""}</p>
+                              </div>
+                              <Badge className={account.running_bots > 0 ? "bg-emerald-100 text-emerald-700" : "bg-zinc-100 text-zinc-700"}>
+                                {account.running_bots > 0 ? "Running" : "Stopped"}
+                              </Badge>
+                            </div>
+
+                            <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+                              <div className="rounded-md bg-background p-2">
+                                <p className="text-xs text-muted-foreground">Balance</p>
+                                <p className="font-semibold text-emerald-600">{formatCurrency(account.balance)}</p>
+                              </div>
+                              <div className="rounded-md bg-background p-2">
+                                <p className="text-xs text-muted-foreground">Bot Status</p>
+                                <p className="font-semibold">{account.active_bots} active / {account.running_bots} running</p>
+                              </div>
+                            </div>
+
+                            {account.bots.length > 0 ? (
+                              <div className="mt-3 space-y-2">
+                                {account.bots.map((bot) => (
+                                  <div key={bot.id} className="flex items-center justify-between rounded-md border border-border bg-background p-2">
+                                    <div className="min-w-0">
+                                      <p className="truncate text-sm font-medium">{bot.label || `Bot #${bot.bot_instance_id}`}</p>
+                                      <p className="text-xs text-muted-foreground">#{bot.bot_instance_id} · {bot.symbol || "-"} {bot.timeframe || ""}</p>
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                      <Badge variant="outline" className="capitalize">
+                                        {bot.container_status || (bot.is_active ? "active" : "stopped")}
+                                      </Badge>
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        disabled={updatingBotId === bot.id}
+                                        onClick={() => updateBotStatus(bot.id, bot.container_status === "running" ? "stopped" : "running")}
+                                      >
+                                        <Activity className="mr-1 w-3 h-3" />
+                                        {bot.container_status === "running" ? "Stop" : "Run"}
+                                      </Button>
+                                    </div>
                                   </div>
-                                  <div className="flex items-center gap-2">
-                                    <Badge variant="outline" className="capitalize">
-                                      {bot.container_status || (bot.is_active ? "active" : "stopped")}
-                                    </Badge>
-                                    <Button
-                                      size="sm"
-                                      variant="outline"
-                                      disabled={updatingBotId === bot.id}
-                                      onClick={() => updateBotStatus(bot.id, bot.container_status === "running" ? "stopped" : "running")}
-                                    >
-                                      <Activity className="mr-1 w-3 h-3" />
-                                      {bot.container_status === "running" ? "Stop" : "Run"}
-                                    </Button>
-                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="mt-3 text-xs text-muted-foreground">No bots configured for this account.</p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </TabsContent>
+
+                  <TabsContent value="subscriptions" className="space-y-3">
+                    <div className="flex items-center justify-between border-b border-border pb-2">
+                      <h3 className="text-base font-semibold">Subscription Settings</h3>
+                      <span className="text-xs text-muted-foreground">
+                        {userDetail.subscriptions.length} subscriptions
+                      </span>
+                    </div>
+
+                    {userDetail.subscriptions.length === 0 ? (
+                      <div className="rounded-lg border border-dashed border-border p-4 text-center text-sm text-muted-foreground">
+                        No subscriptions for this user.
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {userDetail.subscriptions.map((subscription) => {
+                          const draft = subscriptionDrafts[subscription.id] || {
+                            fee_type: subscription.fee_type,
+                            fee_value: String(subscription.fee_value),
+                            min_profit_threshold: String(subscription.min_profit_threshold),
+                          };
+
+                          return (
+                            <div key={subscription.id} className="rounded-lg border border-border bg-secondary/20 p-4">
+                              <div className="mb-3 flex items-center justify-between">
+                                <div>
+                                  <p className="text-sm font-semibold">{shortId(subscription.id)}</p>
+                                  <p className="text-xs text-muted-foreground">
+                                    Next billing: {subscription.next_billing_date || "-"}
+                                  </p>
                                 </div>
-                              ))}
+                                <Badge variant="outline" className="capitalize">
+                                  {subscription.status}
+                                </Badge>
+                              </div>
+
+                              <div className="grid gap-3 md:grid-cols-3">
+                                <div>
+                                  <p className="text-xs text-muted-foreground mb-1">Fee Type</p>
+                                  <select
+                                    className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+                                    value={draft.fee_type}
+                                    onChange={(event) =>
+                                      updateSubscriptionDraft(
+                                        subscription.id,
+                                        "fee_type",
+                                        event.target.value as "percentage" | "fixed"
+                                      )
+                                    }
+                                  >
+                                    <option value="percentage">Percentage</option>
+                                    <option value="fixed">Fixed</option>
+                                  </select>
+                                </div>
+
+                                <div>
+                                  <p className="text-xs text-muted-foreground mb-1">
+                                    Fee Value ({draft.fee_type === "percentage" ? "%" : "$"})
+                                  </p>
+                                  <Input
+                                    type="number"
+                                    min={0}
+                                    value={draft.fee_value}
+                                    onChange={(event) =>
+                                      updateSubscriptionDraft(subscription.id, "fee_value", event.target.value)
+                                    }
+                                  />
+                                </div>
+
+                                <div>
+                                  <p className="text-xs text-muted-foreground mb-1">Min Profit Threshold ($)</p>
+                                  <Input
+                                    type="number"
+                                    min={0}
+                                    value={draft.min_profit_threshold}
+                                    onChange={(event) =>
+                                      updateSubscriptionDraft(
+                                        subscription.id,
+                                        "min_profit_threshold",
+                                        event.target.value
+                                      )
+                                    }
+                                  />
+                                </div>
+                              </div>
+
+                              <div className="mt-3 flex justify-end">
+                                <Button
+                                  size="sm"
+                                  onClick={() => saveSubscriptionBilling(subscription.id)}
+                                  disabled={savingSubscriptionId === subscription.id}
+                                >
+                                  <Save className="mr-2 w-4 h-4" />
+                                  {savingSubscriptionId === subscription.id ? "Saving..." : "Save Billing"}
+                                </Button>
+                              </div>
                             </div>
-                          ) : (
-                            <p className="mt-3 text-xs text-muted-foreground">No bots configured for this account.</p>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </section>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </TabsContent>
 
-                <section className="space-y-3">
-                  <div className="flex items-center justify-between border-b border-border pb-2">
-                    <h3 className="text-base font-semibold">Billing History</h3>
-                    <span className="text-xs text-muted-foreground">recent invoices</span>
-                  </div>
+                  <TabsContent value="billing" className="space-y-3">
+                    <div className="flex items-center justify-between border-b border-border pb-2">
+                      <h3 className="text-base font-semibold">Billing History</h3>
+                      <span className="text-xs text-muted-foreground">recent invoices</span>
+                    </div>
 
-                  <div className="grid gap-2 md:grid-cols-2">
-                    <div className="rounded-lg border border-rose-100 bg-rose-50 px-4 py-3">
-                      <p className="text-xs font-medium uppercase tracking-wide text-rose-600">Pending ({userDetail.billing.pending_count})</p>
-                      <p className="mt-1 font-semibold text-rose-700">{formatCurrency(userDetail.billing.pending_amount)}</p>
+                    <div className="grid gap-2 md:grid-cols-2">
+                      <div className="rounded-lg border border-rose-100 bg-rose-50 px-4 py-3">
+                        <p className="text-xs font-medium uppercase tracking-wide text-rose-600">Pending ({userDetail.billing.pending_count})</p>
+                        <p className="mt-1 font-semibold text-rose-700">{formatCurrency(userDetail.billing.pending_amount)}</p>
+                      </div>
+                      <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-3">
+                        <p className="text-xs font-medium uppercase tracking-wide text-zinc-600">Paid ({userDetail.billing.paid_count})</p>
+                        <p className="mt-1 font-semibold text-zinc-800">{formatCurrency(userDetail.billing.paid_amount)}</p>
+                      </div>
                     </div>
-                    <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-3">
-                      <p className="text-xs font-medium uppercase tracking-wide text-zinc-600">Paid ({userDetail.billing.paid_count})</p>
-                      <p className="mt-1 font-semibold text-zinc-800">{formatCurrency(userDetail.billing.paid_amount)}</p>
-                    </div>
-                  </div>
 
-                  {userDetail.billing.recent_invoices.length === 0 ? (
-                    <div className="rounded-lg border border-dashed border-border p-4 text-center text-sm text-muted-foreground">
-                      No invoice history found.
-                    </div>
-                  ) : (
-                    <div className="space-y-2">
-                      {userDetail.billing.recent_invoices.map((invoice) => (
-                        <div key={invoice.id} className="flex items-center justify-between rounded-md border border-border p-3">
-                          <div>
-                            <p className="text-sm font-medium">{shortId(invoice.id)}</p>
-                            <p className="text-xs text-muted-foreground">
-                              {invoice.billing_start_date || "-"} to {invoice.billing_end_date || "-"}
-                            </p>
+                    {userDetail.billing.recent_invoices.length === 0 ? (
+                      <div className="rounded-lg border border-dashed border-border p-4 text-center text-sm text-muted-foreground">
+                        No invoice history found.
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {userDetail.billing.recent_invoices.map((invoice) => (
+                          <div key={invoice.id} className="flex items-center justify-between rounded-md border border-border p-3">
+                            <div>
+                              <p className="text-sm font-medium">{shortId(invoice.id)}</p>
+                              <p className="text-xs text-muted-foreground">
+                                {invoice.billing_start_date || "-"} to {invoice.billing_end_date || "-"}
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-3">
+                              <Badge variant="outline" className="capitalize">{invoice.status || "unknown"}</Badge>
+                              <p className="text-sm font-semibold">{formatCurrency(invoice.amount)}</p>
+                              {invoice.status !== "paid" && invoice.status !== "skipped" && (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  disabled={skippingInvoiceId === invoice.id}
+                                  onClick={() => skipInvoice(invoice.id)}
+                                >
+                                  {skippingInvoiceId === invoice.id ? "Skipping..." : "Skip"}
+                                </Button>
+                              )}
+                            </div>
                           </div>
-                          <div className="flex items-center gap-3">
-                            <Badge variant="outline" className="capitalize">{invoice.status || "unknown"}</Badge>
-                            <p className="text-sm font-semibold">{formatCurrency(invoice.amount)}</p>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </section>
-              </>
+                        ))}
+                      </div>
+                    )}
+                  </TabsContent>
+                </div>
+              </Tabs>
             ) : (
               <div className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
                 User details unavailable.
