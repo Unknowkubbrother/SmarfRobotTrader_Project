@@ -28,8 +28,10 @@ const navItems = [
   { icon: HelpCircle, label: "Support", path: "/support" },
 ];
 
+import { useLayout } from "@/contexts/LayoutContext";
+
 export function Sidebar() {
-  const [collapsed, setCollapsed] = useState(false);
+  const { collapsed, setCollapsed } = useLayout();
   const pathname = usePathname();
   const router = useRouter();
   const { user, isAdmin, signOut } = useAuth();
@@ -47,15 +49,19 @@ export function Sidebar() {
       )}
     >
       {/* Logo */}
-      <div className="flex items-center justify-between h-14 px-4 border-b border-border">
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1">
-            <span className="text-lg font-bold text-foreground">RoBot</span>
-            {!collapsed && (
+      {/* Logo */}
+      <div className={cn(
+        "flex items-center h-14 px-4 border-b border-border transition-all",
+        collapsed ? "justify-center" : "justify-between"
+      )}>
+        {!collapsed && (
+          <div className="flex items-center gap-2 overflow-hidden whitespace-nowrap">
+            <div className="flex items-center gap-1">
+              <span className="text-lg font-bold text-foreground">RoBot</span>
               <span className="text-lg font-bold text-primary">Smarf</span>
-            )}
+            </div>
           </div>
-        </div>
+        )}
         <button
           onClick={() => setCollapsed(!collapsed)}
           className="p-1 rounded hover:bg-secondary transition-colors"

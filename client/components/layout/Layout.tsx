@@ -1,19 +1,32 @@
+"use client";
+
 import { ReactNode } from "react";
-import { Sidebar } from "./Sidebar";
 import { Header } from "./Header";
+import { Sidebar } from "./Sidebar";
+import { LayoutProvider, useLayout } from "@/contexts/LayoutContext";
+import { cn } from "@/lib/utils";
 
-interface LayoutProps {
-  children: ReactNode;
-}
+function LayoutContent({ children }: { children: ReactNode }) {
+  const { collapsed } = useLayout();
 
-export function Layout({ children }: LayoutProps) {
   return (
-    <div className="min-h-screen bg-background">
+    <>
       <Sidebar />
-      <div className="pl-60">
+      <div className={cn(
+        "transition-all duration-300",
+        collapsed ? "pl-16" : "pl-56"
+      )}>
         <Header />
         <main className="p-6">{children}</main>
       </div>
-    </div>
+    </>
+  );
+}
+
+export function Layout({ children }: { children: ReactNode }) {
+  return (
+    <LayoutProvider>
+      <LayoutContent>{children}</LayoutContent>
+    </LayoutProvider>
   );
 }
