@@ -8,6 +8,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { api } from "@/lib/api";
 
 interface Notification {
     id: string;
@@ -38,10 +39,8 @@ export default function NotificationsPage() {
     const fetchNotifications = async () => {
         setLoading(true);
         try {
-            const res = await fetch("/notifications");
-            if (res.ok) {
-                setNotifications(await res.json());
-            }
+            const { data } = await api.get<Notification[]>("/notifications");
+            setNotifications(data || []);
         } catch (error) {
             console.error("Failed to fetch notifications", error);
         } finally {
@@ -55,7 +54,7 @@ export default function NotificationsPage() {
 
     const markAsRead = async (id: string, link?: string) => {
         try {
-            await fetch(`/notifications/${id}/read`, { method: "PATCH" });
+            await api.patch(`/notifications/${id}/read`);
             setNotifications((prev) =>
                 prev.map((n) => (n.id === id ? { ...n, isRead: true } : n))
             );
@@ -67,7 +66,7 @@ export default function NotificationsPage() {
 
     const markAllAsRead = async () => {
         try {
-            await fetch("/notifications/read-all", { method: "PATCH" });
+            await api.patch("/notifications/read-all");
             setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
         } catch (error) {
             console.error("Failed to mark all read", error);

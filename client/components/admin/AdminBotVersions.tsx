@@ -527,7 +527,7 @@ export function AdminBotVersions() {
                 checked={publishForm.notify_users}
                 onChange={(event) => setPublishForm({ ...publishForm, notify_users: event.target.checked })}
               />
-              Notify users (web notifications + primary email if allowed in settings)
+              Broadcast to users on older versions of this bot (web + email via Resend, if allowed in settings)
             </label>
           </div>
 

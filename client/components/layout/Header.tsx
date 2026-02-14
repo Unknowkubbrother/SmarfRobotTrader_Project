@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
+import { api } from "@/lib/api";
 
 interface SearchResult {
   id: string;
@@ -66,12 +67,9 @@ export function Header() {
   useEffect(() => {
     const fetchNotifications = async () => {
       try {
-        const res = await fetch("/notifications"); // Will be proxied to backend
-        if (res.ok) {
-          const data = await res.json();
-          setNotifications(data);
-          setUnreadCount(data.filter((n: Notification) => !n.isRead).length);
-        }
+        const { data } = await api.get<Notification[]>("/notifications");
+        setNotifications(data || []);
+        setUnreadCount((data || []).filter((n: Notification) => !n.isRead).length);
       } catch (error) {
         console.error("Failed to fetch notifications", error);
       }
@@ -93,12 +91,11 @@ export function Header() {
 
       setIsSearching(true);
       try {
-        const res = await fetch(`/search?q=${encodeURIComponent(query)}`);
-        if (res.ok) {
-          const data = await res.json();
-          setResults(data);
-          setShowResults(true);
-        }
+        const { data } = await api.get<SearchResult[]>("/search", {
+          params: { q: query },
+        });
+        setResults(data || []);
+        setShowResults(true);
       } catch (error) {
         console.error("Search failed", error);
       } finally {
@@ -116,7 +113,7 @@ export function Header() {
 
   const markAsRead = async (id: string, link?: string) => {
     try {
-      await fetch(`/notifications/${id}/read`, { method: "PATCH" });
+      await api.patch(`/notifications/${id}/read`);
       setNotifications(prev => prev.map(n => n.id === id ? { ...n, isRead: true } : n));
       setUnreadCount(prev => Math.max(0, prev - 1));
       if (link) router.push(link);

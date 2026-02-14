@@ -145,9 +145,48 @@ def _build_bot_update_email_html(
 </html>"""
 
 
-async def _notify_users_for_bot_update(model_id: str, version, release_notes: List[str]) -> tuple[int, int]:
+async def _notify_users_for_bot_update(
+    model_id: str,
+    version,
+    release_notes: List[str],
+) -> tuple[int, int]:
+    source_where = {"modelId": {"not": model_id}}
+    if version.symbol:
+        source_where["symbol"] = version.symbol
+    if version.timeframe:
+        source_where["timeframe"] = version.timeframe
+    if not version.symbol and not version.timeframe and version.label:
+        source_where["label"] = version.label
+
+    old_versions = []
+    if version.symbol or version.timeframe or version.label:
+        old_versions = await db.botversion.find_many(where=source_where)
+
+    old_model_ids = [str(item.modelId) for item in old_versions]
+
+    notify_filters = []
+    if old_model_ids:
+        notify_filters.append({"modelId": {"in": old_model_ids}})
+
+    latest_image_id = getattr(version, "dockerImageId", None)
+    if latest_image_id:
+        notify_filters.append(
+            {
+                "modelId": model_id,
+                "OR": [
+                    {"installedDockerImageId": None},
+                    {"installedDockerImageId": {"not": latest_image_id}},
+                ],
+            }
+        )
+    else:
+        notify_filters.append({"modelId": model_id})
+
+    if not notify_filters:
+        return 0, 0
+
     bot_configurations = await db.botconfiguration.find_many(
-        where={"modelId": model_id},
+        where={"OR": notify_filters},
         include={
             "account": {
                 "include": {
@@ -166,6 +205,9 @@ async def _notify_users_for_bot_update(model_id: str, version, release_notes: Li
         account = getattr(config, "account", None)
         user = getattr(account, "user", None) if account else None
         if not user:
+            continue
+        user_status = _enum_value(getattr(user, "status", None))
+        if user_status == "banned":
             continue
         if not _is_notification_allowed(getattr(user, "notificationConfig", None)):
             continue
@@ -804,7 +846,7 @@ async def publish_admin_bot_update(
     affected_bots = await db.botconfiguration.count(where={"modelId": model_id})
     users_notified = 0
     emails_sent = 0
-    if bool(data.notify_users) and affected_bots > 0:
+    if bool(data.notify_users):
         users_notified, emails_sent = await _notify_users_for_bot_update(
             model_id=model_id,
             version=updated_version,
