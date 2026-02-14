@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException, Depends, status, Response, Request, Form
 from pydantic import BaseModel
+from prisma import Json
 from ..models.bot import Create_Bot_Version,Create_Bot_Configuration, RiskLevelEnum
 from ..database.client import db
-from json import dumps
 
 bot_router = APIRouter()
 
@@ -98,8 +98,7 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
 
     bot_configuration_count = await db.botconfiguration.count(
         where={
-            "accountId": data.accountId,
-            "modelId": data.modelId
+            "accountId": data.accountId
         }
     )
 
@@ -107,7 +106,7 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
 
     botInstanceId = 1000 + bot_configuration_count
     
-    tradingSchedule = dumps({
+    tradingSchedule = {
         "fri": True,
         "mon": True,
         "sat": False,
@@ -115,14 +114,14 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
         "thu": True,
         "tue": True,
         "wed": True
-    })
+    }
 
     bot_configuration = await db.botconfiguration.create(
         data={
-            "accountId": data.accountId,
-            "modelId": data.modelId,
+            "account": {"connect": {"id": data.accountId}},
+            "botVersion": {"connect": {"modelId": data.modelId}},
             "riskLevel": data.riskLevel.value,
-            "tradingSchedule": tradingSchedule,
+            "tradingSchedule": Json(tradingSchedule),
             "isActive": False,
             "containerStatus": "stopped",
             "botInstanceId": botInstanceId

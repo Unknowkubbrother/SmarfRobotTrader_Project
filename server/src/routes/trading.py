@@ -4,7 +4,7 @@ from cryptography.fernet import Fernet
 import base64
 import hashlib
 import os
-from datetime import date
+from datetime import date, datetime
 from ..models.trading_model import Create_Trading_Account
 from ..database.client import db
 
@@ -53,11 +53,11 @@ async def get_accounts_with_bots(request: Request):
                     "account_id": str(config.accountId),
                     "model_id": str(config.modelId),
                     "bot_instance_id": config.botInstanceId,
-                    "risk_level": config.riskLevel.value if config.riskLevel else None,
+                    "risk_level": config.riskLevel if config.riskLevel else None,
                     "trading_schedule": config.tradingSchedule,
                     "is_active": config.isActive,
                     "docker_container_id": config.dockerContainerId,
-                    "container_status": config.containerStatus.value if config.containerStatus else None,
+                    "container_status": config.containerStatus if config.containerStatus else None,
                     "bot_version": bot_version,
                 })
 
@@ -115,6 +115,15 @@ async def create_account(request: Request, data: Create_Trading_Account):
 
     if not trading_account:
         raise HTTPException(status_code=400, detail="Trading account creation failed")
+
+    await db.dailyaggregate.create(
+        data={
+            "account": {"connect": {"id": trading_account.id}},
+            "date": datetime.combine(date.today(), datetime.min.time()),
+            "dailyNetProfit": 0,
+            "totalTrades": 0
+        }
+    )
 
     return {
         "status_code": 200,

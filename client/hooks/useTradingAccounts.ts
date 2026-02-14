@@ -64,11 +64,14 @@ export interface AccountWithBot {
 }
 
 export function useTradingAccounts() {
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   const [accounts, setAccounts] = useState<AccountWithBots[]>([]);
   const [loading, setLoading] = useState(true);
 
   const fetchAccounts = useCallback(async () => {
+    // Wait for auth to finish loading before deciding
+    if (authLoading) return;
+
     if (!user) {
       setAccounts([]);
       setLoading(false);
@@ -76,6 +79,7 @@ export function useTradingAccounts() {
     }
 
     try {
+      setLoading(true);
       const result = await api.get("/trading/accounts_with_bots");
 
       const accountsData: AccountWithBots[] = (result.data?.data || []).map((account: any) => ({
@@ -94,7 +98,7 @@ export function useTradingAccounts() {
     } finally {
       setLoading(false);
     }
-  }, [user]);
+  }, [user, authLoading]);
 
   useEffect(() => {
     fetchAccounts();
