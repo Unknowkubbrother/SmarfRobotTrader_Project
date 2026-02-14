@@ -1,34 +1,39 @@
 import { useState, useEffect } from "react";
-import { Plus, Upload, Tag, Clock, Edit, Trash2 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Badge } from "@/components/ui/badge";
-import { Textarea } from "@/components/ui/textarea";
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { Label } from "@/components/ui/label";
-import { supabase } from "@/lib/integrations/supabase/client";
+import { Plus, Upload, Tag, Clock, Trash2, Boxes } from "lucide-react";
 import { toast } from "sonner";
+
+import { api } from "@/lib/api";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 
 interface BotVersion {
   id: string;
-  label: string;
-  version_tag: string;
-  symbol: string;
+  label: string | null;
+  version_tag: string | null;
+  symbol: string | null;
   timeframe: string | null;
-  release_notes: string | null;
+  docker_image_id: string | null;
+  release_notes: string[];
   release_date: string | null;
-  is_active: boolean | null;
+  usage_count: number;
 }
 
 export function AdminBotVersions() {
   const [versions, setVersions] = useState<BotVersion[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAddDialog, setShowAddDialog] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [formData, setFormData] = useState({
     label: "",
     version_tag: "",
     symbol: "XAUUSD",
     timeframe: "H1",
+    docker_image_id: "",
     release_notes: "",
   });
 
@@ -38,73 +43,69 @@ export function AdminBotVersions() {
 
   const fetchVersions = async () => {
     try {
-      const { data, error } = await supabase
-        .from("bot_versions")
-        .select("*")
-        .order("release_date", { ascending: false });
-
-      if (error) throw error;
+      setLoading(true);
+      const { data } = await api.get<BotVersion[]>("/admin/bot-versions");
       setVersions(data || []);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error fetching versions:", error);
-      toast.error("Failed to load bot versions");
+      toast.error(error?.message || "Failed to load bot versions");
     } finally {
       setLoading(false);
     }
   };
 
   const handleAddVersion = async () => {
-    if (!formData.label || !formData.version_tag) {
-      toast.error("Please fill in all required fields");
+    if (!formData.label.trim() || !formData.version_tag.trim()) {
+      toast.error("Please fill in label and version tag");
       return;
     }
 
+    setSubmitting(true);
     try {
-      const { error } = await supabase.from("bot_versions").insert({
-        label: formData.label,
-        version_tag: formData.version_tag,
-        symbol: formData.symbol,
-        timeframe: formData.timeframe,
-        release_notes: formData.release_notes || null,
+      const releaseNotes = formData.release_notes
+        .split("\n")
+        .map((note) => note.trim())
+        .filter(Boolean);
+
+      await api.post("/admin/bot-versions", {
+        label: formData.label.trim(),
+        version_tag: formData.version_tag.trim(),
+        symbol: formData.symbol.trim() || null,
+        timeframe: formData.timeframe.trim() || null,
+        docker_image_id: formData.docker_image_id.trim() || null,
+        release_notes: releaseNotes,
       });
 
-      if (error) throw error;
       toast.success("Bot version added successfully");
       setShowAddDialog(false);
-      setFormData({ label: "", version_tag: "", symbol: "XAUUSD", timeframe: "H1", release_notes: "" });
-      fetchVersions();
-    } catch (error) {
+      setFormData({
+        label: "",
+        version_tag: "",
+        symbol: "XAUUSD",
+        timeframe: "H1",
+        docker_image_id: "",
+        release_notes: "",
+      });
+      await fetchVersions();
+    } catch (error: any) {
       console.error("Error adding version:", error);
-      toast.error("Failed to add bot version");
-    }
-  };
-
-  const toggleVersionStatus = async (id: string, currentStatus: boolean) => {
-    try {
-      const { error } = await supabase
-        .from("bot_versions")
-        .update({ is_active: !currentStatus })
-        .eq("id", id);
-
-      if (error) throw error;
-      toast.success(`Version ${!currentStatus ? "activated" : "deactivated"}`);
-      fetchVersions();
-    } catch (error) {
-      console.error("Error updating version:", error);
-      toast.error("Failed to update version");
+      toast.error(error?.message || "Failed to add bot version");
+    } finally {
+      setSubmitting(false);
     }
   };
 
   const deleteVersion = async (id: string) => {
+    setDeletingId(id);
     try {
-      const { error } = await supabase.from("bot_versions").delete().eq("id", id);
-
-      if (error) throw error;
+      await api.delete(`/admin/bot-versions/${id}`);
       toast.success("Version deleted");
-      fetchVersions();
-    } catch (error) {
+      await fetchVersions();
+    } catch (error: any) {
       console.error("Error deleting version:", error);
-      toast.error("Failed to delete version");
+      toast.error(error?.message || "Failed to delete version");
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -141,7 +142,7 @@ export function AdminBotVersions() {
                   id="label"
                   placeholder="e.g., Gold Scalper v2"
                   value={formData.label}
-                  onChange={(e) => setFormData({ ...formData, label: e.target.value })}
+                  onChange={(event) => setFormData({ ...formData, label: event.target.value })}
                 />
               </div>
               <div>
@@ -150,7 +151,7 @@ export function AdminBotVersions() {
                   id="version_tag"
                   placeholder="e.g., v2.0.0"
                   value={formData.version_tag}
-                  onChange={(e) => setFormData({ ...formData, version_tag: e.target.value })}
+                  onChange={(event) => setFormData({ ...formData, version_tag: event.target.value })}
                 />
               </div>
               <div className="grid grid-cols-2 gap-4">
@@ -159,7 +160,7 @@ export function AdminBotVersions() {
                   <Input
                     id="symbol"
                     value={formData.symbol}
-                    onChange={(e) => setFormData({ ...formData, symbol: e.target.value })}
+                    onChange={(event) => setFormData({ ...formData, symbol: event.target.value })}
                   />
                 </div>
                 <div>
@@ -167,25 +168,36 @@ export function AdminBotVersions() {
                   <Input
                     id="timeframe"
                     value={formData.timeframe}
-                    onChange={(e) => setFormData({ ...formData, timeframe: e.target.value })}
+                    onChange={(event) => setFormData({ ...formData, timeframe: event.target.value })}
                   />
                 </div>
               </div>
               <div>
-                <Label htmlFor="release_notes">Release Notes</Label>
+                <Label htmlFor="docker_image_id">Docker Image ID</Label>
+                <Input
+                  id="docker_image_id"
+                  placeholder="registry/repo:tag"
+                  value={formData.docker_image_id}
+                  onChange={(event) => setFormData({ ...formData, docker_image_id: event.target.value })}
+                />
+              </div>
+              <div>
+                <Label htmlFor="release_notes">Release Notes (one line each)</Label>
                 <Textarea
                   id="release_notes"
-                  placeholder="Describe changes in this version..."
+                  placeholder="Improved signal filters&#10;Lower drawdown"
                   value={formData.release_notes}
-                  onChange={(e) => setFormData({ ...formData, release_notes: e.target.value })}
+                  onChange={(event) => setFormData({ ...formData, release_notes: event.target.value })}
                 />
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setShowAddDialog(false)}>
+              <Button variant="outline" onClick={() => setShowAddDialog(false)} disabled={submitting}>
                 Cancel
               </Button>
-              <Button onClick={handleAddVersion}>Add Version</Button>
+              <Button onClick={handleAddVersion} disabled={submitting}>
+                {submitting ? "Adding..." : "Add Version"}
+              </Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -201,44 +213,46 @@ export function AdminBotVersions() {
         ) : (
           versions.map((version) => (
             <div key={version.id} className="glass-card p-4">
-              <div className="flex items-start justify-between">
-                <div className="flex-1">
-                  <div className="flex items-center gap-2 mb-2">
-                    <h3 className="font-semibold">{version.label}</h3>
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-2 flex-wrap">
+                    <h3 className="font-semibold">{version.label || "Unnamed Version"}</h3>
                     <Badge variant="outline">
                       <Tag className="w-3 h-3 mr-1" />
-                      {version.version_tag}
+                      {version.version_tag || "-"}
                     </Badge>
-                    {version.is_active ? (
-                      <Badge className="bg-success/10 text-success">Active</Badge>
-                    ) : (
-                      <Badge variant="secondary">Inactive</Badge>
-                    )}
+                    <Badge variant="secondary" className="flex items-center gap-1">
+                      <Boxes className="w-3 h-3" />
+                      In use {version.usage_count}
+                    </Badge>
                   </div>
-                  <div className="flex items-center gap-4 text-sm text-muted-foreground">
-                    <span className="font-mono">{version.symbol}</span>
-                    <span>{version.timeframe}</span>
+                  <div className="flex items-center gap-4 text-sm text-muted-foreground flex-wrap">
+                    <span className="font-mono">{version.symbol || "-"}</span>
+                    <span>{version.timeframe || "-"}</span>
                     <span className="flex items-center gap-1">
                       <Clock className="w-3 h-3" />
-                      {version.release_date ? new Date(version.release_date).toLocaleDateString() : 'N/A'}
+                      {version.release_date ? new Date(version.release_date).toLocaleDateString() : "N/A"}
                     </span>
                   </div>
-                  {version.release_notes && (
-                    <p className="text-sm text-muted-foreground mt-2">{version.release_notes}</p>
+                  {version.docker_image_id && (
+                    <p className="text-xs text-muted-foreground mt-2 font-mono">
+                      {version.docker_image_id}
+                    </p>
+                  )}
+                  {version.release_notes.length > 0 && (
+                    <ul className="text-sm text-muted-foreground mt-2 list-disc list-inside">
+                      {version.release_notes.map((note, index) => (
+                        <li key={`${version.id}-${index}`}>{note}</li>
+                      ))}
+                    </ul>
                   )}
                 </div>
                 <div className="flex items-center gap-2">
                   <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => toggleVersionStatus(version.id, version.is_active ?? false)}
-                  >
-                    {version.is_active ? "Deactivate" : "Activate"}
-                  </Button>
-                  <Button
                     variant="ghost"
                     size="icon"
                     onClick={() => deleteVersion(version.id)}
+                    disabled={deletingId === version.id}
                     className="text-destructive hover:text-destructive"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -252,3 +266,4 @@ export function AdminBotVersions() {
     </div>
   );
 }
+

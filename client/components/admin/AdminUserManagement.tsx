@@ -1,28 +1,32 @@
 import { useState, useEffect } from "react";
 import { Search, MoreVertical, UserCheck, UserX, Shield, Eye } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Badge } from "@/components/ui/badge";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { supabase } from "@/lib/integrations/supabase/client";
 import { toast } from "sonner";
 
-interface UserProfile {
+import { api } from "@/lib/api";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+
+interface AdminUser {
   id: string;
+  username: string;
   email: string;
-  status: string | null;
-  created_at: string | null;
-  is_onboarding_completed: boolean | null;
+  role: "user" | "admin";
+  status: "active" | "banned" | "pending";
+  created_at: string;
+  is_onboarding_completed: boolean;
 }
 
 export function AdminUserManagement() {
-  const [users, setUsers] = useState<UserProfile[]>([]);
+  const [users, setUsers] = useState<AdminUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState("");
-  const [selectedUser, setSelectedUser] = useState<UserProfile | null>(null);
+  const [selectedUser, setSelectedUser] = useState<AdminUser | null>(null);
   const [showUserDialog, setShowUserDialog] = useState(false);
+  const [updatingUserId, setUpdatingUserId] = useState<string | null>(null);
 
   useEffect(() => {
     fetchUsers();
@@ -30,68 +34,57 @@ export function AdminUserManagement() {
 
   const fetchUsers = async () => {
     try {
-      const { data, error } = await supabase
-        .from("profiles")
-        .select("*")
-        .order("created_at", { ascending: false });
-
-      if (error) throw error;
+      setLoading(true);
+      const { data } = await api.get<AdminUser[]>("/admin/users");
       setUsers(data || []);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error fetching users:", error);
-      toast.error("Failed to load users");
+      toast.error(error?.message || "Failed to load users");
     } finally {
       setLoading(false);
     }
   };
 
-  const updateUserStatus = async (userId: string, status: string) => {
+  const updateUserStatus = async (userId: string, status: "active" | "banned" | "pending") => {
+    setUpdatingUserId(userId);
     try {
-      const { error } = await supabase
-        .from("profiles")
-        .update({ status })
-        .eq("id", userId);
-
-      if (error) throw error;
+      await api.patch(`/admin/users/${userId}/status`, { status });
       toast.success(`User status updated to ${status}`);
-      fetchUsers();
-    } catch (error) {
-      console.error("Error updating user:", error);
-      toast.error("Failed to update user");
+      await fetchUsers();
+    } catch (error: any) {
+      console.error("Error updating user status:", error);
+      toast.error(error?.message || "Failed to update user status");
+    } finally {
+      setUpdatingUserId(null);
     }
   };
 
   const promoteToAdmin = async (userId: string) => {
+    setUpdatingUserId(userId);
     try {
-      const { error } = await supabase
-        .from("user_roles")
-        .insert({ user_id: userId, role: "admin" });
-
-      if (error) {
-        if (error.message.includes("duplicate")) {
-          toast.info("User is already an admin");
-        } else {
-          throw error;
-        }
-        return;
-      }
+      await api.patch(`/admin/users/${userId}/role`, { role: "admin" });
       toast.success("User promoted to admin");
-    } catch (error) {
+      await fetchUsers();
+    } catch (error: any) {
       console.error("Error promoting user:", error);
-      toast.error("Failed to promote user");
+      toast.error(error?.message || "Failed to promote user");
+    } finally {
+      setUpdatingUserId(null);
     }
   };
 
   const filteredUsers = users.filter((user) =>
-    user.email.toLowerCase().includes(searchTerm.toLowerCase())
+    `${user.username} ${user.email}`.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  const getStatusBadge = (status: string) => {
+  const getStatusBadge = (status: AdminUser["status"]) => {
     switch (status) {
       case "active":
         return <Badge className="bg-success/10 text-success">Active</Badge>;
-      case "suspended":
-        return <Badge className="bg-destructive/10 text-destructive">Suspended</Badge>;
+      case "banned":
+        return <Badge className="bg-destructive/10 text-destructive">Banned</Badge>;
+      case "pending":
+        return <Badge className="bg-warning/10 text-warning">Pending</Badge>;
       default:
         return <Badge variant="secondary">{status}</Badge>;
     }
@@ -114,7 +107,7 @@ export function AdminUserManagement() {
           <Input
             placeholder="Search users..."
             value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
+            onChange={(event) => setSearchTerm(event.target.value)}
             className="pl-9"
           />
         </div>
@@ -124,9 +117,9 @@ export function AdminUserManagement() {
         <Table>
           <TableHeader>
             <TableRow>
+              <TableHead>Username</TableHead>
               <TableHead>Email</TableHead>
               <TableHead>Status</TableHead>
-              <TableHead>Onboarding</TableHead>
               <TableHead>Joined</TableHead>
               <TableHead className="w-12"></TableHead>
             </TableRow>
@@ -134,17 +127,11 @@ export function AdminUserManagement() {
           <TableBody>
             {filteredUsers.map((user) => (
               <TableRow key={user.id}>
-                <TableCell className="font-medium">{user.email}</TableCell>
-                <TableCell>{getStatusBadge(user.status ?? 'unknown')}</TableCell>
-                <TableCell>
-                  {user.is_onboarding_completed ? (
-                    <Badge variant="outline">Completed</Badge>
-                  ) : (
-                    <Badge variant="secondary">Pending</Badge>
-                  )}
-                </TableCell>
+                <TableCell className="font-medium">{user.username}</TableCell>
+                <TableCell>{user.email}</TableCell>
+                <TableCell>{getStatusBadge(user.status)}</TableCell>
                 <TableCell className="text-muted-foreground">
-                  {user.created_at ? new Date(user.created_at).toLocaleDateString() : 'N/A'}
+                  {user.created_at ? new Date(user.created_at).toLocaleDateString() : "N/A"}
                 </TableCell>
                 <TableCell>
                   <DropdownMenu>
@@ -162,20 +149,31 @@ export function AdminUserManagement() {
                         View Details
                       </DropdownMenuItem>
                       {user.status === "active" ? (
-                        <DropdownMenuItem onClick={() => updateUserStatus(user.id, "suspended")}>
+                        <DropdownMenuItem
+                          disabled={updatingUserId === user.id}
+                          onClick={() => updateUserStatus(user.id, "banned")}
+                        >
                           <UserX className="w-4 h-4 mr-2" />
-                          Suspend User
+                          Ban User
                         </DropdownMenuItem>
                       ) : (
-                        <DropdownMenuItem onClick={() => updateUserStatus(user.id, "active")}>
+                        <DropdownMenuItem
+                          disabled={updatingUserId === user.id}
+                          onClick={() => updateUserStatus(user.id, "active")}
+                        >
                           <UserCheck className="w-4 h-4 mr-2" />
                           Activate User
                         </DropdownMenuItem>
                       )}
-                      <DropdownMenuItem onClick={() => promoteToAdmin(user.id)}>
-                        <Shield className="w-4 h-4 mr-2" />
-                        Promote to Admin
-                      </DropdownMenuItem>
+                      {user.role !== "admin" && (
+                        <DropdownMenuItem
+                          disabled={updatingUserId === user.id}
+                          onClick={() => promoteToAdmin(user.id)}
+                        >
+                          <Shield className="w-4 h-4 mr-2" />
+                          Promote to Admin
+                        </DropdownMenuItem>
+                      )}
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </TableCell>
@@ -197,16 +195,26 @@ export function AdminUserManagement() {
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-4">
                 <div>
+                  <p className="text-sm text-muted-foreground">Username</p>
+                  <p className="font-medium">{selectedUser.username}</p>
+                </div>
+                <div>
                   <p className="text-sm text-muted-foreground">Email</p>
                   <p className="font-medium">{selectedUser.email}</p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Status</p>
-                  {getStatusBadge(selectedUser.status ?? 'unknown')}
+                  {getStatusBadge(selectedUser.status)}
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Role</p>
+                  <p className="font-medium capitalize">{selectedUser.role}</p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Joined</p>
-                  <p className="font-medium">{selectedUser.created_at ? new Date(selectedUser.created_at).toLocaleDateString() : 'N/A'}</p>
+                  <p className="font-medium">
+                    {selectedUser.created_at ? new Date(selectedUser.created_at).toLocaleDateString() : "N/A"}
+                  </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Onboarding</p>
@@ -225,3 +233,4 @@ export function AdminUserManagement() {
     </div>
   );
 }
+

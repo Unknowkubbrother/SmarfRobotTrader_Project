@@ -24,40 +24,6 @@ async def verify_bot_ownership(bot_config_id: str, user_id: str):
     return config
 
 
-## @@comment bot version
-@bot_router.post("/create_bot_version", tags=["bot"])
-async def create_bot_version(request: Request, data: Create_Bot_Version):
-    if not request.state.user_id:
-        raise HTTPException(status_code=400, detail="User ID is required")
-
-    user = await db.user.find_unique(
-        where={
-            "id": request.state.user_id
-        }
-    )
-    
-    if not user or user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    bot_version = await db.botversion.create(
-        data={
-            "label": data.label,
-            "dockerImageId": data.dockerImageId,
-            "versionTag": data.versionTag,
-            "symbol": data.symbol,
-            "timeframe": data.timeframe,
-            "releaseNotes": data.releaseNotes
-        }
-    )
-    
-    if not bot_version:
-        raise HTTPException(status_code=400, detail="Bot version creation failed")
-    
-    return {
-        "status_code": 200,
-        "message": "Bot version created successfully"
-    }
-
 @bot_router.get("/versions", tags=["bot"])
 async def get_bot_versions(request: Request):
     if not request.state.user_id:

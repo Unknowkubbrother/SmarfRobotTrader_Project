@@ -19,10 +19,12 @@ export default function Admin() {
   const [activeTab, setActiveTab] = useState<AdminTab>("overview");
   const [stats, setStats] = useState({
     totalUsers: 0,
+    totalMt5Accounts: 0,
     activeSubscriptions: 0,
     totalBots: 0,
     totalRevenue: 0,
     pendingTickets: 0,
+    runningBots: 0,
   });
 
   useEffect(() => {
@@ -40,14 +42,16 @@ export default function Admin() {
 
   const fetchStats = async () => {
     try {
-      const { data } = await api.get("/subscription/admin/stats");
+      const { data } = await api.get("/admin/stats");
 
       setStats({
         totalUsers: data?.total_users || 0,
+        totalMt5Accounts: data?.total_mt5_accounts || 0,
         activeSubscriptions: data?.active_subscriptions || 0,
         totalBots: data?.total_bot_versions || 0,
         totalRevenue: data?.monthly_revenue || 0,
         pendingTickets: data?.pending_tickets || 0,
+        runningBots: data?.running_bots || 0,
       });
     } catch (error: any) {
       console.error("Error fetching stats:", error);
@@ -107,7 +111,7 @@ export default function Admin() {
       {activeTab === "overview" && (
         <div className="space-y-6">
           {/* Stats Grid */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
             <div className="glass-card p-4">
               <div className="flex items-center justify-between">
                 <Users className="w-5 h-5 text-primary" />
@@ -119,10 +123,10 @@ export default function Admin() {
             <div className="glass-card p-4">
               <div className="flex items-center justify-between">
                 <Bot className="w-5 h-5 text-success" />
-                <Badge variant="outline">Active</Badge>
+                <Badge variant="outline">Total</Badge>
               </div>
-              <p className="text-2xl font-bold mt-2">{stats.activeSubscriptions}</p>
-              <p className="text-sm text-muted-foreground">Subscriptions</p>
+              <p className="text-2xl font-bold mt-2">{stats.totalMt5Accounts}</p>
+              <p className="text-sm text-muted-foreground">Total MT5 accounts</p>
             </div>
             <div className="glass-card p-4">
               <div className="flex items-center justify-between">
@@ -139,6 +143,14 @@ export default function Admin() {
               </div>
               <p className="text-2xl font-bold mt-2">{stats.pendingTickets}</p>
               <p className="text-sm text-muted-foreground">Support Tickets</p>
+            </div>
+            <div className="glass-card p-4">
+              <div className="flex items-center justify-between">
+                <Bot className="w-5 h-5 text-warning" />
+                <Badge variant="outline">Bot</Badge>
+              </div>
+              <p className="text-2xl font-bold mt-2">{stats.runningBots}</p>
+              <p className="text-sm text-muted-foreground">Running Bot</p>
             </div>
           </div>
 
