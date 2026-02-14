@@ -11,6 +11,7 @@ interface User {
   email: string;
   role: string;
   status: string;
+  avatar_url?: string;
 }
 
 interface AuthContextType {

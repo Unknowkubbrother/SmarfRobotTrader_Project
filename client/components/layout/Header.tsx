@@ -154,31 +154,37 @@ export function Header() {
           </div>
 
           {/* Search Dropdown */}
-          {showResults && results.length > 0 && (
-            <div className="absolute top-full left-0 right-0 mt-2 bg-popover border border-border rounded-xl shadow-lg overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+          {showResults && (
+            <div className="absolute top-full left-0 right-0 mt-2 z-50 bg-popover border border-border rounded-xl shadow-lg overflow-hidden animate-in fade-in zoom-in-95 duration-200">
               <div className="p-1">
-                {results.map((result) => (
-                  <Link
-                    key={result.id}
-                    href={result.link}
-                    onClick={() => setShowResults(false)}
-                    className="flex items-center gap-3 p-3 rounded-lg hover:bg-accent transition-colors"
-                  >
-                    <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
-                      {result.type === "bot" ? (
-                        <Bot className="w-4 h-4 text-primary" />
-                      ) : (
-                        <LayoutDashboard className="w-4 h-4 text-primary" />
-                      )}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium leading-none truncate">{result.label}</p>
-                      {result.subLabel && (
-                        <p className="text-xs text-muted-foreground mt-1 truncate">{result.subLabel}</p>
-                      )}
-                    </div>
-                  </Link>
-                ))}
+                {results.length > 0 ? (
+                  results.map((result) => (
+                    <Link
+                      key={result.id}
+                      href={result.link}
+                      onClick={() => setShowResults(false)}
+                      className="flex items-center gap-3 p-3 rounded-lg hover:bg-accent transition-colors"
+                    >
+                      <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+                        {result.type === "bot" ? (
+                          <Bot className="w-4 h-4 text-primary" />
+                        ) : (
+                          <LayoutDashboard className="w-4 h-4 text-primary" />
+                        )}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium leading-none truncate">{result.label}</p>
+                        {result.subLabel && (
+                          <p className="text-xs text-muted-foreground mt-1 truncate">{result.subLabel}</p>
+                        )}
+                      </div>
+                    </Link>
+                  ))
+                ) : (
+                  <div className="p-4 text-center text-sm text-muted-foreground">
+                    No results found for "{query}"
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -253,7 +259,7 @@ export function Header() {
               <Button variant="ghost" size="icon" className="rounded-full">
                 <div className="w-8 h-8 rounded-full bg-secondary flex items-center justify-center overflow-hidden">
                   {user?.avatar_url ? (
-                    <img src={user.avatar_url} alt="Avatar" className="w-full h-full object-cover" />
+                    <img src={user?.avatar_url} alt="Avatar" className="w-full h-full object-cover" />
                   ) : (
                     <User className="w-4 h-4 text-muted-foreground" />
                   )}

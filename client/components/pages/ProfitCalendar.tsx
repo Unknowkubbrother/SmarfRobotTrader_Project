@@ -78,8 +78,7 @@ export default function ProfitCalendar() {
   };
 
   const getIntensity = (profit: number | null): string => {
-    if (profit === null) return "bg-muted/30";
-    if (profit === 0) return "bg-neutral";
+    if (profit === null || profit === 0) return "bg-secondary hover:bg-secondary/80"; // Gray for no trades/data
     if (profit > 0) {
       if (profit > 300) return "bg-success";
       if (profit > 100) return "bg-success/70";

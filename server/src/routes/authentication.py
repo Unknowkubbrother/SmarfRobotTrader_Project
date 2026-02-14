@@ -440,7 +440,8 @@ async def get_me(current_user: Annotated[any, Depends(get_current_active_user)])
         "username": current_user.username,
         "email": current_user.email,
         "role": current_user.role,
-        "status": current_user.status
+        "status": current_user.status,
+        "avatar_url": current_user.avatarUrl
     }
 
 
