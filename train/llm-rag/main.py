@@ -1,5 +1,8 @@
 import os
+from dotenv import load_dotenv
 import re
+
+load_dotenv()
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -9,10 +12,12 @@ from retrieval import (
     hybrid_search_image_query,
 )
 
-from langchain_ollama import OllamaLLM
+# from langchain_ollama import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import HumanMessage
+import base64
 
 # ----------------------------
 # PROMPTS
@@ -137,21 +142,45 @@ def build_rag_context(results, max_chars: int = 1500) -> str:
     ctx = "\n\n---\n\n".join(chunks)
     return ctx[:max_chars]
 
+def encode_image(image_path):
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+
 
 # ----------------------------
 # MAIN
 # ----------------------------
 def main():
     DATASET_JSON = "dataset.json"
-    QUERY_IMAGE = "datasets1/new_chart3.png"
+    QUERY_IMAGE = "datasets1/NVDA.png"
 
     chart_db = upsert_image_dataset(DATASET_JSON)
     text_db = upsert_text_dataset(DATASET_JSON)
 
-    vision_llm = OllamaLLM(model="ministral-3:14b", temperature=0)
+    # vision_llm = OllamaLLM(model="ministral-3:14b", temperature=0)
+    vision_llm = init_chat_model(
+        model="mistralai/ministral-14b-2512",
+        model_provider="openai",
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+    )
 
-    draft = vision_llm.invoke(PROMPT_DRAFT_FROM_IMAGE, images=[QUERY_IMAGE])
-    draft_clean = strip_markdown(draft)
+    base64_image = encode_image(QUERY_IMAGE)
+    
+    # 1. Draft from image
+    messages = [
+        HumanMessage(
+            content=[
+                {"type": "text", "text": PROMPT_DRAFT_FROM_IMAGE},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64_image}"},
+                },
+            ]
+        )
+    ]
+    draft = vision_llm.invoke(messages)
+    draft_clean = strip_markdown(draft.content)
     print("\n📝 Draft (from image):\n", draft_clean)
 
     ex_docs = text_db.similarity_search(draft_clean, k=6)
@@ -165,7 +194,7 @@ def main():
 
     rewrite_prompt = f"""
 DRAFT:
-{draft}
+{draft.content}
 
 DOMAIN EXAMPLES (จาก dataset เดิม):
 {domain_examples}
@@ -175,8 +204,22 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
 {AUTO_TEXT_COMPRESS_NOTE}
 """.strip()
 
-    auto_text = vision_llm.invoke(rewrite_prompt, images=[QUERY_IMAGE])
-    auto_text = strip_markdown(auto_text)
+    # 2. Rewrite prompt with image context
+    print(f"Rewrite Prompt Length: {len(rewrite_prompt)}")
+    
+    messages = [
+        HumanMessage(
+            content=[
+                {"type": "text", "text": rewrite_prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64_image}"},
+                },
+            ]
+        )
+    ]
+    auto_text = vision_llm.invoke(messages)
+    auto_text = strip_markdown(auto_text.content)
     print("\n📝 Auto-text (domain rewritten):\n", auto_text)
 
     query_text = build_query_text_from_auto(auto_text)
@@ -221,18 +264,31 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
 คำถาม: วิเคราะห์กราฟนี้และให้คำแนะนำการเทรด
 """
     
-    prompt = ChatPromptTemplate.from_template(rag_template)
+    # prompt = ChatPromptTemplate.from_template(rag_template)
     
-    rag_chain = (
-        {"context": lambda x: x["context"]}
-        | prompt
-        | vision_llm
-        | StrOutputParser()
-    )
+    # rag_chain = (
+    #     {"context": lambda x: x["context"]}
+    #     | prompt
+    #     | vision_llm
+    #     | StrOutputParser()
+    # )
     
-    formatted_prompt = prompt.format(context=rag_context)
-    final_answer = vision_llm.invoke(formatted_prompt, images=[QUERY_IMAGE])
-    final_answer = strip_markdown(final_answer)
+    formatted_prompt = rag_template.format(context=rag_context)
+    
+    # 3. Final analysis with RAG context and image
+    messages = [
+        HumanMessage(
+            content=[
+                {"type": "text", "text": formatted_prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64_image}"},
+                },
+            ]
+        )
+    ]
+    final_answer = vision_llm.invoke(messages)
+    final_answer = strip_markdown(final_answer.content)
 
     print("\n🧠 Final Analysis:")
     print(final_answer)
