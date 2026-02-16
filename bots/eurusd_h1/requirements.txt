@@ -1,9 +1,0 @@
-stable-baselines3[extra]
-shimmy>=2.0.0
-gymnasium
-numpy<2.0.0
-pandas
-git+https://github.com/lucas-campagna/mt5linux.git@master
-tqdm
-pytz
-tensorboard
