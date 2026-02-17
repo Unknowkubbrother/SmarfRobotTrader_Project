@@ -115,6 +115,11 @@ def main():
     df_csv['time'] = pd.to_datetime(df_csv['time'])
     df_csv = df_csv[df_csv['has_delta'] == 1].sort_values("time").reset_index(drop=True)
 
+    # Resume from specific time
+    start_from = pd.to_datetime("2021-03-29 00:00:00")
+    df_csv = df_csv[df_csv['time'] >= start_from]
+    print(f"Resuming from {start_from}...")
+
     # 3. Setup Output
     ensure_dir(OUTPUT_DIR)
     
