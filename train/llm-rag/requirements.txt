@@ -22,3 +22,6 @@ langchain-core  # ChatPromptTemplate, StrOutputParser
 langchain-text-splitters  # RecursiveCharacterTextSplitter
 requests
 opencv-python
+
+
+supabase

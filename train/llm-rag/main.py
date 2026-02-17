@@ -4,6 +4,11 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage
 from typing import List, Dict, Any, Optional
 
+# Supabase Text Embedding
+from supabase import create_client
+from FlagEmbedding import BGEM3FlagModel
+from datetime import datetime
+
 from retrieval import (
     upsert_image_dataset,
     upsert_text_dataset,
@@ -51,6 +56,56 @@ class VisionLLMClient:
         ]
         response = self.llm.invoke(messages)
         return strip_markdown(response.content)
+
+class TextEmbeddingClient:
+    def __init__(self):
+        load_dotenv()
+        self.url = os.environ["SUPABASE_URL"]
+        self.key = os.environ["SUPABASE_ANON_KEY"]
+        self.supabase = create_client(self.url, self.key)
+        self.model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+
+    def embed_dense(self, texts: list[str]) -> list[list[float]]:
+        out = self.model.encode(
+            texts,
+            return_dense=True,
+            return_sparse=False,
+            return_colbert_vecs=False,
+        )
+        dense = out["dense_vecs"]
+        return [v.tolist() for v in dense]
+
+    def insert_document(self, symbol: str, symbol_datetime: datetime, content: str):
+        emb = self.embed_dense([content])[0]
+
+        payload = {
+            "symbol": symbol,
+            "symbol_datetime": symbol_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+            "content": content,
+            "embedding": emb,
+        }
+
+        res = self.supabase.table("documents").insert(payload).execute()
+        return res.data
+
+    def search_similar(self, query_text: str, match_threshold: float = 0.78, match_count: int = 1):
+        q_emb = self.embed_dense([query_text])[0]
+
+        res = self.supabase.rpc(
+            "match_documents",
+            {
+                "query_embedding": q_emb,
+                "match_threshold": match_threshold,
+                "match_count": match_count,
+            },
+        ).execute()
+
+        return res.data
+
+    def get_document(self, document_id: int):
+        res = self.supabase.table("documents").select("*").eq("id", document_id).execute()
+        return res.data
+
 
 def run_rag_pipeline():
     DATASET_JSON = "dataset.json"
@@ -127,6 +182,11 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
 
     print("\n🧠 Final Analysis:")
     print(final_answer)
+
+    # 8. Insert document
+    # text_embedding = TextEmbeddingClient()
+    # text_embedding.insert_document("EURUSD", datetime(2025, 1, 23, 23, 0), final_answer)
+    
 
 if __name__ == "__main__":
     run_rag_pipeline()
