@@ -31,7 +31,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class VisionLLMClient:
     def __init__(self):
         self.llm = init_chat_model(
-            model="mistralai/ministral-14b-2512",
+            model="nvidia/nemotron-nano-12b-v2-vl:free",
             model_provider="openai",
             base_url="https://openrouter.ai/api/v1",
             api_key=os.getenv("OPENROUTER_API_KEY"),
