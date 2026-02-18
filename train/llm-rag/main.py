@@ -75,7 +75,7 @@ class TextEmbeddingClient:
         dense = out["dense_vecs"]
         return [v.tolist() for v in dense]
 
-    def insert_document(self, symbol: str, symbol_datetime: datetime, content: str):
+    def insert_document(self, symbol: str, symbol_datetime: datetime, timeframe: str, content: str):
         emb = self.embed_dense([content])[0]
 
         payload = {
@@ -83,6 +83,7 @@ class TextEmbeddingClient:
             "symbol_datetime": symbol_datetime.strftime("%Y-%m-%d %H:%M:%S"),
             "content": content,
             "embedding": emb,
+            "timeframe": timeframe,
         }
 
         res = self.supabase.table("documents").insert(payload).execute()
@@ -107,16 +108,7 @@ class TextEmbeddingClient:
         return res.data
 
 
-def run_rag_pipeline():
-    DATASET_JSON = "dataset.json"
-    QUERY_IMAGE = "datasets1/NVDA.png"
-
-    # 1. Setup DBs
-    chart_db = upsert_image_dataset(DATASET_JSON)
-    text_db = upsert_text_dataset(DATASET_JSON)
-
-    # 2. Setup LLM
-    vision_llm = VisionLLMClient()
+def run_rag_pipeline(chart_db, text_db, vision_llm, DATASET_JSON ,QUERY_IMAGE : str) -> str:
     base64_image = encode_image(QUERY_IMAGE)
 
     # 3. Draft from image
@@ -180,13 +172,39 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
     
     final_answer = vision_llm.invoke(formatted_prompt, base64_image)
 
-    print("\n🧠 Final Analysis:")
-    print(final_answer)
-
-    # 8. Insert document
-    # text_embedding = TextEmbeddingClient()
-    # text_embedding.insert_document("EURUSD", datetime(2025, 1, 23, 23, 0), final_answer)
-    
+    return final_answer    
 
 if __name__ == "__main__":
-    run_rag_pipeline()
+
+    DATASET_JSON = "dataset.json"
+
+    LIST_QUERY_IMAGE = [
+        "datasets1/NVDA.png",
+        "datasets1/THBUSD.png",
+        "datasets1/XAUUSD.png",
+    ]
+
+    chart_db = upsert_image_dataset(DATASET_JSON)
+    text_db = upsert_text_dataset(DATASET_JSON)
+
+    vision_llm = VisionLLMClient()
+
+    text_embedding = TextEmbeddingClient()
+
+    for query_image in LIST_QUERY_IMAGE:
+        final_answer = run_rag_pipeline(chart_db, text_db, vision_llm, DATASET_JSON, query_image)
+
+        symbol = query_image.split("/")[1].split(".")[0]
+        timeframe = "H1"
+        
+
+        print("\n🧠 Final Analysis:")
+        print(final_answer)
+
+        inserted = text_embedding.insert_document(symbol, datetime(2025, 1, 23, 23, 0), timeframe, final_answer)
+
+        if inserted:
+            print(f"\n✅ Inserted document {symbol}")
+        else:
+            print(f"\n❌ Failed to insert document {symbol}")
+        
