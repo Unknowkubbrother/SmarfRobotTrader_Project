@@ -72,7 +72,7 @@ def run_rag_pipeline(chart_db, text_db, vision_llm, DATASET_JSON ,QUERY_IMAGE : 
     base64_image = encode_image(QUERY_IMAGE)
 
     draft_clean = vision_llm.invoke(PROMPT_DRAFT_FROM_IMAGE, base64_image)
-    print("\n📝 Draft (from image):\n", draft_clean)
+    # print("\n📝 Draft (from image):\n", draft_clean)
 
     ex_docs = text_db.similarity_search(draft_clean, k=6)
     domain_examples = "\n\n---\n\n".join(
@@ -95,13 +95,13 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
 {AUTO_TEXT_COMPRESS_NOTE}
 """.strip()
 
-    print(f"Rewrite Prompt Length: {len(rewrite_prompt)}")
+    # print(f"Rewrite Prompt Length: {len(rewrite_prompt)}")
     auto_text = vision_llm.invoke(rewrite_prompt, base64_image)
-    print("\n📝 Auto-text (domain rewritten):\n", auto_text)
+    # print("\n📝 Auto-text (domain rewritten):\n", auto_text)
 
     # 6. Hybrid Search
     query_text = build_query_text_from_auto(auto_text)
-    print("\n🔎 Query text (used for text):\n", query_text)
+    # print("\n🔎 Query text (used for text):\n", query_text)
 
     results = hybrid_search_image_query(
         chart_db=chart_db,
@@ -119,12 +119,12 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
         w_rerank=0.45,
     )
 
-    print_results("IMAGE → HYBRID (Chart + Text via auto_text)", results)
+    # print_results("IMAGE → HYBRID (Chart + Text via auto_text)", results)
 
     # 7. Final Analysis
     rag_context = build_rag_context(results, max_chars=1500)
-    print("\n🔎 RAG Context (preview):")
-    print(rag_context)
+    # print("\n🔎 RAG Context (preview):")
+    # print(rag_context)
 
     formatted_prompt = RAG_TEMPLATE.format(context=rag_context)
     
