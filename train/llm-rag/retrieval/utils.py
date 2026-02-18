@@ -4,6 +4,8 @@ import re
 import base64
 from typing import Dict, List, Tuple, Any
 
+from datetime import datetime
+
 
 def norm_path(p: str) -> str:
     p = (p or "").strip()
@@ -130,3 +132,26 @@ def build_rag_context(results, max_chars: int = 1500) -> str:
 def encode_image(image_path: str) -> str:
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
+
+
+def parse_dt_from_filename(name: str):
+    try:
+        base = os.path.splitext(name)[0]
+        dt_str = base.split("_", 1)[1]
+        return datetime.strptime(dt_str, "%Y.%m.%d %H.%M")
+    except Exception:
+        return None
+
+
+def list_fileDate_folder(folder: str) -> List[str]:
+    items = []
+    for name in os.listdir(folder):
+        full = os.path.join(folder, name)
+        if not os.path.isfile(full):
+            continue
+        dt = parse_dt_from_filename(name)
+        if dt is None:
+            continue
+        items.append((dt, name))
+    items.sort(key=lambda x: x[0])
+    return items

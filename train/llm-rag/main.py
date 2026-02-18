@@ -21,6 +21,7 @@ from retrieval.utils import (
     print_results,
     build_rag_context,
     encode_image,
+    list_fileDate_folder
 )
 from prompts import (
     PROMPT_DRAFT_FROM_IMAGE,
@@ -35,11 +36,17 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class VisionLLMClient:
     def __init__(self):
-        self.llm = init_chat_model(
-            model="nvidia/nemotron-nano-12b-v2-vl:free",
-            model_provider="openai",
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.getenv("OPENROUTER_API_KEY"),
+        # self.llm = init_chat_model(
+        #     model="nvidia/nemotron-nano-12b-v2-vl:free",
+        #     model_provider="openai",
+        #     base_url="https://openrouter.ai/api/v1",
+        #     api_key=os.getenv("OPENROUTER_API_KEY"),
+        #
+
+        self.llm= init_chat_model(
+            model="ministral-3:14b",
+            model_provider="ollama",
+            base_url="http://202.44.40.197:11434",
         )
 
     def invoke(self, text: str, image_base64: str) -> str:
@@ -49,7 +56,7 @@ class VisionLLMClient:
                     {"type": "text", "text": text},
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{image_base64}"},
+                        "image_url": f"data:image/png;base64,{image_base64}",
                     },
                 ]
             )
@@ -178,12 +185,6 @@ if __name__ == "__main__":
 
     DATASET_JSON = "dataset.json"
 
-    LIST_QUERY_IMAGE = [
-        "datasets1/NVDA.png",
-        "datasets1/THBUSD.png",
-        "datasets1/XAUUSD.png",
-    ]
-
     chart_db = upsert_image_dataset(DATASET_JSON)
     text_db = upsert_text_dataset(DATASET_JSON)
 
@@ -191,20 +192,28 @@ if __name__ == "__main__":
 
     text_embedding = TextEmbeddingClient()
 
-    for query_image in LIST_QUERY_IMAGE:
-        final_answer = run_rag_pipeline(chart_db, text_db, vision_llm, DATASET_JSON, query_image)
+    folder = "../data_images/images"
+    
+    LIST_QUERY_IMAGE = list_fileDate_folder(folder)
+    for dt, name in LIST_QUERY_IMAGE:
+        symbol = name.split("_")[0]
 
-        symbol = query_image.split("/")[1].split(".")[0]
+        final_answer = run_rag_pipeline(chart_db, text_db, vision_llm, DATASET_JSON, f"{folder}/{name}")
+
         timeframe = "H1"
-        
 
+        print("\n\n")
+        print("--------------------------------")
+        print(f"{name}")
+        print("--------------------------------")
         print("\n🧠 Final Analysis:")
         print(final_answer)
+        print("--------------------------------")
+        print("\n\n")
 
-        inserted = text_embedding.insert_document(symbol, datetime(2025, 1, 23, 23, 0), timeframe, final_answer)
+        inserted = text_embedding.insert_document(symbol, dt, timeframe, final_answer)
 
         if inserted:
             print(f"\n✅ Inserted document {symbol}")
         else:
             print(f"\n❌ Failed to insert document {symbol}")
-        
