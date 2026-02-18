@@ -37,18 +37,37 @@ class ChromaDBClient:
                 "symbol_datetime": symbol_datetime.strftime("%Y-%m-%d %H:%M:%S"),
                 "timeframe": timeframe
             }
-            
+            # Insert into ChromaDB
             self.collection.add(
                 ids=[doc_id],
                 embeddings=[emb],
                 metadatas=[metadata],
                 documents=[content]
             )
-            return True
+            return emb
             
         except Exception as e:
             print(f"❌ Failed to insert document into ChromaDB: {e}")
-            return False
+            return None
+
+    def get_document(self, doc_id: str):
+        try:
+            results = self.collection.get(
+                ids=[doc_id],
+                include=["metadatas", "documents", "embeddings"]
+            )
+            
+            if results['ids']:
+                return {
+                    "id": results['ids'][0],
+                    "content": results['documents'][0],
+                    "metadata": results['metadatas'][0],
+                    "embedding": results['embeddings'][0]
+                }
+            return None
+        except Exception as e:
+            print(f"❌ Failed to get document: {e}")
+            return None
 
     def search_similar(self, query_text: str, k: int = 5):
         try:

@@ -21,15 +21,20 @@ def main():
 
         results = collection.get(
             limit=50,
-            include=["metadatas", "documents"]
+            include=["metadatas", "documents", "embeddings"]
         )
 
         # 3. Format as Table
         data = []
         for i, doc_id in enumerate(results['ids']):
+            embedding_len = 0
+            if results.get('embeddings') is not None and len(results['embeddings']) > i:
+                embedding_len = len(results['embeddings'][i])
+
             item = {
                 "id": doc_id,
-                "document": results['documents'][i][:100] + "..." if len(results['documents'][i]) > 100 else results['documents'][i],
+                "document": results['documents'][i][:50] + "..." if len(results['documents'][i]) > 50 else results['documents'][i],
+                "vector_size": embedding_len,
                 **results['metadatas'][i]
             }
             data.append(item)

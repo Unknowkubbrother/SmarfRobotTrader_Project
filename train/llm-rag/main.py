@@ -71,11 +71,9 @@ from retrieval.chroma_client import ChromaDBClient
 def run_rag_pipeline(chart_db, text_db, vision_llm, DATASET_JSON ,QUERY_IMAGE : str) -> str:
     base64_image = encode_image(QUERY_IMAGE)
 
-    # 3. Draft from image
     draft_clean = vision_llm.invoke(PROMPT_DRAFT_FROM_IMAGE, base64_image)
     print("\n📝 Draft (from image):\n", draft_clean)
 
-    # 4. Search for examples
     ex_docs = text_db.similarity_search(draft_clean, k=6)
     domain_examples = "\n\n---\n\n".join(
         mask_numbers(d.page_content) for d in ex_docs if getattr(d, "page_content", None)
