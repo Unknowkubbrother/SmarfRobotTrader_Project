@@ -250,3 +250,57 @@ results = sorted(fused.items(), key=lambda x: x[1]["score"], reverse=True)
 * top5 ของ img_hits / t_hits / x_hits
 * ตาราง merged ที่โชว์ (img_rank, t_rank, x_rank, rrf_score)
   เพื่อให้คุณเห็นว่ามันถูกดันขึ้นมาด้วยเหตุผลอะไรครับ
+
+sudo apt-get update
+sudo apt-get install -y build-essential zlib1g-dev libncurses5-dev libgdbm-dev \
+libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev wget \
+libbz2-dev liblzma-dev tk-dev
+
+cd /tmp
+wget https://www.python.org/ftp/python/3.11.9/Python-3.11.9.tgz
+tar xzf Python-3.11.9.tgz
+cd Python-3.11.9
+
+# Configure & Install
+./configure --enable-optimizations --with-lto
+make -j 2
+sudo make altinstall
+
+python3.11 -c "import lzma; print('✅ LZMA OK')"
+
+cd /tmp
+sudo rm -rf Python-3.11.9 Python-3.11.9.tgz
+sudo apt-get clean
+
+cd ~/llm-rag  # เข้าโฟลเดอร์โปรเจค
+
+# สร้าง venv
+rm -rf myenv
+python3.11 -m venv myenv
+source myenv/bin/activate
+
+# ติดตั้ง dependencies (เวอร์ชั่นล่าสุดที่แก้แล้ว)
+pip install --no-cache-dir -r requirements.txt
+
+# 1. ตั้งค่าโฟลเดอร์ชั่วคราวใหม่
+export TMPDIR="/dev/shm"
+export TEMP="/dev/shm"
+export TMP="/dev/shm"
+
+# 2. ตั้งค่าที่เก็บ Model และ Cache
+export HF_HOME="/dev/shm/huggingface"
+export TORCH_HOME="/dev/shm/torch"
+
+# 3. สร้างโฟลเดอร์ให้พร้อม
+mkdir -p /dev/shm/huggingface
+mkdir -p /dev/shm/torch
+
+
+# หยุดตัวเก่าก่อน
+pkill ollama
+
+# รันใหม่โดยบอกให้รับได้ 8 คิวพร้อมกัน
+OLLAMA_NUM_PARALLEL=8 ollama serve
+
+# 4. รันโปรแกรม
+python main.py

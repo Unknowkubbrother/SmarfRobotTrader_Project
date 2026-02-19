@@ -166,26 +166,53 @@ if __name__ == "__main__":
         if skipped_count > 0:
             print(f"⏭️ Skipping {skipped_count} already processed images.")
     
-    for dt, name in tqdm(LIST_QUERY_IMAGE, desc="Processing Images"):
-        time.sleep(0.5)  # Rate limit protection
+    # --- Batch Processing Config ---
+    MAX_WORKERS = 8  # A100 can handle this easily if Ollama is configured correctly
+    print(f"🚀 Starting Batch Processing with {MAX_WORKERS} workers...")
+    
+    import concurrent.futures
+    import threading
+
+    # Lock for thread-safe DB writing
+    db_lock = threading.Lock()
+
+    def process_one_image(item):
+        dt, name = item
         symbol = name.split("_")[0]
+        
+        try:
+            # Run RAG Pipeline
+            final_answer = run_rag_pipeline(chart_db, text_db, vision_llm, DATASET_JSON, f"{folder}/{name}")
+            
+            # Print result (use lock to prevent messy output)
+            with db_lock:
+                print("\n\n")
+                print("--------------------------------")
+                print(f"{name}")
+                print("--------------------------------")
+                print("\n🧠 Final Analysis:")
+                print(final_answer)
+                print("--------------------------------")
+                print("\n\n")
 
-        final_answer = run_rag_pipeline(chart_db, text_db, vision_llm, DATASET_JSON, f"{folder}/{name}")
+            # Insert into DB (Thread-safe)
+            with db_lock:
+                timeframe = "H1"
+                inserted = text_embedding.insert_document(symbol, dt, timeframe, final_answer)
+                if inserted:
+                    print(f"\n✅ Inserted document {symbol}")
+                else:
+                    print(f"\n❌ Failed to insert document {symbol}")
+                    
+        except Exception as e:
+            with db_lock:
+                print(f"❌ Error processing {name}: {e}")
 
-        timeframe = "H1"
-
-        print("\n\n")
-        print("--------------------------------")
-        print(f"{name}")
-        print("--------------------------------")
-        print("\n🧠 Final Analysis:")
-        print(final_answer)
-        print("--------------------------------")
-        print("\n\n")
-
-        inserted = text_embedding.insert_document(symbol, dt, timeframe, final_answer)
-
-        if inserted:
-            print(f"\n✅ Inserted document {symbol}")
-        else:
-            print(f"\n❌ Failed to insert document {symbol}")
+    # Run in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tasks
+        futures = {executor.submit(process_one_image, item): item for item in LIST_QUERY_IMAGE}
+        
+        # Monitor progress
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(LIST_QUERY_IMAGE), desc="Processing Images"):
+            pass  # Progress bar updates automatically as futures complete
