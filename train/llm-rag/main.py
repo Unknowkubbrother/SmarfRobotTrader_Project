@@ -47,7 +47,7 @@ class VisionLLMClient:
         self.llm= init_chat_model(
             model="ministral-3:14b",
             model_provider="ollama",
-            base_url="http://202.44.40.197:11434",
+            base_url="http://localhost:11434",
         )
 
     def invoke(self, text: str, image_base64: str) -> str:
@@ -153,7 +153,7 @@ if __name__ == "__main__":
         print("🆕 No existing data found. Starting from scratch.")
     # --------------------
 
-    folder = "../data_images/images"
+    folder = "images"
     
     from tqdm import tqdm
     LIST_QUERY_IMAGE = list_fileDate_folder(folder)

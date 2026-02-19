@@ -1,7 +1,10 @@
 # AI Core & Math
 torch
 torchvision
+accelerate
 numpy
+pandas
+python-dotenv
 
 # Image Processing
 pillow
@@ -16,13 +19,11 @@ chromadb
 
 # Embeddings & Models
 sentence-transformers
-transformers
+transformers==4.46.0
 FlagEmbedding  # BGE-M3 สำหรับ Thai language support
 langchain-core  # ChatPromptTemplate, StrOutputParser
 langchain-text-splitters  # RecursiveCharacterTextSplitter
 requests
 opencv-python
 
-
-supabase
 tqdm
