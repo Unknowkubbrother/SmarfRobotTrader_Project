@@ -2,7 +2,7 @@ import os
 import chromadb
 from datetime import datetime
 from FlagEmbedding import BGEM3FlagModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 class ChromaDBClient:
     def __init__(self, persist_path: str = "chroma_db"):
@@ -94,3 +94,31 @@ class ChromaDBClient:
         except Exception as e:
             print(f"❌ ChromaDB Search Error: {e}")
             return []
+
+    def get_latest_document_datetime(self) -> Optional[datetime]:
+        try:
+            results = self.collection.get(include=["metadatas"])
+            
+            if not results or not results['metadatas']:
+                return None
+            
+            latest_dt = None
+            
+            for meta in results['metadatas']:
+                if not meta or 'symbol_datetime' not in meta:
+                    continue
+                
+                try:
+                    dt_str = meta['symbol_datetime']
+                    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+                    
+                    if latest_dt is None or dt > latest_dt:
+                        latest_dt = dt
+                except Exception:
+                    continue
+                    
+            return latest_dt
+            
+        except Exception as e:
+            print(f"❌ Error getting latest datetime: {e}")
+            return None

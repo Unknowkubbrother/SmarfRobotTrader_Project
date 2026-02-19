@@ -143,10 +143,29 @@ if __name__ == "__main__":
 
     text_embedding = ChromaDBClient()
 
+    # --- Resume Logic ---
+    print("🔄 Checking for existing progress in ChromaDB...")
+    latest_dt = text_embedding.get_latest_document_datetime()
+    
+    if latest_dt:
+        print(f"⏩ Found existing data up to: {latest_dt}")
+    else:
+        print("🆕 No existing data found. Starting from scratch.")
+    # --------------------
+
     folder = "../data_images/images"
     
     from tqdm import tqdm
     LIST_QUERY_IMAGE = list_fileDate_folder(folder)
+
+    # Filter list
+    if latest_dt:
+        original_count = len(LIST_QUERY_IMAGE)
+        LIST_QUERY_IMAGE = [item for item in LIST_QUERY_IMAGE if item[0] > latest_dt]
+        skipped_count = original_count - len(LIST_QUERY_IMAGE)
+        if skipped_count > 0:
+            print(f"⏭️ Skipping {skipped_count} already processed images.")
+    
     for dt, name in tqdm(LIST_QUERY_IMAGE, desc="Processing Images"):
         time.sleep(0.5)  # Rate limit protection
         symbol = name.split("_")[0]
