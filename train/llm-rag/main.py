@@ -47,7 +47,7 @@ class VisionLLMClient:
         self.llm= init_chat_model(
             model="ministral-3:14b",
             model_provider="ollama",
-            base_url="http://localhost:11434",
+            base_url="http://202.44.40.197:11434",
         )
 
     def invoke(self, text: str, image_base64: str) -> str:
@@ -167,7 +167,7 @@ if __name__ == "__main__":
             print(f"⏭️ Skipping {skipped_count} already processed images.")
     
     # --- Batch Processing Config ---
-    MAX_WORKERS = 8  # A100 can handle this easily if Ollama is configured correctly
+    MAX_WORKERS = 1  # A100 can handle this easily if Ollama is configured correctly
     print(f"🚀 Starting Batch Processing with {MAX_WORKERS} workers...")
     
     import concurrent.futures
