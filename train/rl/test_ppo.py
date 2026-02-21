@@ -19,7 +19,7 @@ from env_trading import TradingEnv
 # CONFIG (must match zmq_bridge_server.py)
 # ==================================================
 WINDOW_SIZE = 20
-INITIAL_BALANCE = 10000
+INITIAL_BALANCE = 100
 PIP_SIZE = 0.0001
 PIP_VALUE = 10.0
 SL_PIPS = 50
