@@ -35,7 +35,7 @@ class TradingEnv(gym.Env):
         pip_value=10.0,           # $10 per pip for 1.0 standard lot on EURUSD
         sl_pips=30,               # Stop Loss in pips (matches MT5 EA)
         tp_pips=60,               # Take Profit in pips (matches MT5 EA)
-        spread_pips=0,            # 0 because MT5 handles spread via ask/bid
+        spread_pips=2,            # Typical broker spread in pips
         commission_per_lot=0.0,   # Commission per lot (0 if spread-only broker)
         max_dd=0.30,              # Max drawdown 30%
         max_hold_steps=30,        # ถือสูงสุด 30 แท่ง H1
@@ -269,44 +269,52 @@ class TradingEnv(gym.Env):
         self.max_equity = max(self.max_equity, self.equity)
         drawdown = (self.max_equity - self.equity) / self.max_equity if self.max_equity > 0 else 0
         
-        # ===== REWARD CALCULATION (Balanced v3 — adapted for pip-based) =====
+        # ===== REWARD CALCULATION (Balanced Profitability v5) =====
         
-        # 1. PnL-based reward — core signal
+        # 1. Base PnL reward
         equity_change = (self.equity - prev_equity) / self.initial_balance
-        reward = np.clip(equity_change * 50, -1, 1)
+        if equity_change > 0:
+            reward = np.clip(equity_change * 80, 0, 1.0)
+        else:
+            reward = np.clip(equity_change * 100, -1.0, 0)
         
-        # 2. HOLD winning position bonus
-        if self.position != 0 and self.unrealized_pnl > 0:
-            reward += 0.02
-        
-        # 3. Trade penalty — STRONG
+        # 2. Gentle Floating Loss Penalty
+        if self.position != 0 and self.unrealized_pnl < 0:
+            reward -= 0.02
+        elif self.position != 0 and self.unrealized_pnl > 0:
+            reward += 0.05  # Encourage holding winners
+
+        # 3. Trade Entry Penalty (Spread awareness)
         if trade_executed and not sl_tp_closed:
             reward -= 0.1
         
-        # 4. Close trade bonus
+        # 4. Close Trade Reward
         if close_pnl != 0:
             close_return = close_pnl / self.initial_balance
             self.trade_returns.append(close_return)
             if close_pnl > 0:
-                reward += min(abs(close_return) * 30, 0.8)
+                reward += min(close_return * 40, 1.0)
             else:
-                reward -= min(abs(close_return) * 15, 0.4)
+                reward -= min(abs(close_return) * 50, 1.0)
         
-        # 5. SL/TP bonuses
-        if sl_tp_closed and close_pnl > 0:
-            reward += 0.3  # TP hit bonus
+        # 5. SL/TP specific bonuses/penalties
+        if sl_tp_closed:
+            if close_pnl > 0:
+                reward += 1.0  # Strong reward for hitting TP
+            else:
+                reward -= 0.5  # Standard penalty for SL
         
         # 6. Hold too long penalty
-        if self.position != 0 and self.hold_steps > self.max_hold_steps * 0.8:
-            reward -= 0.005
+        if self.position != 0 and self.hold_steps >= self.max_hold_steps * 0.9:
+            reward -= 0.1
         
-        # 7. Drawdown penalty
+        # 7. Drawdown survival penalty
         if drawdown > 0.08:
-            reward -= (drawdown - 0.08) * 2
+            reward -= (drawdown - 0.08) * 3
         
         # 8. Stay flat bonus
         if action == 0 and self.position == 0:
-            reward += 0.005
+            reward += 0.01
         
         # ===== STEP FORWARD =====
         self.step_idx += 1

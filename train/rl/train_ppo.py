@@ -213,6 +213,6 @@ print(f"🎯 SL=30 pips | TP=60 pips | Lot=0.1 | MaxHold=30 | RandomStart=ON")
 print(f"📈 Features: {len(FEATURE_LIST)} (incl. SMA, RSI, ATR, Trend)")
 print("="*50 + "\n")
 
-model.learn(total_timesteps=500_000, callback=trading_callback)
+model.learn(total_timesteps=1_000_000, callback=trading_callback)
 model.save("ppo_trading")
 train_env.save("vec_normalize.pkl")
