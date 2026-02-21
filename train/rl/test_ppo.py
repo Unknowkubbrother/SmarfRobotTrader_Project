@@ -27,15 +27,12 @@ TP_PIPS = 60
 SPREAD_PIPS = 2
 MAX_HOLD_STEPS = 30
 BAR_HISTORY = 200  # Same as EA sends
-RISK_PERCENT = 1.0  # Risk % per trade (0 = use fixed LOT_SIZE below)
-LOT_SIZE = 0.1      # Fallback fixed lot
+RISK_PERCENT = 1.0  # Risk % per trade
 
 
 def calc_auto_lot(balance, risk_pct=RISK_PERCENT, sl_pips=SL_PIPS,
                   pip_value_per_lot=PIP_VALUE, min_lot=0.01, lot_step=0.01):
     """Risk-based position sizing (same formula as EA)"""
-    if risk_pct <= 0:
-        return LOT_SIZE
     risk_amount = balance * risk_pct / 100.0
     lot = risk_amount / (sl_pips * pip_value_per_lot)
     lot = max(min_lot, lot_step * int(lot / lot_step))
@@ -196,7 +193,7 @@ class PPOBridge:
             unrealized_ret = self.position * (current_price - self.entry_price) / self.entry_price
             unrealized_pips = self.position * (current_price - self.entry_price) / PIP_SIZE
             
-        total_pnl_pips = self.total_pnl / (PIP_VALUE * LOT_SIZE) if LOT_SIZE > 0 else 0.0
+        total_pnl_pips = self.total_pnl / (PIP_VALUE * self.lot_size) if self.lot_size > 0 else 0.0
 
         state_feat = np.array([
             self.position,
@@ -267,7 +264,7 @@ dummy_data = {
     'sma_cross': [0]*80, 'rsi_norm': [0]*80, 'atr_norm': [0]*80, 'trend': [0]*80
 }
 mock_df = pd.DataFrame(dummy_data)
-dummy_env = DummyVecEnv([lambda: TradingEnv(mock_df, lot_size=LOT_SIZE, sl_pips=SL_PIPS, tp_pips=TP_PIPS)])
+dummy_env = DummyVecEnv([lambda: TradingEnv(mock_df, lot_size=calc_auto_lot(INITIAL_BALANCE), sl_pips=SL_PIPS, tp_pips=TP_PIPS)])
 vec_norm = VecNormalize.load("vec_normalize.pkl", dummy_env)
 vec_norm.training = False
 vec_norm.norm_reward = False

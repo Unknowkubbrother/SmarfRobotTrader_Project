@@ -18,12 +18,12 @@ mt5 = MetaTrader5(host="localhost", port=8001)
 # ==================================================
 SYMBOL = "EURUSD"
 TIMEFRAME = mt5.TIMEFRAME_H1
-LOT_SIZE = 0.01         # Fallback fixed lot (used when RISK_PERCENT=0)
+LOT_SIZE_FALLBACK = 0.01  # Min lot fallback (used only if calc fails)
 MAGIC_NUMBER = 123456
 MODEL_PATH = "ppo_trading.zip"
 VEC_NORM_PATH = "vec_normalize.pkl"
 DEVIATION = 20
-RISK_PERCENT = 1.0      # Risk % per trade (0 = use fixed LOT_SIZE)
+RISK_PERCENT = 1.0      # Risk % per trade
 
 # ==================================================
 # SL/TP CONFIGURATION
@@ -36,8 +36,6 @@ PIP_VALUE_PER_LOT = 10.0  # $10 per pip for 1 standard lot on EURUSD
 def calc_auto_lot(balance, risk_pct=RISK_PERCENT, sl_pips=SL_PIPS,
                   pip_value_per_lot=PIP_VALUE_PER_LOT, min_lot=0.01, lot_step=0.01):
     """Risk-based position sizing"""
-    if risk_pct <= 0:
-        return LOT_SIZE
     risk_amount = balance * risk_pct / 100.0
     lot = risk_amount / (sl_pips * pip_value_per_lot)
     lot = max(min_lot, lot_step * int(lot / lot_step))
