@@ -37,6 +37,7 @@ double lastBid = 0.0;
 double lastAsk = 0.0;
 int accumDeltaTick = 0;
 double accumDeltaPrice = 0.0;
+double pipSize = 0.0; // Actual pip size (auto-detected)
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -45,7 +46,12 @@ int OnInit() {
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(10);
 
-  Print("🚀 ZmqBridgeEA initialized");
+  // Auto-detect pip size: 5-digit broker → point*10, 4-digit → point
+  // EURUSD 5-digit: point=0.00001, pipSize=0.0001
+  // USDJPY 3-digit: point=0.001,   pipSize=0.01
+  pipSize = _Point * ((_Digits == 3 || _Digits == 5) ? 10 : 1);
+  Print("🚀 ZmqBridgeEA initialized | pipSize=", pipSize, " point=", _Point,
+        " digits=", _Digits);
 
   // Create REQ socket for Request-Reply pattern
   reqSocket = new Socket(context, ZMQ_REQ);
@@ -63,6 +69,8 @@ int OnInit() {
   }
 
   Print("✅ ZMQ Connection established");
+  Print("🎯 SL=", SL_Pips, " pips (", SL_Pips * pipSize, ") | TP=", TP_Pips,
+        " pips (", TP_Pips * pipSize, ")");
 
   return (INIT_SUCCEEDED);
 }
@@ -166,7 +174,6 @@ string BuildDataString(int dTick, double dPrice) {
 //+------------------------------------------------------------------+
 void ExecuteAction(int action) {
   double price, sl, tp;
-  double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
   bool hasPosition = PositionSelect(_Symbol);
   long posType = -1;
@@ -184,8 +191,8 @@ void ExecuteAction(int action) {
     }
     if (!hasPosition || posType == POSITION_TYPE_SELL) {
       price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      sl = NormalizeDouble(price - SL_Pips * point, _Digits);
-      tp = NormalizeDouble(price + TP_Pips * point, _Digits);
+      sl = NormalizeDouble(price - SL_Pips * pipSize, _Digits);
+      tp = NormalizeDouble(price + TP_Pips * pipSize, _Digits);
       trade.Buy(LotSize, _Symbol, price, sl, tp, "PPO_BUY");
       Print("📈 BUY @ ", price, " SL:", sl, " TP:", tp);
     }
@@ -198,8 +205,8 @@ void ExecuteAction(int action) {
     }
     if (!hasPosition || posType == POSITION_TYPE_BUY) {
       price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      sl = NormalizeDouble(price + SL_Pips * point, _Digits);
-      tp = NormalizeDouble(price - TP_Pips * point, _Digits);
+      sl = NormalizeDouble(price + SL_Pips * pipSize, _Digits);
+      tp = NormalizeDouble(price - TP_Pips * pipSize, _Digits);
       trade.Sell(LotSize, _Symbol, price, sl, tp, "PPO_SELL");
       Print("📉 SELL @ ", price, " SL:", sl, " TP:", tp);
     }
