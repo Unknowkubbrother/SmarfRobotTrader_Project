@@ -26,7 +26,11 @@ class TradingEnv(gym.Env):
         lot_size=1.0,
         spread_cost=0.0001,      # 0.01% spread
         commission=0.00002,      # 0.002% commission
-        max_dd=0.20,             # Max drawdown 20%
+        max_dd=0.15,             # Max drawdown 15%
+        stop_loss_pct=0.01,      # 1% SL
+        take_profit_pct=0.02,    # 2% TP (R:R = 1:2)
+        max_hold_steps=30,       # ถือสูงสุด 30 แท่ง H1
+        random_start=False,      # สุ่มเริ่มต้นในแต่ละ episode
     ):
         self.df = df.reset_index(drop=True)
         self.window_size = window_size
@@ -35,15 +39,19 @@ class TradingEnv(gym.Env):
         self.spread_cost = spread_cost
         self.commission = commission
         self.max_dd = max_dd
+        self.stop_loss_pct = stop_loss_pct
+        self.take_profit_pct = take_profit_pct
+        self.max_hold_steps = max_hold_steps
+        self.random_start = random_start
         
         self.max_step = len(df) - 2
         
         # 4 Actions: Hold, Buy(Long), Sell(Short), Close
         self.action_space = gym.spaces.Discrete(4)
         
-        # Features: 7 market + 4 state
-        self.market_features = 7
-        self.state_features = 4
+        # Features: 11 market + 5 state (เพิ่ม trend indicators)
+        self.market_features = len(self._get_feature_columns())
+        self.state_features = 5
         total_features = (self.window_size * self.market_features) + self.state_features
         
         self.observation_space = gym.spaces.Box(
@@ -52,13 +60,27 @@ class TradingEnv(gym.Env):
         
         self.reset()
     
+    @staticmethod
+    def _get_feature_columns():
+        return [
+            'return', 'range', 'delta_tick', 'delta_price', 'has_delta',
+            'body_ratio', 'momentum',
+            'sma_cross', 'rsi_norm', 'atr_norm', 'trend'
+        ]
+    
     def seed(self, seed=None):
         np.random.seed(seed)
         return [seed]
     
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.step_idx = self.window_size
+        
+        # Random start position — ป้องกันการจำ pattern
+        if self.random_start:
+            max_start = max(self.window_size + 1, self.max_step - 500)  # เหลืออย่างน้อย 500 steps
+            self.step_idx = np.random.randint(self.window_size, max_start)
+        else:
+            self.step_idx = self.window_size
         self.position = 0       # -1: Short, 0: Flat, 1: Long
         self.equity = self.initial_balance
         self.balance = self.initial_balance
@@ -73,9 +95,16 @@ class TradingEnv(gym.Env):
         self.total_fees = 0.0
         self.total_pnl = 0.0
         
+        # SL/TP tracking
+        self.sl_hits = 0
+        self.tp_hits = 0
+        
         # Track predictions
         self.correct_predictions = 0
         self.total_predictions = 0
+        
+        # Track trade returns for Sharpe-like reward
+        self.trade_returns = []
         
         return self._get_obs(), {}
     
@@ -83,21 +112,24 @@ class TradingEnv(gym.Env):
         start = self.step_idx - self.window_size
         end = self.step_idx
         
-        feature_columns = [
-            'return', 'range', 'delta_tick', 'delta_price', 'has_delta',
-            'body_ratio', 'momentum'
-        ]
+        feature_columns = self._get_feature_columns()
         available_cols = [col for col in feature_columns if col in self.df.columns]
         
         block = self.df.iloc[start:end][available_cols].values
         market_data = block.flatten().astype(np.float32)
         
-        # State: position, equity ratio, unrealized pnl, hold steps
+        # State: position, equity ratio, unrealized pnl, hold steps, unrealized return
+        unrealized_ret = 0.0
+        if self.position != 0 and self.entry_price > 0:
+            current_price = self._get_current_price()
+            unrealized_ret = self.position * (current_price - self.entry_price) / self.entry_price
+        
         state_data = np.array([
             self.position,
             self.equity / self.initial_balance,
             self.unrealized_pnl / self.initial_balance,
-            min(self.hold_steps / 50, 1.0)  # Normalized hold time
+            min(self.hold_steps / self.max_hold_steps, 1.0),  # Normalized hold time
+            np.clip(unrealized_ret * 100, -5, 5),  # Unrealized return % (clipped)
         ], dtype=np.float32)
         
         return np.concatenate([market_data, state_data])
@@ -113,48 +145,73 @@ class TradingEnv(gym.Env):
         
         reward = 0.0
         trade_executed = False
+        sl_tp_closed = False
+        close_pnl = 0.0  # PnL เมื่อปิด position
         
-        # ===== ACTION LOGIC =====
+        # ===== SL/TP AUTO-CLOSE CHECK (ก่อน action) =====
+        if self.position != 0 and self.entry_price > 0:
+            unrealized_return = self.position * (current_price - self.entry_price) / self.entry_price
+            
+            if unrealized_return <= -self.stop_loss_pct:
+                # Stop Loss hit → auto close
+                close_pnl = self.unrealized_pnl
+                self._close_position(current_price)
+                self.sl_hits += 1
+                sl_tp_closed = True
+                trade_executed = True
+            elif unrealized_return >= self.take_profit_pct:
+                # Take Profit hit → auto close
+                close_pnl = self.unrealized_pnl
+                self._close_position(current_price)
+                self.tp_hits += 1
+                sl_tp_closed = True
+                trade_executed = True
+            elif self.hold_steps >= self.max_hold_steps:
+                # ถือนานเกินไป → บังคับปิด
+                close_pnl = self.unrealized_pnl
+                self._close_position(current_price)
+                sl_tp_closed = True
+                trade_executed = True
+        
+        # ===== ACTION LOGIC (skip if SL/TP just closed) =====
         # 0: HOLD - ไม่ทำอะไร
         # 1: BUY - ทำนายว่าขึ้น (Long)
         # 2: SELL - ทำนายว่าลง (Short)
         # 3: CLOSE - ปิด order
         
-        if action == 0:  # HOLD
+        if sl_tp_closed:
+            pass  # SL/TP ปิดแล้ว ไม่ต้องทำ action
+        elif action == 0:  # HOLD
             pass  # ไม่ทำอะไร
             
         elif action == 1:  # BUY (ทำนายว่าขึ้น)
             if self.position == -1:
-                # มี Short อยู่ -> ปิด Short ก่อน แล้วเปิด Long
+                close_pnl = self.unrealized_pnl
                 self._close_position(current_price)
                 self._open_position(1, current_price)
                 trade_executed = True
             elif self.position == 0:
-                # ไม่มี position -> เปิด Long
                 self._open_position(1, current_price)
                 trade_executed = True
-            # ถ้ามี Long อยู่แล้ว -> ถือต่อ (ไม่ทำอะไร)
             
         elif action == 2:  # SELL (ทำนายว่าลง)
             if self.position == 1:
-                # มี Long อยู่ -> ปิด Long ก่อน แล้วเปิด Short
+                close_pnl = self.unrealized_pnl
                 self._close_position(current_price)
                 self._open_position(-1, current_price)
                 trade_executed = True
             elif self.position == 0:
-                # ไม่มี position -> เปิด Short
                 self._open_position(-1, current_price)
                 trade_executed = True
-            # ถ้ามี Short อยู่แล้ว -> ถือต่อ
             
         elif action == 3:  # CLOSE
-            if self.position != 0:
+            if self.position != 0 and not sl_tp_closed:
+                close_pnl = self.unrealized_pnl
                 self._close_position(current_price)
                 trade_executed = True
         
         # ===== PRICE MOVEMENT & PnL =====
         if self.position != 0:
-            # คำนวณ PnL จากการเคลื่อนไหวของราคา
             pnl = self.position * next_return * self.lot_size * self.equity
             self.unrealized_pnl += pnl
             self.equity += pnl
@@ -163,34 +220,55 @@ class TradingEnv(gym.Env):
             # Track prediction accuracy
             if trade_executed and prev_position == 0:
                 self.total_predictions += 1
-                # ทำนายถูกถ้า: Long & ราคาขึ้น หรือ Short & ราคาลง
                 if (self.position == 1 and next_return > 0) or (self.position == -1 and next_return < 0):
                     self.correct_predictions += 1
         
         self.max_equity = max(self.max_equity, self.equity)
-        # ===== REWARD CALCULATION (Simpler & More Robust) =====
+        drawdown = (self.max_equity - self.equity) / self.max_equity if self.max_equity > 0 else 0
         
-        # 1. PnL-based reward - ใช้ log scale เพื่อลด extreme rewards
+        # ===== REWARD CALCULATION (Balanced v3) =====
+        
+        # 1. PnL-based reward — core signal
         equity_change = (self.equity - prev_equity) / self.initial_balance
-        reward = np.sign(equity_change) * np.sqrt(abs(equity_change)) * 5
+        reward = np.clip(equity_change * 50, -1, 1)
         
-        # 2. สนับสนุน HOLD (ไม่เทรดเกินไป)
+        # 2. HOLD winning position bonus
+        if self.position != 0 and self.unrealized_pnl > 0:
+            reward += 0.02  # ถือกำไร = ดี (เพิ่มขึ้น)
+        
+        # 3. Trade penalty — STRONG (ค่า fee ทำลาย performance!)
+        if trade_executed and not sl_tp_closed:
+            reward -= 0.1  # เพิ่มจาก 0.05
+        
+        # 4. Close trade bonus — only if held minimum time
+        if close_pnl != 0:
+            close_return = close_pnl / self.initial_balance
+            self.trade_returns.append(close_return)
+            if close_pnl > 0:
+                reward += min(abs(close_return) * 30, 0.8)  # Big win bonus
+            else:
+                reward -= min(abs(close_return) * 15, 0.4)
+        
+        # 5. SL/TP bonuses
+        if sl_tp_closed and close_pnl > 0:
+            reward += 0.3  # TP hit bonus
+        
+        # 6. Hold too long penalty
+        if self.position != 0 and self.hold_steps > self.max_hold_steps * 0.8:
+            reward -= 0.005
+        
+        # 7. Drawdown penalty
+        if drawdown > 0.08:
+            reward -= (drawdown - 0.08) * 2
+        
+        # 8. Stay flat bonus — stronger
         if action == 0 and self.position == 0:
-            reward += 0.0001  # Small bonus for staying flat when uncertain
-        
-        # 3. Penalty สำหรับการเปลี่ยน position บ่อย
-        if trade_executed:
-            reward -= 0.001
-        
-        # 4. Simple win/loss bonus at close
-        # (ให้ reward เมื่อปิด position กำไร)
+            reward += 0.005  # เพิ่มจาก 0.002
         
         # ===== STEP FORWARD =====
         self.step_idx += 1
         
         # ===== DONE CONDITIONS =====
-        drawdown = (self.max_equity - self.equity) / self.max_equity if self.max_equity > 0 else 0
-        
         truncated = self.step_idx >= self.max_step
         terminated = (
             drawdown >= self.max_dd
@@ -198,13 +276,20 @@ class TradingEnv(gym.Env):
         )
         done = terminated or truncated
         
-        # Simple end bonus
+        # End episode bonus/penalty
         if done:
             final_return = (self.equity - self.initial_balance) / self.initial_balance
             if final_return > 0:
-                reward += 0.1  # Bonus for positive return
+                reward += min(final_return * 5, 1.0)  # Scaled bonus (max 1.0)
             else:
-                reward -= 0.05  # Small penalty for loss
+                reward -= 0.2
+            
+            # Sharpe-like bonus
+            if len(self.trade_returns) > 5:
+                avg_ret = np.mean(self.trade_returns)
+                std_ret = np.std(self.trade_returns) + 1e-8
+                sharpe = avg_ret / std_ret
+                reward += np.clip(sharpe * 0.3, -0.5, 0.5)
         
         # Prediction accuracy
         accuracy = (self.correct_predictions / self.total_predictions * 100) if self.total_predictions > 0 else 0
@@ -223,6 +308,8 @@ class TradingEnv(gym.Env):
             "total_pnl": self.total_pnl,
             "accuracy": accuracy,
             "action": action,
+            "sl_hits": self.sl_hits,
+            "tp_hits": self.tp_hits,
         }
         
         return self._get_obs(), reward, terminated, truncated, info

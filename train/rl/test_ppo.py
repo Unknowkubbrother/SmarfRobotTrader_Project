@@ -31,12 +31,39 @@ df['return'] = df['close'].pct_change().fillna(0)
 df['range'] = (df['high'] - df['low']) / df['close']
 df['raw_return'] = df['return']
 
-# Body Ratio - วัด strength ของแท่งเทียน
+# Body Ratio
 full_range = df['high'] - df['low']
 df['body_ratio'] = np.where(full_range > 0, abs(df['close'] - df['open']) / full_range, 0)
 
-# Momentum (sum of recent returns)
+# Momentum
 df['momentum'] = df['return'].rolling(window=5).sum().fillna(0)
+
+# ===== Trend Indicators (ต้องตรงกับ train_ppo.py) =====
+sma20 = df['close'].rolling(20).mean()
+sma50 = df['close'].rolling(50).mean()
+df['sma_cross'] = np.where(sma20 > sma50, 1, np.where(sma20 < sma50, -1, 0))
+df['sma_cross'] = df['sma_cross'].fillna(0)
+
+delta_c = df['close'].diff()
+gain = delta_c.clip(lower=0).rolling(14).mean()
+loss = (-delta_c.clip(upper=0)).rolling(14).mean()
+rs = gain / (loss + 1e-10)
+rsi = 100 - (100 / (1 + rs))
+df['rsi_norm'] = ((rsi - 50) / 50).fillna(0)
+
+tr = np.maximum(
+    df['high'] - df['low'],
+    np.maximum(
+        abs(df['high'] - df['close'].shift(1)),
+        abs(df['low'] - df['close'].shift(1))
+    )
+)
+df['atr_norm'] = (tr.rolling(14).mean() / df['close']).fillna(0)
+
+df['trend'] = (sma20.pct_change(5) * 100).fillna(0)
+df['trend'] = df['trend'].clip(-2, 2)
+
+df = df.iloc[50:].reset_index(drop=True)
 
 print(f"✅ Features: return, range, delta_tick, delta_price, has_delta, body_ratio, momentum")
 print("="*50 + "\n")
@@ -83,6 +110,8 @@ print(f"Win Rate:         {(wins/trades*100) if trades > 0 else 0:.2f}%")
 print(f"Max Drawdown:     {info[0]['drawdown']*100:.2f}%")
 print(f"Avg Hold Steps:   {avg_hold:.1f}")
 print(f"Total Fees Paid:  ${info[0]['fees']:.2f}")
+print(f"SL Hits:          {info[0].get('sl_hits', 0)}")
+print(f"TP Hits:          {info[0].get('tp_hits', 0)}")
 print("="*50)
 
 # Sharpe Ratio calculation

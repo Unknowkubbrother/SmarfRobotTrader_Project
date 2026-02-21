@@ -23,7 +23,12 @@ MAGIC_NUMBER = 123456
 MODEL_PATH = "ppo_trading.zip"
 VEC_NORM_PATH = "vec_normalize.pkl"
 DEVIATION = 20
-# INITIAL_BALANCE removed here, will be fetched from account info
+
+# ==================================================
+# SL/TP CONFIGURATION
+# ==================================================
+SL_PIPS = 30    # Stop Loss in pips (30 pips = 0.00030 for 5-digit broker)
+TP_PIPS = 50    # Take Profit in pips (50 pips = 0.00050 for 5-digit broker)
 
 # Features ที่ใช้ (ต้องเรียงตาม train_ppo.py เป๊ะๆ)
 FEATURE_COLUMNS = [
@@ -40,6 +45,13 @@ class LiveTradingBot:
         self.initial_balance = 0.0 # Will be set on connect
         self.point = 0.00001 # Default fallback
         self.digits = 5 # Default fallback
+        
+        # SL/TP tracking
+        self.sl_hits = 0
+        self.tp_hits = 0
+        self.entry_price = 0.0
+        self.current_sl = 0.0
+        self.current_tp = 0.0
         
     def connect(self):
         if not mt5.initialize():
@@ -169,6 +181,9 @@ class LiveTradingBot:
             elif pos.type == mt5.ORDER_TYPE_SELL:
                 current_position = -1
             unrealized_pnl = pos.profit
+            self.entry_price = pos.price_open
+            self.current_sl = pos.sl
+            self.current_tp = pos.tp
             
             # Logic to track hold steps
             if current_position == self.last_trade_action:
@@ -179,11 +194,12 @@ class LiveTradingBot:
         else:
             self.hold_steps = 0
             self.last_trade_action = 0
+            self.entry_price = 0.0
+            self.current_sl = 0.0
+            self.current_tp = 0.0
 
         # 2. Equity
         account = mt5.account_info()
-        # Use simple normalization against current balance if initial balance isn't tracked long-term
-        # But to match training 'equity/initial', we use the balance at script start
         equity_ratio = account.equity / self.initial_balance if self.initial_balance > 0 else 1.0
         
         # 3. Hold Steps Norm
@@ -259,32 +275,73 @@ class LiveTradingBot:
                 
                 # 3. Predict
                 action, _ = self.model.predict(obs_norm, deterministic=True)
-                print(f"🤖 Prediction: {action} (Pos: {current_pos})")
+                action_names = {0: 'HOLD', 1: 'BUY', 2: 'SELL', 3: 'CLOSE'}
+                print(f"🤖 Prediction: {action_names.get(int(action), '?')} (Pos: {current_pos})")
                 
                 # 4. Execute
                 self.execute_trade(action, current_pos)
             
             # ==========================================
-            # REAL-TIME PRICE & DELTA DISPLAY
+            # REAL-TIME PRICE & DELTA & SL/TP DISPLAY
             # ==========================================
             tick = mt5.symbol_info_tick(SYMBOL)
-            if tick and len(rates) > 0: # Ensure we have rates
-                # Calculate Delta for CURRENT forming candle (Index 0)
-                # Note: copy_rates_from_pos(..., 1, ...) returns PREVIOUS candle at index 0
-                # We need CURRENT candle start time.
-                # Let's fetch current candle rate for timestamp
+            if tick and len(rates) > 0:
+                # ===== SL/TP TICK-LEVEL MONITORING =====
+                # เช็คทุกวินาที ไม่ต้องรอแท่ง H1 ใหม่
+                positions = mt5.positions_get(symbol=SYMBOL)
+                sl_tp_info = ""
+                if positions is not None and len(positions) > 0:
+                    pos = positions[0]
+                    current_pnl = pos.profit
+                    sl_tp_info = f" | SL:{pos.sl:.{self.digits}f} TP:{pos.tp:.{self.digits}f} PnL:{current_pnl:+.2f}"
+                    
+                    # ถ้า broker ไม่ได้ตั้ง SL/TP (sl=0, tp=0) → เช็คเอง
+                    if pos.sl == 0.0 or pos.tp == 0.0:
+                        bid = tick.bid
+                        ask = tick.ask
+                        sl_pips_price = SL_PIPS * self.point
+                        tp_pips_price = TP_PIPS * self.point
+                        
+                        should_close = False
+                        close_reason = ""
+                        
+                        if pos.type == mt5.ORDER_TYPE_BUY:  # Long
+                            if bid <= pos.price_open - sl_pips_price:
+                                should_close = True
+                                close_reason = "SL_HIT"
+                                self.sl_hits += 1
+                            elif bid >= pos.price_open + tp_pips_price:
+                                should_close = True
+                                close_reason = "TP_HIT"
+                                self.tp_hits += 1
+                        elif pos.type == mt5.ORDER_TYPE_SELL:  # Short
+                            if ask >= pos.price_open + sl_pips_price:
+                                should_close = True
+                                close_reason = "SL_HIT"
+                                self.sl_hits += 1
+                            elif ask <= pos.price_open - tp_pips_price:
+                                should_close = True
+                                close_reason = "TP_HIT"
+                                self.tp_hits += 1
+                        
+                        if should_close:
+                            print(f"\n⚡ {close_reason}! Closing position immediately...")
+                            print(f"   Entry: {pos.price_open:.{self.digits}f} | Current PnL: {current_pnl:+.2f}")
+                            print(f"   SL hits: {self.sl_hits} | TP hits: {self.tp_hits}")
+                            self.close_all()
+                            continue
+                
+                # Calculate Delta for current forming candle
                 current_rate = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 1)
                 
+                current_delta = 0
+                current_delta_price = 0.0
+                
                 if current_rate is not None and len(current_rate) > 0:
-                    candle_start_ts = current_rate[0]['time'] # Broker Server Timestamp
+                    candle_start_ts = current_rate[0]['time']
                     candle_start_dt = datetime.fromtimestamp(candle_start_ts)
                     
-                    # Use copy_ticks_from to get all ticks from candle start
-                    # This avoids timezone issues between local datetime.now() and broker server time
                     ticks = mt5.copy_ticks_from(SYMBOL, candle_start_dt, 10000, mt5.COPY_TICKS_ALL)
-                    
-                    current_delta = 0
-                    current_delta_price = 0.0
                     
                     if ticks is not None and len(ticks) > 0:
                         tdf = pd.DataFrame(ticks)
@@ -294,17 +351,13 @@ class LiveTradingBot:
                         buy = (tdf['bid'] > tdf['prev_bid']) | ((tdf['bid'] == tdf['prev_bid']) & (tdf['ask'] > tdf['prev_ask']))
                         sell = (tdf['bid'] < tdf['prev_bid']) | ((tdf['bid'] == tdf['prev_bid']) & (tdf['ask'] < tdf['prev_ask']))
                         current_delta = buy.sum() - sell.sum()
-                        
-                        # Calculate Delta Price (Total price movement from start)
                         current_delta_price = (tdf['bid'].iloc[-1] - tdf['bid'].iloc[0]) + (tdf['ask'].iloc[-1] - tdf['ask'].iloc[0])
 
-                                        # Display status on the same line with padding to clear old text
-                    # Shortened to avoid terminal wrapping issues
-                    server_time_str = datetime.fromtimestamp(tick.time).strftime('%H:%M:%S')
-                    local_time_str = datetime.now().strftime('%H:%M')
-                    status_line = f"📊 Pr: {tick.bid:.{self.digits}f} | 🌊 DT: {current_delta} | 💰 DP: {current_delta_price:.{self.digits}f} | ⏳ {server_time_str} ({local_time_str})      "
-                    sys.stdout.write(f"\r{status_line}")
-                    sys.stdout.flush()
+                server_time_str = datetime.fromtimestamp(tick.time).strftime('%H:%M:%S')
+                local_time_str = datetime.now().strftime('%H:%M')
+                status_line = f"📊 Pr: {tick.bid:.{self.digits}f} | 🌊 DT: {current_delta} | 💰 DP: {current_delta_price:.{self.digits}f}{sl_tp_info} | ⏳ {server_time_str} ({local_time_str})      "
+                sys.stdout.write(f"\r{status_line}")
+                sys.stdout.flush()
 
             time.sleep(1)
 
@@ -320,11 +373,11 @@ class LiveTradingBot:
                 
         elif action == 1: # BUY
             if current_pos == -1: self.close_all()
-            if current_pos == 0: self.send_order(mt5.ORDER_TYPE_BUY)
+            if current_pos <= 0: self.send_order(mt5.ORDER_TYPE_BUY)
             
         elif action == 2: # SELL
             if current_pos == 1: self.close_all()
-            if current_pos == 0: self.send_order(mt5.ORDER_TYPE_SELL)
+            if current_pos >= 0: self.send_order(mt5.ORDER_TYPE_SELL)
 
     def get_filling_mode(self):
         symbol_info = mt5.symbol_info(SYMBOL)
@@ -341,9 +394,12 @@ class LiveTradingBot:
 
     def close_all(self):
         positions = mt5.positions_get(symbol=SYMBOL)
+        if positions is None:
+            return
         for pos in positions:
             tick = mt5.symbol_info_tick(SYMBOL)
             price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+            filling_mode = self.get_filling_mode()
             req = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "position": pos.ticket,
@@ -351,33 +407,57 @@ class LiveTradingBot:
                 "volume": pos.volume,
                 "type": mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY,
                 "price": price,
+                "deviation": DEVIATION,
                 "magic": MAGIC_NUMBER,
                 "comment": "AI Close",
+                "type_filling": filling_mode,
             }
-            mt5.order_send(req)
-            print("✅ Closed Position")
+            res = mt5.order_send(req)
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"\n✅ Closed Position | PnL: {pos.profit:+.2f}")
+            else:
+                comment = res.comment if res else 'No response'
+                print(f"\n❌ Close Failed: {comment}")
 
-    def send_order(self, type):
+    def send_order(self, order_type):
         tick = mt5.symbol_info_tick(SYMBOL)
-        price = tick.ask if type == mt5.ORDER_TYPE_BUY else tick.bid
+        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
         filling_mode = self.get_filling_mode()
+        
+        # Calculate SL/TP prices
+        sl_distance = SL_PIPS * self.point
+        tp_distance = TP_PIPS * self.point
+        
+        if order_type == mt5.ORDER_TYPE_BUY:
+            sl_price = round(price - sl_distance, self.digits)
+            tp_price = round(price + tp_distance, self.digits)
+        else:  # SELL
+            sl_price = round(price + sl_distance, self.digits)
+            tp_price = round(price - tp_distance, self.digits)
 
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": SYMBOL,
             "volume": LOT_SIZE,
-            "type": type,
+            "type": order_type,
             "price": price,
+            "sl": sl_price,
+            "tp": tp_price,
+            "deviation": DEVIATION,
             "magic": MAGIC_NUMBER,
-            "comment": "AI Value Trade",
+            "comment": "AI Trade",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": filling_mode,
         }
         res = mt5.order_send(req)
         if res.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f"✅ Opened {'BUY' if type == mt5.ORDER_TYPE_BUY else 'SELL'}")
+            side = 'BUY' if order_type == mt5.ORDER_TYPE_BUY else 'SELL'
+            print(f"\n✅ Opened {side} @ {price:.{self.digits}f} | SL: {sl_price:.{self.digits}f} | TP: {tp_price:.{self.digits}f}")
+            self.entry_price = price
+            self.current_sl = sl_price
+            self.current_tp = tp_price
         else:
-            print(f"❌ Order Failed: {res.comment}")
+            print(f"\n❌ Order Failed: {res.comment}")
 
 if __name__ == "__main__":
     bot = LiveTradingBot()

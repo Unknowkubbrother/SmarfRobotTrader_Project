@@ -100,26 +100,36 @@ class TradingMetricsCallback(BaseCallback):
         
         if self.episode_drawdowns:
             self.logger.record("trading/max_drawdown", np.max(self.episode_drawdowns[-100:]) * 100)
+        
+        # SL/TP hits
+        infos = self.locals.get("infos", [{}])
+        for info in infos:
+            if info:
+                self.logger.record("trading/sl_hits", info.get("sl_hits", 0))
+                self.logger.record("trading/tp_hits", info.get("tp_hits", 0))
 
 df = pd.read_csv("h1_ohlc_delta.csv")
 
 # ==================================================
-# FILTER: ใช้เฉพาะข้อมูลที่มี delta (2024-2025)
+# FILTER: ใช้เฉพาะข้อมูลที่มี delta + ข้อมูลล่าสุด
 # ==================================================
 df_full = df.copy()
 df['time'] = pd.to_datetime(df['time'])
 df = df[df['has_delta'] == 1].sort_values("time").reset_index(drop=True)
 
+# ใช้เฉพาะข้อมูลตั้งแต่ 2020 — ตลาดเก่าเกินไปไม่ช่วย
+df = df[df['time'] >= '2020-01-01'].reset_index(drop=True)
+
 print("="*50)
-print("📊 DATA FILTERING")
+print("📊 DATA FILTERING (Recent Only)")
 print("="*50)
 print(f"ข้อมูลทั้งหมด:     {len(df_full):,} rows")
-print(f"ข้อมูลที่มี delta: {len(df):,} rows")
+print(f"ข้อมูลที่ใช้ train: {len(df):,} rows (2020+, has_delta)")
 print(f"ช่วงเวลา:          {df['time'].iloc[0]} → {df['time'].iloc[-1]}")
 print("="*50 + "\n")
 
 # ==================================================
-# FEATURE ENGINEERING (เฉพาะที่สำคัญ)
+# FEATURE ENGINEERING (รวม Trend Indicators)
 # ==================================================
 print("🔧 Creating features...")
 
@@ -128,48 +138,81 @@ df['return'] = df['close'].pct_change().fillna(0)
 df['range'] = (df['high'] - df['low']) / df['close']
 df['raw_return'] = df['return']
 
-# Body Ratio - วัด strength ของแท่งเทียน
+# Body Ratio
 full_range = df['high'] - df['low']
 df['body_ratio'] = np.where(full_range > 0, abs(df['close'] - df['open']) / full_range, 0)
 
-# Momentum (sum of recent returns)
+# Momentum
 df['momentum'] = df['return'].rolling(window=5).sum().fillna(0)
 
-print(f"✅ Features: return, range, delta_tick, delta_price, has_delta, body_ratio, momentum")
+# ===== NEW: Trend Indicators =====
+# SMA Cross — ราคาอยู่เหนือ/ต่ำกว่า SMA20
+sma20 = df['close'].rolling(20).mean()
+sma50 = df['close'].rolling(50).mean()
+df['sma_cross'] = np.where(sma20 > sma50, 1, np.where(sma20 < sma50, -1, 0))
+df['sma_cross'] = df['sma_cross'].fillna(0)
+
+# RSI (normalized to -1 to 1)
+delta = df['close'].diff()
+gain = delta.clip(lower=0).rolling(14).mean()
+loss = (-delta.clip(upper=0)).rolling(14).mean()
+rs = gain / (loss + 1e-10)
+rsi = 100 - (100 / (1 + rs))
+df['rsi_norm'] = ((rsi - 50) / 50).fillna(0)  # -1 to 1
+
+# ATR (normalized by price)
+tr = np.maximum(
+    df['high'] - df['low'],
+    np.maximum(
+        abs(df['high'] - df['close'].shift(1)),
+        abs(df['low'] - df['close'].shift(1))
+    )
+)
+df['atr_norm'] = (tr.rolling(14).mean() / df['close']).fillna(0)
+
+# Trend direction — momentum of SMA20
+df['trend'] = (sma20.pct_change(5) * 100).fillna(0)  # % change over 5 bars
+df['trend'] = df['trend'].clip(-2, 2)  # Clip extremes
+
+# Drop rows with NaN from rolling calculations
+df = df.iloc[50:].reset_index(drop=True)
+
+FEATURE_LIST = TradingEnv._get_feature_columns()
+print(f"✅ Features ({len(FEATURE_LIST)}): {', '.join(FEATURE_LIST)}")
 print("="*50 + "\n")
 
-train_env = DummyVecEnv([lambda: TradingEnv(df)])
+train_env = DummyVecEnv([lambda: TradingEnv(df, random_start=True)])
 train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.)
 
 model = PPO(
     "MlpPolicy",
     train_env,
-    learning_rate=1e-4,          # ลดลง ให้เรียนช้าๆ
-    n_steps=2048,                # เพิ่มขึ้น
-    batch_size=128,              # เพิ่มขึ้น
-    n_epochs=5,                  # ลดลง (ลด overfitting)
-    gamma=0.95,                  # ลดลง (focus short-term)
-    gae_lambda=0.9,              # ลดลง
-    clip_range=0.3,              # เพิ่มขึ้น (ให้ยืดหยุ่นมากขึ้น)
-    ent_coef=0.02,               # เพิ่มขึ้นมาก (explore มากขึ้น)
+    learning_rate=2e-4,
+    n_steps=4096,
+    batch_size=256,
+    n_epochs=8,
+    gamma=0.97,
+    gae_lambda=0.95,
+    clip_range=0.2,
+    ent_coef=0.005,
     vf_coef=0.5,
     max_grad_norm=0.5,
-    seed=42,                
-    policy_kwargs=dict(net_arch=[32, 32]),  # Network เล็กมาก (ลด overfitting)
+    seed=42,
+    policy_kwargs=dict(net_arch=[64, 64]),  # ใหญ่ขึ้นเพราะ features เยอะขึ้น
     verbose=1,
     tensorboard_log="./tensorboard/"
 )
 
-# สร้าง callback สำหรับ log trading metrics
 trading_callback = TradingMetricsCallback(verbose=1)
 
 print("\n" + "="*50)
-print("🚀 Starting Training (Anti-Overfitting Mode)")
+print("🚀 Starting Training (Trend-Aware Mode)")
 print("="*50)
 print("📊 TensorBoard: tensorboard --logdir=./tensorboard/")
+print(f"🎯 SL=1% | TP=2% | MaxHold=30 | RandomStart=ON")
+print(f"📈 Features: {len(FEATURE_LIST)} (incl. SMA, RSI, ATR, Trend)")
 print("="*50 + "\n")
 
-# ลด timesteps เพื่อไม่ให้ overfit
-model.learn(total_timesteps=300_000, callback=trading_callback)
+model.learn(total_timesteps=500_000, callback=trading_callback)
 model.save("ppo_trading")
 train_env.save("vec_normalize.pkl")
