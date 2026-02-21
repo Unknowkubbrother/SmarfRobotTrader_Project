@@ -4,13 +4,19 @@ import numpy as np
 
 class TradingEnv(gym.Env):
     """
-    Trading Environment - Simple & Clear
+    Trading Environment — MT5-Aligned (Pip-Based)
+    
+    Simulates trading exactly like MT5 Strategy Tester:
+    - Fixed pip SL/TP (not percentage)
+    - Pip-value PnL (not compound return)
+    - Intra-bar SL/TP check via High/Low
+    - Fixed spread cost in pips
     
     Actions:
     - 0: HOLD    → ถือต่อ / ไม่ทำอะไร
-    - 1: BUY     → ทำนายว่าราคาจะขึ้น (Open Long)
-    - 2: SELL    → ทำนายว่าราคาจะลง (Open Short)
-    - 3: CLOSE   → ปิด order (Take Profit / Cut Loss)
+    - 1: BUY     → Open Long (ซื้อ)
+    - 2: SELL    → Open Short (ขาย)
+    - 3: CLOSE   → ปิด order
     
     Position:
     - 0: Flat (ไม่มี position)
@@ -23,33 +29,43 @@ class TradingEnv(gym.Env):
         df,
         window_size=20,
         initial_balance=10_000,
-        lot_size=1.0,
-        spread_cost=0.0001,      # 0.01% spread
-        commission=0.00002,      # 0.002% commission
-        max_dd=0.15,             # Max drawdown 15%
-        stop_loss_pct=0.01,      # 1% SL
-        take_profit_pct=0.02,    # 2% TP (R:R = 1:2)
-        max_hold_steps=30,       # ถือสูงสุด 30 แท่ง H1
-        random_start=False,      # สุ่มเริ่มต้นในแต่ละ episode
+        # ===== MT5-Aligned Parameters =====
+        lot_size=0.1,             # MT5 lot size (0.1 = mini lot)
+        pip_size=0.0001,          # EURUSD: 1 pip = 0.0001
+        pip_value=10.0,           # $10 per pip for 1.0 standard lot on EURUSD
+        sl_pips=30,               # Stop Loss in pips (matches MT5 EA)
+        tp_pips=60,               # Take Profit in pips (matches MT5 EA)
+        spread_pips=2,            # Typical broker spread in pips
+        commission_per_lot=0.0,   # Commission per lot (0 if spread-only broker)
+        max_dd=0.30,              # Max drawdown 30%
+        max_hold_steps=30,        # ถือสูงสุด 30 แท่ง H1
+        random_start=False,       # สุ่มเริ่มต้นในแต่ละ episode
     ):
         self.df = df.reset_index(drop=True)
         self.window_size = window_size
         self.initial_balance = initial_balance
         self.lot_size = lot_size
-        self.spread_cost = spread_cost
-        self.commission = commission
+        self.pip_size = pip_size
+        self.pip_value = pip_value
+        self.sl_pips = sl_pips
+        self.tp_pips = tp_pips
+        self.spread_pips = spread_pips
+        self.commission_per_lot = commission_per_lot
         self.max_dd = max_dd
-        self.stop_loss_pct = stop_loss_pct
-        self.take_profit_pct = take_profit_pct
         self.max_hold_steps = max_hold_steps
         self.random_start = random_start
+        
+        # Derived: cost per trade (spread + commission)
+        # e.g., 2 pips * $10/pip * 0.1 lot = $2 per entry
+        self.spread_cost = self.spread_pips * self.pip_value * self.lot_size
+        self.commission_cost = self.commission_per_lot * self.lot_size
         
         self.max_step = len(df) - 2
         
         # 4 Actions: Hold, Buy(Long), Sell(Short), Close
         self.action_space = gym.spaces.Discrete(4)
         
-        # Features: 11 market + 5 state (เพิ่ม trend indicators)
+        # Features: 10 market + 5 state
         self.market_features = len(self._get_feature_columns())
         self.state_features = 5
         total_features = (self.window_size * self.market_features) + self.state_features
@@ -77,7 +93,7 @@ class TradingEnv(gym.Env):
         
         # Random start position — ป้องกันการจำ pattern
         if self.random_start:
-            max_start = max(self.window_size + 1, self.max_step - 500)  # เหลืออย่างน้อย 500 steps
+            max_start = max(self.window_size + 1, self.max_step - 500)
             self.step_idx = np.random.randint(self.window_size, max_start)
         else:
             self.step_idx = self.window_size
@@ -128,8 +144,8 @@ class TradingEnv(gym.Env):
             self.position,
             self.equity / self.initial_balance,
             self.unrealized_pnl / self.initial_balance,
-            min(self.hold_steps / self.max_hold_steps, 1.0),  # Normalized hold time
-            np.clip(unrealized_ret * 100, -5, 5),  # Unrealized return % (clipped)
+            min(self.hold_steps / self.max_hold_steps, 1.0),
+            np.clip(unrealized_ret * 100, -5, 5),
         ], dtype=np.float32)
         
         return np.concatenate([market_data, state_data])
@@ -137,67 +153,91 @@ class TradingEnv(gym.Env):
     def _get_current_price(self):
         return self.df.iloc[self.step_idx]['close']
     
+    def _calc_pnl_pips(self, entry_price, exit_price, direction):
+        """Calculate PnL in dollar amount (MT5-style pip-based)"""
+        price_diff = exit_price - entry_price
+        pips_moved = price_diff / self.pip_size
+        pnl = direction * pips_moved * self.pip_value * self.lot_size
+        return pnl
+    
     def step(self, action):
         prev_equity = self.equity
         prev_position = self.position
         current_price = self._get_current_price()
-        next_return = self.df.iloc[self.step_idx + 1]['raw_return']
+        
+        # Next bar data for intra-bar SL/TP check
+        next_bar = self.df.iloc[self.step_idx + 1]
+        next_high = next_bar['high']
+        next_low = next_bar['low']
+        next_close = next_bar['close']
         
         reward = 0.0
         trade_executed = False
         sl_tp_closed = False
-        close_pnl = 0.0  # PnL เมื่อปิด position
+        close_pnl = 0.0
         
-        # ===== SL/TP AUTO-CLOSE CHECK (ก่อน action) =====
+        # ===== SL/TP AUTO-CLOSE CHECK (Intra-bar using High/Low like MT5) =====
         if self.position != 0 and self.entry_price > 0:
-            unrealized_return = self.position * (current_price - self.entry_price) / self.entry_price
+            if self.position == 1:  # Long position
+                sl_price = self.entry_price - self.sl_pips * self.pip_size
+                tp_price = self.entry_price + self.tp_pips * self.pip_size
+                bar_hit_sl = next_low <= sl_price
+                bar_hit_tp = next_high >= tp_price
+            else:  # Short position (position == -1)
+                sl_price = self.entry_price + self.sl_pips * self.pip_size
+                tp_price = self.entry_price - self.tp_pips * self.pip_size
+                bar_hit_sl = next_high >= sl_price
+                bar_hit_tp = next_low <= tp_price
             
-            if unrealized_return <= -self.stop_loss_pct:
-                # Stop Loss hit → auto close
-                close_pnl = self.unrealized_pnl
-                self._close_position(current_price)
+            if bar_hit_sl and bar_hit_tp:
+                # Both SL and TP hit in same bar — assume SL hit first (conservative)
+                close_pnl = self._calc_pnl_pips(self.entry_price, sl_price, self.position)
+                self._close_position_at(sl_price)
                 self.sl_hits += 1
                 sl_tp_closed = True
                 trade_executed = True
-            elif unrealized_return >= self.take_profit_pct:
-                # Take Profit hit → auto close
-                close_pnl = self.unrealized_pnl
-                self._close_position(current_price)
+            elif bar_hit_sl:
+                # Stop Loss hit
+                close_pnl = self._calc_pnl_pips(self.entry_price, sl_price, self.position)
+                self._close_position_at(sl_price)
+                self.sl_hits += 1
+                sl_tp_closed = True
+                trade_executed = True
+            elif bar_hit_tp:
+                # Take Profit hit
+                close_pnl = self._calc_pnl_pips(self.entry_price, tp_price, self.position)
+                self._close_position_at(tp_price)
                 self.tp_hits += 1
                 sl_tp_closed = True
                 trade_executed = True
             elif self.hold_steps >= self.max_hold_steps:
-                # ถือนานเกินไป → บังคับปิด
-                close_pnl = self.unrealized_pnl
-                self._close_position(current_price)
+                # ถือนานเกินไป → บังคับปิดที่ราคาปิด
+                close_pnl = self._calc_pnl_pips(self.entry_price, next_close, self.position)
+                self._close_position_at(next_close)
                 sl_tp_closed = True
                 trade_executed = True
         
         # ===== ACTION LOGIC (skip if SL/TP just closed) =====
-        # 0: HOLD - ไม่ทำอะไร
-        # 1: BUY - ทำนายว่าขึ้น (Long)
-        # 2: SELL - ทำนายว่าลง (Short)
-        # 3: CLOSE - ปิด order
-        
         if sl_tp_closed:
-            pass  # SL/TP ปิดแล้ว ไม่ต้องทำ action
+            pass
         elif action == 0:  # HOLD
-            pass  # ไม่ทำอะไร
+            pass
             
-        elif action == 1:  # BUY (ทำนายว่าขึ้น)
+        elif action == 1:  # BUY (Long)
             if self.position == -1:
-                close_pnl = self.unrealized_pnl
-                self._close_position(current_price)
+                # Close short first, then open long
+                close_pnl = self._calc_pnl_pips(self.entry_price, current_price, self.position)
+                self._close_position_at(current_price)
                 self._open_position(1, current_price)
                 trade_executed = True
             elif self.position == 0:
                 self._open_position(1, current_price)
                 trade_executed = True
             
-        elif action == 2:  # SELL (ทำนายว่าลง)
+        elif action == 2:  # SELL (Short)
             if self.position == 1:
-                close_pnl = self.unrealized_pnl
-                self._close_position(current_price)
+                close_pnl = self._calc_pnl_pips(self.entry_price, current_price, self.position)
+                self._close_position_at(current_price)
                 self._open_position(-1, current_price)
                 trade_executed = True
             elif self.position == 0:
@@ -206,18 +246,21 @@ class TradingEnv(gym.Env):
             
         elif action == 3:  # CLOSE
             if self.position != 0 and not sl_tp_closed:
-                close_pnl = self.unrealized_pnl
-                self._close_position(current_price)
+                close_pnl = self._calc_pnl_pips(self.entry_price, current_price, self.position)
+                self._close_position_at(current_price)
                 trade_executed = True
         
-        # ===== PRICE MOVEMENT & PnL =====
+        # ===== PRICE MOVEMENT & PnL (pip-based, like MT5) =====
         if self.position != 0:
-            pnl = self.position * next_return * self.lot_size * self.equity
-            self.unrealized_pnl += pnl
-            self.equity += pnl
+            # Update unrealized PnL based on next bar's close
+            self.unrealized_pnl = self._calc_pnl_pips(
+                self.entry_price, next_close, self.position
+            )
+            self.equity = self.balance + self.unrealized_pnl
             self.hold_steps += 1
             
             # Track prediction accuracy
+            next_return = next_close - current_price
             if trade_executed and prev_position == 0:
                 self.total_predictions += 1
                 if (self.position == 1 and next_return > 0) or (self.position == -1 and next_return < 0):
@@ -226,7 +269,7 @@ class TradingEnv(gym.Env):
         self.max_equity = max(self.max_equity, self.equity)
         drawdown = (self.max_equity - self.equity) / self.max_equity if self.max_equity > 0 else 0
         
-        # ===== REWARD CALCULATION (Balanced v3) =====
+        # ===== REWARD CALCULATION (Balanced v3 — adapted for pip-based) =====
         
         # 1. PnL-based reward — core signal
         equity_change = (self.equity - prev_equity) / self.initial_balance
@@ -234,18 +277,18 @@ class TradingEnv(gym.Env):
         
         # 2. HOLD winning position bonus
         if self.position != 0 and self.unrealized_pnl > 0:
-            reward += 0.02  # ถือกำไร = ดี (เพิ่มขึ้น)
+            reward += 0.02
         
-        # 3. Trade penalty — STRONG (ค่า fee ทำลาย performance!)
+        # 3. Trade penalty — STRONG
         if trade_executed and not sl_tp_closed:
-            reward -= 0.1  # เพิ่มจาก 0.05
+            reward -= 0.1
         
-        # 4. Close trade bonus — only if held minimum time
+        # 4. Close trade bonus
         if close_pnl != 0:
             close_return = close_pnl / self.initial_balance
             self.trade_returns.append(close_return)
             if close_pnl > 0:
-                reward += min(abs(close_return) * 30, 0.8)  # Big win bonus
+                reward += min(abs(close_return) * 30, 0.8)
             else:
                 reward -= min(abs(close_return) * 15, 0.4)
         
@@ -261,9 +304,9 @@ class TradingEnv(gym.Env):
         if drawdown > 0.08:
             reward -= (drawdown - 0.08) * 2
         
-        # 8. Stay flat bonus — stronger
+        # 8. Stay flat bonus
         if action == 0 and self.position == 0:
-            reward += 0.005  # เพิ่มจาก 0.002
+            reward += 0.005
         
         # ===== STEP FORWARD =====
         self.step_idx += 1
@@ -280,7 +323,7 @@ class TradingEnv(gym.Env):
         if done:
             final_return = (self.equity - self.initial_balance) / self.initial_balance
             if final_return > 0:
-                reward += min(final_return * 5, 1.0)  # Scaled bonus (max 1.0)
+                reward += min(final_return * 5, 1.0)
             else:
                 reward -= 0.2
             
@@ -315,36 +358,39 @@ class TradingEnv(gym.Env):
         return self._get_obs(), reward, terminated, truncated, info
     
     def _open_position(self, direction, price):
-        """เปิด position ใหม่"""
+        """เปิด position ใหม่ (MT5-style: จ่าย spread + commission คงที่)"""
         self.position = direction
         self.entry_price = price
         self.hold_steps = 0
         self.unrealized_pnl = 0.0
         
-        # จ่าย spread + commission
-        cost = (self.spread_cost + self.commission) * self.equity * self.lot_size
+        # Fixed cost: spread + commission (like MT5)
+        cost = self.spread_cost + self.commission_cost
         self.equity -= cost
+        self.balance -= cost
         self.total_fees += cost
     
-    def _close_position(self, price):
-        """ปิด position และ realize PnL"""
+    def _close_position_at(self, exit_price):
+        """ปิด position และ realize PnL (MT5-style pip-based)"""
         if self.position == 0:
             return
         
-        # Realize PnL
-        realized_pnl = self.unrealized_pnl
+        # Realize PnL (already calculated by caller or from unrealized)
+        realized_pnl = self._calc_pnl_pips(self.entry_price, exit_price, self.position)
         self.total_pnl += realized_pnl
-        self.balance = self.equity
+        self.balance += realized_pnl
+        self.equity = self.balance
         
         # Track win/loss
         self.trades += 1
         if realized_pnl > 0:
             self.wins += 1
         
-        # จ่าย commission
-        cost = self.commission * self.equity * self.lot_size
-        self.equity -= cost
-        self.total_fees += cost
+        # Commission on close (if applicable)
+        if self.commission_cost > 0:
+            self.equity -= self.commission_cost
+            self.balance -= self.commission_cost
+            self.total_fees += self.commission_cost
         
         # Reset position state
         self.position = 0

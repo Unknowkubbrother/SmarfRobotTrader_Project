@@ -52,7 +52,7 @@ def load_model():
         'sma_cross': [0]*80, 'rsi_norm': [0]*80, 'atr_norm': [0]*80, 'trend': [0]*80
     }
     mock_df = pd.DataFrame(dummy_data)
-    dummy_env = DummyVecEnv([lambda: TradingEnv(mock_df)])
+    dummy_env = DummyVecEnv([lambda: TradingEnv(mock_df, lot_size=0.1, sl_pips=30, tp_pips=60)])
     
     vec_norm = VecNormalize.load(VEC_NORM_PATH, dummy_env)
     vec_norm.training = False

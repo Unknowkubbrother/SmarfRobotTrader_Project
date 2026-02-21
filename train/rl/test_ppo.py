@@ -69,7 +69,7 @@ print(f"✅ Features: return, range, delta_tick, delta_price, body_ratio, moment
 print("="*50 + "\n")
 
 
-test_env  = DummyVecEnv([lambda: TradingEnv(df)])
+test_env  = DummyVecEnv([lambda: TradingEnv(df, lot_size=0.1, sl_pips=30, tp_pips=60)])
 test_env = VecNormalize.load("vec_normalize.pkl", test_env)
 test_env.training = False
 test_env.norm_reward = False

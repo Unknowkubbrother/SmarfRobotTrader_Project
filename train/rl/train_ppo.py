@@ -181,7 +181,7 @@ FEATURE_LIST = TradingEnv._get_feature_columns()
 print(f"✅ Features ({len(FEATURE_LIST)}): {', '.join(FEATURE_LIST)}")
 print("="*50 + "\n")
 
-train_env = DummyVecEnv([lambda: TradingEnv(df, random_start=True)])
+train_env = DummyVecEnv([lambda: TradingEnv(df, random_start=True, lot_size=0.1, sl_pips=30, tp_pips=60)])
 train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.)
 
 model = PPO(
@@ -209,7 +209,7 @@ print("\n" + "="*50)
 print("🚀 Starting Training (Trend-Aware Mode)")
 print("="*50)
 print("📊 TensorBoard: tensorboard --logdir=./tensorboard/")
-print(f"🎯 SL=1% | TP=2% | MaxHold=30 | RandomStart=ON")
+print(f"🎯 SL=30 pips | TP=60 pips | Lot=0.1 | MaxHold=30 | RandomStart=ON")
 print(f"📈 Features: {len(FEATURE_LIST)} (incl. SMA, RSI, ATR, Trend)")
 print("="*50 + "\n")
 
