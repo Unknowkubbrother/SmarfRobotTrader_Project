@@ -85,10 +85,33 @@ positions_held = []
 trades = 0
 wins = 0
 
+# For plotting
+equity_history = [10000]
+time_history = [df['time'].iloc[0]]
+buy_signals = []
+sell_signals = []
+close_signals = []
+
+step_idx = 0
 while not done:
     action, _ = model.predict(obs, deterministic=True)
     obs, reward, done, info = test_env.step(action)
     total_reward += reward[0]
+    
+    current_time = df['time'].iloc[min(step_idx, len(df)-1)]
+    equity_history.append(info[0]['equity'])
+    time_history.append(current_time)
+    
+    # Track actions for plotting
+    action_val = action[0]
+    price = df['close'].iloc[min(step_idx, len(df)-1)]
+    
+    if action_val == 1: # BUY
+        buy_signals.append((current_time, equity_history[-1]))
+    elif action_val == 2: # SELL
+        sell_signals.append((current_time, equity_history[-1]))
+    elif action_val == 3: # CLOSE
+        close_signals.append((current_time, equity_history[-1]))
 
     if info[0]['position'] != 0:
         positions_held.append(info[0]['hold_steps'])
@@ -96,11 +119,13 @@ while not done:
     if info[0]['trades'] > trades:
         trades = info[0]['trades']
         wins = info[0]['wins']
+        
+    step_idx += 1
 
 avg_hold = np.mean(positions_held) if positions_held else 0
 
 print("\n" + "="*50)
-print("📈 TEST RESULTS")
+print("📈 TEST RESULTS (Strategy Tester Mode)")
 print("="*50)
 print(f"Total Reward:     {total_reward:.4f}")
 print(f"Final Equity:     ${info[0]['equity']:.2f}")
@@ -121,5 +146,49 @@ if len(df) > 0:
     print(f"Sharpe Ratio:     {sharpe:.2f}")
     print("="*50)
 
-print(f"start time = {df.head(1)}")
-print(f"end time = {df.tail(1)}")
+print(f"Start Time: {df['time'].iloc[0]}")
+print(f"End Time:   {df['time'].iloc[-1]}")
+
+# ==================================================
+# VISUALIZATION (เหมือน MT5 Strategy Tester)
+# ==================================================
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    
+    print("\n📊 Generating Strategy Tester Graph...")
+    
+    plt.figure(figsize=(14, 7))
+    plt.title(f"PPO Backtest Equity Curve (Return: {((info[0]['equity']/10000 - 1) * 100):.2f}%)")
+    plt.plot(time_history, equity_history, label='Equity', color='blue', linewidth=1.5)
+    
+    # Plot trade signals on equity curve
+    if buy_signals:
+        bx, by = zip(*buy_signals)
+        plt.scatter(bx, by, marker='^', color='green', s=50, label='Buy', alpha=0.7)
+    if sell_signals:
+        sx, sy = zip(*sell_signals)
+        plt.scatter(sx, sy, marker='v', color='red', s=50, label='Sell', alpha=0.7)
+    if close_signals:
+        cx, cy = zip(*close_signals)
+        plt.scatter(cx, cy, marker='x', color='black', s=30, label='Close', alpha=0.5)
+        
+    plt.axhline(y=10000, color='r', linestyle='--', alpha=0.5, label='Initial Balance')
+    
+    plt.xlabel('Time')
+    plt.ylabel('Equity (USD)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Formatter
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    plt.gcf().autofmt_xdate()
+    
+    # Save & Show
+    plt.savefig('strategy_tester_results.png', dpi=300, bbox_inches='tight')
+    print("✅ Graph saved as 'strategy_tester_results.png'")
+    # plt.show() # Uncomment if running in notebook/GUI
+    
+except ImportError:
+    print("\n⚠️  matplotlib not installed. Graph not generated.")
+    print("👉 Install with: pip install matplotlib")
