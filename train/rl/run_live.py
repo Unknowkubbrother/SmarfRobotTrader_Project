@@ -197,25 +197,32 @@ class LiveTradingBot:
             self.current_sl = 0.0
             self.current_tp = 0.0
 
-        # 2. Equity
+        # 2. Total PnL (Pips)
         account = mt5.account_info()
-        equity_ratio = account.equity / self.initial_balance if self.initial_balance > 0 else 1.0
+        pip_size = self.point * 10 # Assuming 5-digit broker (1 pip = 10 points)
+        pip_value = 10.0 # Standard $10/pip for EURUSD at 1 lot
+        point_value = pip_value * LOT_SIZE
+        
+        realized_pnl = account.balance - self.initial_balance
+        total_pnl_pips = realized_pnl / point_value if point_value > 0 else 0.0
         
         # 3. Hold Steps Norm (ต้องตรงกับ env: max_hold_steps=30)
         hold_norm = min(self.hold_steps / 30.0, 1.0)
         
-        # 4. Unrealized Return (feature ที่ 5 ของ state)
+        # 4. Unrealized Return & Pips
         unrealized_ret = 0.0
+        unrealized_pips = 0.0
         if current_position != 0 and self.entry_price > 0:
             tick = mt5.symbol_info_tick(SYMBOL)
             if tick:
                 current_price = tick.bid if current_position == 1 else tick.ask
                 unrealized_ret = current_position * (current_price - self.entry_price) / self.entry_price
+                unrealized_pips = current_position * (current_price - self.entry_price) / pip_size
         
         state = np.array([
             current_position,
-            equity_ratio,
-            unrealized_pnl / self.initial_balance if self.initial_balance > 0 else 0,
+            total_pnl_pips / 1000.0,
+            unrealized_pips / 100.0,
             hold_norm,
             np.clip(unrealized_ret * 100, -5, 5)  # ตรงกับ env
         ], dtype=np.float32)

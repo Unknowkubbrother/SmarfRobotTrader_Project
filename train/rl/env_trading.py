@@ -134,16 +134,21 @@ class TradingEnv(gym.Env):
         block = self.df.iloc[start:end][available_cols].values
         market_data = block.flatten().astype(np.float32)
         
-        # State: position, equity ratio, unrealized pnl, hold steps, unrealized return
+        # State: position, total_pnl_pips, unrealized_pips, hold_steps, unrealized_return
         unrealized_ret = 0.0
+        unrealized_pips = 0.0
         if self.position != 0 and self.entry_price > 0:
             current_price = self._get_current_price()
             unrealized_ret = self.position * (current_price - self.entry_price) / self.entry_price
+            unrealized_pips = self.position * (current_price - self.entry_price) / self.pip_size
+        
+        # Calculate total pnl in pips
+        total_pnl_pips = self.total_pnl / (self.pip_value * self.lot_size) if self.lot_size > 0 else 0.0
         
         state_data = np.array([
             self.position,
-            self.equity / self.initial_balance,
-            self.unrealized_pnl / self.initial_balance,
+            total_pnl_pips / 1000.0,          # Scale ~1000 pips to reasonable range (1.0~-1.0)
+            unrealized_pips / 100.0,          # Scale ~100 pips to reasonable range (1.0~-1.0)
             min(self.hold_steps / self.max_hold_steps, 1.0),
             np.clip(unrealized_ret * 100, -5, 5),
         ], dtype=np.float32)
@@ -271,12 +276,14 @@ class TradingEnv(gym.Env):
         
         # ===== REWARD CALCULATION (Balanced Profitability v5) =====
         
-        # 1. Base PnL reward
-        equity_change = (self.equity - prev_equity) / self.initial_balance
-        if equity_change > 0:
-            reward = np.clip(equity_change * 80, 0, 1.0)
+        # 1. Base PnL reward (Pip-based instead of balance-based)
+        point_value = self.pip_value * self.lot_size
+        pips_change = (self.equity - prev_equity) / point_value if point_value > 0 else 0.0
+        
+        if pips_change > 0:
+            reward = np.clip(pips_change / 20.0, 0, 1.0) # max out reward at 20 pips
         else:
-            reward = np.clip(equity_change * 100, -1.0, 0)
+            reward = np.clip(pips_change / 20.0, -1.0, 0)
         
         # 2. Gentle Floating Loss Penalty
         if self.position != 0 and self.unrealized_pnl < 0:
@@ -290,12 +297,12 @@ class TradingEnv(gym.Env):
         
         # 4. Close Trade Reward
         if close_pnl != 0:
-            close_return = close_pnl / self.initial_balance
-            self.trade_returns.append(close_return)
+            close_pips = close_pnl / point_value if point_value > 0 else 0.0
+            self.trade_returns.append(close_pips) # Track pips instead of % return for Sharpe
             if close_pnl > 0:
-                reward += min(close_return * 40, 1.0)
+                reward += min(close_pips / 30.0, 1.0) # 30 pips gives 1.0 reward
             else:
-                reward -= min(abs(close_return) * 50, 1.0)
+                reward -= min(abs(close_pips) / 40.0, 1.0)
         
         # 5. SL/TP specific bonuses/penalties
         if sl_tp_closed:
@@ -329,9 +336,9 @@ class TradingEnv(gym.Env):
         
         # End episode bonus/penalty
         if done:
-            final_return = (self.equity - self.initial_balance) / self.initial_balance
-            if final_return > 0:
-                reward += min(final_return * 5, 1.0)
+            total_pips = (self.equity - self.initial_balance) / point_value if point_value > 0 else 0.0
+            if total_pips > 0:
+                reward += min(total_pips / 200.0, 1.0) # Bonus caps at 200 pips
             else:
                 reward -= 0.2
             

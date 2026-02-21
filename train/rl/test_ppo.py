@@ -177,13 +177,17 @@ class PPOBridge:
         # Build observation (same as server)
         obs_window = df[FEATURE_COLUMNS].iloc[-WINDOW_SIZE:].values.flatten().astype(np.float32)
         unrealized_ret = 0.0
+        unrealized_pips = 0.0
         if self.position != 0 and self.entry_price > 0:
             unrealized_ret = self.position * (current_price - self.entry_price) / self.entry_price
+            unrealized_pips = self.position * (current_price - self.entry_price) / PIP_SIZE
+            
+        total_pnl_pips = self.total_pnl / (PIP_VALUE * LOT_SIZE) if LOT_SIZE > 0 else 0.0
 
         state_feat = np.array([
             self.position,
-            self.equity / INITIAL_BALANCE,
-            self.unrealized_pnl / INITIAL_BALANCE,
+            total_pnl_pips / 1000.0,
+            unrealized_pips / 100.0,
             min(self.hold_steps / MAX_HOLD_STEPS, 1.0),
             np.clip(unrealized_ret * 100, -5, 5)
         ], dtype=np.float32)
