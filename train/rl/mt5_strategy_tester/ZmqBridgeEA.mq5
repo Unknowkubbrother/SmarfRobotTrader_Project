@@ -17,8 +17,9 @@
 //--- Input Parameters
 input string ZmqHost = "127.0.0.1";
 input int ZmqPort = 5555;
-input double LotSize = 0.1;
 input int MagicNumber = 12345;
+input double RiskPercent = 1.0; // Risk % per trade
+input int SL_Pips_Input = 30;   // SL in pips (for auto lot calculation)
 
 //--- Global Variables
 Context context("PPO_ZMQ_Client");
@@ -29,6 +30,32 @@ double lastBid = 0.0;
 double lastAsk = 0.0;
 int accumDeltaTick = 0;
 double accumDeltaPrice = 0.0;
+double currentLot = 0.0; // Auto-calculated lot size
+
+//+------------------------------------------------------------------+
+double CalculateLotSize() {
+  double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+  double riskAmount = balance * RiskPercent / 100.0;
+
+  // Get pip value per 1 standard lot
+  double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+  double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+  double pipSize = (_Digits == 5 || _Digits == 3) ? tickSize * 10 : tickSize;
+  double pipValuePerLot = tickValue * (pipSize / tickSize);
+
+  // Lot = Risk$ / (SL_pips × pip_value_per_lot)
+  double lotCalc = riskAmount / (SL_Pips_Input * pipValuePerLot);
+
+  // Normalize to broker limits
+  double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+  double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+  double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+  lotCalc = MathFloor(lotCalc / lotStep) * lotStep;
+  lotCalc = MathMax(minLot, MathMin(maxLot, lotCalc));
+
+  return NormalizeDouble(lotCalc, 2);
+}
 
 //+------------------------------------------------------------------+
 int OnInit() {
@@ -126,7 +153,8 @@ string BuildDataString(int dTick, double dPrice) {
   data += ";" + IntegerToString(position) + "," + DoubleToString(equity, 2) +
           "," + DoubleToString(unrealized_pnl, 2) + ",0," +
           DoubleToString(entry_price, _Digits) + "," + IntegerToString(dTick) +
-          "," + DoubleToString(dPrice, _Digits);
+          "," + DoubleToString(dPrice, _Digits) + "," +
+          DoubleToString(currentLot, 2);
 
   return data;
 }
@@ -152,8 +180,8 @@ void ExecuteAction(int action) {
     if (!hasPosition || posType == POSITION_TYPE_SELL) {
       price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       // No SL/TP on order — Python server manages SL/TP
-      trade.Buy(LotSize, _Symbol, price, 0, 0, "PPO_BUY");
-      Print("📈 BUY @ ", price, " (no order SL/TP, managed by Python)");
+      trade.Buy(currentLot, _Symbol, price, 0, 0, "PPO_BUY");
+      Print("📈 BUY @ ", price, " | Lot: ", currentLot, " (auto-sized)");
     }
     break;
 
@@ -164,8 +192,8 @@ void ExecuteAction(int action) {
     }
     if (!hasPosition || posType == POSITION_TYPE_BUY) {
       price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      trade.Sell(LotSize, _Symbol, price, 0, 0, "PPO_SELL");
-      Print("📉 SELL @ ", price, " (no order SL/TP, managed by Python)");
+      trade.Sell(currentLot, _Symbol, price, 0, 0, "PPO_SELL");
+      Print("📉 SELL @ ", price, " | Lot: ", currentLot, " (auto-sized)");
     }
     break;
 
@@ -200,6 +228,9 @@ void OnTick() {
     return;
   }
   lastBarTime = currentBarTime;
+
+  // Recalculate lot size each bar (adapts to balance changes)
+  currentLot = CalculateLotSize();
 
   int deltaTickToSend = accumDeltaTick;
   double deltaPriceToSend = accumDeltaPrice;

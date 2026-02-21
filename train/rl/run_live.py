@@ -18,17 +18,30 @@ mt5 = MetaTrader5(host="localhost", port=8001)
 # ==================================================
 SYMBOL = "EURUSD"
 TIMEFRAME = mt5.TIMEFRAME_H1
-LOT_SIZE = 0.01
+LOT_SIZE = 0.01         # Fallback fixed lot (used when RISK_PERCENT=0)
 MAGIC_NUMBER = 123456
 MODEL_PATH = "ppo_trading.zip"
 VEC_NORM_PATH = "vec_normalize.pkl"
 DEVIATION = 20
+RISK_PERCENT = 1.0      # Risk % per trade (0 = use fixed LOT_SIZE)
 
 # ==================================================
 # SL/TP CONFIGURATION
 # ==================================================
 SL_PIPS = 30    # Stop Loss in pips (30 pips = 0.00030 for 5-digit broker)
 TP_PIPS = 60    # Take Profit in pips (60 pips ≈ 2% TP, R:R = 1:2)
+PIP_VALUE_PER_LOT = 10.0  # $10 per pip for 1 standard lot on EURUSD
+
+
+def calc_auto_lot(balance, risk_pct=RISK_PERCENT, sl_pips=SL_PIPS,
+                  pip_value_per_lot=PIP_VALUE_PER_LOT, min_lot=0.01, lot_step=0.01):
+    """Risk-based position sizing"""
+    if risk_pct <= 0:
+        return LOT_SIZE
+    risk_amount = balance * risk_pct / 100.0
+    lot = risk_amount / (sl_pips * pip_value_per_lot)
+    lot = max(min_lot, lot_step * int(lot / lot_step))
+    return round(lot, 2)
 
 # Features ที่ใช้ (ต้องเรียงตาม train_ppo.py เป๊ะๆ)
 FEATURE_COLUMNS = [
@@ -46,6 +59,7 @@ class LiveTradingBot:
         self.initial_balance = 0.0 # Will be set on connect
         self.point = 0.00001 # Default fallback
         self.digits = 5 # Default fallback
+        self.current_lot = LOT_SIZE  # Will be recalculated after connect
         
         # SL/TP tracking
         self.sl_hits = 0
@@ -67,7 +81,10 @@ class LiveTradingBot:
             
         print(f"✅ MT5 Connected. Account: {account_info.login}")
         self.initial_balance = account_info.balance
-        print(f"💰 Initial Balance: ${self.initial_balance:.2f} (Used for Normalization)")
+        
+        # Auto lot calculation
+        self.current_lot = calc_auto_lot(self.initial_balance)
+        print(f"💰 Balance: ${self.initial_balance:.2f} | Auto Lot: {self.current_lot}")
         
         # Check Symbol
         symbol_info = mt5.symbol_info(SYMBOL)
@@ -467,10 +484,15 @@ class LiveTradingBot:
             sl_price = round(price + sl_distance, self.digits)
             tp_price = round(price - tp_distance, self.digits)
 
+        # Recalculate lot from current balance
+        account = mt5.account_info()
+        if account:
+            self.current_lot = calc_auto_lot(account.balance)
+        
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": SYMBOL,
-            "volume": LOT_SIZE,
+            "volume": self.current_lot,
             "type": order_type,
             "price": price,
             "sl": sl_price,
@@ -484,7 +506,7 @@ class LiveTradingBot:
         res = mt5.order_send(req)
         if res.retcode == mt5.TRADE_RETCODE_DONE:
             side = 'BUY' if order_type == mt5.ORDER_TYPE_BUY else 'SELL'
-            print(f"\n✅ Opened {side} @ {price:.{self.digits}f} | SL: {sl_price:.{self.digits}f} | TP: {tp_price:.{self.digits}f}")
+            print(f"\n✅ Opened {side} @ {price:.{self.digits}f} | Lot: {self.current_lot} | SL: {sl_price:.{self.digits}f} | TP: {tp_price:.{self.digits}f}")
             self.entry_price = price
             self.current_sl = sl_price
             self.current_tp = tp_price

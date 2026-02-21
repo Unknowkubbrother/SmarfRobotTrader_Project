@@ -20,7 +20,6 @@ from env_trading import TradingEnv
 # ==================================================
 WINDOW_SIZE = 20
 INITIAL_BALANCE = 10000
-LOT_SIZE = 0.1
 PIP_SIZE = 0.0001
 PIP_VALUE = 10.0
 SL_PIPS = 30
@@ -28,6 +27,19 @@ TP_PIPS = 60
 SPREAD_PIPS = 2
 MAX_HOLD_STEPS = 30
 BAR_HISTORY = 200  # Same as EA sends
+RISK_PERCENT = 1.0  # Risk % per trade (0 = use fixed LOT_SIZE below)
+LOT_SIZE = 0.1      # Fallback fixed lot
+
+
+def calc_auto_lot(balance, risk_pct=RISK_PERCENT, sl_pips=SL_PIPS,
+                  pip_value_per_lot=PIP_VALUE, min_lot=0.01, lot_step=0.01):
+    """Risk-based position sizing (same formula as EA)"""
+    if risk_pct <= 0:
+        return LOT_SIZE
+    risk_amount = balance * risk_pct / 100.0
+    lot = risk_amount / (sl_pips * pip_value_per_lot)
+    lot = max(min_lot, lot_step * int(lot / lot_step))
+    return round(lot, 2)
 
 FEATURE_COLUMNS = [
     'return', 'range', 'delta_tick', 'delta_price',
@@ -100,12 +112,14 @@ class PPOBridge:
         self.sl_hits = 0
         self.tp_hits = 0
         self.max_equity = INITIAL_BALANCE
-        self.spread_cost = SPREAD_PIPS * PIP_VALUE * LOT_SIZE
+        self.lot_size = calc_auto_lot(INITIAL_BALANCE)
+        self.spread_cost = SPREAD_PIPS * PIP_VALUE * self.lot_size
         self.first_bar = True
+        print(f"\n💰 Auto Lot: {self.lot_size} (Balance: ${INITIAL_BALANCE}, Risk: {RISK_PERCENT}%)")
 
     def _calc_pnl(self, entry, exit_price, direction):
         pips = (exit_price - entry) / PIP_SIZE
-        return direction * pips * PIP_VALUE * LOT_SIZE
+        return direction * pips * PIP_VALUE * self.lot_size
 
     def _open(self, direction, price):
         self.position = direction

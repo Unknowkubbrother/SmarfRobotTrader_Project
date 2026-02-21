@@ -34,13 +34,25 @@ VEC_NORM_PATH = os.path.join(BASE_DIR, "vec_normalize.pkl")
 # Must match env_trading.py and EA settings
 WINDOW_SIZE = 20
 INITIAL_BALANCE = 10000
-LOT_SIZE = 0.1
 PIP_SIZE = 0.0001
 PIP_VALUE = 10.0
 SL_PIPS = 30
 TP_PIPS = 60
 SPREAD_PIPS = 2
 MAX_HOLD_STEPS = 30
+RISK_PERCENT = 1.0  # Risk % per trade (0 = use fixed LOT_SIZE below)
+LOT_SIZE = 0.1      # Fallback fixed lot
+
+
+def calc_auto_lot(balance, risk_pct=RISK_PERCENT, sl_pips=SL_PIPS,
+                  pip_value_per_lot=PIP_VALUE, min_lot=0.01, lot_step=0.01):
+    """Risk-based position sizing (same formula as EA)"""
+    if risk_pct <= 0:
+        return LOT_SIZE
+    risk_amount = balance * risk_pct / 100.0
+    lot = risk_amount / (sl_pips * pip_value_per_lot)
+    lot = max(min_lot, lot_step * int(lot / lot_step))
+    return round(lot, 2)
 
 FEATURE_COLUMNS = [
     'return', 'range', 'delta_tick', 'delta_price',
@@ -138,7 +150,8 @@ class PPOBridge:
         self.sl_hits = 0
         self.tp_hits = 0
 
-        self.spread_cost = SPREAD_PIPS * PIP_VALUE * LOT_SIZE  # $2
+        self.lot_size = calc_auto_lot(INITIAL_BALANCE)
+        self.spread_cost = SPREAD_PIPS * PIP_VALUE * self.lot_size
 
         self.prev_bar_high = 0.0
         self.prev_bar_low = 0.0
@@ -146,7 +159,7 @@ class PPOBridge:
 
     def _calc_pnl(self, entry, exit_price, direction):
         pips = (exit_price - entry) / PIP_SIZE
-        return direction * pips * PIP_VALUE * LOT_SIZE
+        return direction * pips * PIP_VALUE * self.lot_size
 
     def _open(self, direction, price):
         self.position = direction
@@ -291,15 +304,16 @@ def parse_mt5_data(data_str):
 
         df = pd.DataFrame(rows)
 
-        state_str = parts[1] if len(parts) > 1 else "0,10000,0,0,0,0,0.0"
+        state_str = parts[1] if len(parts) > 1 else "0,10000,0,0,0,0,0.0,0.1"
         state_values = state_str.split(",")
         delta_tick = int(state_values[5]) if len(state_values) > 5 else 0
         delta_price = float(state_values[6]) if len(state_values) > 6 else 0.0
+        lot_size = float(state_values[7]) if len(state_values) > 7 else 0.0
 
-        return df, delta_tick, delta_price
+        return df, delta_tick, delta_price, lot_size
     except Exception as e:
         print(f"❌ Parse error: {e}")
-        return None, 0, 0.0
+        return None, 0, 0.0, 0.0
 
 
 # ==================================================
@@ -337,11 +351,16 @@ def main():
                 socket.send_string("0")
                 continue
 
-            df, delta_tick, delta_price = parse_mt5_data(data_str)
+            df, delta_tick, delta_price, lot_from_ea = parse_mt5_data(data_str)
 
             if df is None or len(df) < WINDOW_SIZE:
                 socket.send_string("0")
                 continue
+
+            # Update lot size from EA (if auto-lot is active)
+            if lot_from_ea > 0:
+                bridge.lot_size = lot_from_ea
+                bridge.spread_cost = SPREAD_PIPS * PIP_VALUE * lot_from_ea
 
             action = bridge.process_bar(df, delta_tick, delta_price)
             bar_count += 1
