@@ -158,16 +158,23 @@ if __name__ == "__main__":
     from tqdm import tqdm
     LIST_QUERY_IMAGE = list_fileDate_folder(folder)
 
-    # Filter list
+    # Filter: ใช้เฉพาะข้อมูลตั้งแต่ 2020 (ตรงกับ RL training data)
+    START_DATE = datetime(2020, 1, 1)
+    original_count = len(LIST_QUERY_IMAGE)
+    LIST_QUERY_IMAGE = [item for item in LIST_QUERY_IMAGE if item[0] >= START_DATE]
+    if original_count - len(LIST_QUERY_IMAGE) > 0:
+        print(f"⏭️ Skipping {original_count - len(LIST_QUERY_IMAGE)} images before 2020.")
+
+    # Filter: skip already processed
     if latest_dt:
-        original_count = len(LIST_QUERY_IMAGE)
+        before_resume = len(LIST_QUERY_IMAGE)
         LIST_QUERY_IMAGE = [item for item in LIST_QUERY_IMAGE if item[0] > latest_dt]
-        skipped_count = original_count - len(LIST_QUERY_IMAGE)
+        skipped_count = before_resume - len(LIST_QUERY_IMAGE)
         if skipped_count > 0:
             print(f"⏭️ Skipping {skipped_count} already processed images.")
     
     # --- Batch Processing Config ---
-    MAX_WORKERS = 1  # A100 can handle this easily if Ollama is configured correctly
+    MAX_WORKERS = 4  # A100 can handle this easily if Ollama is configured correctly
     print(f"🚀 Starting Batch Processing with {MAX_WORKERS} workers...")
     
     import concurrent.futures

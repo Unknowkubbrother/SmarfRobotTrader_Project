@@ -28,12 +28,13 @@ DEVIATION = 20
 # SL/TP CONFIGURATION
 # ==================================================
 SL_PIPS = 30    # Stop Loss in pips (30 pips = 0.00030 for 5-digit broker)
-TP_PIPS = 50    # Take Profit in pips (50 pips = 0.00050 for 5-digit broker)
+TP_PIPS = 60    # Take Profit in pips (60 pips ≈ 2% TP, R:R = 1:2)
 
 # Features ที่ใช้ (ต้องเรียงตาม train_ppo.py เป๊ะๆ)
 FEATURE_COLUMNS = [
     'return', 'range', 'delta_tick', 'delta_price', 'has_delta',
-    'body_ratio', 'momentum'
+    'body_ratio', 'momentum',
+    'sma_cross', 'rsi_norm', 'atr_norm', 'trend'
 ]
 
 class LiveTradingBot:
@@ -95,9 +96,10 @@ class LiveTradingBot:
         # Create a dummy env just to initialize
         # Note: We need to mock data to init TradingEnv
         dummy_data = {
-            'time': [datetime.now()] * 50,
-            'open': [1.0] * 50, 'high': [1.0] * 50, 'low': [1.0] * 50, 'close': [1.0] * 50,
-            'delta_tick': [0]*50, 'delta_price': [0]*50, 'has_delta': [0]*50
+            'time': [datetime.now()] * 80,
+            'open': [1.0] * 80, 'high': [1.0] * 80, 'low': [1.0] * 80, 'close': [1.0] * 80,
+            'delta_tick': [0]*80, 'delta_price': [0]*80, 'has_delta': [0]*80,
+            'sma_cross': [0]*80, 'rsi_norm': [0]*80, 'atr_norm': [0]*80, 'trend': [0]*80
         }
         mock_df = pd.DataFrame(dummy_data) 
         dummy_env = DummyVecEnv([lambda: TradingEnv(mock_df)])
@@ -202,14 +204,23 @@ class LiveTradingBot:
         account = mt5.account_info()
         equity_ratio = account.equity / self.initial_balance if self.initial_balance > 0 else 1.0
         
-        # 3. Hold Steps Norm
-        hold_norm = min(self.hold_steps / 50.0, 1.0)
+        # 3. Hold Steps Norm (ต้องตรงกับ env: max_hold_steps=30)
+        hold_norm = min(self.hold_steps / 30.0, 1.0)
+        
+        # 4. Unrealized Return (feature ที่ 5 ของ state)
+        unrealized_ret = 0.0
+        if current_position != 0 and self.entry_price > 0:
+            tick = mt5.symbol_info_tick(SYMBOL)
+            if tick:
+                current_price = tick.bid if current_position == 1 else tick.ask
+                unrealized_ret = current_position * (current_price - self.entry_price) / self.entry_price
         
         state = np.array([
             current_position,
             equity_ratio,
-            unrealized_pnl,
-            hold_norm
+            unrealized_pnl / self.initial_balance if self.initial_balance > 0 else 0,
+            hold_norm,
+            np.clip(unrealized_ret * 100, -5, 5)  # ตรงกับ env
         ], dtype=np.float32)
         
         return state, current_position
@@ -241,31 +252,49 @@ class LiveTradingBot:
                 # TradingEnv constructs obs as `block.flatten()` of window_size rows!
                 # I MUST FETCH WINDOW_SIZE ROWS!
                 
-                # Correction: Fetch 20 rows (Completed)
-                rates_window = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 1, 40) # buffer
+                # Correction: Fetch 80 rows for rolling(50) to work correctly
+                rates_window = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 1, 80)
                 df_window = pd.DataFrame(rates_window)
                 df_window['time'] = pd.to_datetime(df_window['time'], unit='s')
                 
-                # Calculate features for ALL rows to get correct momentum/rolling
+                # Calculate features for ALL rows
                 df_window['return'] = df_window['close'].pct_change().fillna(0)
                 df_window['range'] = (df_window['high'] - df_window['low']) / df_window['close']
                 full_range = df_window['high'] - df_window['low']
                 df_window['body_ratio'] = np.where(full_range > 0, abs(df_window['close'] - df_window['open']) / full_range, 0)
                 df_window['momentum'] = df_window['return'].rolling(window=5).sum().fillna(0)
-                # Delta is tricky for history... assume 0 for history, calc real for last?
-                # For simplicity/robustness: use 0 for history deita
+                
+                # Delta (0 for history — live limitation)
                 df_window['delta_tick'] = 0
                 df_window['delta_price'] = 0.0
                 df_window['has_delta'] = 0
                 
-                # Fill last row with real delta
-                # (Re-using Delta Logic from above - simplified here)
-                # ... [Insert Delta Logic Here if crucial] ... 
-                # Let's skip Delta for history to keep it simple, only last row matters most for some, 
-                # but CNN/MLP looks at whole window.
-                # Ideally we need full history delta. Live trading limitation.
+                # ===== Trend Indicators (ต้องตรงกับ train_ppo.py) =====
+                sma20 = df_window['close'].rolling(20).mean()
+                sma50 = df_window['close'].rolling(50).mean()
+                df_window['sma_cross'] = np.where(sma20 > sma50, 1, np.where(sma20 < sma50, -1, 0))
+                df_window['sma_cross'] = df_window['sma_cross'].fillna(0)
                 
-                # Get last 20 rows
+                delta_c = df_window['close'].diff()
+                gain = delta_c.clip(lower=0).rolling(14).mean()
+                loss_c = (-delta_c.clip(upper=0)).rolling(14).mean()
+                rs = gain / (loss_c + 1e-10)
+                rsi = 100 - (100 / (1 + rs))
+                df_window['rsi_norm'] = ((rsi - 50) / 50).fillna(0)
+                
+                tr = np.maximum(
+                    df_window['high'] - df_window['low'],
+                    np.maximum(
+                        abs(df_window['high'] - df_window['close'].shift(1)),
+                        abs(df_window['low'] - df_window['close'].shift(1))
+                    )
+                )
+                df_window['atr_norm'] = (tr.rolling(14).mean() / df_window['close']).fillna(0)
+                
+                df_window['trend'] = (sma20.pct_change(5) * 100).fillna(0)
+                df_window['trend'] = df_window['trend'].clip(-2, 2)
+                
+                # Get last 20 rows (after rolling calcs)
                 obs_window = df_window[FEATURE_COLUMNS].iloc[-20:].values.flatten().astype(np.float32)
                 
                 full_obs = np.concatenate([obs_window, state_feat])
