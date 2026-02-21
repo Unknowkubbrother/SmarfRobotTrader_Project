@@ -65,7 +65,7 @@ df['trend'] = df['trend'].clip(-2, 2)
 
 df = df.iloc[50:].reset_index(drop=True)
 
-print(f"✅ Features: return, range, delta_tick, delta_price, has_delta, body_ratio, momentum")
+print(f"✅ Features: return, range, delta_tick, delta_price, body_ratio, momentum")
 print("="*50 + "\n")
 
 

@@ -48,7 +48,7 @@ def load_model():
     dummy_data = {
         'time': [datetime.now()] * 80,
         'open': [1.0]*80, 'high': [1.0]*80, 'low': [1.0]*80, 'close': [1.0]*80,
-        'delta_tick': [0]*80, 'delta_price': [0]*80, 'has_delta': [0]*80,
+        'delta_tick': [0]*80, 'delta_price': [0]*80,
         'sma_cross': [0]*80, 'rsi_norm': [0]*80, 'atr_norm': [0]*80, 'trend': [0]*80
     }
     mock_df = pd.DataFrame(dummy_data)
@@ -66,8 +66,8 @@ def load_model():
 # ==================================================
 # FEATURE ENGINEERING
 # ==================================================
-def calculate_features(df):
-    """Calculate all 11 features from OHLC data"""
+def calculate_features(df, delta_tick=0, delta_price=0.0):
+    """Calculate all 10 features from OHLC data"""
     df['return'] = df['close'].pct_change().fillna(0)
     df['range'] = (df['high'] - df['low']) / df['close']
     
@@ -77,7 +77,10 @@ def calculate_features(df):
     
     df['delta_tick'] = 0
     df['delta_price'] = 0.0
-    df['has_delta'] = 0
+    
+    # Override real-time delta on the last row
+    df.loc[df.index[-1], 'delta_tick'] = delta_tick
+    df.loc[df.index[-1], 'delta_price'] = delta_price
     
     sma20 = df['close'].rolling(20).mean()
     sma50 = df['close'].rolling(50).mean()
@@ -106,7 +109,7 @@ def calculate_features(df):
     return df
 
 FEATURE_COLUMNS = [
-    'return', 'range', 'delta_tick', 'delta_price', 'has_delta',
+    'return', 'range', 'delta_tick', 'delta_price',
     'body_ratio', 'momentum',
     'sma_cross', 'rsi_norm', 'atr_norm', 'trend'
 ]
@@ -130,19 +133,22 @@ def parse_mt5_data(data_str):
         
         df = pd.DataFrame(rows)
         
-        state_str = parts[1] if len(parts) > 1 else "0,10000,0,0,0"
+        state_str = parts[1] if len(parts) > 1 else "0,10000,0,0,0,0,0.0"
         state_values = state_str.split(",")
         position, equity, unrealized_pnl, hold_steps, entry_price = (
             int(state_values[0]), float(state_values[1]), float(state_values[2]),
             int(state_values[3]), float(state_values[4])
         )
-        return df, position, equity, unrealized_pnl, hold_steps, entry_price
+        delta_tick = int(state_values[5]) if len(state_values) > 5 else 0
+        delta_price = float(state_values[6]) if len(state_values) > 6 else 0.0
+        
+        return df, position, equity, unrealized_pnl, hold_steps, entry_price, delta_tick, delta_price
     except Exception as e:
         print(f"❌ Parse error: {e}")
-        return None, 0, INITIAL_BALANCE, 0, 0, 0
+        return None, 0, INITIAL_BALANCE, 0, 0, 0, 0, 0.0
 
-def predict_action(model, vec_norm, df, position, equity, unrealized_pnl, hold_steps, entry_price):
-    df = calculate_features(df)
+def predict_action(model, vec_norm, df, position, equity, unrealized_pnl, hold_steps, entry_price, delta_tick, delta_price):
+    df = calculate_features(df, delta_tick, delta_price)
     obs_window = df[FEATURE_COLUMNS].iloc[-WINDOW_SIZE:].values.flatten().astype(np.float32)
     
     unrealized_ret = 0.0
@@ -194,13 +200,13 @@ def main():
                 socket.send_string("0")
                 continue
                 
-            df, position, equity, unrealized_pnl, hold_steps, entry_price = parse_mt5_data(data_str)
+            df, position, equity, unrealized_pnl, hold_steps, entry_price, delta_tick, delta_price = parse_mt5_data(data_str)
             
             if df is None or len(df) < WINDOW_SIZE:
                 socket.send_string("0")
                 continue
                 
-            action = predict_action(model, vec_norm, df, position, equity, unrealized_pnl, hold_steps, entry_price)
+            action = predict_action(model, vec_norm, df, position, equity, unrealized_pnl, hold_steps, entry_price, delta_tick, delta_price)
             trade_count += 1
             
             p = df['close'].iloc[-1]

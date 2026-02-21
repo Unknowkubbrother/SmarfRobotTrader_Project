@@ -63,7 +63,7 @@ class TradingEnv(gym.Env):
     @staticmethod
     def _get_feature_columns():
         return [
-            'return', 'range', 'delta_tick', 'delta_price', 'has_delta',
+            'return', 'range', 'delta_tick', 'delta_price',
             'body_ratio', 'momentum',
             'sma_cross', 'rsi_norm', 'atr_norm', 'trend'
         ]

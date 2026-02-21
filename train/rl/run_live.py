@@ -32,7 +32,7 @@ TP_PIPS = 60    # Take Profit in pips (60 pips ≈ 2% TP, R:R = 1:2)
 
 # Features ที่ใช้ (ต้องเรียงตาม train_ppo.py เป๊ะๆ)
 FEATURE_COLUMNS = [
-    'return', 'range', 'delta_tick', 'delta_price', 'has_delta',
+    'return', 'range', 'delta_tick', 'delta_price',
     'body_ratio', 'momentum',
     'sma_cross', 'rsi_norm', 'atr_norm', 'trend'
 ]
@@ -98,7 +98,7 @@ class LiveTradingBot:
         dummy_data = {
             'time': [datetime.now()] * 80,
             'open': [1.0] * 80, 'high': [1.0] * 80, 'low': [1.0] * 80, 'close': [1.0] * 80,
-            'delta_tick': [0]*80, 'delta_price': [0]*80, 'has_delta': [0]*80,
+            'delta_tick': [0]*80, 'delta_price': [0]*80,
             'sma_cross': [0]*80, 'rsi_norm': [0]*80, 'atr_norm': [0]*80, 'trend': [0]*80
         }
         mock_df = pd.DataFrame(dummy_data) 
@@ -135,7 +135,6 @@ class LiveTradingBot:
         
         delta_tick = 0
         delta_price = 0.0
-        has_delta = 0
         
         if ticks is not None and len(ticks) > 0:
             tdf = pd.DataFrame(ticks)
@@ -149,7 +148,6 @@ class LiveTradingBot:
             
             delta_tick = buy.sum() - sell.sum()
             delta_price = (tdf['bid'].iloc[-1] - tdf['bid'].iloc[0]) + (tdf['ask'].iloc[-1] - tdf['ask'].iloc[0])
-            has_delta = 1
 
         # Fill features
         # We need the LAST row's features
@@ -161,7 +159,6 @@ class LiveTradingBot:
             last_row['range'],
             delta_tick,
             delta_price,
-            has_delta,
             last_row['body_ratio'],
             last_row['momentum']
         ], dtype=np.float32)
@@ -267,7 +264,6 @@ class LiveTradingBot:
                 # Delta (0 for history — live limitation)
                 df_window['delta_tick'] = 0
                 df_window['delta_price'] = 0.0
-                df_window['has_delta'] = 0
                 
                 # ===== Trend Indicators (ต้องตรงกับ train_ppo.py) =====
                 sma20 = df_window['close'].rolling(20).mean()

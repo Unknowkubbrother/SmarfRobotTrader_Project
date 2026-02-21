@@ -33,6 +33,10 @@ Context context("PPO_ZMQ_Client");
 Socket *reqSocket = NULL;
 CTrade trade;
 datetime lastBarTime = 0;
+double lastBid = 0.0;
+double lastAsk = 0.0;
+int accumDeltaTick = 0;
+double accumDeltaPrice = 0.0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -105,7 +109,7 @@ int GetPPOAction(string data) {
 //+------------------------------------------------------------------+
 //| Build OHLC data string for Python                                |
 //+------------------------------------------------------------------+
-string BuildDataString() {
+string BuildDataString(int dTick, double dPrice) {
   MqlRates rates[];
   int copied = CopyRates(_Symbol, PERIOD_H1, 1, 80, rates);
 
@@ -151,7 +155,8 @@ string BuildDataString() {
   data += ";" + IntegerToString(position) + "," + DoubleToString(equity, 2) +
           "," + DoubleToString(unrealized_pnl, 2) + "," +
           IntegerToString(holdSteps) + "," +
-          DoubleToString(entry_price, _Digits);
+          DoubleToString(entry_price, _Digits) + "," + IntegerToString(dTick) +
+          "," + DoubleToString(dPrice, _Digits);
 
   return data;
 }
@@ -213,12 +218,35 @@ void ExecuteAction(int action) {
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
+  double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+  double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+  if (lastBid > 0.0 && lastAsk > 0.0) {
+    if (bid > lastBid || (bid == lastBid && ask > lastAsk)) {
+      accumDeltaTick++;
+    } else if (bid < lastBid || (bid == lastBid && ask < lastAsk)) {
+      accumDeltaTick--;
+    }
+    accumDeltaPrice += (bid - lastBid) + (ask - lastAsk);
+  }
+  lastBid = bid;
+  lastAsk = ask;
+
   datetime currentBarTime = iTime(_Symbol, PERIOD_H1, 0);
-  if (currentBarTime == lastBarTime)
+  if (currentBarTime == lastBarTime || lastBarTime == 0) {
+    if (lastBarTime == 0)
+      lastBarTime = currentBarTime;
     return;
+  }
   lastBarTime = currentBarTime;
 
-  string data = BuildDataString();
+  int deltaTickToSend = accumDeltaTick;
+  double deltaPriceToSend = accumDeltaPrice;
+
+  accumDeltaTick = 0;
+  accumDeltaPrice = 0.0;
+
+  string data = BuildDataString(deltaTickToSend, deltaPriceToSend);
   if (data == "")
     return;
 
@@ -230,7 +258,7 @@ void OnTick() {
   }
 
   string actionNames[] = {"HOLD", "BUY", "SELL", "CLOSE"};
-  Print("🤖 PPO Action (ZMQ): ", actionNames[action], " (", action, ")");
+  Print("🤖 PPO Action (ZMQ+Delta): ", actionNames[action], " (", action, ")");
 
   ExecuteAction(action);
 }
