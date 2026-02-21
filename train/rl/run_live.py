@@ -28,8 +28,8 @@ RISK_PERCENT = 1.0      # Risk % per trade
 # ==================================================
 # SL/TP CONFIGURATION
 # ==================================================
-SL_PIPS = 30    # Stop Loss in pips (30 pips = 0.00030 for 5-digit broker)
-TP_PIPS = 60    # Take Profit in pips (60 pips ≈ 2% TP, R:R = 1:2)
+SL_PIPS = 50    # Stop Loss in pips
+TP_PIPS = 50    # Take Profit in pips (R:R = 1:1)
 PIP_VALUE_PER_LOT = 10.0  # $10 per pip for 1 standard lot on EURUSD
 
 
@@ -45,7 +45,7 @@ def calc_auto_lot(balance, risk_pct=RISK_PERCENT, sl_pips=SL_PIPS,
 FEATURE_COLUMNS = [
     'return', 'range', 'delta_tick', 'delta_price',
     'body_ratio', 'momentum',
-    'sma_cross', 'rsi_norm', 'atr_norm', 'trend'
+    'sma_cross', 'rsi_norm', 'atr_norm', 'trend', 'adx'
 ]
 
 class LiveTradingBot:
@@ -311,6 +311,25 @@ class LiveTradingBot:
                 
                 df_window['trend'] = (sma20.pct_change(5) * 100).fillna(0)
                 df_window['trend'] = df_window['trend'].clip(-2, 2)
+                
+                # ADX (Average Directional Index)
+                tr_adx = np.maximum(
+                    df_window['high'] - df_window['low'],
+                    np.maximum(
+                        abs(df_window['high'] - df_window['close'].shift(1)),
+                        abs(df_window['low'] - df_window['close'].shift(1))
+                    )
+                )
+                plus_dm = np.where((df_window['high'] - df_window['high'].shift(1)) > (df_window['low'].shift(1) - df_window['low']),
+                                    np.maximum(df_window['high'] - df_window['high'].shift(1), 0), 0)
+                minus_dm = np.where((df_window['low'].shift(1) - df_window['low']) > (df_window['high'] - df_window['high'].shift(1)),
+                                     np.maximum(df_window['low'].shift(1) - df_window['low'], 0), 0)
+                atr14_adx = pd.Series(tr_adx).rolling(14).mean()
+                plus_di = 100 * pd.Series(plus_dm).rolling(14).mean() / (atr14_adx + 1e-10)
+                minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / (atr14_adx + 1e-10)
+                dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+                adx_raw = dx.rolling(14).mean()
+                df_window['adx'] = ((adx_raw - 25) / 25).fillna(0).clip(-1, 1)
                 
                 # Get last 20 rows (after rolling calcs)
                 obs_window = df_window[FEATURE_COLUMNS].iloc[-20:].values.flatten().astype(np.float32)

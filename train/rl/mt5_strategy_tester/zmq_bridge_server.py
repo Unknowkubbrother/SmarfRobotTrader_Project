@@ -36,8 +36,8 @@ WINDOW_SIZE = 20
 INITIAL_BALANCE = 10000
 PIP_SIZE = 0.0001
 PIP_VALUE = 10.0
-SL_PIPS = 30
-TP_PIPS = 60
+SL_PIPS = 50
+TP_PIPS = 50
 SPREAD_PIPS = 2
 MAX_HOLD_STEPS = 30
 RISK_PERCENT = 1.0  # Risk % per trade
@@ -54,7 +54,7 @@ def calc_auto_lot(balance, risk_pct=RISK_PERCENT, sl_pips=SL_PIPS,
 FEATURE_COLUMNS = [
     'return', 'range', 'delta_tick', 'delta_price',
     'body_ratio', 'momentum',
-    'sma_cross', 'rsi_norm', 'atr_norm', 'trend'
+    'sma_cross', 'rsi_norm', 'atr_norm', 'trend', 'adx'
 ]
 
 
@@ -119,6 +119,25 @@ def calculate_features(df, delta_tick=0, delta_price=0.0):
 
     df['trend'] = (sma20.pct_change(5) * 100).fillna(0)
     df['trend'] = df['trend'].clip(-2, 2)
+
+    # ADX (Average Directional Index)
+    tr_adx = np.maximum(
+        df['high'] - df['low'],
+        np.maximum(
+            abs(df['high'] - df['close'].shift(1)),
+            abs(df['low'] - df['close'].shift(1))
+        )
+    )
+    plus_dm = np.where((df['high'] - df['high'].shift(1)) > (df['low'].shift(1) - df['low']),
+                        np.maximum(df['high'] - df['high'].shift(1), 0), 0)
+    minus_dm = np.where((df['low'].shift(1) - df['low']) > (df['high'] - df['high'].shift(1)),
+                         np.maximum(df['low'].shift(1) - df['low'], 0), 0)
+    atr14_adx = pd.Series(tr_adx).rolling(14).mean()
+    plus_di = 100 * pd.Series(plus_dm).rolling(14).mean() / (atr14_adx + 1e-10)
+    minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / (atr14_adx + 1e-10)
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+    adx_raw = dx.rolling(14).mean()
+    df['adx'] = ((adx_raw - 25) / 25).fillna(0).clip(-1, 1)
 
     return df
 

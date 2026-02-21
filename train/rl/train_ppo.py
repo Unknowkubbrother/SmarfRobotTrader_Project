@@ -174,6 +174,25 @@ df['atr_norm'] = (tr.rolling(14).mean() / df['close']).fillna(0)
 df['trend'] = (sma20.pct_change(5) * 100).fillna(0)  # % change over 5 bars
 df['trend'] = df['trend'].clip(-2, 2)  # Clip extremes
 
+# ADX (Average Directional Index) — วัดความแรงของเทรนด์
+tr_adx = np.maximum(
+    df['high'] - df['low'],
+    np.maximum(
+        abs(df['high'] - df['close'].shift(1)),
+        abs(df['low'] - df['close'].shift(1))
+    )
+)
+plus_dm = np.where((df['high'] - df['high'].shift(1)) > (df['low'].shift(1) - df['low']),
+                    np.maximum(df['high'] - df['high'].shift(1), 0), 0)
+minus_dm = np.where((df['low'].shift(1) - df['low']) > (df['high'] - df['high'].shift(1)),
+                     np.maximum(df['low'].shift(1) - df['low'], 0), 0)
+atr14_adx = pd.Series(tr_adx).rolling(14).mean()
+plus_di = 100 * pd.Series(plus_dm).rolling(14).mean() / (atr14_adx + 1e-10)
+minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / (atr14_adx + 1e-10)
+dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+adx_raw = dx.rolling(14).mean()
+df['adx'] = ((adx_raw - 25) / 25).fillna(0).clip(-1, 1)  # Normalize: <25=ranging(-), >25=trending(+)
+
 # Drop rows with NaN from rolling calculations
 df = df.iloc[50:].reset_index(drop=True)
 
@@ -181,7 +200,7 @@ FEATURE_LIST = TradingEnv._get_feature_columns()
 print(f"✅ Features ({len(FEATURE_LIST)}): {', '.join(FEATURE_LIST)}")
 print("="*50 + "\n")
 
-train_env = DummyVecEnv([lambda: TradingEnv(df, random_start=True, lot_size=0.1, sl_pips=30, tp_pips=60)])
+train_env = DummyVecEnv([lambda: TradingEnv(df, random_start=True, lot_size=0.1, sl_pips=50, tp_pips=50)])
 train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.)
 
 model = PPO(
@@ -209,8 +228,8 @@ print("\n" + "="*50)
 print("🚀 Starting Training (Trend-Aware Mode)")
 print("="*50)
 print("📊 TensorBoard: tensorboard --logdir=./tensorboard/")
-print(f"🎯 SL=30 pips | TP=60 pips | Lot=0.1 | MaxHold=30 | RandomStart=ON")
-print(f"📈 Features: {len(FEATURE_LIST)} (incl. SMA, RSI, ATR, Trend)")
+print(f"🎯 SL=50 pips | TP=50 pips | Lot=0.1 | MaxHold=30 | RandomStart=ON")
+print(f"📈 Features: {len(FEATURE_LIST)} (incl. SMA, RSI, ATR, Trend, ADX)")
 print("="*50 + "\n")
 
 model.learn(total_timesteps=1_000_000, callback=trading_callback)

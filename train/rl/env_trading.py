@@ -81,7 +81,7 @@ class TradingEnv(gym.Env):
         return [
             'return', 'range', 'delta_tick', 'delta_price',
             'body_ratio', 'momentum',
-            'sma_cross', 'rsi_norm', 'atr_norm', 'trend'
+            'sma_cross', 'rsi_norm', 'atr_norm', 'trend', 'adx'
         ]
     
     def seed(self, seed=None):

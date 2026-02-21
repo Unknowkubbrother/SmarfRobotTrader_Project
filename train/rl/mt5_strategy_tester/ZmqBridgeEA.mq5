@@ -19,7 +19,7 @@ input string ZmqHost = "127.0.0.1";
 input int ZmqPort = 5555;
 input int MagicNumber = 12345;
 input double RiskPercent = 1.0; // Risk % per trade
-input int SL_Pips_Input = 30;   // SL in pips (for auto lot calculation)
+input int SL_Pips_Input = 50;   // SL in pips (for auto lot calculation)
 
 //--- Global Variables
 Context context("PPO_ZMQ_Client");
