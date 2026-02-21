@@ -35,7 +35,7 @@ class TradingEnv(gym.Env):
         pip_value=10.0,           # $10 per pip for 1.0 standard lot on EURUSD
         sl_pips=30,               # Stop Loss in pips (matches MT5 EA)
         tp_pips=60,               # Take Profit in pips (matches MT5 EA)
-        spread_pips=2,            # Typical broker spread in pips
+        spread_pips=0,            # 0 because MT5 handles spread via ask/bid
         commission_per_lot=0.0,   # Commission per lot (0 if spread-only broker)
         max_dd=0.30,              # Max drawdown 30%
         max_hold_steps=30,        # ถือสูงสุด 30 แท่ง H1
