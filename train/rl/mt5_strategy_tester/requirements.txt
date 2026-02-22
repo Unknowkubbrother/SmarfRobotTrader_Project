@@ -1,5 +1,3 @@
-pyzmq==27.1.0
-numpy==2.2.3
-pandas==2.2.3
-stable-baselines3[extra]==2.5.0
-gymnasium==1.0.0
+# Unified requirements are managed at ../requirements.txt
+# Keep this file only for compatibility with existing install commands.
+-r ../requirements.txt

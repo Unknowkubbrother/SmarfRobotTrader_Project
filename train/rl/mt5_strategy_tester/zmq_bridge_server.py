@@ -1,37 +1,28 @@
-"""
-PPO ZMQ Bridge Server v2.0 — Python-Managed State (MT5-Aligned)
-
-Key difference from v1: This server tracks position/equity/PnL internally
-(same as env_trading.py) instead of relying on MT5's state. This ensures
-the model sees identical observations in both Python test and MT5.
-
-SL/TP is also managed here using bar H/L, matching env_trading.py exactly.
-MT5 orders are opened WITHOUT SL/TP — Python sends CLOSE when SL/TP hit.
-"""
-
 import zmq
 import sys
 import os
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+RL_ROOT = os.path.join(os.path.dirname(__file__), "..")
+CORE_DIR = os.path.join(RL_ROOT, "core")
+if CORE_DIR not in sys.path:
+    sys.path.insert(0, CORE_DIR)
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from env_trading import TradingEnv
 from datetime import datetime
 
-# ==================================================
-# CONFIG
-# ==================================================
+
 HOST = "0.0.0.0"
 PORT = 5555
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
-MODEL_PATH = os.path.join(BASE_DIR, "ppo_trading")
-VEC_NORM_PATH = os.path.join(BASE_DIR, "vec_normalize.pkl")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+MODEL_PATH = os.path.join(MODELS_DIR, "ppo_trading")
+VEC_NORM_PATH = os.path.join(MODELS_DIR, "vec_normalize.pkl")
 
-# Must match env_trading.py and EA settings
+
 WINDOW_SIZE = 20
 INITIAL_BALANCE = 10000
 PIP_SIZE = 0.0001
@@ -40,12 +31,11 @@ SL_PIPS = 50
 TP_PIPS = 50
 SPREAD_PIPS = 2
 MAX_HOLD_STEPS = 30
-RISK_PERCENT = 1.0  # Risk % per trade
+RISK_PERCENT = 1.0
 
 
 def calc_auto_lot(balance, risk_pct=RISK_PERCENT, sl_pips=SL_PIPS,
                   pip_value_per_lot=PIP_VALUE, min_lot=0.01, lot_step=0.01):
-    """Risk-based position sizing (same formula as EA)"""
     risk_amount = balance * risk_pct / 100.0
     lot = risk_amount / (sl_pips * pip_value_per_lot)
     lot = max(min_lot, lot_step * int(lot / lot_step))
@@ -58,11 +48,8 @@ FEATURE_COLUMNS = [
 ]
 
 
-# ==================================================
-# LOAD MODEL
-# ==================================================
 def load_model():
-    print("📦 Loading PPO model...")
+    print(" Loading PPO model...")
     dummy_data = {
         'time': [datetime.now()] * 80,
         'open': [1.0]*80, 'high': [1.0]*80, 'low': [1.0]*80, 'close': [1.0]*80,
@@ -75,13 +62,10 @@ def load_model():
     vec_norm.training = False
     vec_norm.norm_reward = False
     model = PPO.load(MODEL_PATH)
-    print("✅ Model loaded successfully")
+    print(" Model loaded successfully")
     return model, vec_norm
 
 
-# ==================================================
-# FEATURE ENGINEERING (same as test_ppo.py)
-# ==================================================
 def calculate_features(df, delta_tick=0, delta_price=0.0):
     df = df.copy()
     df['return'] = df['close'].pct_change().fillna(0)
@@ -120,7 +104,7 @@ def calculate_features(df, delta_tick=0, delta_price=0.0):
     df['trend'] = (sma20.pct_change(5) * 100).fillna(0)
     df['trend'] = df['trend'].clip(-2, 2)
 
-    # ADX (Average Directional Index)
+
     tr_adx = np.maximum(
         df['high'] - df['low'],
         np.maximum(
@@ -142,17 +126,13 @@ def calculate_features(df, delta_tick=0, delta_price=0.0):
     return df
 
 
-# ==================================================
-# PYTHON-MANAGED STATE (mirrors env_trading.py)
-# ==================================================
 class PPOBridge:
-    """Tracks position/equity/PnL internally — same logic as env_trading.py"""
 
     def __init__(self, model, vec_norm):
         self.model = model
         self.vec_norm = vec_norm
 
-        # Internal state (same as env_trading.py)
+
         self.position = 0
         self.entry_price = 0.0
         self.hold_steps = 0
@@ -200,7 +180,6 @@ class PPOBridge:
         self.unrealized_pnl = 0.0
 
     def process_bar(self, df, delta_tick, delta_price):
-        """Process one bar — returns action for EA"""
         df = calculate_features(df, delta_tick, delta_price)
         last_bar = df.iloc[-1]
         current_price = last_bar['close']
@@ -209,21 +188,21 @@ class PPOBridge:
 
         sl_tp_closed = False
 
-        # === SL/TP CHECK on last completed bar's H/L (same as env next_bar check) ===
+
         if self.position != 0 and self.entry_price > 0 and not self.first_bar:
-            if self.position == 1:  # Long
+            if self.position == 1:
                 sl_price = self.entry_price - SL_PIPS * PIP_SIZE
                 tp_price = self.entry_price + TP_PIPS * PIP_SIZE
                 hit_sl = bar_low <= sl_price
                 hit_tp = bar_high >= tp_price
-            else:  # Short
+            else:
                 sl_price = self.entry_price + SL_PIPS * PIP_SIZE
                 tp_price = self.entry_price - TP_PIPS * PIP_SIZE
                 hit_sl = bar_high >= sl_price
                 hit_tp = bar_low <= tp_price
 
             if hit_sl and hit_tp:
-                self._close(sl_price)  # Conservative: SL first
+                self._close(sl_price)
                 self.sl_hits += 1
                 sl_tp_closed = True
             elif hit_sl:
@@ -238,13 +217,13 @@ class PPOBridge:
                 self._close(current_price)
                 sl_tp_closed = True
 
-        # Update unrealized PnL (if position still open)
+
         if self.position != 0 and not sl_tp_closed:
             self.unrealized_pnl = self._calc_pnl(self.entry_price, current_price, self.position)
             self.equity = self.balance + self.unrealized_pnl
             self.hold_steps += 1
 
-        # === BUILD OBSERVATION (same as env_trading.py._get_obs) ===
+
         obs_window = df[FEATURE_COLUMNS].iloc[-WINDOW_SIZE:].values.flatten().astype(np.float32)
 
         unrealized_ret = 0.0
@@ -252,7 +231,7 @@ class PPOBridge:
         if self.position != 0 and self.entry_price > 0:
             unrealized_ret = self.position * (current_price - self.entry_price) / self.entry_price
             unrealized_pips = self.position * (current_price - self.entry_price) / PIP_SIZE
-            
+
         total_pnl_pips = self.total_pnl / (PIP_VALUE * self.lot_size) if self.lot_size > 0 else 0.0
 
         state_feat = np.array([
@@ -268,13 +247,13 @@ class PPOBridge:
         action, _ = self.model.predict(obs_norm, deterministic=True)
         action = int(action)
 
-        # === If SL/TP already closed, skip action (same as env) ===
+
         if sl_tp_closed:
             self.first_bar = True
-            return 3  # Tell EA to close (in case MT5 position is still open)
+            return 3
 
-        # === Execute action internally (same as env) ===
-        if action == 1:  # BUY
+
+        if action == 1:
             if self.position == -1:
                 self._close(current_price)
                 self._open(1, current_price)
@@ -282,7 +261,7 @@ class PPOBridge:
             elif self.position == 0:
                 self._open(1, current_price)
                 self.first_bar = True
-        elif action == 2:  # SELL
+        elif action == 2:
             if self.position == 1:
                 self._close(current_price)
                 self._open(-1, current_price)
@@ -290,7 +269,7 @@ class PPOBridge:
             elif self.position == 0:
                 self._open(-1, current_price)
                 self.first_bar = True
-        elif action == 3:  # CLOSE
+        elif action == 3:
             if self.position != 0:
                 self._close(current_price)
         else:
@@ -302,9 +281,6 @@ class PPOBridge:
         return action
 
 
-# ==================================================
-# PARSE MT5 DATA
-# ==================================================
 def parse_mt5_data(data_str):
     try:
         parts = data_str.strip().split(";")
@@ -328,13 +304,10 @@ def parse_mt5_data(data_str):
 
         return df, delta_tick, delta_price, lot_size
     except Exception as e:
-        print(f"❌ Parse error: {e}")
+        print(f" Parse error: {e}")
         return None, 0, 0.0, 0.0
 
 
-# ==================================================
-# MAIN SERVER
-# ==================================================
 def main():
     model, vec_norm = load_model()
     bridge = PPOBridge(model, vec_norm)
@@ -348,13 +321,13 @@ def main():
     action_names = ["HOLD", "BUY", "SELL", "CLOSE"]
 
     print("\n" + "="*60)
-    print("🚀 PPO ZMQ Server v2.0 — Python-Managed State")
+    print(" PPO ZMQ Server v2.0 — Python-Managed State")
     print("="*60)
-    print(f"📡 ZMQ Endpoint: {endpoint}")
-    print(f"📊 Model: {MODEL_PATH}")
-    print(f"🎯 SL={SL_PIPS} pips | TP={TP_PIPS} pips | Lot=Auto (Risk {RISK_PERCENT}%)")
-    print(f"📈 Features: {len(FEATURE_COLUMNS)} | Window: {WINDOW_SIZE}")
-    print(f"💡 State tracked internally (same as env_trading.py)")
+    print(f" ZMQ Endpoint: {endpoint}")
+    print(f" Model: {MODEL_PATH}")
+    print(f" SL={SL_PIPS} pips | TP={TP_PIPS} pips | Lot=Auto (Risk {RISK_PERCENT}%)")
+    print(f" Features: {len(FEATURE_COLUMNS)} | Window: {WINDOW_SIZE}")
+    print(f" State tracked internally (same as env_trading.py)")
     print("="*60)
     print("\n⏳ Waiting for MT5 Strategy Tester...\n")
 
@@ -373,7 +346,7 @@ def main():
                 socket.send_string("0")
                 continue
 
-            # Update lot size from EA (if auto-lot is active)
+
             if lot_from_ea > 0:
                 bridge.lot_size = lot_from_ea
                 bridge.spread_cost = SPREAD_PIPS * PIP_VALUE * lot_from_ea
@@ -396,13 +369,13 @@ def main():
     except KeyboardInterrupt:
         ret = (bridge.equity / INITIAL_BALANCE - 1) * 100
         print(f"\n\n{'='*60}")
-        print(f"🛑 Server stopped")
+        print(f" Server stopped")
         print(f"{'='*60}")
-        print(f"📊 Bars processed: {bar_count}")
-        print(f"💰 Equity: ${bridge.equity:.2f} ({ret:+.2f}%)")
-        print(f"📈 Trades: {bridge.trades} | WR: {(bridge.wins/bridge.trades*100) if bridge.trades > 0 else 0:.1f}%")
-        print(f"🔴 SL Hits: {bridge.sl_hits} | 🟢 TP Hits: {bridge.tp_hits}")
-        print(f"💸 Fees: ${bridge.total_fees:.2f}")
+        print(f" Bars processed: {bar_count}")
+        print(f" Equity: ${bridge.equity:.2f} ({ret:+.2f}%)")
+        print(f" Trades: {bridge.trades} | WR: {(bridge.wins/bridge.trades*100) if bridge.trades > 0 else 0:.1f}%")
+        print(f" SL Hits: {bridge.sl_hits} |  TP Hits: {bridge.tp_hits}")
+        print(f" Fees: ${bridge.total_fees:.2f}")
         print(f"{'='*60}")
         socket.close()
         context.term()

@@ -1,9 +1,28 @@
+# ==================================================
+# RL Core (train/test)
+# ==================================================
 stable-baselines3[extra]
-shimmy>=2.0.0
 gymnasium
+shimmy>=2.0.0
 numpy<2.0.0
 pandas
-git+https://github.com/lucas-campagna/mt5linux.git@master
+joblib
+scikit-learn
+
+torch
+
+# Semantic embedding + vector DB
+chromadb
+FlagEmbedding
+
+# Utilities
+matplotlib          # test plotting
+tensorboard         # train logs
 tqdm
 pytz
-tensorboard
+
+# ==================================================
+# MT5 / Live / Strategy Tester
+# ==================================================
+git+https://github.com/lucas-campagna/mt5linux.git@master
+pyzmq               # used by mt5_strategy_tester/zmq_bridge_server.py
