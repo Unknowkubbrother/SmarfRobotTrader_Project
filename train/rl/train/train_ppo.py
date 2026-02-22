@@ -188,30 +188,29 @@ class TradingMetricsCallback(BaseCallback):
 
 def load_training_data() -> pd.DataFrame:
     base_file = os.getenv("TRAIN_DATA_FILE", "h1_ohlc_delta.csv").strip() or "h1_ohlc_delta.csv"
-    extra_file = os.getenv("TRAIN_EXTRA_DATA_FILE", "h1_ohlc_delta1.csv").strip()
-
-    data_paths = [os.path.join(DATASETS_DIR, base_file)]
-    if extra_file:
-        extra_path = os.path.join(DATASETS_DIR, extra_file)
-        if os.path.exists(extra_path):
-            data_paths.append(extra_path)
-
-    data_frames = [pd.read_csv(path) for path in data_paths]
-    df = pd.concat(data_frames, ignore_index=True)
+    train_date_from = os.getenv("TRAIN_DATE_FROM", "2020-01-01").strip()
+    train_date_to = os.getenv("TRAIN_DATE_TO", "2025-12-31 23:59:59").strip()
+    data_path = os.path.join(DATASETS_DIR, base_file)
+    df = pd.read_csv(data_path)
 
     df["time"] = pd.to_datetime(df["time"])
     df = df.sort_values("time").drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
     df_full = df.copy()
     df = df[df["has_delta"] == 1].sort_values("time").reset_index(drop=True)
-    df = df[df["time"] >= "2020-01-01"].reset_index(drop=True)
+    if train_date_from:
+        df = df[df["time"] >= pd.to_datetime(train_date_from)]
+    if train_date_to:
+        df = df[df["time"] <= pd.to_datetime(train_date_to)]
+    df = df.reset_index(drop=True)
     df.drop(columns=["has_delta"], inplace=True)
 
     print("=" * 50)
     print(" DATA FILTERING (Recent Only)")
     print("=" * 50)
-    print(f"ไฟล์ที่ใช้:         {', '.join([os.path.basename(p) for p in data_paths])}")
+    print(f"ไฟล์ที่ใช้:         {os.path.basename(data_path)}")
+    print(f"ช่วงเทรนที่เลือก:   from={train_date_from or '-'} to={train_date_to or '-'}")
     print(f"ข้อมูลทั้งหมด:     {len(df_full):,} rows")
-    print(f"ข้อมูลที่ใช้ train: {len(df):,} rows (2020+, has_delta)")
+    print(f"ข้อมูลที่ใช้ train: {len(df):,} rows (ตามช่วงที่เลือก, has_delta)")
     print(f"ช่วงเวลา:          {df['time'].iloc[0]} → {df['time'].iloc[-1]}")
     print("=" * 50 + "\n")
     return df

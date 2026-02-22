@@ -2,7 +2,7 @@ import os
 
 
 WINDOW_SIZE = 20
-INITIAL_BALANCE = 10000
+INITIAL_BALANCE = 100
 PIP_SIZE = 0.0001
 PIP_VALUE = 10.0
 SL_PIPS = 50
@@ -23,11 +23,11 @@ TEST_DATE_TO = os.getenv("TEST_DATE_TO", "").strip()
 DISABLE_PLOT = os.getenv("DISABLE_PLOT", "0").strip().lower() in {"1", "true", "yes"}
 EMBED_TEST_MODE = os.getenv("EMBED_TEST_MODE", "knn_map").strip().lower() or "knn_map"
 
-OPEN_PROB_THRESHOLD = float(os.getenv("OPEN_PROB_THRESHOLD", "0.88"))
+OPEN_PROB_THRESHOLD = float(os.getenv("OPEN_PROB_THRESHOLD", "0.86"))
 OPEN_EDGE_THRESHOLD = float(os.getenv("OPEN_EDGE_THRESHOLD", "0.16"))
 MIN_ACTION_MARGIN = float(os.getenv("MIN_ACTION_MARGIN", "0.20"))
 HOLD_EDGE_THRESHOLD = float(os.getenv("HOLD_EDGE_THRESHOLD", "0.08"))
-TRADE_COOLDOWN_BARS = int(os.getenv("TRADE_COOLDOWN_BARS", "6"))
+TRADE_COOLDOWN_BARS = int(os.getenv("TRADE_COOLDOWN_BARS", "10"))
 
 ADAPTIVE_GATE = os.getenv("ADAPTIVE_GATE", "1").strip().lower() not in {"0", "false", "no"}
 DEF_LOOKBACK_TRADES = int(os.getenv("DEF_LOOKBACK_TRADES", "20"))
