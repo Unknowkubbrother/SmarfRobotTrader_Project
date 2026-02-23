@@ -206,7 +206,7 @@ def _run_backtest(df):
     sell_signals = []
     close_signals = []
 
-    print(f" Processing {len(df) - BAR_HISTORY} bars (200-bar sliding window)...")
+    print(f" Processing {len(df) - BAR_HISTORY} bars ({BAR_HISTORY}-bar sliding window)...")
 
     for i in range(BAR_HISTORY, len(df)):
         window_df = df.iloc[i - BAR_HISTORY : i][["time", "open", "high", "low", "close"]].reset_index(drop=True)
