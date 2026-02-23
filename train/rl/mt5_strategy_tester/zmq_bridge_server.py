@@ -42,6 +42,49 @@ VEC_NORM_PATH = os.path.join(MODELS_DIR, "vec_normalize.pkl")
 SYNC_EXTERNAL_LOT = os.getenv("MT5_SYNC_EXTERNAL_LOT", "0").strip().lower() in {"1", "true", "yes"}
 
 
+def _patch_numpy_bitgenerator_compat():
+    """
+    Handle cross-version NumPy pickle differences.
+
+    Some vec_normalize.pkl files store bit generators as class objects
+    (e.g. <class 'numpy.random._pcg64.PCG64'>) while older NumPy expects
+    a short string name ("PCG64"). This patch normalizes the input before
+    delegating to NumPy's original constructor.
+    """
+    try:
+        import numpy.random._pickle as np_pickle
+    except Exception:
+        return
+
+    original_ctor = getattr(np_pickle, "__bit_generator_ctor", None)
+    if original_ctor is None:
+        return
+    if getattr(original_ctor, "__name__", "") == "_compat_bit_generator_ctor":
+        return
+
+    def _normalize_bg_name(value):
+        if isinstance(value, type):
+            return value.__name__
+        if isinstance(value, str):
+            if "PCG64DXSM" in value:
+                return "PCG64DXSM"
+            if "PCG64" in value:
+                return "PCG64"
+            if "MT19937" in value:
+                return "MT19937"
+            if "Philox" in value:
+                return "Philox"
+            if "SFC64" in value:
+                return "SFC64"
+            return value
+        return str(value)
+
+    def _compat_bit_generator_ctor(bit_generator_name="MT19937"):
+        return original_ctor(_normalize_bg_name(bit_generator_name))
+
+    np_pickle.__bit_generator_ctor = _compat_bit_generator_ctor
+
+
 class GateStatsProvider:
     def __init__(self):
         self._stats = self._load_from_dataset()
@@ -122,6 +165,7 @@ class GateStatsProvider:
 
 def load_model(feature_columns):
     print(" Loading PPO model and VecNormalize...")
+    _patch_numpy_bitgenerator_compat()
     dummy_data = {
         "time": [pd.Timestamp.now()] * 80,
         "open": [1.0] * 80,
@@ -145,7 +189,13 @@ def load_model(feature_columns):
         ]
     )
 
-    vec_norm = VecNormalize.load(VEC_NORM_PATH, dummy_env)
+    try:
+        vec_norm = VecNormalize.load(VEC_NORM_PATH, dummy_env)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load vec_normalize.pkl. "
+            "Check NumPy version compatibility between training and runtime environments."
+        ) from exc
     vec_norm.training = False
     vec_norm.norm_reward = False
 
