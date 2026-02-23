@@ -20,7 +20,7 @@ if CORE_DIR not in sys.path:
     sys.path.insert(0, CORE_DIR)
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-from chroma_client import ChromaDBClient
+from embedding_source import load_time_to_embedding_map, normalize_source_mode
 from embedding_projector import fit_and_save_projector
 from env_trading import TradingEnv
 from semantic_embedding import build_semantic_map, compute_regime_frame, resolve_from_semantic_map
@@ -30,6 +30,7 @@ from semantic_embedding import build_semantic_map, compute_regime_frame, resolve
 class TrainConfig:
     sem_latent_dim: int
     projector_mode: str
+    embed_source_mode: str
     random_seed: int
     ae_hidden_dim: int
     ae_epochs: int
@@ -46,10 +47,9 @@ class TrainConfig:
 
 
 def _build_config() -> TrainConfig:
-    sem_latent_dim = int(os.getenv("SEM_LATENT_DIM", os.getenv("PCA_COMPONENTS", "16")))
-    projector_mode = os.getenv("EMBED_PROJECTOR_MODE", os.getenv("PROJECTOR_MODE", "autoencoder")).strip().lower()
-    if projector_mode not in {"autoencoder", "linear", "pca"}:
-        projector_mode = "autoencoder"
+    sem_latent_dim = int(os.getenv("SEM_LATENT_DIM", "16"))
+    projector_mode = "autoencoder"
+    embed_source_mode = normalize_source_mode("cls")
     random_seed = int(os.getenv("TRAIN_RANDOM_SEED", "42"))
     ae_hidden_dim = int(os.getenv("TRAIN_AE_HIDDEN_DIM", "256"))
     ae_epochs = int(os.getenv("TRAIN_AE_EPOCHS", "35"))
@@ -69,6 +69,7 @@ def _build_config() -> TrainConfig:
     return TrainConfig(
         sem_latent_dim=sem_latent_dim,
         projector_mode=projector_mode,
+        embed_source_mode=embed_source_mode,
         random_seed=random_seed,
         ae_hidden_dim=ae_hidden_dim,
         ae_epochs=ae_epochs,
@@ -216,25 +217,24 @@ def load_training_data() -> pd.DataFrame:
     return df
 
 
-def _load_time_to_embedding() -> dict:
-    client = ChromaDBClient(persist_path=os.path.join(MODELS_DIR, "chroma_db"))
-    docs = client.collection.get(include=["metadatas", "embeddings"])
-    return {
-        m["symbol_datetime"]: v
-        for m, v in zip(docs.get("metadatas", []), docs.get("embeddings", []))
-        if m and m.get("symbol_datetime")
-    }
+def _load_time_to_embedding(source_mode: str) -> tuple[dict, str]:
+    return load_time_to_embedding_map(
+        models_dir=MODELS_DIR,
+        source_mode=source_mode,
+        force_rebuild=False,
+    )
 
 
 def build_semantic_features(df: pd.DataFrame, cfg: TrainConfig) -> tuple[pd.DataFrame, int]:
     import joblib
 
-    time_to_vec = _load_time_to_embedding()
+    time_to_vec, resolved_source_mode = _load_time_to_embedding(cfg.embed_source_mode)
     df = df.copy()
     df["raw_embedding"] = df["time"].dt.strftime("%Y-%m-%d %H:%M:%S").map(time_to_vec)
 
     matched_count = int(df["raw_embedding"].notna().sum())
     missing_count = int(len(df) - matched_count)
+    print(f" Embedding source mode: {resolved_source_mode}")
     print(f" Embedding overlap: {matched_count}/{len(df)} rows matched ChromaDB dates")
     if missing_count > 0:
         print(f" {missing_count} rows have no embedding — mode=knn_map")
@@ -435,7 +435,7 @@ def print_training_banner(cfg: TrainConfig, feature_list: list[str]):
     print(" SL=50 pips | TP=50 pips | Lot=0.1 | MaxHold=30 | RandomStart=ON")
     print(
         " Projector: "
-        f"mode={cfg.projector_mode}, latent={cfg.sem_latent_dim}, "
+        f"mode={cfg.projector_mode}, latent={cfg.sem_latent_dim}, source={cfg.embed_source_mode}, "
         f"ae_epochs={cfg.ae_epochs}, ae_hidden={cfg.ae_hidden_dim}"
     )
     print(

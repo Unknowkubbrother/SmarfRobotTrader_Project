@@ -25,7 +25,7 @@
 ## Runtime Flow
 1. `train/train_ppo.py` reads data from `datasets/`.
 2. Missing embedding is filled by semantic fallback (`knn_map` only).
-3. Embedding is reduced by projector (`autoencoder`/`linear`/`pca`) to `sem_pca_*` features.
+3. Embedding source is fixed to `cls` and reduced by `autoencoder` to `sem_pca_*` features.
 4. PPO model is trained and saved to `models/`.
 5. `test/test_ppo.py` loads model + semantic artifacts from `models/` and runs bar-by-bar backtest.
 
@@ -34,8 +34,6 @@
   - `python train/train_ppo.py`
 - Backtest:
   - `python test/test_ppo.py`
-- Example strict short-term gate:
-  - `ADAPTIVE_GATE=1 OPEN_PROB_THRESHOLD=0.92 OPEN_EDGE_THRESHOLD=0.36 MIN_ACTION_MARGIN=0.40 HOLD_EDGE_THRESHOLD=0.22 TRADE_COOLDOWN_BARS=6 python test/test_ppo.py`
 
 ## Notes
 - `SEM_LATENT_DIM` controls number of semantic latent features (default 16).

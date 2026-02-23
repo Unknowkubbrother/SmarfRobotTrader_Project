@@ -19,6 +19,7 @@ from backtest_config import (
     DATASETS_DIR,
     OUTPUT_DIR,
     DISABLE_PLOT,
+    EMBED_SOURCE_MODE,
     EMBED_TEST_MODE,
     EMBED_QUALITY_MIN,
     HOLD_EDGE_THRESHOLD,
@@ -120,11 +121,8 @@ def _print_results(df, bridge, equity_history, gate_stats):
         " Semantic cache: "
         f"{len(SEMANTIC_RUNTIME.cache)} timestamps | "
         f"matched={SEMANTIC_RUNTIME.stats['matched']} | synthetic={SEMANTIC_RUNTIME.stats['synthetic']} | "
-        f"mode={EMBED_TEST_MODE} | "
+        f"mode={EMBED_TEST_MODE} | source={EMBED_SOURCE_MODE} | "
         f"knn={SEMANTIC_RUNTIME.stats['knn_fallback']} | "
-        f"regime={SEMANTIC_RUNTIME.stats.get('regime_fallback', 0)} | "
-        f"hour={SEMANTIC_RUNTIME.stats.get('hour_fallback', 0)} | "
-        f"global={SEMANTIC_RUNTIME.stats.get('global_fallback', 0)} | "
         f"zero={SEMANTIC_RUNTIME.stats['zero_fallback']} | "
         f"quality_avg={avg_quality:.3f} ({quality_count}) | "
         f"quality_low={low_quality}"
