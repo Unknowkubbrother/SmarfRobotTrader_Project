@@ -31,7 +31,7 @@ TIMEFRAME_CONFIG = {
 SELECTED_TIMEFRAME = "H1"
 tf_config = TIMEFRAME_CONFIG[SELECTED_TIMEFRAME]
 
-ohlc_start = datetime(2025, 1, 1, tzinfo=timezone)
+ohlc_start = datetime(2026, 1, 21, tzinfo=timezone)
 ohlc_end   = datetime(2026, 2, 20, 23, 59, 59, tzinfo=timezone)
 
 
