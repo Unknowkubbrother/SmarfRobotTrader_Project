@@ -1,316 +1,233 @@
-import zmq
-import sys
 import os
-import numpy as np
+import sys
+
 import pandas as pd
-
-RL_ROOT = os.path.join(os.path.dirname(__file__), "..")
-CORE_DIR = os.path.join(RL_ROOT, "core")
-if CORE_DIR not in sys.path:
-    sys.path.insert(0, CORE_DIR)
-
+import zmq
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+
+RL_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+CORE_DIR = os.path.join(RL_ROOT, "core")
+TEST_DIR = os.path.join(RL_ROOT, "test")
+for _path in (CORE_DIR, TEST_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+from backtest_bridge import PPOBridge, calc_auto_lot
+from backtest_config import (
+    BAR_HISTORY,
+    DATASETS_DIR,
+    INITIAL_BALANCE,
+    MODELS_DIR,
+    PIP_VALUE,
+    RISK_PERCENT,
+    SL_PIPS,
+    SPREAD_PIPS,
+    TEST_DATA_FILE,
+    TEST_DATE_FROM,
+    TEST_DATE_TO,
+    TP_PIPS,
+    WINDOW_SIZE,
+)
+from backtest_features import build_feature_columns, build_gate_stats
+from backtest_semantic import SemanticRuntime
 from env_trading import TradingEnv
-from datetime import datetime
 
 
-HOST = "0.0.0.0"
-PORT = 5555
-BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
-MODELS_DIR = os.path.join(BASE_DIR, "models")
-MODEL_PATH = os.path.join(MODELS_DIR, "ppo_trading")
+HOST = os.getenv("ZMQ_HOST", "0.0.0.0")
+PORT = int(os.getenv("ZMQ_PORT", "5555"))
+MODEL_PATH = os.path.join(MODELS_DIR, "ppo_trading.zip")
 VEC_NORM_PATH = os.path.join(MODELS_DIR, "vec_normalize.pkl")
+SYNC_EXTERNAL_LOT = os.getenv("MT5_SYNC_EXTERNAL_LOT", "0").strip().lower() in {"1", "true", "yes"}
 
 
-WINDOW_SIZE = 20
-INITIAL_BALANCE = 10000
-PIP_SIZE = 0.0001
-PIP_VALUE = 10.0
-SL_PIPS = 50
-TP_PIPS = 50
-SPREAD_PIPS = 2
-MAX_HOLD_STEPS = 30
-RISK_PERCENT = 1.0
+class GateStatsProvider:
+    def __init__(self):
+        self._stats = self._load_from_dataset()
+        self._history = pd.DataFrame(columns=["time", "open", "high", "low", "close"])
+
+    @property
+    def mode(self) -> str:
+        return "dataset" if self._stats is not None else "dynamic"
+
+    def initial(self):
+        return self._stats if self._stats is not None else {}
+
+    def _load_from_dataset(self):
+        data_path = os.path.join(DATASETS_DIR, TEST_DATA_FILE)
+        if not os.path.exists(data_path):
+            print(f" Gate stats dataset not found: {data_path}")
+            return None
+
+        try:
+            df = pd.read_csv(data_path)
+            if "time" not in df.columns:
+                print(" Gate stats dataset has no 'time' column; fallback to dynamic.")
+                return None
+
+            df["time"] = pd.to_datetime(df["time"])
+            if TEST_DATE_FROM:
+                df = df[df["time"] >= pd.to_datetime(TEST_DATE_FROM)]
+            if TEST_DATE_TO:
+                df = df[df["time"] <= pd.to_datetime(TEST_DATE_TO)]
+
+            if "has_delta" in df.columns:
+                df = df[df["has_delta"] == 1]
+
+            df = (
+                df[["time", "open", "high", "low", "close"]]
+                .sort_values("time")
+                .drop_duplicates(subset=["time"], keep="last")
+                .reset_index(drop=True)
+            )
+
+            if len(df) <= max(BAR_HISTORY, WINDOW_SIZE):
+                print(
+                    f" Gate stats dataset too short ({len(df)} rows); "
+                    "fallback to dynamic window-based stats."
+                )
+                return None
+
+            stats = build_gate_stats(df)
+            print(
+                " Gate stats loaded from dataset "
+                f"({os.path.basename(data_path)}, rows={len(df)})"
+            )
+            return stats
+        except Exception as exc:
+            print(f" Gate stats load failed ({exc}); fallback to dynamic.")
+            return None
+
+    def update(self, window_df: pd.DataFrame):
+        if self._stats is not None:
+            return self._stats
+
+        incremental = (
+            window_df[["time", "open", "high", "low", "close"]]
+            .copy()
+            .sort_values("time")
+            .drop_duplicates(subset=["time"], keep="last")
+        )
+        self._history = (
+            pd.concat([self._history, incremental], ignore_index=True)
+            .sort_values("time")
+            .drop_duplicates(subset=["time"], keep="last")
+            .reset_index(drop=True)
+        )
+        if len(self._history) < WINDOW_SIZE:
+            return {}
+        return build_gate_stats(self._history)
 
 
-def calc_auto_lot(balance, risk_pct=RISK_PERCENT, sl_pips=SL_PIPS,
-                  pip_value_per_lot=PIP_VALUE, min_lot=0.01, lot_step=0.01):
-    risk_amount = balance * risk_pct / 100.0
-    lot = risk_amount / (sl_pips * pip_value_per_lot)
-    lot = max(min_lot, lot_step * int(lot / lot_step))
-    return round(lot, 2)
-
-FEATURE_COLUMNS = [
-    'return', 'range', 'delta_tick', 'delta_price',
-    'body_ratio', 'momentum',
-    'sma_cross', 'rsi_norm', 'atr_norm', 'trend', 'adx'
-]
-
-
-def load_model():
-    print(" Loading PPO model...")
+def load_model(feature_columns):
+    print(" Loading PPO model and VecNormalize...")
     dummy_data = {
-        'time': [datetime.now()] * 80,
-        'open': [1.0]*80, 'high': [1.0]*80, 'low': [1.0]*80, 'close': [1.0]*80,
-        'delta_tick': [0]*80, 'delta_price': [0]*80,
-        'sma_cross': [0]*80, 'rsi_norm': [0]*80, 'atr_norm': [0]*80, 'trend': [0]*80
+        "time": [pd.Timestamp.now()] * 80,
+        "open": [1.0] * 80,
+        "high": [1.0] * 80,
+        "low": [1.0] * 80,
+        "close": [1.0] * 80,
     }
+    for col in feature_columns:
+        if col not in dummy_data:
+            dummy_data[col] = [0.0] * 80
+
     mock_df = pd.DataFrame(dummy_data)
-    dummy_env = DummyVecEnv([lambda: TradingEnv(mock_df, lot_size=calc_auto_lot(INITIAL_BALANCE), sl_pips=SL_PIPS, tp_pips=TP_PIPS)])
+    dummy_env = DummyVecEnv(
+        [
+            lambda: TradingEnv(
+                mock_df,
+                lot_size=calc_auto_lot(INITIAL_BALANCE),
+                sl_pips=SL_PIPS,
+                tp_pips=TP_PIPS,
+            )
+        ]
+    )
+
     vec_norm = VecNormalize.load(VEC_NORM_PATH, dummy_env)
     vec_norm.training = False
     vec_norm.norm_reward = False
+
     model = PPO.load(MODEL_PATH)
     print(" Model loaded successfully")
     return model, vec_norm
 
 
-def calculate_features(df, delta_tick=0, delta_price=0.0):
-    df = df.copy()
-    df['return'] = df['close'].pct_change().fillna(0)
-    df['range'] = (df['high'] - df['low']) / df['close']
-
-    full_range = df['high'] - df['low']
-    df['body_ratio'] = np.where(full_range > 0, abs(df['close'] - df['open']) / full_range, 0)
-    df['momentum'] = df['return'].rolling(window=5).sum().fillna(0)
-
-    df['delta_tick'] = 0
-    df['delta_price'] = 0.0
-    df.loc[df.index[-1], 'delta_tick'] = delta_tick
-    df.loc[df.index[-1], 'delta_price'] = delta_price
-
-    sma20 = df['close'].rolling(20).mean()
-    sma50 = df['close'].rolling(50).mean()
-    df['sma_cross'] = np.where(sma20 > sma50, 1, np.where(sma20 < sma50, -1, 0))
-    df['sma_cross'] = df['sma_cross'].fillna(0)
-
-    delta_c = df['close'].diff()
-    gain = delta_c.clip(lower=0).rolling(14).mean()
-    loss = (-delta_c.clip(upper=0)).rolling(14).mean()
-    rs = gain / (loss + 1e-10)
-    rsi = 100 - (100 / (1 + rs))
-    df['rsi_norm'] = ((rsi - 50) / 50).fillna(0)
-
-    tr = np.maximum(
-        df['high'] - df['low'],
-        np.maximum(
-            abs(df['high'] - df['close'].shift(1)),
-            abs(df['low'] - df['close'].shift(1))
-        )
-    )
-    df['atr_norm'] = (tr.rolling(14).mean() / df['close']).fillna(0)
-
-    df['trend'] = (sma20.pct_change(5) * 100).fillna(0)
-    df['trend'] = df['trend'].clip(-2, 2)
+def _fallback_times(bar_count: int):
+    end = pd.Timestamp.utcnow().floor("h")
+    return [end - pd.Timedelta(hours=bar_count - i - 1) for i in range(bar_count)]
 
 
-    tr_adx = np.maximum(
-        df['high'] - df['low'],
-        np.maximum(
-            abs(df['high'] - df['close'].shift(1)),
-            abs(df['low'] - df['close'].shift(1))
-        )
-    )
-    plus_dm = np.where((df['high'] - df['high'].shift(1)) > (df['low'].shift(1) - df['low']),
-                        np.maximum(df['high'] - df['high'].shift(1), 0), 0)
-    minus_dm = np.where((df['low'].shift(1) - df['low']) > (df['high'] - df['high'].shift(1)),
-                         np.maximum(df['low'].shift(1) - df['low'], 0), 0)
-    atr14_adx = pd.Series(tr_adx).rolling(14).mean()
-    plus_di = 100 * pd.Series(plus_dm).rolling(14).mean() / (atr14_adx + 1e-10)
-    minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / (atr14_adx + 1e-10)
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
-    adx_raw = dx.rolling(14).mean()
-    df['adx'] = ((adx_raw - 25) / 25).fillna(0).clip(-1, 1)
-
-    return df
-
-
-class PPOBridge:
-
-    def __init__(self, model, vec_norm):
-        self.model = model
-        self.vec_norm = vec_norm
-
-
-        self.position = 0
-        self.entry_price = 0.0
-        self.hold_steps = 0
-        self.equity = INITIAL_BALANCE
-        self.balance = INITIAL_BALANCE
-        self.unrealized_pnl = 0.0
-        self.trades = 0
-        self.wins = 0
-        self.total_pnl = 0.0
-        self.total_fees = 0.0
-        self.sl_hits = 0
-        self.tp_hits = 0
-
-        self.lot_size = calc_auto_lot(INITIAL_BALANCE)
-        self.spread_cost = SPREAD_PIPS * PIP_VALUE * self.lot_size
-
-        self.prev_bar_high = 0.0
-        self.prev_bar_low = 0.0
-        self.first_bar = True
-
-    def _calc_pnl(self, entry, exit_price, direction):
-        pips = (exit_price - entry) / PIP_SIZE
-        return direction * pips * PIP_VALUE * self.lot_size
-
-    def _open(self, direction, price):
-        self.position = direction
-        self.entry_price = price
-        self.hold_steps = 0
-        self.unrealized_pnl = 0.0
-        self.equity -= self.spread_cost
-        self.balance -= self.spread_cost
-        self.total_fees += self.spread_cost
-
-    def _close(self, exit_price):
-        pnl = self._calc_pnl(self.entry_price, exit_price, self.position)
-        self.total_pnl += pnl
-        self.balance += pnl
-        self.equity = self.balance
-        self.trades += 1
-        if pnl > 0:
-            self.wins += 1
-        self.position = 0
-        self.entry_price = 0.0
-        self.hold_steps = 0
-        self.unrealized_pnl = 0.0
-
-    def process_bar(self, df, delta_tick, delta_price):
-        df = calculate_features(df, delta_tick, delta_price)
-        last_bar = df.iloc[-1]
-        current_price = last_bar['close']
-        bar_high = last_bar['high']
-        bar_low = last_bar['low']
-
-        sl_tp_closed = False
-
-
-        if self.position != 0 and self.entry_price > 0 and not self.first_bar:
-            if self.position == 1:
-                sl_price = self.entry_price - SL_PIPS * PIP_SIZE
-                tp_price = self.entry_price + TP_PIPS * PIP_SIZE
-                hit_sl = bar_low <= sl_price
-                hit_tp = bar_high >= tp_price
-            else:
-                sl_price = self.entry_price + SL_PIPS * PIP_SIZE
-                tp_price = self.entry_price - TP_PIPS * PIP_SIZE
-                hit_sl = bar_high >= sl_price
-                hit_tp = bar_low <= tp_price
-
-            if hit_sl and hit_tp:
-                self._close(sl_price)
-                self.sl_hits += 1
-                sl_tp_closed = True
-            elif hit_sl:
-                self._close(sl_price)
-                self.sl_hits += 1
-                sl_tp_closed = True
-            elif hit_tp:
-                self._close(tp_price)
-                self.tp_hits += 1
-                sl_tp_closed = True
-            elif self.hold_steps >= MAX_HOLD_STEPS:
-                self._close(current_price)
-                sl_tp_closed = True
-
-
-        if self.position != 0 and not sl_tp_closed:
-            self.unrealized_pnl = self._calc_pnl(self.entry_price, current_price, self.position)
-            self.equity = self.balance + self.unrealized_pnl
-            self.hold_steps += 1
-
-
-        obs_window = df[FEATURE_COLUMNS].iloc[-WINDOW_SIZE:].values.flatten().astype(np.float32)
-
-        unrealized_ret = 0.0
-        unrealized_pips = 0.0
-        if self.position != 0 and self.entry_price > 0:
-            unrealized_ret = self.position * (current_price - self.entry_price) / self.entry_price
-            unrealized_pips = self.position * (current_price - self.entry_price) / PIP_SIZE
-
-        total_pnl_pips = self.total_pnl / (PIP_VALUE * self.lot_size) if self.lot_size > 0 else 0.0
-
-        state_feat = np.array([
-            self.position,
-            total_pnl_pips / 1000.0,
-            unrealized_pips / 100.0,
-            min(self.hold_steps / MAX_HOLD_STEPS, 1.0),
-            np.clip(unrealized_ret * 100, -5, 5)
-        ], dtype=np.float32)
-
-        full_obs = np.concatenate([obs_window, state_feat])
-        obs_norm = self.vec_norm.normalize_obs(full_obs)
-        action, _ = self.model.predict(obs_norm, deterministic=True)
-        action = int(action)
-
-
-        if sl_tp_closed:
-            self.first_bar = True
-            return 3
-
-
-        if action == 1:
-            if self.position == -1:
-                self._close(current_price)
-                self._open(1, current_price)
-                self.first_bar = True
-            elif self.position == 0:
-                self._open(1, current_price)
-                self.first_bar = True
-        elif action == 2:
-            if self.position == 1:
-                self._close(current_price)
-                self._open(-1, current_price)
-                self.first_bar = True
-            elif self.position == 0:
-                self._open(-1, current_price)
-                self.first_bar = True
-        elif action == 3:
-            if self.position != 0:
-                self._close(current_price)
-        else:
-            self.first_bar = False
-
-        if action != 1 and action != 2:
-            self.first_bar = False
-
-        return action
-
-
-def parse_mt5_data(data_str):
+def parse_mt5_data(data_str: str):
     try:
         parts = data_str.strip().split(";")
-        bars = parts[0].split("|")
+        bars_raw = parts[0].split("|") if parts and parts[0] else []
+        if not bars_raw:
+            return None, 0, 0.0, 0.0
 
+        fallback_times = _fallback_times(len(bars_raw))
         rows = []
-        for bar in bars:
-            values = bar.split(",")
-            rows.append({
-                'open': float(values[0]), 'high': float(values[1]),
-                'low': float(values[2]), 'close': float(values[3])
-            })
+        for i, bar in enumerate(bars_raw):
+            values = [v.strip() for v in bar.split(",")]
+            if len(values) < 4:
+                continue
 
-        df = pd.DataFrame(rows)
+            if len(values) >= 5:
+                ts_token = values[0]
+                try:
+                    ts = pd.to_datetime(int(float(ts_token)), unit="s")
+                except Exception:
+                    ts = pd.to_datetime(ts_token, errors="coerce")
+                if pd.isna(ts):
+                    ts = fallback_times[i]
+                offset = 1
+            else:
+                ts = fallback_times[i]
+                offset = 0
 
-        state_str = parts[1] if len(parts) > 1 else "0,10000,0,0,0,0,0.0,0.1"
-        state_values = state_str.split(",")
-        delta_tick = int(state_values[5]) if len(state_values) > 5 else 0
-        delta_price = float(state_values[6]) if len(state_values) > 6 else 0.0
-        lot_size = float(state_values[7]) if len(state_values) > 7 else 0.0
+            rows.append(
+                {
+                    "time": ts,
+                    "open": float(values[offset]),
+                    "high": float(values[offset + 1]),
+                    "low": float(values[offset + 2]),
+                    "close": float(values[offset + 3]),
+                }
+            )
+
+        if not rows:
+            return None, 0, 0.0, 0.0
+
+        df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+
+        state_str = parts[1] if len(parts) > 1 else ""
+        state_values = [v.strip() for v in state_str.split(",")] if state_str else []
+        delta_tick = int(float(state_values[5])) if len(state_values) > 5 and state_values[5] else 0
+        delta_price = float(state_values[6]) if len(state_values) > 6 and state_values[6] else 0.0
+        lot_size = float(state_values[7]) if len(state_values) > 7 and state_values[7] else 0.0
 
         return df, delta_tick, delta_price, lot_size
-    except Exception as e:
-        print(f" Parse error: {e}")
+    except Exception as exc:
+        print(f" Parse error: {exc}")
         return None, 0, 0.0, 0.0
 
 
 def main():
-    model, vec_norm = load_model()
-    bridge = PPOBridge(model, vec_norm)
+    semantic_runtime = SemanticRuntime(models_dir=MODELS_DIR)
+    feature_columns = build_feature_columns(semantic_runtime.semantic_feature_count)
+
+    model, vec_norm = load_model(feature_columns)
+    gate_stats_provider = GateStatsProvider()
+
+    bridge = PPOBridge(
+        model=model,
+        vec_norm=vec_norm,
+        feature_columns=feature_columns,
+        semantic_runtime=semantic_runtime,
+        semantic_feature_count=semantic_runtime.semantic_feature_count,
+        gate_stats=gate_stats_provider.initial(),
+    )
 
     context = zmq.Context()
     socket = context.socket(zmq.REP)
@@ -320,64 +237,84 @@ def main():
     bar_count = 0
     action_names = ["HOLD", "BUY", "SELL", "CLOSE"]
 
-    print("\n" + "="*60)
-    print(" PPO ZMQ Server v2.0 — Python-Managed State")
-    print("="*60)
+    print("\n" + "=" * 70)
+    print(" PPO ZMQ Server (MT5) - Test-Logic Aligned")
+    print("=" * 70)
     print(f" ZMQ Endpoint: {endpoint}")
     print(f" Model: {MODEL_PATH}")
-    print(f" SL={SL_PIPS} pips | TP={TP_PIPS} pips | Lot=Auto (Risk {RISK_PERCENT}%)")
-    print(f" Features: {len(FEATURE_COLUMNS)} | Window: {WINDOW_SIZE}")
-    print(f" State tracked internally (same as env_trading.py)")
-    print("="*60)
-    print("\n⏳ Waiting for MT5 Strategy Tester...\n")
+    print(f" VecNorm: {VEC_NORM_PATH}")
+    print(
+        f" SL={SL_PIPS} pips | TP={TP_PIPS} pips | "
+        f"Risk={RISK_PERCENT}% | InitialBalance={INITIAL_BALANCE}"
+    )
+    print(f" Feature count: {len(feature_columns)} (semantic={semantic_runtime.semantic_feature_count})")
+    print(f" Gate stats mode: {gate_stats_provider.mode}")
+    print(f" External lot sync: {SYNC_EXTERNAL_LOT}")
+    print(" Waiting for MT5 Strategy Tester...")
+    print("=" * 70 + "\n")
 
     try:
         while True:
             message = socket.recv()
-            data_str = message.decode('utf-8').strip()
+            data_str = message.decode("utf-8").strip()
 
             if not data_str:
                 socket.send_string("0")
                 continue
 
             df, delta_tick, delta_price, lot_from_ea = parse_mt5_data(data_str)
-
             if df is None or len(df) < WINDOW_SIZE:
                 socket.send_string("0")
                 continue
 
+            bridge.gate_stats = gate_stats_provider.update(df)
 
-            if lot_from_ea > 0:
+            if SYNC_EXTERNAL_LOT and lot_from_ea > 0:
                 bridge.lot_size = lot_from_ea
                 bridge.spread_cost = SPREAD_PIPS * PIP_VALUE * lot_from_ea
 
-            action = bridge.process_bar(df, delta_tick, delta_price)
-            bar_count += 1
+            try:
+                action, current_price = bridge.process_bar(df, delta_tick, delta_price)
+                action = int(action)
+            except Exception as exc:
+                print(f" process_bar error: {exc}")
+                socket.send_string("0")
+                continue
 
-            p = df['close'].iloc[-1]
-            wr = (bridge.wins / bridge.trades * 100) if bridge.trades > 0 else 0
+            bar_count += 1
+            win_rate = (bridge.wins / bridge.trades * 100.0) if bridge.trades > 0 else 0.0
 
             if bar_count % 50 == 0 or action != 0:
-                print(f"  #{bar_count:4d} | {action_names[action]:5s} | "
-                      f"Price: {p:.5f} | Pos: {bridge.position} | "
-                      f"Eq: ${bridge.equity:.2f} | "
-                      f"Trades: {bridge.trades} (WR:{wr:.1f}%) | "
-                      f"SL:{bridge.sl_hits} TP:{bridge.tp_hits}")
+                avg_q, low_q, q_count = semantic_runtime.quality_summary()
+                print(
+                    f" #{bar_count:5d} | {action_names[action]:5s} | "
+                    f"Price: {current_price:.5f} | Pos: {bridge.position:+d} | "
+                    f"Eq: {bridge.equity:.2f} | Trades: {bridge.trades} (WR:{win_rate:.1f}%) | "
+                    f"SL:{bridge.sl_hits} TP:{bridge.tp_hits} | "
+                    f"Qavg:{avg_q:.3f} low:{low_q}/{q_count}"
+                )
 
             socket.send_string(str(action))
 
     except KeyboardInterrupt:
-        ret = (bridge.equity / INITIAL_BALANCE - 1) * 100
-        print(f"\n\n{'='*60}")
-        print(f" Server stopped")
-        print(f"{'='*60}")
+        ret = (bridge.equity / INITIAL_BALANCE - 1.0) * 100.0
+        avg_q, low_q, q_count = semantic_runtime.quality_summary()
+        print("\n" + "=" * 70)
+        print(" Server stopped")
+        print("=" * 70)
         print(f" Bars processed: {bar_count}")
-        print(f" Equity: ${bridge.equity:.2f} ({ret:+.2f}%)")
-        print(f" Trades: {bridge.trades} | WR: {(bridge.wins/bridge.trades*100) if bridge.trades > 0 else 0:.1f}%")
-        print(f" SL Hits: {bridge.sl_hits} |  TP Hits: {bridge.tp_hits}")
-        print(f" Fees: ${bridge.total_fees:.2f}")
-        print(f"{'='*60}")
-        socket.close()
+        print(f" Equity: {bridge.equity:.2f} ({ret:+.2f}%)")
+        print(f" Trades: {bridge.trades} | WR: {(bridge.wins / bridge.trades * 100.0) if bridge.trades > 0 else 0.0:.1f}%")
+        print(f" SL Hits: {bridge.sl_hits} | TP Hits: {bridge.tp_hits}")
+        print(f" Fees: {bridge.total_fees:.2f}")
+        print(
+            " Semantic quality: "
+            f"avg={avg_q:.3f}, low={low_q}/{q_count}, "
+            f"matched={semantic_runtime.stats['matched']}, synthetic={semantic_runtime.stats['synthetic']}"
+        )
+        print("=" * 70)
+    finally:
+        socket.close(0)
         context.term()
 
 

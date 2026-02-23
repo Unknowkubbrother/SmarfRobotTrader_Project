@@ -127,7 +127,8 @@ string BuildDataString(int dTick, double dPrice) {
   for (int i = 0; i < copied; i++) {
     if (i > 0)
       data += "|";
-    data += DoubleToString(rates[i].open, _Digits) + "," +
+    data += LongToString((long)rates[i].time) + "," +
+            DoubleToString(rates[i].open, _Digits) + "," +
             DoubleToString(rates[i].high, _Digits) + "," +
             DoubleToString(rates[i].low, _Digits) + "," +
             DoubleToString(rates[i].close, _Digits);
