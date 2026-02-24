@@ -42,6 +42,9 @@ DEVIATION = int(os.getenv("LIVE_DEVIATION", "20"))
 POLL_SECONDS = float(os.getenv("LIVE_POLL_SECONDS", "1"))
 SYNC_EXTERNAL_LOT = os.getenv("LIVE_SYNC_EXTERNAL_LOT", "1").strip().lower() in {"1", "true", "yes"}
 EVAL_ON_START = os.getenv("LIVE_EVAL_ON_START", "0").strip().lower() in {"1", "true", "yes"}
+ENABLE_CATCHUP_REPLAY = os.getenv("LIVE_ENABLE_CATCHUP_REPLAY", "1").strip().lower() in {"1", "true", "yes"}
+MAX_CATCHUP_BARS = int(os.getenv("LIVE_CATCHUP_MAX_BARS", "0"))
+EXECUTE_STALE_REPLAY_ORDERS = os.getenv("LIVE_CATCHUP_EXECUTE_STALE", "0").strip().lower() in {"1", "true", "yes"}
 STATE_FILE = os.getenv("LIVE_STATE_FILE", os.path.join(MODELS_DIR, "run_live_state.json")).strip() or os.path.join(
     MODELS_DIR, "run_live_state.json"
 )
@@ -51,6 +54,29 @@ VEC_NORM_PATH = os.path.join(MODELS_DIR, "vec_normalize.pkl")
 
 
 mt5 = MetaTrader5(host=MT5_HOST, port=MT5_PORT)
+
+TIMEFRAME_SECONDS_MAP = {
+    "M1": 60,
+    "M2": 120,
+    "M3": 180,
+    "M4": 240,
+    "M5": 300,
+    "M6": 360,
+    "M10": 600,
+    "M12": 720,
+    "M15": 900,
+    "M20": 1200,
+    "M30": 1800,
+    "H1": 3600,
+    "H2": 7200,
+    "H3": 10800,
+    "H4": 14400,
+    "H6": 21600,
+    "H8": 28800,
+    "H12": 43200,
+    "D1": 86400,
+    "W1": 604800,
+}
 
 
 def _patch_numpy_bitgenerator_compat():
@@ -196,6 +222,7 @@ class LiveTradingBot:
 
         tf_attr = f"TIMEFRAME_{TIMEFRAME_NAME}"
         self.timeframe = getattr(mt5, tf_attr, mt5.TIMEFRAME_H1)
+        self.timeframe_seconds = int(TIMEFRAME_SECONDS_MAP.get(TIMEFRAME_NAME, 3600))
 
     def connect(self):
         if not mt5.initialize():
@@ -448,19 +475,43 @@ class LiveTradingBot:
         self.current_lot = self.bridge.lot_size
         self.last_known_ticket = current_ticket
 
-    def _fetch_window(self):
-        rates = mt5.copy_rates_from_pos(SYMBOL, self.timeframe, 1, BAR_HISTORY)
+    def _fetch_window(self, bar_end_ts: int):
+        rates = None
+        anchor_dt = datetime.fromtimestamp(max(1, int(bar_end_ts) - 1))
+
+        if hasattr(mt5, "copy_rates_from"):
+            try:
+                rates = mt5.copy_rates_from(SYMBOL, self.timeframe, anchor_dt, BAR_HISTORY)
+            except Exception:
+                rates = None
+
+        if rates is None and hasattr(mt5, "copy_rates_range"):
+            try:
+                lookback_secs = max(self.timeframe_seconds * BAR_HISTORY * 3, 86400)
+                start_dt = anchor_dt - timedelta(seconds=lookback_secs)
+                rates = mt5.copy_rates_range(SYMBOL, self.timeframe, start_dt, anchor_dt)
+            except Exception:
+                rates = None
+
+        if rates is None:
+            rates = mt5.copy_rates_from_pos(SYMBOL, self.timeframe, 1, BAR_HISTORY)
+
         if rates is None or len(rates) < BAR_HISTORY:
             return None
+
         df = pd.DataFrame(rates)
         if len(df) < BAR_HISTORY:
             return None
+
         df["time"] = pd.to_datetime(df["time"], unit="s")
-        return df[["time", "open", "high", "low", "close"]].sort_values("time").reset_index(drop=True)
+        df = df[["time", "open", "high", "low", "close"]].sort_values("time").reset_index(drop=True)
+        if len(df) > BAR_HISTORY:
+            df = df.tail(BAR_HISTORY).reset_index(drop=True)
+        return df
 
     def _calc_delta_for_closed_bar(self, current_bar_ts: int):
         end_dt = datetime.fromtimestamp(current_bar_ts)
-        start_dt = end_dt - timedelta(hours=1)
+        start_dt = end_dt - timedelta(seconds=self.timeframe_seconds)
         ticks = mt5.copy_ticks_range(SYMBOL, start_dt, end_dt, mt5.COPY_TICKS_ALL)
 
         if ticks is None or len(ticks) <= 1:
@@ -480,6 +531,79 @@ class LiveTradingBot:
         delta_tick = int(buy.sum() - sell.sum())
         delta_price = float((tdf["bid"].iloc[-1] - tdf["bid"].iloc[0]) + (tdf["ask"].iloc[-1] - tdf["ask"].iloc[0]))
         return delta_tick, delta_price
+
+    def _current_bar_time(self) -> int:
+        latest = mt5.copy_rates_from_pos(SYMBOL, self.timeframe, 0, 1)
+        if latest is None or len(latest) == 0:
+            return 0
+        return int(latest[0]["time"])
+
+    def _discover_missed_bar_ends(self, prev_bar_time: int, current_bar_time: int):
+        if current_bar_time <= prev_bar_time:
+            return []
+
+        bar_times = []
+        if hasattr(mt5, "copy_rates_range"):
+            try:
+                start_dt = datetime.fromtimestamp(prev_bar_time)
+                end_dt = datetime.fromtimestamp(current_bar_time)
+                rates = mt5.copy_rates_range(SYMBOL, self.timeframe, start_dt, end_dt)
+                if rates is not None and len(rates) > 0:
+                    rdf = pd.DataFrame(rates)
+                    if "time" in rdf.columns:
+                        bar_times = sorted(
+                            int(ts)
+                            for ts in rdf["time"].tolist()
+                            if int(ts) > prev_bar_time and int(ts) <= current_bar_time
+                        )
+            except Exception:
+                bar_times = []
+
+        if bar_times:
+            return bar_times
+
+        if self.timeframe_seconds <= 0:
+            return [current_bar_time]
+
+        ts = int(prev_bar_time + self.timeframe_seconds)
+        fallback = []
+        while ts <= current_bar_time:
+            fallback.append(ts)
+            ts += self.timeframe_seconds
+        return fallback
+
+    def _replay_missed_bars_if_any(self, current_bar_time: int):
+        if not ENABLE_CATCHUP_REPLAY:
+            return
+        if self.last_bar_time <= 0 or current_bar_time <= self.last_bar_time:
+            return
+
+        missed_bar_ends = self._discover_missed_bar_ends(self.last_bar_time, current_bar_time)
+        if not missed_bar_ends:
+            return
+
+        skipped = 0
+        if MAX_CATCHUP_BARS > 0 and len(missed_bar_ends) > MAX_CATCHUP_BARS:
+            skipped = len(missed_bar_ends) - MAX_CATCHUP_BARS
+            missed_bar_ends = missed_bar_ends[-MAX_CATCHUP_BARS:]
+
+        print(
+            " Catch-up replay | "
+            f"bars={len(missed_bar_ends)} skipped={skipped} "
+            f"execute_stale={int(EXECUTE_STALE_REPLAY_ORDERS)}"
+        )
+
+        total = len(missed_bar_ends)
+        for idx, bar_end_ts in enumerate(missed_bar_ends, start=1):
+            is_latest = idx == total
+            execute_orders = is_latest or EXECUTE_STALE_REPLAY_ORDERS
+            mode = f"Catch-up {idx}/{total}"
+            self.last_bar_time = int(bar_end_ts)
+            self._process_closed_bar(
+                bar_end_ts=int(bar_end_ts),
+                mode=mode,
+                execute_orders=execute_orders,
+            )
 
     def close_all(self):
         positions = mt5.positions_get(symbol=SYMBOL)
@@ -603,11 +727,10 @@ class LiveTradingBot:
         sys.stdout.write(line)
         sys.stdout.flush()
 
-    def _process_closed_bar(self, bar_end_ts: int, startup: bool = False):
-        mode = "Startup" if startup else "New Candle"
+    def _process_closed_bar(self, bar_end_ts: int, mode: str = "New Candle", execute_orders: bool = True):
         print(f"\n {mode}: processing closed bar -> {datetime.fromtimestamp(bar_end_ts)}")
 
-        window_df = self._fetch_window()
+        window_df = self._fetch_window(bar_end_ts)
         if window_df is None:
             print(" Not enough bars yet for model window")
             return
@@ -625,7 +748,10 @@ class LiveTradingBot:
             f"dTick={delta_tick} | dPrice={delta_price:.5f}"
         )
 
-        self.execute_action(action)
+        if execute_orders:
+            self.execute_action(action)
+        elif action != 0:
+            print(" Replay mode: stale-bar order skipped")
         self._sync_bridge_from_mt5()
         self._save_runtime_state(reason="bar_close")
 
@@ -639,24 +765,25 @@ class LiveTradingBot:
 
         try:
             while True:
-                latest = mt5.copy_rates_from_pos(SYMBOL, self.timeframe, 0, 1)
-                if latest is None or len(latest) == 0:
+                current_bar_time = self._current_bar_time()
+                if current_bar_time <= 0:
                     time.sleep(POLL_SECONDS)
                     continue
 
-                current_bar_time = int(latest[0]["time"])
                 if self.last_bar_time == 0:
                     self.last_bar_time = current_bar_time
                     if EVAL_ON_START:
-                        self._process_closed_bar(current_bar_time, startup=True)
+                        self._process_closed_bar(current_bar_time, mode="Startup", execute_orders=True)
                     self._sync_bridge_from_mt5()
                     self._print_status_line()
                     time.sleep(POLL_SECONDS)
                     continue
 
                 if current_bar_time != self.last_bar_time:
-                    self.last_bar_time = current_bar_time
-                    self._process_closed_bar(current_bar_time, startup=False)
+                    self._replay_missed_bars_if_any(current_bar_time)
+                    if self.last_bar_time != current_bar_time:
+                        self.last_bar_time = current_bar_time
+                        self._process_closed_bar(current_bar_time, mode="New Candle", execute_orders=True)
 
                 self._sync_bridge_from_mt5()
                 self._print_status_line()
