@@ -1,456 +1,497 @@
-from mt5linux import MetaTrader5
-import pandas as pd
-import numpy as np
-import time
 import os
 import sys
+import time
+import json
 from datetime import datetime, timedelta
+
+import pandas as pd
+from mt5linux import MetaTrader5
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
+
 RL_ROOT = os.path.dirname(os.path.abspath(__file__))
 CORE_DIR = os.path.join(RL_ROOT, "core")
-MODELS_DIR = os.path.join(RL_ROOT, "models")
-if CORE_DIR not in sys.path:
-    sys.path.insert(0, CORE_DIR)
+TEST_DIR = os.path.join(RL_ROOT, "test")
+for _path in (CORE_DIR, TEST_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
+from backtest_bridge import PPOBridge, calc_auto_lot
+from backtest_config import (
+    BAR_HISTORY,
+    MODELS_DIR,
+    PIP_VALUE,
+    RISK_PERCENT,
+    SL_PIPS,
+    SPREAD_PIPS,
+    TP_PIPS,
+    WINDOW_SIZE,
+)
+from backtest_features import build_feature_columns, build_gate_stats
+from backtest_semantic import SemanticRuntime
 from env_trading import TradingEnv
 
 
-mt5 = MetaTrader5(host="localhost", port=8001)
+MT5_HOST = os.getenv("MT5_HOST", "localhost").strip() or "localhost"
+MT5_PORT = int(os.getenv("MT5_PORT", "8001"))
+SYMBOL = os.getenv("LIVE_SYMBOL", "EURUSD").strip() or "EURUSD"
+TIMEFRAME_NAME = os.getenv("LIVE_TIMEFRAME", "H1").strip().upper()
+MAGIC_NUMBER = int(os.getenv("LIVE_MAGIC_NUMBER", "123456"))
+DEVIATION = int(os.getenv("LIVE_DEVIATION", "20"))
+POLL_SECONDS = float(os.getenv("LIVE_POLL_SECONDS", "1"))
+SYNC_EXTERNAL_LOT = os.getenv("LIVE_SYNC_EXTERNAL_LOT", "1").strip().lower() in {"1", "true", "yes"}
+EVAL_ON_START = os.getenv("LIVE_EVAL_ON_START", "0").strip().lower() in {"1", "true", "yes"}
+STATE_FILE = os.getenv("LIVE_STATE_FILE", os.path.join(MODELS_DIR, "run_live_state.json")).strip() or os.path.join(
+    MODELS_DIR, "run_live_state.json"
+)
 
-
-SYMBOL = "EURUSD"
-TIMEFRAME = mt5.TIMEFRAME_H1
-LOT_SIZE_FALLBACK = 0.01
-MAGIC_NUMBER = 123456
 MODEL_PATH = os.path.join(MODELS_DIR, "ppo_trading.zip")
 VEC_NORM_PATH = os.path.join(MODELS_DIR, "vec_normalize.pkl")
-DEVIATION = 20
-RISK_PERCENT = 1.0
 
 
-SL_PIPS = 50
-TP_PIPS = 50
-PIP_VALUE_PER_LOT = 10.0
+mt5 = MetaTrader5(host=MT5_HOST, port=MT5_PORT)
 
 
-def calc_auto_lot(balance, risk_pct=RISK_PERCENT, sl_pips=SL_PIPS,
-                  pip_value_per_lot=PIP_VALUE_PER_LOT, min_lot=0.01, lot_step=0.01):
-    risk_amount = balance * risk_pct / 100.0
-    lot = risk_amount / (sl_pips * pip_value_per_lot)
-    lot = max(min_lot, lot_step * int(lot / lot_step))
-    return round(lot, 2)
+def _patch_numpy_bitgenerator_compat():
+    try:
+        import numpy.random._pickle as np_pickle
+    except Exception:
+        return
+
+    original_ctor = getattr(np_pickle, "__bit_generator_ctor", None)
+    if original_ctor is None:
+        return
+    if getattr(original_ctor, "__name__", "") == "_compat_bit_generator_ctor":
+        return
+
+    tolerant_cache = {}
+
+    def _normalize_bg_name(value):
+        if isinstance(value, type):
+            return value.__name__
+        if isinstance(value, str):
+            if "PCG64DXSM" in value:
+                return "PCG64DXSM"
+            if "PCG64" in value:
+                return "PCG64"
+            if "MT19937" in value:
+                return "MT19937"
+            if "Philox" in value:
+                return "Philox"
+            if "SFC64" in value:
+                return "SFC64"
+            return value
+        return str(value)
+
+    def _build_tolerant_bitgen(base_cls):
+        cached = tolerant_cache.get(base_cls)
+        if cached is not None:
+            return cached
+
+        class _TolerantBitGen(base_cls):
+            def __setstate__(self, state):
+                try:
+                    super().__setstate__(state)
+                    return
+                except Exception:
+                    pass
+
+                if isinstance(state, tuple):
+                    for candidate in state:
+                        if isinstance(candidate, dict):
+                            try:
+                                super().__setstate__(candidate)
+                                return
+                            except Exception:
+                                continue
+                return
+
+        _TolerantBitGen.__name__ = f"Compat{base_cls.__name__}"
+        tolerant_cache[base_cls] = _TolerantBitGen
+        return _TolerantBitGen
+
+    def _compat_bit_generator_ctor(bit_generator_name="MT19937"):
+        normalized = _normalize_bg_name(bit_generator_name)
+        base_cls = None
+        if isinstance(bit_generator_name, type):
+            base_cls = bit_generator_name
+        elif hasattr(np_pickle, "BitGenerators") and normalized in np_pickle.BitGenerators:
+            base_cls = np_pickle.BitGenerators[normalized]
+
+        if base_cls is None:
+            return original_ctor(normalized)
+
+        tolerant_cls = _build_tolerant_bitgen(base_cls)
+        return tolerant_cls()
+
+    np_pickle.__bit_generator_ctor = _compat_bit_generator_ctor
 
 
-FEATURE_COLUMNS = [
-    'return', 'range', 'delta_tick', 'delta_price',
-    'body_ratio', 'momentum',
-    'sma_cross', 'rsi_norm', 'atr_norm', 'trend', 'adx'
-]
+class GateStatsProvider:
+    def __init__(self):
+        self._history = pd.DataFrame(columns=["time", "open", "high", "low", "close"])
+
+    def update(self, window_df: pd.DataFrame):
+        incremental = (
+            window_df[["time", "open", "high", "low", "close"]]
+            .copy()
+            .sort_values("time")
+            .drop_duplicates(subset=["time"], keep="last")
+        )
+        if self._history.empty:
+            self._history = incremental.reset_index(drop=True)
+        else:
+            self._history = (
+                pd.concat([self._history, incremental], ignore_index=True)
+                .sort_values("time")
+                .drop_duplicates(subset=["time"], keep="last")
+                .reset_index(drop=True)
+            )
+        if len(self._history) < WINDOW_SIZE:
+            return {}
+        return build_gate_stats(self._history)
+
+    def to_records(self, max_rows: int = 800):
+        if self._history.empty:
+            return []
+        tail = self._history.tail(max_rows).copy()
+        tail["time"] = pd.to_datetime(tail["time"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+        return tail.to_dict(orient="records")
+
+    def load_records(self, rows):
+        if not rows:
+            self._history = pd.DataFrame(columns=["time", "open", "high", "low", "close"])
+            return
+        df = pd.DataFrame(rows)
+        expected = ["time", "open", "high", "low", "close"]
+        missing = [c for c in expected if c not in df.columns]
+        if missing:
+            self._history = pd.DataFrame(columns=expected)
+            return
+        df = df[expected].copy()
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        df = df.dropna(subset=["time"]).sort_values("time").drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
+        self._history = df
+
 
 class LiveTradingBot:
     def __init__(self):
         self.model = None
         self.vec_norm = None
-        self.hold_steps = 0
-        self.last_trade_action = 0
+        self.bridge = None
+        self.semantic_runtime = None
+        self.feature_columns = None
+        self.gate_provider = GateStatsProvider()
+
         self.initial_balance = 0.0
+        self.current_lot = 0.01
         self.point = 0.00001
         self.digits = 5
-        self.current_lot = LOT_SIZE
+        self.pip_size = 0.0001
+        self.last_bar_time = 0
+        self.last_known_ticket = 0
+        self.state_file = STATE_FILE
+        self.state_loaded = False
 
-
-        self.sl_hits = 0
-        self.tp_hits = 0
-        self.entry_price = 0.0
-        self.current_sl = 0.0
-        self.current_tp = 0.0
+        tf_attr = f"TIMEFRAME_{TIMEFRAME_NAME}"
+        self.timeframe = getattr(mt5, tf_attr, mt5.TIMEFRAME_H1)
 
     def connect(self):
         if not mt5.initialize():
-            print(" initialize() failed")
-            quit()
-
+            raise RuntimeError("initialize() failed")
 
         account_info = mt5.account_info()
         if account_info is None:
-            print(" Failed to get account info")
-            quit()
-
-        print(f" MT5 Connected. Account: {account_info.login}")
-        self.initial_balance = account_info.balance
-
-
-        self.current_lot = calc_auto_lot(self.initial_balance)
-        print(f" Balance: ${self.initial_balance:.2f} | Auto Lot: {self.current_lot}")
-
+            raise RuntimeError("Failed to get account info")
 
         symbol_info = mt5.symbol_info(SYMBOL)
         if symbol_info is None:
-            print(f" Symbol {SYMBOL} not found")
-            quit()
+            raise RuntimeError(f"Symbol {SYMBOL} not found")
 
-        if not symbol_info.visible:
-            print(f" Symbol {SYMBOL} is not visible, trying to select...")
-            if not mt5.symbol_select(SYMBOL, True):
-                print(f" symbol_select({SYMBOL}) failed")
-                quit()
+        if not symbol_info.visible and not mt5.symbol_select(SYMBOL, True):
+            raise RuntimeError(f"symbol_select({SYMBOL}) failed")
 
-        self.point = symbol_info.point
-        self.digits = symbol_info.digits
-        print(f"ℹ Symbol Info: Point={self.point}, Digits={self.digits}")
+        self.initial_balance = float(account_info.balance)
+        self.current_lot = max(0.01, calc_auto_lot(self.initial_balance))
+        self.point = float(symbol_info.point)
+        self.digits = int(symbol_info.digits)
+        self.pip_size = self.point * 10 if self.digits in (3, 5) else self.point
 
-    def load_model(self):
-        print(f" Loading Model: {MODEL_PATH}")
-        self.model = PPO.load(MODEL_PATH)
+        print(f" MT5 Connected. Account: {account_info.login}")
+        print(f" Symbol={SYMBOL} | Timeframe={TIMEFRAME_NAME} | Point={self.point} | Digits={self.digits}")
+        print(f" Balance={self.initial_balance:.2f} | AutoLot={self.current_lot}")
 
+    def _load_model(self):
+        self.semantic_runtime = SemanticRuntime(models_dir=MODELS_DIR)
+        self.feature_columns = build_feature_columns(self.semantic_runtime.semantic_feature_count)
 
-        print(f"Stats Loading: {VEC_NORM_PATH}")
-        dummy_df = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'tick_volume'])
-
+        _patch_numpy_bitgenerator_compat()
 
         dummy_data = {
-            'time': [datetime.now()] * 80,
-            'open': [1.0] * 80, 'high': [1.0] * 80, 'low': [1.0] * 80, 'close': [1.0] * 80,
-            'delta_tick': [0]*80, 'delta_price': [0]*80,
-            'sma_cross': [0]*80, 'rsi_norm': [0]*80, 'atr_norm': [0]*80, 'trend': [0]*80
+            "time": [pd.Timestamp.now()] * 80,
+            "open": [1.0] * 80,
+            "high": [1.0] * 80,
+            "low": [1.0] * 80,
+            "close": [1.0] * 80,
         }
+        for col in self.feature_columns:
+            if col not in dummy_data:
+                dummy_data[col] = [0.0] * 80
+
         mock_df = pd.DataFrame(dummy_data)
-        dummy_env = DummyVecEnv([lambda: TradingEnv(mock_df)])
+        dummy_env = DummyVecEnv(
+            [
+                lambda: TradingEnv(
+                    mock_df,
+                    lot_size=max(0.01, calc_auto_lot(self.initial_balance or 100.0)),
+                    sl_pips=SL_PIPS,
+                    tp_pips=TP_PIPS,
+                )
+            ]
+        )
 
         self.vec_norm = VecNormalize.load(VEC_NORM_PATH, dummy_env)
         self.vec_norm.training = False
         self.vec_norm.norm_reward = False
 
-    def get_market_features(self):
-
-
-        rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 1, 30)
-        df = pd.DataFrame(rates)
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-
-
-        df['return'] = df['close'].pct_change().fillna(0)
-        df['range'] = (df['high'] - df['low']) / df['close']
-
-        full_range = df['high'] - df['low']
-        df['body_ratio'] = np.where(full_range > 0, abs(df['close'] - df['open']) / full_range, 0)
-
-        df['momentum'] = df['return'].rolling(window=5).sum().fillna(0)
-
-
-        now = datetime.now()
-        one_hour_ago = now - timedelta(hours=1)
-        ticks = mt5.copy_ticks_range(SYMBOL, one_hour_ago, now, mt5.COPY_TICKS_ALL)
-
-        delta_tick = 0
-        delta_price = 0.0
-
-        if ticks is not None and len(ticks) > 0:
-            tdf = pd.DataFrame(ticks)
-
-
-            tdf['prev_bid'] = tdf['bid'].shift(1)
-            tdf['prev_ask'] = tdf['ask'].shift(1)
-
-            buy = (tdf['bid'] > tdf['prev_bid']) | ((tdf['bid'] == tdf['prev_bid']) & (tdf['ask'] > tdf['prev_ask']))
-            sell = (tdf['bid'] < tdf['prev_bid']) | ((tdf['bid'] == tdf['prev_bid']) & (tdf['ask'] < tdf['prev_ask']))
-
-            delta_tick = buy.sum() - sell.sum()
-            delta_price = (tdf['bid'].iloc[-1] - tdf['bid'].iloc[0]) + (tdf['ask'].iloc[-1] - tdf['ask'].iloc[0])
-
-
-        last_row = df.iloc[-1].copy()
-
-
-        features = np.array([
-            last_row['return'],
-            last_row['range'],
-            delta_tick,
-            delta_price,
-            last_row['body_ratio'],
-            last_row['momentum']
-        ], dtype=np.float32)
-
-        return features
-
-    def get_state_features(self):
-
-
-        positions = mt5.positions_get(symbol=SYMBOL)
-        current_position = 0
-        unrealized_pnl = 0.0
-
-        if positions is not None and len(positions) > 0:
-            pos = positions[0]
-            if pos.type == mt5.ORDER_TYPE_BUY:
-                current_position = 1
-            elif pos.type == mt5.ORDER_TYPE_SELL:
-                current_position = -1
-            unrealized_pnl = pos.profit
-            self.entry_price = pos.price_open
-            self.current_sl = pos.sl
-            self.current_tp = pos.tp
-
-
-            if current_position == self.last_trade_action:
-                self.hold_steps += 1
-            else:
-                self.hold_steps = 0
-                self.last_trade_action = current_position
-        else:
-            self.hold_steps = 0
-            self.last_trade_action = 0
-            self.entry_price = 0.0
-            self.current_sl = 0.0
-            self.current_tp = 0.0
-
-
-        account = mt5.account_info()
-        pip_size = self.point * 10
-        pip_value = 10.0
-        point_value = pip_value * LOT_SIZE
-
-        realized_pnl = account.balance - self.initial_balance
-        total_pnl_pips = realized_pnl / point_value if point_value > 0 else 0.0
-
-
-        hold_norm = min(self.hold_steps / 30.0, 1.0)
-
-
-        unrealized_ret = 0.0
-        unrealized_pips = 0.0
-        if current_position != 0 and self.entry_price > 0:
-            tick = mt5.symbol_info_tick(SYMBOL)
-            if tick:
-                current_price = tick.bid if current_position == 1 else tick.ask
-                unrealized_ret = current_position * (current_price - self.entry_price) / self.entry_price
-                unrealized_pips = current_position * (current_price - self.entry_price) / pip_size
-
-        state = np.array([
-            current_position,
-            total_pnl_pips / 1000.0,
-            unrealized_pips / 100.0,
-            hold_norm,
-            np.clip(unrealized_ret * 100, -5, 5)
-        ], dtype=np.float32)
-
-        return state, current_position
-
-    def run(self):
-        self.connect()
-        self.load_model()
-
-        print("Waiting for next candle...")
-        last_time = 0
-
-        while True:
-
-            rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 1)
-            current_time = rates[0]['time']
-
-            if current_time != last_time:
-                print(f"\n⏰ New Candle: {datetime.fromtimestamp(current_time)}")
-                last_time = current_time
-
-
-                market_feat = self.get_market_features()
-                state_feat, current_pos = self.get_state_features()
-
-
-                rates_window = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 1, 80)
-                df_window = pd.DataFrame(rates_window)
-                df_window['time'] = pd.to_datetime(df_window['time'], unit='s')
-
-
-                df_window['return'] = df_window['close'].pct_change().fillna(0)
-                df_window['range'] = (df_window['high'] - df_window['low']) / df_window['close']
-                full_range = df_window['high'] - df_window['low']
-                df_window['body_ratio'] = np.where(full_range > 0, abs(df_window['close'] - df_window['open']) / full_range, 0)
-                df_window['momentum'] = df_window['return'].rolling(window=5).sum().fillna(0)
-
-
-                df_window['delta_tick'] = 0
-                df_window['delta_price'] = 0.0
-
-
-                sma20 = df_window['close'].rolling(20).mean()
-                sma50 = df_window['close'].rolling(50).mean()
-                df_window['sma_cross'] = np.where(sma20 > sma50, 1, np.where(sma20 < sma50, -1, 0))
-                df_window['sma_cross'] = df_window['sma_cross'].fillna(0)
-
-                delta_c = df_window['close'].diff()
-                gain = delta_c.clip(lower=0).rolling(14).mean()
-                loss_c = (-delta_c.clip(upper=0)).rolling(14).mean()
-                rs = gain / (loss_c + 1e-10)
-                rsi = 100 - (100 / (1 + rs))
-                df_window['rsi_norm'] = ((rsi - 50) / 50).fillna(0)
-
-                tr = np.maximum(
-                    df_window['high'] - df_window['low'],
-                    np.maximum(
-                        abs(df_window['high'] - df_window['close'].shift(1)),
-                        abs(df_window['low'] - df_window['close'].shift(1))
-                    )
-                )
-                df_window['atr_norm'] = (tr.rolling(14).mean() / df_window['close']).fillna(0)
-
-                df_window['trend'] = (sma20.pct_change(5) * 100).fillna(0)
-                df_window['trend'] = df_window['trend'].clip(-2, 2)
-
-
-                tr_adx = np.maximum(
-                    df_window['high'] - df_window['low'],
-                    np.maximum(
-                        abs(df_window['high'] - df_window['close'].shift(1)),
-                        abs(df_window['low'] - df_window['close'].shift(1))
-                    )
-                )
-                plus_dm = np.where((df_window['high'] - df_window['high'].shift(1)) > (df_window['low'].shift(1) - df_window['low']),
-                                    np.maximum(df_window['high'] - df_window['high'].shift(1), 0), 0)
-                minus_dm = np.where((df_window['low'].shift(1) - df_window['low']) > (df_window['high'] - df_window['high'].shift(1)),
-                                     np.maximum(df_window['low'].shift(1) - df_window['low'], 0), 0)
-                atr14_adx = pd.Series(tr_adx).rolling(14).mean()
-                plus_di = 100 * pd.Series(plus_dm).rolling(14).mean() / (atr14_adx + 1e-10)
-                minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / (atr14_adx + 1e-10)
-                dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
-                adx_raw = dx.rolling(14).mean()
-                df_window['adx'] = ((adx_raw - 25) / 25).fillna(0).clip(-1, 1)
-
-
-                obs_window = df_window[FEATURE_COLUMNS].iloc[-20:].values.flatten().astype(np.float32)
-
-                full_obs = np.concatenate([obs_window, state_feat])
-
-
-                obs_norm = self.vec_norm.normalize_obs(full_obs)
-
-
-                action, _ = self.model.predict(obs_norm, deterministic=True)
-                action_names = {0: 'HOLD', 1: 'BUY', 2: 'SELL', 3: 'CLOSE'}
-                print(f" Prediction: {action_names.get(int(action), '?')} (Pos: {current_pos})")
-
-
-                self.execute_trade(action, current_pos)
-
-
-            tick = mt5.symbol_info_tick(SYMBOL)
-            if tick and len(rates) > 0:
-
-
-                positions = mt5.positions_get(symbol=SYMBOL)
-                sl_tp_info = ""
-                if positions is not None and len(positions) > 0:
-                    pos = positions[0]
-                    current_pnl = pos.profit
-                    sl_tp_info = f" | SL:{pos.sl:.{self.digits}f} TP:{pos.tp:.{self.digits}f} PnL:{current_pnl:+.2f}"
-
-
-                    if pos.sl == 0.0 or pos.tp == 0.0:
-                        bid = tick.bid
-                        ask = tick.ask
-                        sl_pips_price = SL_PIPS * self.point
-                        tp_pips_price = TP_PIPS * self.point
-
-                        should_close = False
-                        close_reason = ""
-
-                        if pos.type == mt5.ORDER_TYPE_BUY:
-                            if bid <= pos.price_open - sl_pips_price:
-                                should_close = True
-                                close_reason = "SL_HIT"
-                                self.sl_hits += 1
-                            elif bid >= pos.price_open + tp_pips_price:
-                                should_close = True
-                                close_reason = "TP_HIT"
-                                self.tp_hits += 1
-                        elif pos.type == mt5.ORDER_TYPE_SELL:
-                            if ask >= pos.price_open + sl_pips_price:
-                                should_close = True
-                                close_reason = "SL_HIT"
-                                self.sl_hits += 1
-                            elif ask <= pos.price_open - tp_pips_price:
-                                should_close = True
-                                close_reason = "TP_HIT"
-                                self.tp_hits += 1
-
-                        if should_close:
-                            print(f"\n {close_reason}! Closing position immediately...")
-                            print(f"   Entry: {pos.price_open:.{self.digits}f} | Current PnL: {current_pnl:+.2f}")
-                            print(f"   SL hits: {self.sl_hits} | TP hits: {self.tp_hits}")
-                            self.close_all()
-                            continue
-
-
-                current_rate = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 1)
-
-                current_delta = 0
-                current_delta_price = 0.0
-
-                if current_rate is not None and len(current_rate) > 0:
-                    candle_start_ts = current_rate[0]['time']
-                    candle_start_dt = datetime.fromtimestamp(candle_start_ts)
-
-                    ticks = mt5.copy_ticks_from(SYMBOL, candle_start_dt, 10000, mt5.COPY_TICKS_ALL)
-
-                    if ticks is not None and len(ticks) > 0:
-                        tdf = pd.DataFrame(ticks)
-                        tdf['prev_bid'] = tdf['bid'].shift(1)
-                        tdf['prev_ask'] = tdf['ask'].shift(1)
-
-                        buy = (tdf['bid'] > tdf['prev_bid']) | ((tdf['bid'] == tdf['prev_bid']) & (tdf['ask'] > tdf['prev_ask']))
-                        sell = (tdf['bid'] < tdf['prev_bid']) | ((tdf['bid'] == tdf['prev_bid']) & (tdf['ask'] < tdf['prev_ask']))
-                        current_delta = buy.sum() - sell.sum()
-                        current_delta_price = (tdf['bid'].iloc[-1] - tdf['bid'].iloc[0]) + (tdf['ask'].iloc[-1] - tdf['ask'].iloc[0])
-
-                server_time_str = datetime.fromtimestamp(tick.time).strftime('%H:%M:%S')
-                local_time_str = datetime.now().strftime('%H:%M')
-                status_line = f" Pr: {tick.bid:.{self.digits}f} |  DT: {current_delta} |  DP: {current_delta_price:.{self.digits}f}{sl_tp_info} | ⏳ {server_time_str} ({local_time_str})      "
-                sys.stdout.write(f"\r{status_line}")
-                sys.stdout.flush()
-
-            time.sleep(1)
-
-    def execute_trade(self, action, current_pos):
-
-
-        if action == 0:
+        self.model = PPO.load(MODEL_PATH)
+
+        self.bridge = PPOBridge(
+            model=self.model,
+            vec_norm=self.vec_norm,
+            feature_columns=self.feature_columns,
+            semantic_runtime=self.semantic_runtime,
+            semantic_feature_count=self.semantic_runtime.semantic_feature_count,
+            gate_stats={},
+        )
+
+        print(" Model + VecNormalize loaded")
+        print(
+            " Pipeline: test-aligned (semantic fallback + adaptive gate) | "
+            f"features={len(self.feature_columns)}"
+        )
+
+    def _runtime_state_payload(self):
+        if self.bridge is None:
+            return {}
+        current_pos, pos = self._get_mt5_position()
+        current_ticket = int(pos.ticket) if pos is not None else 0
+        return {
+            "version": 1,
+            "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": SYMBOL,
+            "timeframe": TIMEFRAME_NAME,
+            "last_bar_time": int(self.last_bar_time),
+            "last_known_ticket": int(current_ticket or self.last_known_ticket),
+            "bridge": {
+                "position": int(self.bridge.position),
+                "entry_price": float(self.bridge.entry_price),
+                "hold_steps": int(self.bridge.hold_steps),
+                "first_bar": bool(self.bridge.first_bar),
+                "trade_cooldown": int(self.bridge.trade_cooldown),
+                "defensive_mode_bars": int(self.bridge.defensive_mode_bars),
+                "defensive_triggers": int(self.bridge.defensive_triggers),
+                "loss_streak": int(self.bridge.loss_streak),
+                "skipped_signals": int(self.bridge.skipped_signals),
+                "margin_skips": int(self.bridge.margin_skips),
+                "defensive_skips": int(self.bridge.defensive_skips),
+                "semantic_skips": int(self.bridge.semantic_skips),
+                "trades": int(self.bridge.trades),
+                "wins": int(self.bridge.wins),
+                "total_pnl": float(self.bridge.total_pnl),
+                "total_fees": float(self.bridge.total_fees),
+                "max_equity": float(self.bridge.max_equity),
+                "recent_trade_pips": [float(x) for x in list(self.bridge.recent_trade_pips)],
+                "gate_stats": {k: float(v) for k, v in dict(self.bridge.gate_stats or {}).items()},
+            },
+            "gate_history": self.gate_provider.to_records(max_rows=max(BAR_HISTORY * 2, 400)),
+        }
+
+    def _save_runtime_state(self, reason: str = "periodic"):
+        if self.bridge is None:
+            return
+        payload = self._runtime_state_payload()
+        if not payload:
+            return
+        try:
+            state_dir = os.path.dirname(self.state_file)
+            if state_dir:
+                os.makedirs(state_dir, exist_ok=True)
+            tmp_path = f"{self.state_file}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=True)
+            os.replace(tmp_path, self.state_file)
+        except Exception as exc:
+            print(f" State save failed ({reason}): {exc}")
+
+    def _load_runtime_state(self):
+        if self.bridge is None:
+            return
+        if not os.path.exists(self.state_file):
             return
 
-        elif action == 3:
-            if current_pos != 0:
-                self.close_all()
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception as exc:
+            print(f" State load skipped (invalid file): {exc}")
+            return
 
-        elif action == 1:
-            if current_pos == -1: self.close_all()
-            if current_pos <= 0: self.send_order(mt5.ORDER_TYPE_BUY)
+        if str(payload.get("symbol", "")).upper() != SYMBOL.upper():
+            print(" State file symbol mismatch; ignored.")
+            return
+        if str(payload.get("timeframe", "")).upper() != TIMEFRAME_NAME.upper():
+            print(" State file timeframe mismatch; ignored.")
+            return
 
-        elif action == 2:
-            if current_pos == 1: self.close_all()
-            if current_pos >= 0: self.send_order(mt5.ORDER_TYPE_SELL)
+        bridge_state = payload.get("bridge", {})
+        if isinstance(bridge_state, dict):
+            self.bridge.position = int(bridge_state.get("position", self.bridge.position))
+            self.bridge.entry_price = float(bridge_state.get("entry_price", self.bridge.entry_price))
+            self.bridge.hold_steps = int(max(0, bridge_state.get("hold_steps", self.bridge.hold_steps)))
+            self.bridge.first_bar = bool(bridge_state.get("first_bar", self.bridge.first_bar))
+            self.bridge.trade_cooldown = int(max(0, bridge_state.get("trade_cooldown", self.bridge.trade_cooldown)))
+            self.bridge.defensive_mode_bars = int(max(0, bridge_state.get("defensive_mode_bars", self.bridge.defensive_mode_bars)))
+            self.bridge.defensive_triggers = int(max(0, bridge_state.get("defensive_triggers", self.bridge.defensive_triggers)))
+            self.bridge.loss_streak = int(max(0, bridge_state.get("loss_streak", self.bridge.loss_streak)))
+            self.bridge.skipped_signals = int(max(0, bridge_state.get("skipped_signals", self.bridge.skipped_signals)))
+            self.bridge.margin_skips = int(max(0, bridge_state.get("margin_skips", self.bridge.margin_skips)))
+            self.bridge.defensive_skips = int(max(0, bridge_state.get("defensive_skips", self.bridge.defensive_skips)))
+            self.bridge.semantic_skips = int(max(0, bridge_state.get("semantic_skips", self.bridge.semantic_skips)))
+            self.bridge.trades = int(max(0, bridge_state.get("trades", self.bridge.trades)))
+            self.bridge.wins = int(max(0, bridge_state.get("wins", self.bridge.wins)))
+            self.bridge.total_pnl = float(bridge_state.get("total_pnl", self.bridge.total_pnl))
+            self.bridge.total_fees = float(bridge_state.get("total_fees", self.bridge.total_fees))
+            self.bridge.max_equity = float(bridge_state.get("max_equity", self.bridge.max_equity))
+            self.bridge.gate_stats = dict(bridge_state.get("gate_stats", self.bridge.gate_stats or {}))
 
-    def get_filling_mode(self):
+            recent = bridge_state.get("recent_trade_pips", [])
+            try:
+                self.bridge.recent_trade_pips.clear()
+                maxlen = int(self.bridge.recent_trade_pips.maxlen or 20)
+                for val in list(recent)[-maxlen:]:
+                    self.bridge.recent_trade_pips.append(float(val))
+            except Exception:
+                pass
+
+        self.last_bar_time = int(max(0, payload.get("last_bar_time", self.last_bar_time)))
+        self.last_known_ticket = int(max(0, payload.get("last_known_ticket", self.last_known_ticket)))
+        self.gate_provider.load_records(payload.get("gate_history", []))
+        self.state_loaded = True
+        print(
+            " Runtime state restored | "
+            f"cooldown={self.bridge.trade_cooldown} "
+            f"def_mode={self.bridge.defensive_mode_bars} "
+            f"loss_streak={self.bridge.loss_streak} "
+            f"hold_steps={self.bridge.hold_steps}"
+        )
+
+    def _get_filling_mode(self):
         symbol_info = mt5.symbol_info(SYMBOL)
         if symbol_info is None:
             return mt5.ORDER_FILLING_FOK
 
-        filling_mode = symbol_info.filling_mode
+        filling_mode = int(symbol_info.filling_mode)
         if filling_mode & 1:
             return mt5.ORDER_FILLING_FOK
-        elif filling_mode & 2:
+        if filling_mode & 2:
             return mt5.ORDER_FILLING_IOC
+        return mt5.ORDER_FILLING_RETURNAL
+
+    def _get_mt5_position(self):
+        positions = mt5.positions_get(symbol=SYMBOL)
+        if positions is None or len(positions) == 0:
+            return 0, None
+        pos = positions[0]
+        if pos.type == mt5.ORDER_TYPE_BUY:
+            return 1, pos
+        if pos.type == mt5.ORDER_TYPE_SELL:
+            return -1, pos
+        return 0, pos
+
+    def _sync_bridge_from_mt5(self):
+        if self.bridge is None:
+            return
+
+        account = mt5.account_info()
+        if account is None:
+            return
+
+        prev_pos = int(self.bridge.position)
+        current_pos, pos = self._get_mt5_position()
+        current_ticket = int(pos.ticket) if pos is not None else 0
+
+        self.bridge.position = current_pos
+        if current_pos != 0 and pos is not None:
+            self.bridge.entry_price = float(pos.price_open)
+            if prev_pos != current_pos or (self.last_known_ticket != 0 and self.last_known_ticket != current_ticket):
+                self.bridge.hold_steps = 0
+                self.bridge.first_bar = True
         else:
-            return mt5.ORDER_FILLING_RETURNAL
+            self.bridge.entry_price = 0.0
+            self.bridge.hold_steps = 0
+            self.bridge.unrealized_pnl = 0.0
+            self.bridge.first_bar = False
+
+        self.bridge.balance = float(account.balance)
+        self.bridge.equity = float(account.equity)
+        self.bridge.total_pnl = float(account.balance - self.initial_balance)
+        self.bridge.max_equity = max(float(self.bridge.max_equity), float(self.bridge.equity))
+
+        if SYNC_EXTERNAL_LOT and pos is not None and float(pos.volume) > 0:
+            self.bridge.lot_size = float(pos.volume)
+        else:
+            self.bridge.lot_size = max(0.01, calc_auto_lot(float(account.balance)))
+        self.bridge.spread_cost = SPREAD_PIPS * PIP_VALUE * self.bridge.lot_size
+
+        self.current_lot = self.bridge.lot_size
+        self.last_known_ticket = current_ticket
+
+    def _fetch_window(self):
+        rates = mt5.copy_rates_from_pos(SYMBOL, self.timeframe, 1, BAR_HISTORY)
+        if rates is None or len(rates) < BAR_HISTORY:
+            return None
+        df = pd.DataFrame(rates)
+        if len(df) < BAR_HISTORY:
+            return None
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        return df[["time", "open", "high", "low", "close"]].sort_values("time").reset_index(drop=True)
+
+    def _calc_delta_for_closed_bar(self, current_bar_ts: int):
+        end_dt = datetime.fromtimestamp(current_bar_ts)
+        start_dt = end_dt - timedelta(hours=1)
+        ticks = mt5.copy_ticks_range(SYMBOL, start_dt, end_dt, mt5.COPY_TICKS_ALL)
+
+        if ticks is None or len(ticks) <= 1:
+            return 0, 0.0
+
+        tdf = pd.DataFrame(ticks)
+        tdf["prev_bid"] = tdf["bid"].shift(1)
+        tdf["prev_ask"] = tdf["ask"].shift(1)
+
+        buy = (tdf["bid"] > tdf["prev_bid"]) | (
+            (tdf["bid"] == tdf["prev_bid"]) & (tdf["ask"] > tdf["prev_ask"])
+        )
+        sell = (tdf["bid"] < tdf["prev_bid"]) | (
+            (tdf["bid"] == tdf["prev_bid"]) & (tdf["ask"] < tdf["prev_ask"])
+        )
+
+        delta_tick = int(buy.sum() - sell.sum())
+        delta_price = float((tdf["bid"].iloc[-1] - tdf["bid"].iloc[0]) + (tdf["ask"].iloc[-1] - tdf["ask"].iloc[0]))
+        return delta_tick, delta_price
 
     def close_all(self):
         positions = mt5.positions_get(symbol=SYMBOL)
         if positions is None:
             return
+
         for pos in positions:
             tick = mt5.symbol_info_tick(SYMBOL)
+            if tick is None:
+                continue
+
             price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
-            filling_mode = self.get_filling_mode()
             req = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "position": pos.ticket,
@@ -461,23 +502,24 @@ class LiveTradingBot:
                 "deviation": DEVIATION,
                 "magic": MAGIC_NUMBER,
                 "comment": "AI Close",
-                "type_filling": filling_mode,
+                "type_filling": self._get_filling_mode(),
             }
             res = mt5.order_send(req)
             if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                print(f"\n Closed Position | PnL: {pos.profit:+.2f}")
+                print(f" Closed Position | ticket={pos.ticket} | PnL={pos.profit:+.2f}")
             else:
-                comment = res.comment if res else 'No response'
-                print(f"\n Close Failed: {comment}")
+                comment = res.comment if res else "No response"
+                print(f" Close Failed | ticket={pos.ticket} | {comment}")
 
     def send_order(self, order_type):
         tick = mt5.symbol_info_tick(SYMBOL)
+        if tick is None:
+            print(" Order Failed: no symbol tick")
+            return
+
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
-        filling_mode = self.get_filling_mode()
-
-
-        sl_distance = SL_PIPS * self.point
-        tp_distance = TP_PIPS * self.point
+        sl_distance = SL_PIPS * self.pip_size
+        tp_distance = TP_PIPS * self.pip_size
 
         if order_type == mt5.ORDER_TYPE_BUY:
             sl_price = round(price - sl_distance, self.digits)
@@ -486,10 +528,9 @@ class LiveTradingBot:
             sl_price = round(price + sl_distance, self.digits)
             tp_price = round(price - tp_distance, self.digits)
 
-
         account = mt5.account_info()
-        if account:
-            self.current_lot = calc_auto_lot(account.balance)
+        if account is not None:
+            self.current_lot = max(0.01, calc_auto_lot(float(account.balance), risk_pct=RISK_PERCENT))
 
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -503,17 +544,133 @@ class LiveTradingBot:
             "magic": MAGIC_NUMBER,
             "comment": "AI Trade",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": filling_mode,
+            "type_filling": self._get_filling_mode(),
         }
+
         res = mt5.order_send(req)
-        if res.retcode == mt5.TRADE_RETCODE_DONE:
-            side = 'BUY' if order_type == mt5.ORDER_TYPE_BUY else 'SELL'
-            print(f"\n Opened {side} @ {price:.{self.digits}f} | Lot: {self.current_lot} | SL: {sl_price:.{self.digits}f} | TP: {tp_price:.{self.digits}f}")
-            self.entry_price = price
-            self.current_sl = sl_price
-            self.current_tp = tp_price
+        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            side = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
+            print(
+                f" Opened {side} @ {price:.{self.digits}f} | "
+                f"Lot={self.current_lot} | SL={sl_price:.{self.digits}f} | TP={tp_price:.{self.digits}f}"
+            )
         else:
-            print(f"\n Order Failed: {res.comment}")
+            comment = res.comment if res else "No response"
+            print(f" Order Failed: {comment}")
+
+    def execute_action(self, action):
+        current_pos, _ = self._get_mt5_position()
+
+        if action == 0:
+            return
+
+        if action == 3:
+            if current_pos != 0:
+                self.close_all()
+            return
+
+        if action == 1:
+            if current_pos == -1:
+                self.close_all()
+                time.sleep(0.2)
+                current_pos, _ = self._get_mt5_position()
+            if current_pos <= 0:
+                self.send_order(mt5.ORDER_TYPE_BUY)
+            return
+
+        if action == 2:
+            if current_pos == 1:
+                self.close_all()
+                time.sleep(0.2)
+                current_pos, _ = self._get_mt5_position()
+            if current_pos >= 0:
+                self.send_order(mt5.ORDER_TYPE_SELL)
+
+    def _print_status_line(self):
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if tick is None:
+            return
+
+        current_pos, pos = self._get_mt5_position()
+        pos_txt = {1: "LONG", -1: "SHORT", 0: "FLAT"}[current_pos]
+        pnl_txt = f"{pos.profit:+.2f}" if pos is not None else "0.00"
+        server_time = datetime.fromtimestamp(tick.time).strftime("%H:%M:%S")
+
+        line = (
+            f"\r Pr:{tick.bid:.{self.digits}f} | Pos:{pos_txt:5s} | PnL:{pnl_txt:>8s} | "
+            f"Eq:{self.bridge.equity:8.2f} | T:{server_time}      "
+        )
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+    def _process_closed_bar(self, bar_end_ts: int, startup: bool = False):
+        mode = "Startup" if startup else "New Candle"
+        print(f"\n {mode}: processing closed bar -> {datetime.fromtimestamp(bar_end_ts)}")
+
+        window_df = self._fetch_window()
+        if window_df is None:
+            print(" Not enough bars yet for model window")
+            return
+
+        delta_tick, delta_price = self._calc_delta_for_closed_bar(bar_end_ts)
+        self.bridge.gate_stats = self.gate_provider.update(window_df)
+
+        self._sync_bridge_from_mt5()
+        action, model_price = self.bridge.process_bar(window_df, delta_tick, delta_price)
+        action = int(action)
+
+        action_name = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}.get(action, "?")
+        print(
+            f" Model Action: {action_name} | Price={model_price:.5f} | "
+            f"dTick={delta_tick} | dPrice={delta_price:.5f}"
+        )
+
+        self.execute_action(action)
+        self._sync_bridge_from_mt5()
+        self._save_runtime_state(reason="bar_close")
+
+    def run(self):
+        self.connect()
+        self._load_model()
+        self._load_runtime_state()
+        self._sync_bridge_from_mt5()
+
+        print(" Waiting for new H1 candles...")
+
+        try:
+            while True:
+                latest = mt5.copy_rates_from_pos(SYMBOL, self.timeframe, 0, 1)
+                if latest is None or len(latest) == 0:
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+                current_bar_time = int(latest[0]["time"])
+                if self.last_bar_time == 0:
+                    self.last_bar_time = current_bar_time
+                    if EVAL_ON_START:
+                        self._process_closed_bar(current_bar_time, startup=True)
+                    self._sync_bridge_from_mt5()
+                    self._print_status_line()
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+                if current_bar_time != self.last_bar_time:
+                    self.last_bar_time = current_bar_time
+                    self._process_closed_bar(current_bar_time, startup=False)
+
+                self._sync_bridge_from_mt5()
+                self._print_status_line()
+                time.sleep(POLL_SECONDS)
+
+        except KeyboardInterrupt:
+            print("\n Stopped by user")
+        finally:
+            self._save_runtime_state(reason="shutdown")
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     bot = LiveTradingBot()

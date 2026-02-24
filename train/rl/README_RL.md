@@ -34,6 +34,13 @@
   - `python train/train_ppo.py`
 - Backtest:
   - `python test/test_ppo.py`
+- Forward test (out-of-sample):
+  - `python test/forward_test.py`
+  - optional envs:
+    - `FORWARD_DATE_FROM`, `FORWARD_DATE_TO`
+    - `FORWARD_TRAIN_END` (start forward after this timestamp)
+    - `FORWARD_SPLIT_RATIO` (default `0.80` when no forward start date is set)
+    - `FORWARD_DISABLE_PLOT=1`
 
 ## Notes
 - `SEM_LATENT_DIM` controls number of semantic latent features (default 16).
