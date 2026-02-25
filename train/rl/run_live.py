@@ -891,6 +891,7 @@ class LiveTradingBot:
         self._load_model()
         self._load_runtime_state()
         self._sync_bridge_from_mt5()
+        startup_eval_pending = bool(EVAL_ON_START)
 
         print(" Waiting for new H1 candles...")
 
@@ -901,10 +902,28 @@ class LiveTradingBot:
                     time.sleep(POLL_SECONDS)
                     continue
 
+                if startup_eval_pending:
+                    startup_eval_pending = False
+                    if self.last_bar_time == 0:
+                        self.last_bar_time = current_bar_time
+                        self._process_closed_bar(current_bar_time, mode="Startup", execute_orders=True)
+                        self._sync_bridge_from_mt5()
+                        self._print_status_line()
+                        time.sleep(POLL_SECONDS)
+                        continue
+
+                    if self.last_bar_time == current_bar_time:
+                        print("\n Startup eval: current bar already processed; running no-order refresh")
+                        self._process_closed_bar(current_bar_time, mode="Startup", execute_orders=False)
+                        self._sync_bridge_from_mt5()
+                        self._print_status_line()
+                        time.sleep(POLL_SECONDS)
+                        continue
+
+                    print("\n Startup eval deferred: missed bars detected; catch-up replay will process first")
+
                 if self.last_bar_time == 0:
                     self.last_bar_time = current_bar_time
-                    if EVAL_ON_START:
-                        self._process_closed_bar(current_bar_time, mode="Startup", execute_orders=True)
                     self._sync_bridge_from_mt5()
                     self._print_status_line()
                     time.sleep(POLL_SECONDS)

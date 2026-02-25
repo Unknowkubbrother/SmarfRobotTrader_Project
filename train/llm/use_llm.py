@@ -185,7 +185,7 @@ DOMAIN EXAMPLES (จาก dataset เดิม):
         w_rerank=0.45,
     )
 
-    print_results("IMAGE → HYBRID (Chart + Text via auto_text)", results)
+    # print_results("IMAGE → HYBRID (Chart + Text via auto_text)", results)
 
     rag_context = build_rag_context(results, max_chars=1500)
 
