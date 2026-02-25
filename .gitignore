@@ -14,3 +14,5 @@ Archive.zip
 **/chroma_db_old/
 **/chroma_store_images/
 **/chroma_store_text_bge_1024/
+
+time_to_embedding_cls.joblib

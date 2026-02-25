@@ -31,9 +31,8 @@ TIMEFRAME_CONFIG = {
 SELECTED_TIMEFRAME = "H1"
 tf_config = TIMEFRAME_CONFIG[SELECTED_TIMEFRAME]
 
-ohlc_start = datetime(2024, 12, 23, tzinfo=timezone)
-ohlc_end   = datetime(2026, 2, 20, 23, 59, 59, tzinfo=timezone)
-
+ohlc_start = datetime(2026, 1, 1, tzinfo=timezone)
+ohlc_end   = datetime(2026, 2, 25, 23, 59, 59, tzinfo=timezone)
 
 symbol_info = mt5.symbol_info(symbol)
 if symbol_info is None:

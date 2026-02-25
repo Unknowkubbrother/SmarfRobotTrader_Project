@@ -22,10 +22,9 @@ from backtest_config import (
     BAR_HISTORY,
     MODELS_DIR,
     PIP_VALUE,
+    RISK_LEVEL,
     RISK_PERCENT,
-    SL_PIPS,
     SPREAD_PIPS,
-    TP_PIPS,
     WINDOW_SIZE,
 )
 from backtest_features import build_feature_columns, build_gate_stats
@@ -214,7 +213,6 @@ class LiveTradingBot:
         self.current_lot = 0.01
         self.point = 0.00001
         self.digits = 5
-        self.pip_size = 0.0001
         self.last_bar_time = 0
         self.last_known_ticket = 0
         self.state_file = STATE_FILE
@@ -243,11 +241,10 @@ class LiveTradingBot:
         self.current_lot = max(0.01, calc_auto_lot(self.initial_balance))
         self.point = float(symbol_info.point)
         self.digits = int(symbol_info.digits)
-        self.pip_size = self.point * 10 if self.digits in (3, 5) else self.point
 
         print(f" MT5 Connected. Account: {account_info.login}")
         print(f" Symbol={SYMBOL} | Timeframe={TIMEFRAME_NAME} | Point={self.point} | Digits={self.digits}")
-        print(f" Balance={self.initial_balance:.2f} | AutoLot={self.current_lot}")
+        print(f" Balance={self.initial_balance:.2f} | RiskLevel={RISK_LEVEL} ({RISK_PERCENT}%) | AutoLot={self.current_lot}")
 
     def _load_model(self):
         self.semantic_runtime = SemanticRuntime(models_dir=MODELS_DIR)
@@ -272,8 +269,6 @@ class LiveTradingBot:
                 lambda: TradingEnv(
                     mock_df,
                     lot_size=max(0.01, calc_auto_lot(self.initial_balance or 100.0)),
-                    sl_pips=SL_PIPS,
-                    tp_pips=TP_PIPS,
                 )
             ]
         )
@@ -315,21 +310,11 @@ class LiveTradingBot:
                 "position": int(self.bridge.position),
                 "entry_price": float(self.bridge.entry_price),
                 "hold_steps": int(self.bridge.hold_steps),
-                "first_bar": bool(self.bridge.first_bar),
-                "trade_cooldown": int(self.bridge.trade_cooldown),
-                "defensive_mode_bars": int(self.bridge.defensive_mode_bars),
-                "defensive_triggers": int(self.bridge.defensive_triggers),
-                "loss_streak": int(self.bridge.loss_streak),
-                "skipped_signals": int(self.bridge.skipped_signals),
-                "margin_skips": int(self.bridge.margin_skips),
-                "defensive_skips": int(self.bridge.defensive_skips),
-                "semantic_skips": int(self.bridge.semantic_skips),
                 "trades": int(self.bridge.trades),
                 "wins": int(self.bridge.wins),
                 "total_pnl": float(self.bridge.total_pnl),
                 "total_fees": float(self.bridge.total_fees),
                 "max_equity": float(self.bridge.max_equity),
-                "recent_trade_pips": [float(x) for x in list(self.bridge.recent_trade_pips)],
                 "gate_stats": {k: float(v) for k, v in dict(self.bridge.gate_stats or {}).items()},
             },
             "gate_history": self.gate_provider.to_records(max_rows=max(BAR_HISTORY * 2, 400)),
@@ -377,15 +362,6 @@ class LiveTradingBot:
             self.bridge.position = int(bridge_state.get("position", self.bridge.position))
             self.bridge.entry_price = float(bridge_state.get("entry_price", self.bridge.entry_price))
             self.bridge.hold_steps = int(max(0, bridge_state.get("hold_steps", self.bridge.hold_steps)))
-            self.bridge.first_bar = bool(bridge_state.get("first_bar", self.bridge.first_bar))
-            self.bridge.trade_cooldown = int(max(0, bridge_state.get("trade_cooldown", self.bridge.trade_cooldown)))
-            self.bridge.defensive_mode_bars = int(max(0, bridge_state.get("defensive_mode_bars", self.bridge.defensive_mode_bars)))
-            self.bridge.defensive_triggers = int(max(0, bridge_state.get("defensive_triggers", self.bridge.defensive_triggers)))
-            self.bridge.loss_streak = int(max(0, bridge_state.get("loss_streak", self.bridge.loss_streak)))
-            self.bridge.skipped_signals = int(max(0, bridge_state.get("skipped_signals", self.bridge.skipped_signals)))
-            self.bridge.margin_skips = int(max(0, bridge_state.get("margin_skips", self.bridge.margin_skips)))
-            self.bridge.defensive_skips = int(max(0, bridge_state.get("defensive_skips", self.bridge.defensive_skips)))
-            self.bridge.semantic_skips = int(max(0, bridge_state.get("semantic_skips", self.bridge.semantic_skips)))
             self.bridge.trades = int(max(0, bridge_state.get("trades", self.bridge.trades)))
             self.bridge.wins = int(max(0, bridge_state.get("wins", self.bridge.wins)))
             self.bridge.total_pnl = float(bridge_state.get("total_pnl", self.bridge.total_pnl))
@@ -393,24 +369,12 @@ class LiveTradingBot:
             self.bridge.max_equity = float(bridge_state.get("max_equity", self.bridge.max_equity))
             self.bridge.gate_stats = dict(bridge_state.get("gate_stats", self.bridge.gate_stats or {}))
 
-            recent = bridge_state.get("recent_trade_pips", [])
-            try:
-                self.bridge.recent_trade_pips.clear()
-                maxlen = int(self.bridge.recent_trade_pips.maxlen or 20)
-                for val in list(recent)[-maxlen:]:
-                    self.bridge.recent_trade_pips.append(float(val))
-            except Exception:
-                pass
-
         self.last_bar_time = int(max(0, payload.get("last_bar_time", self.last_bar_time)))
         self.last_known_ticket = int(max(0, payload.get("last_known_ticket", self.last_known_ticket)))
         self.gate_provider.load_records(payload.get("gate_history", []))
         self.state_loaded = True
         print(
             " Runtime state restored | "
-            f"cooldown={self.bridge.trade_cooldown} "
-            f"def_mode={self.bridge.defensive_mode_bars} "
-            f"loss_streak={self.bridge.loss_streak} "
             f"hold_steps={self.bridge.hold_steps}"
         )
 
@@ -454,12 +418,10 @@ class LiveTradingBot:
             self.bridge.entry_price = float(pos.price_open)
             if prev_pos != current_pos or (self.last_known_ticket != 0 and self.last_known_ticket != current_ticket):
                 self.bridge.hold_steps = 0
-                self.bridge.first_bar = True
         else:
             self.bridge.entry_price = 0.0
             self.bridge.hold_steps = 0
             self.bridge.unrealized_pnl = 0.0
-            self.bridge.first_bar = False
 
         self.bridge.balance = float(account.balance)
         self.bridge.equity = float(account.equity)
@@ -642,15 +604,6 @@ class LiveTradingBot:
             return
 
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
-        sl_distance = SL_PIPS * self.pip_size
-        tp_distance = TP_PIPS * self.pip_size
-
-        if order_type == mt5.ORDER_TYPE_BUY:
-            sl_price = round(price - sl_distance, self.digits)
-            tp_price = round(price + tp_distance, self.digits)
-        else:
-            sl_price = round(price + sl_distance, self.digits)
-            tp_price = round(price - tp_distance, self.digits)
 
         account = mt5.account_info()
         if account is not None:
@@ -662,8 +615,6 @@ class LiveTradingBot:
             "volume": self.current_lot,
             "type": order_type,
             "price": price,
-            "sl": sl_price,
-            "tp": tp_price,
             "deviation": DEVIATION,
             "magic": MAGIC_NUMBER,
             "comment": "AI Trade",
@@ -676,7 +627,7 @@ class LiveTradingBot:
             side = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
             print(
                 f" Opened {side} @ {price:.{self.digits}f} | "
-                f"Lot={self.current_lot} | SL={sl_price:.{self.digits}f} | TP={tp_price:.{self.digits}f}"
+                f"Lot={self.current_lot}"
             )
         else:
             comment = res.comment if res else "No response"

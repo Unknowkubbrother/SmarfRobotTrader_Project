@@ -21,7 +21,14 @@ def build_feature_columns(semantic_feature_count):
     return cols
 
 
-def calculate_features(df, semantic_runtime, semantic_feature_count, delta_tick=0, delta_price=0.0):
+def calculate_features(
+    df,
+    semantic_runtime,
+    semantic_feature_count,
+    delta_tick=0,
+    delta_price=0.0,
+    preserve_existing_delta=False,
+):
     df = df.copy()
     regime_frame = compute_regime_frame(df)
     ts_keys = df["time"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
@@ -39,10 +46,14 @@ def calculate_features(df, semantic_runtime, semantic_feature_count, delta_tick=
     df["body_ratio"] = np.where(full_range > 0, abs(df["close"] - df["open"]) / full_range, 0)
     df["momentum"] = df["return"].rolling(window=5).sum().fillna(0)
 
-    df["delta_tick"] = 0
-    df["delta_price"] = 0.0
-    df.loc[df.index[-1], "delta_tick"] = delta_tick
-    df.loc[df.index[-1], "delta_price"] = delta_price
+    if preserve_existing_delta and {"delta_tick", "delta_price"}.issubset(df.columns):
+        df["delta_tick"] = pd.to_numeric(df["delta_tick"], errors="coerce").fillna(0).astype(np.float32)
+        df["delta_price"] = pd.to_numeric(df["delta_price"], errors="coerce").fillna(0.0).astype(np.float32)
+    else:
+        df["delta_tick"] = 0
+        df["delta_price"] = 0.0
+        df.loc[df.index[-1], "delta_tick"] = delta_tick
+        df.loc[df.index[-1], "delta_price"] = delta_price
 
     sma20 = df["close"].rolling(20).mean()
     sma50 = df["close"].rolling(50).mean()

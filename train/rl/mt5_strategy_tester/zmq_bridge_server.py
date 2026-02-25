@@ -21,13 +21,12 @@ from backtest_config import (
     INITIAL_BALANCE,
     MODELS_DIR,
     PIP_VALUE,
+    RISK_LEVEL,
     RISK_PERCENT,
-    SL_PIPS,
     SPREAD_PIPS,
     TEST_DATA_FILE,
     TEST_DATE_FROM,
     TEST_DATE_TO,
-    TP_PIPS,
     WINDOW_SIZE,
 )
 from backtest_features import build_feature_columns, build_gate_stats
@@ -227,8 +226,6 @@ def load_model(feature_columns):
             lambda: TradingEnv(
                 mock_df,
                 lot_size=calc_auto_lot(INITIAL_BALANCE),
-                sl_pips=SL_PIPS,
-                tp_pips=TP_PIPS,
             )
         ]
     )
@@ -338,8 +335,8 @@ def main():
     print(f" Model: {MODEL_PATH}")
     print(f" VecNorm: {VEC_NORM_PATH}")
     print(
-        f" SL={SL_PIPS} pips | TP={TP_PIPS} pips | "
-        f"Risk={RISK_PERCENT}% | InitialBalance={INITIAL_BALANCE}"
+        f" No forced auto-close (RL handles close/hold) | "
+        f"RiskLevel={RISK_LEVEL} ({RISK_PERCENT}%) | InitialBalance={INITIAL_BALANCE}"
     )
     print(f" Feature count: {len(feature_columns)} (semantic={semantic_runtime.semantic_feature_count})")
     print(f" Gate stats mode: {gate_stats_provider.mode}")
@@ -384,7 +381,6 @@ def main():
                     f" #{bar_count:5d} | {action_names[action]:5s} | "
                     f"Price: {current_price:.5f} | Pos: {bridge.position:+d} | "
                     f"Eq: {bridge.equity:.2f} | Trades: {bridge.trades} (WR:{win_rate:.1f}%) | "
-                    f"SL:{bridge.sl_hits} TP:{bridge.tp_hits} | "
                     f"Qavg:{avg_q:.3f} low:{low_q}/{q_count}"
                 )
 
@@ -399,7 +395,6 @@ def main():
         print(f" Bars processed: {bar_count}")
         print(f" Equity: {bridge.equity:.2f} ({ret:+.2f}%)")
         print(f" Trades: {bridge.trades} | WR: {(bridge.wins / bridge.trades * 100.0) if bridge.trades > 0 else 0.0:.1f}%")
-        print(f" SL Hits: {bridge.sl_hits} | TP Hits: {bridge.tp_hits}")
         print(f" Fees: {bridge.total_fees:.2f}")
         print(
             " Semantic quality: "
