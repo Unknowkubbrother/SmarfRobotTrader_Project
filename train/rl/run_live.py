@@ -757,12 +757,16 @@ class LiveTradingBot:
     def close_all(self):
         positions = mt5.positions_get(symbol=SYMBOL)
         if positions is None:
-            return
+            return False
+        if len(positions) == 0:
+            return True
 
+        all_ok = True
         for pos in positions:
             tick = self._get_trade_tick()
             if tick is None:
                 print(" Close Skipped: no live tick")
+                all_ok = False
                 continue
 
             price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
@@ -784,6 +788,8 @@ class LiveTradingBot:
             else:
                 comment = res.comment if res else "No response"
                 print(f" Close Failed | ticket={pos.ticket} | {comment}")
+                all_ok = False
+        return all_ok
 
     def _get_trade_tick(self):
         retries = max(1, int(ORDER_TICK_RETRIES))
@@ -804,7 +810,7 @@ class LiveTradingBot:
         tick = self._get_trade_tick()
         if tick is None:
             print(" Order Skipped: no live tick (market closed or quote unavailable)")
-            return
+            return False
 
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
         sl_distance = SL_PIPS * self.pip_size
@@ -843,37 +849,87 @@ class LiveTradingBot:
                 f" Opened {side} @ {price:.{self.digits}f} | "
                 f"Lot={self.current_lot} | SL={sl_price:.{self.digits}f} | TP={tp_price:.{self.digits}f}"
             )
+            return True
         else:
             comment = res.comment if res else "No response"
             print(f" Order Failed: {comment}")
+            return False
 
     def execute_action(self, action):
         current_pos, _ = self._get_mt5_position()
 
         if action == 0:
-            return
+            return True
 
         if action == 3:
             if current_pos != 0:
-                self.close_all()
-            return
+                return self.close_all()
+            return True
 
         if action == 1:
             if current_pos == -1:
-                self.close_all()
+                closed_ok = self.close_all()
                 time.sleep(0.2)
                 current_pos, _ = self._get_mt5_position()
+                if not closed_ok and current_pos == -1:
+                    return False
             if current_pos <= 0:
-                self.send_order(mt5.ORDER_TYPE_BUY)
-            return
+                return self.send_order(mt5.ORDER_TYPE_BUY)
+            return True
 
         if action == 2:
             if current_pos == 1:
-                self.close_all()
+                closed_ok = self.close_all()
                 time.sleep(0.2)
                 current_pos, _ = self._get_mt5_position()
+                if not closed_ok and current_pos == 1:
+                    return False
             if current_pos >= 0:
-                self.send_order(mt5.ORDER_TYPE_SELL)
+                return self.send_order(mt5.ORDER_TYPE_SELL)
+            return True
+        return False
+
+    def _reconcile_broker_execution(
+        self,
+        action: int,
+        execute_orders: bool,
+        order_ok: bool,
+        broker_pos_before: int,
+        broker_pos_after: int,
+    ):
+        if self.bridge is None or not execute_orders or action not in (1, 2, 3):
+            return
+
+        expected_after = broker_pos_before
+        if action == 1:
+            expected_after = 1
+        elif action == 2:
+            expected_after = -1
+        elif action == 3:
+            expected_after = 0
+
+        mismatch = broker_pos_after != expected_after
+        if order_ok and not mismatch:
+            return
+
+        print(
+            " Broker reconcile: action not reflected on broker "
+            f"(action={action} expected_pos={expected_after} actual_pos={broker_pos_after})"
+        )
+
+        # Prevent virtual bridge cooldown from blocking entries when order failed.
+        self.bridge.trade_cooldown = 0
+        self.bridge.first_bar = False
+
+        if broker_pos_after == 0:
+            self.bridge.position = 0
+            self.bridge.entry_price = 0.0
+            self.bridge.hold_steps = 0
+            self.bridge.unrealized_pnl = 0.0
+
+        # Roll back synthetic spread fee if an open from flat did not fill.
+        if action in (1, 2) and broker_pos_before == 0 and broker_pos_after == 0:
+            self.bridge.total_fees = max(0.0, float(self.bridge.total_fees) - float(self.bridge.spread_cost))
 
     def _print_status_line(self):
         tick = mt5.symbol_info_tick(SYMBOL)
@@ -921,11 +977,21 @@ class LiveTradingBot:
             f"dTick={delta_tick} | dPrice={delta_price:.5f}"
         )
 
+        broker_pos_before, _ = self._get_mt5_position()
+        order_ok = True
         if execute_orders:
-            self.execute_action(action)
+            order_ok = bool(self.execute_action(action))
         elif action != 0:
-            print(" Replay mode: stale-bar order skipped")
+            print(" No-order mode: action skipped")
         self._sync_bridge_from_mt5()
+        broker_pos_after, _ = self._get_mt5_position()
+        self._reconcile_broker_execution(
+            action=action,
+            execute_orders=execute_orders,
+            order_ok=order_ok,
+            broker_pos_before=int(broker_pos_before),
+            broker_pos_after=int(broker_pos_after),
+        )
         self._save_runtime_state(reason="bar_close")
 
     def run(self):
