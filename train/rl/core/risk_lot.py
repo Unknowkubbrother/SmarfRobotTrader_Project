@@ -60,4 +60,6 @@ def calc_auto_lot(
     step = max(float(lot_step), 1e-9)
     stepped = step * int(np.floor(raw_lot / step))
     lot = max(float(min_lot), stepped)
-    return round(lot, 2)
+    step_str = f"{step:.10f}".rstrip("0")
+    decimals = len(step_str.split(".")[1]) if "." in step_str else 0
+    return round(lot, decimals)

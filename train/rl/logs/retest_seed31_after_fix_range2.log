@@ -1,0 +1,40 @@
+ Loading embeddings from ChromaDB... source=cls
+ Embedding cache completeness check skipped (chroma unavailable): `BaseSettings` has been moved to the `pydantic-settings` package. See https://docs.pydantic.dev/2.12/migration/#basesettings-has-moved-to-pydantic-settings for more details.
+
+For further information visit https://errors.pydantic.dev/2.12/u/import-error
+ Loaded 32619 embeddings globally.
+ Loaded embedding projector successfully. mode=autoencoder, latent_dim=16
+ Loaded semantic_map.joblib for deterministic embedding fallback.
+==================================================
+ DATA FILTERING
+==================================================
+ไฟล์ข้อมูล:        /Users/unknowkubbrother/Coding/SmarfRobotTrader_Project/train/rl/datasets/h1_ohlc_delta1.csv
+ข้อมูลทั้งหมด:     360 rows
+ข้อมูลที่มี delta: 351 rows
+ช่วงเวลา:          2026-02-02 00:00:00 -> 2026-02-20 15:00:00
+ช่วงที่เลือก:       from=2026-02-01 00:00:00 to=2026-02-20 23:00:00
+lot config:         0.0020 (auto(risk_level=medium, risk_pct=1.0%, min=0.0001, step=0.0001))
+max open orders:    1
+model path:         /Users/unknowkubbrother/Coding/SmarfRobotTrader_Project/train/rl/models/ppo_trading.zip
+vecnorm path:       /Users/unknowkubbrother/Coding/SmarfRobotTrader_Project/train/rl/models/vec_normalize.pkl
+==================================================
+
+ Processing 281 bars (TradingEnv window=20)...
+
+==================================================
+ TEST RESULTS (Train-Env Parity)
+==================================================
+Final Equity:     $103.42
+Return:           3.42%
+Total Trades:     18
+Win Rate:         77.78%
+Max Drawdown:     0.87%
+Total Fees Paid:  $0.76
+==================================================
+Start Time: 2026-02-04 22:00:00
+End Time:   2026-02-20 14:00:00
+ Semantic cache: 351 timestamps | matched=0 | synthetic=351 | mode=knn_map | source=cls | knn=351 | zero=0 | quality_avg=0.587 (351) | quality_low=0
+ Action policy: model.predict(deterministic=True) on TradingEnv (train-parity) | sem_q_min=0.25
+ Gate stats (diagnostic only): atr_high=0.001132, atr_extreme=0.001289, trend_flat=0.0154, trend_strong=0.0683, adx_flat=0.0000, adx_strong=0.6824
+
+ Plot disabled by DISABLE_PLOT=1

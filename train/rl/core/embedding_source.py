@@ -3,8 +3,6 @@ import os
 import joblib
 import numpy as np
 
-from chroma_client import ChromaDBClient
-
 
 EMBED_SOURCE_MODE = "cls"
 
@@ -50,8 +48,16 @@ def _save_cached_map(cache_file: str, time_to_vec: dict):
     os.replace(tmp_file, cache_file)
 
 
+def _new_chroma_client(models_dir: str):
+    # Lazy import so test/train can run from cached embeddings
+    # even when chromadb runtime is unavailable.
+    from chroma_client import ChromaDBClient
+
+    return ChromaDBClient(persist_path=os.path.join(models_dir, "chroma_db"))
+
+
 def _load_chroma_rows(models_dir: str):
-    client = ChromaDBClient(persist_path=os.path.join(models_dir, "chroma_db"))
+    client = _new_chroma_client(models_dir)
     docs = client.collection.get(include=["metadatas", "embeddings", "documents"])
 
     metadatas = docs.get("metadatas")
@@ -84,7 +90,7 @@ def _load_chroma_rows(models_dir: str):
 
 
 def _load_chroma_time_keys(models_dir: str) -> set[str]:
-    client = ChromaDBClient(persist_path=os.path.join(models_dir, "chroma_db"))
+    client = _new_chroma_client(models_dir)
     docs = client.collection.get(include=["metadatas"])
     metadatas = docs.get("metadatas")
     if metadatas is None:
@@ -153,7 +159,7 @@ def load_time_to_embedding_map(
     _ = source_mode
     _ = batch_size
     if ensure_complete is None:
-        ensure_complete = os.getenv("EMBED_CACHE_ENSURE_COMPLETE", "1").strip().lower() in {"1", "true", "yes"}
+        ensure_complete = os.getenv("EMBED_CACHE_ENSURE_COMPLETE", "0").strip().lower() in {"1", "true", "yes"}
 
     cache_file = _cache_path(models_dir)
     if not force_rebuild:
@@ -162,7 +168,11 @@ def load_time_to_embedding_map(
             if not ensure_complete:
                 return cached, EMBED_SOURCE_MODE
 
-            chroma_keys = _load_chroma_time_keys(models_dir)
+            try:
+                chroma_keys = _load_chroma_time_keys(models_dir)
+            except Exception as e:
+                print(f" Embedding cache completeness check skipped (chroma unavailable): {e}")
+                return cached, EMBED_SOURCE_MODE
             if not chroma_keys:
                 return cached, EMBED_SOURCE_MODE
 

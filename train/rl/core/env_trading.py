@@ -25,6 +25,7 @@ class TradingEnv(gym.Env):
         self.df = df.reset_index(drop=True)
         self.window_size = window_size
         self.initial_balance = initial_balance
+        self.balance_scale = max(float(initial_balance), 1e-9)
         self.lot_size = lot_size
         self.pip_size = pip_size
         self.pip_value = pip_value
@@ -64,6 +65,11 @@ class TradingEnv(gym.Env):
         )
 
         self.reset()
+
+    def _ratio_to_unit01(self, value, full_scale):
+        scale = max(float(full_scale), 1e-9)
+        signed = np.tanh(float(value) / scale)
+        return float(np.clip(0.5 * (signed + 1.0), 0.0, 1.0))
 
     def _get_feature_columns(self):
         base_cols = [
@@ -135,14 +141,14 @@ class TradingEnv(gym.Env):
         block = self.df.iloc[start:end][available_cols].values
         market_data = block.flatten().astype(np.float32)
 
-        unrealized_pips = self._to_pips(self.unrealized_pnl)
-        total_pnl_pips = self.total_pnl / (self.pip_value * self.lot_size) if self.lot_size > 0 else 0.0
+        total_pnl_ratio = self.total_pnl / self.balance_scale
+        unrealized_pnl_ratio = self.unrealized_pnl / self.balance_scale
 
         state_data = np.array([
-            self.net_units / float(self.max_open_orders),
+            np.clip((self.net_units / float(self.max_open_orders) + 1.0) * 0.5, 0.0, 1.0),
             self.open_orders / float(self.max_open_orders),
-            total_pnl_pips / 1000.0,
-            unrealized_pips / 100.0,
+            self._ratio_to_unit01(total_pnl_ratio, full_scale=0.20),
+            self._ratio_to_unit01(unrealized_pnl_ratio, full_scale=0.05),
             np.tanh(self.hold_steps / max(float(self.window_size), 1.0)),
         ], dtype=np.float32)
 
@@ -150,11 +156,6 @@ class TradingEnv(gym.Env):
 
     def _get_current_price(self):
         return self.df.iloc[self.step_idx]['close']
-
-    def _to_pips(self, pnl_value):
-        if self.lot_size <= 0:
-            return 0.0
-        return pnl_value / (self.pip_value * self.lot_size)
 
     def _calc_pnl_pips(self, entry_price, exit_price, direction):
         price_diff = exit_price - entry_price
@@ -227,7 +228,7 @@ class TradingEnv(gym.Env):
 
         self.max_equity = max(self.max_equity, self.equity)
         drawdown = (self.max_equity - self.equity) / self.max_equity if self.max_equity > 0 else 0
-        reward = float(np.clip((self.equity - prev_equity) / max(self.initial_balance, 1e-9), -1.0, 1.0))
+        reward = float(np.clip((self.equity - prev_equity) / self.balance_scale, -1.0, 1.0))
 
         self.step_idx += 1
 
@@ -241,6 +242,8 @@ class TradingEnv(gym.Env):
         info = {
             "equity": self.equity,
             "balance": self.balance,
+            "equity_ratio": self.equity / self.balance_scale,
+            "balance_ratio": self.balance / self.balance_scale,
             "drawdown": drawdown,
             "position": self.position,
             "net_units": self.net_units,
@@ -254,6 +257,8 @@ class TradingEnv(gym.Env):
             "fees": self.total_fees,
             "unrealized_pnl": self.unrealized_pnl,
             "total_pnl": self.total_pnl,
+            "unrealized_pnl_ratio": self.unrealized_pnl / self.balance_scale,
+            "total_pnl_ratio": self.total_pnl / self.balance_scale,
             "accuracy": accuracy,
             "action": action,
         }
