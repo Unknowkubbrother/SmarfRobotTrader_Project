@@ -8,7 +8,7 @@ from langchain_core.messages import HumanMessage
 import numpy as np
 from FlagEmbedding import BGEM3FlagModel
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import mplfinance as mpf
@@ -42,10 +42,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 LLM_ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATASET_JSON = os.getenv("LLM_DATASET_JSON", os.path.join(LLM_ROOT, "dataset.json"))
 DEFAULT_EMBED_MODEL = os.getenv("LLM_EMBED_MODEL", "BAAI/bge-m3")
-
-UTC_TO_BROKER = 7
-BROKER_TO_TARGET = 7
-TOTAL_OFFSET = UTC_TO_BROKER + BROKER_TO_TARGET
 
 _runtime_cache = {}
 _embedder = None
@@ -202,20 +198,20 @@ def generate_image(date_time: datetime, symbol: str = "EURUSD") -> str:
 
     try:
         start_input = date_time.replace(minute=0, second=0, microsecond=0)
-        end_input = start_input + timedelta(hours=1)
+        if start_input.tzinfo is None:
+            start_utc = start_input.replace(tzinfo=timezone.utc)
+        else:
+            start_utc = start_input.astimezone(timezone.utc)
+        end_utc = start_utc + timedelta(hours=1)
 
-        broker_start = start_input - timedelta(hours=BROKER_TO_TARGET)
-        broker_end = end_input - timedelta(hours=BROKER_TO_TARGET)
-
-        rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M1, broker_start, broker_end)
+        rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M1, start_utc, end_utc)
 
         if rates is None or len(rates) == 0:
             raise ValueError(f"❌ No data found for {symbol} at {date_time}")
 
         # 5. Prepare DataFrame
         df = pd.DataFrame(rates)
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        df['time'] = df['time'] + timedelta(hours=TOTAL_OFFSET)
+        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True).dt.tz_convert(None)
         df.set_index('time', inplace=True)
         df = df.rename(columns={
             'open': 'Open', 'high': 'High',
@@ -290,7 +286,7 @@ def generate_llm_cls_for_bar(
 
 def use_llm() -> str:
     runtime = _get_runtime(DEFAULT_DATASET_JSON)
-    base64_image = generate_image(datetime.now())
+    base64_image = generate_image(datetime.now(timezone.utc))
     return run_rag_pipeline(
         runtime["chart_db"],
         runtime["text_db"],

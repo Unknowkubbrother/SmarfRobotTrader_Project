@@ -2,7 +2,7 @@ import os
 import sys
 import time
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import joblib
 import numpy as np
@@ -59,6 +59,7 @@ LLM_TEXT_LOG_FILE = os.getenv(
     "LIVE_LLM_TEXT_LOG_FILE",
     os.path.join(MODELS_DIR, "time_to_llm_text.jsonl"),
 ).strip() or os.path.join(MODELS_DIR, "time_to_llm_text.jsonl")
+LLM_SEMANTIC_CACHE_SCHEMA = "utc_v2"
 STATE_FILE = os.getenv("LIVE_STATE_FILE", os.path.join(MODELS_DIR, "run_live_state.json")).strip() or os.path.join(
     MODELS_DIR, "run_live_state.json"
 )
@@ -279,8 +280,20 @@ class LiveTradingBot:
         if not isinstance(payload, dict):
             return
 
+        rows = None
+        if payload.get("schema") == LLM_SEMANTIC_CACHE_SCHEMA and isinstance(payload.get("rows"), dict):
+            rows = payload.get("rows")
+        elif payload and all(isinstance(k, str) for k in payload.keys()):
+            print(
+                " LLM semantic cache ignored: legacy schema detected "
+                "(pre-UTC fix). Cache will be rebuilt."
+            )
+            return
+        else:
+            return
+
         restored = {}
-        for key, vec in payload.items():
+        for key, vec in rows.items():
             if not isinstance(key, str):
                 continue
             arr = np.asarray(vec, dtype=np.float32).reshape(-1)
@@ -301,7 +314,12 @@ class LiveTradingBot:
                 os.makedirs(cache_dir, exist_ok=True)
             tmp_path = f"{cache_file}.tmp"
             serializable = {k: np.asarray(v, dtype=np.float32) for k, v in self.llm_semantic_cache.items()}
-            joblib.dump(serializable, tmp_path)
+            payload = {
+                "schema": LLM_SEMANTIC_CACHE_SCHEMA,
+                "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "rows": serializable,
+            }
+            joblib.dump(payload, tmp_path)
             os.replace(tmp_path, cache_file)
         except Exception as exc:
             print(f" LLM semantic cache save failed ({reason}): {exc}")
@@ -606,7 +624,7 @@ class LiveTradingBot:
 
     def _fetch_window(self, bar_end_ts: int):
         rates = None
-        anchor_dt = datetime.fromtimestamp(max(1, int(bar_end_ts) - 1))
+        anchor_dt = datetime.fromtimestamp(max(1, int(bar_end_ts) - 1), tz=timezone.utc)
 
         if hasattr(mt5, "copy_rates_from"):
             try:
@@ -632,14 +650,14 @@ class LiveTradingBot:
         if len(df) < BAR_HISTORY:
             return None
 
-        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(None)
         df = df[["time", "open", "high", "low", "close"]].sort_values("time").reset_index(drop=True)
         if len(df) > BAR_HISTORY:
             df = df.tail(BAR_HISTORY).reset_index(drop=True)
         return df
 
     def _calc_delta_for_closed_bar(self, current_bar_ts: int):
-        end_dt = datetime.fromtimestamp(current_bar_ts)
+        end_dt = datetime.fromtimestamp(current_bar_ts, tz=timezone.utc)
         start_dt = end_dt - timedelta(seconds=self.timeframe_seconds)
         ticks = mt5.copy_ticks_range(SYMBOL, start_dt, end_dt, mt5.COPY_TICKS_ALL)
 
@@ -674,8 +692,8 @@ class LiveTradingBot:
         bar_times = []
         if hasattr(mt5, "copy_rates_range"):
             try:
-                start_dt = datetime.fromtimestamp(prev_bar_time)
-                end_dt = datetime.fromtimestamp(current_bar_time)
+                start_dt = datetime.fromtimestamp(prev_bar_time, tz=timezone.utc)
+                end_dt = datetime.fromtimestamp(current_bar_time, tz=timezone.utc)
                 rates = mt5.copy_rates_range(SYMBOL, self.timeframe, start_dt, end_dt)
                 if rates is not None and len(rates) > 0:
                     rdf = pd.DataFrame(rates)
@@ -847,17 +865,23 @@ class LiveTradingBot:
         current_pos, pos = self._get_mt5_position()
         pos_txt = {1: "LONG", -1: "SHORT", 0: "FLAT"}[current_pos]
         pnl_txt = f"{pos.profit:+.2f}" if pos is not None else "0.00"
-        server_time = datetime.fromtimestamp(tick.time).strftime("%H:%M:%S")
+        server_time_utc = datetime.fromtimestamp(tick.time, tz=timezone.utc).strftime("%H:%M:%SZ")
 
         line = (
             f"\r Pr:{tick.bid:.{self.digits}f} | Pos:{pos_txt:5s} | PnL:{pnl_txt:>8s} | "
-            f"Eq:{self.bridge.equity:8.2f} | T:{server_time}      "
+            f"Eq:{self.bridge.equity:8.2f} | T_UTC:{server_time_utc}      "
         )
         sys.stdout.write(line)
         sys.stdout.flush()
 
     def _process_closed_bar(self, bar_end_ts: int, mode: str = "New Candle", execute_orders: bool = True):
-        print(f"\n {mode}: processing closed bar -> {datetime.fromtimestamp(bar_end_ts)}")
+        bar_end_utc = datetime.fromtimestamp(bar_end_ts, tz=timezone.utc)
+        bar_open_utc = bar_end_utc - timedelta(seconds=self.timeframe_seconds)
+        print(
+            f"\n {mode}: processing closed bar -> "
+            f"open={bar_open_utc.strftime('%Y-%m-%d %H:%M:%SZ')} "
+            f"end={bar_end_utc.strftime('%Y-%m-%d %H:%M:%SZ')}"
+        )
 
         window_df = self._fetch_window(bar_end_ts)
         if window_df is None:
