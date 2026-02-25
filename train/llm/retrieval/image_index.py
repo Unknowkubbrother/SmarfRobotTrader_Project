@@ -1,4 +1,6 @@
 import os
+import base64
+from io import BytesIO
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import math
@@ -77,8 +79,14 @@ def get_clip() -> Tuple[CLIPModel, CLIPProcessor]:
 # ============================================================
 # IMAGE PREP
 # ============================================================
-def load_rgb(path: str) -> Image.Image:
-    return Image.open(path).convert("RGB")
+def load_rgb(path_or_base64: str) -> Image.Image:
+    if os.path.exists(path_or_base64):
+        return Image.open(path_or_base64).convert("RGB")
+    try:
+        img_bytes = base64.b64decode(path_or_base64)
+        return Image.open(BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        return Image.open(path_or_base64).convert("RGB")
 
 
 def crop_chart_roi(

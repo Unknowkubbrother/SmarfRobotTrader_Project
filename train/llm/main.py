@@ -174,7 +174,7 @@ if __name__ == "__main__":
             print(f"⏭️ Skipping {skipped_count} already processed images.")
     
     # --- Batch Processing Config ---
-    MAX_WORKERS = 4  # A100 can handle this easily if Ollama is configured correctly
+    MAX_WORKERS = 1  # A100 can handle this easily if Ollama is configured correctly
     print(f"🚀 Starting Batch Processing with {MAX_WORKERS} workers...")
     
     import concurrent.futures

@@ -128,11 +128,11 @@ def rerank_with_cross_encoder(
 # ----------------------------
 # HYBRID SEARCH (image + text) + optional rerank
 # ----------------------------
-def hybrid_search_image_query(
+def hybrid_search_image_query_temp(
     chart_db: Chroma,
     text_db: Chroma,
     dataset_json: str,
-    base64_image: str,
+    query_image: str,
     auto_text: Optional[str] = None,
     k_img: int = 30,
     k_t: int = 30,
@@ -145,7 +145,7 @@ def hybrid_search_image_query(
     w_rerank: float = 0.35,
     rrf_pool_k: Optional[int] = None,
 ):
-    img_hits = chroma_search_rank_only(chart_db, base64_image, k=int(k_img))
+    img_hits = chroma_search_rank_only(chart_db, query_image, k=int(k_img))
 
     hit_lists = [img_hits]
     weights = [float(w_img)]
