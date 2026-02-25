@@ -11,7 +11,7 @@ BAR_HISTORY = 167
 
 # Train/Test parity defaults for TradingEnv-based offline backtest.
 # Override with env vars when needed.
-TEST_INITIAL_BALANCE = float(os.getenv("TEST_INITIAL_BALANCE", "10000"))
+TEST_INITIAL_BALANCE = float(os.getenv("TEST_INITIAL_BALANCE", "100"))
 _test_lot_size_raw = os.getenv("TEST_LOT_SIZE", "").strip()
 TEST_LOT_SIZE = float(_test_lot_size_raw) if _test_lot_size_raw else None
 
@@ -44,8 +44,8 @@ MODELS_DIR = os.path.join(RL_ROOT, "models")
 DATASETS_DIR = os.path.join(RL_ROOT, "datasets")
 OUTPUT_DIR = os.path.join(TEST_DIR, "outputs")
 TEST_DATA_FILE = os.getenv("TEST_DATA_FILE", "h1_ohlc_delta1.csv").strip() or "h1_ohlc_delta1.csv"
-TEST_DATE_FROM = os.getenv("TEST_DATE_FROM", "").strip()
-TEST_DATE_TO = os.getenv("TEST_DATE_TO", "").strip()
+TEST_DATE_FROM = os.getenv("TEST_DATE_FROM", "2026-01-01 00:00:00").strip() or "2026-01-01 00:00:00"
+TEST_DATE_TO = os.getenv("TEST_DATE_TO", "2026-02-20 23:00:00").strip() or "2026-02-20 23:00:00"
 DISABLE_PLOT = os.getenv("DISABLE_PLOT", "0").strip().lower() in {"1", "true", "yes"}
 EMBED_TEST_MODE = "knn_map"
 EMBED_SOURCE_MODE = "cls"

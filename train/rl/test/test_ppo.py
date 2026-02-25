@@ -48,15 +48,23 @@ TEST_VEC_NORM_PATH = os.getenv("TEST_VEC_NORM_PATH", os.path.join(MODELS_DIR, "v
 TEST_MAX_OPEN_ORDERS = int(
     os.getenv("TEST_MAX_OPEN_ORDERS", os.getenv("TRAIN_MAX_OPEN_ORDERS", os.getenv("MAX_OPEN_ORDERS", "1")))
 )
+TEST_LOT_MIN = float(os.getenv("TEST_LOT_MIN", os.getenv("LOT_MIN", "0.0001")))
+TEST_LOT_STEP = float(os.getenv("TEST_LOT_STEP", os.getenv("LOT_STEP", "0.0001")))
 EFFECTIVE_TEST_LOT_SIZE = (
     float(TEST_LOT_SIZE)
     if TEST_LOT_SIZE is not None
-    else calc_auto_lot(TEST_INITIAL_BALANCE, risk_level=RISK_LEVEL, risk_pct=RISK_PERCENT)
+    else calc_auto_lot(
+        TEST_INITIAL_BALANCE,
+        risk_level=RISK_LEVEL,
+        risk_pct=RISK_PERCENT,
+        min_lot=TEST_LOT_MIN,
+        lot_step=TEST_LOT_STEP,
+    )
 )
 EFFECTIVE_TEST_LOT_SOURCE = (
     "manual(TEST_LOT_SIZE)"
     if TEST_LOT_SIZE is not None
-    else f"auto(risk_level={RISK_LEVEL}, risk_pct={RISK_PERCENT}%)"
+    else f"auto(risk_level={RISK_LEVEL}, risk_pct={RISK_PERCENT}%, min={TEST_LOT_MIN}, step={TEST_LOT_STEP})"
 )
 
 
@@ -81,7 +89,7 @@ def _print_data_filtering(df_full, df, data_path):
     print(f"ช่วงเวลา:          {df['time'].iloc[0]} -> {df['time'].iloc[-1]}")
     if TEST_DATE_FROM or TEST_DATE_TO:
         print(f"ช่วงที่เลือก:       from={TEST_DATE_FROM or '-'} to={TEST_DATE_TO or '-'}")
-    print(f"lot config:         {EFFECTIVE_TEST_LOT_SIZE:.2f} ({EFFECTIVE_TEST_LOT_SOURCE})")
+    print(f"lot config:         {EFFECTIVE_TEST_LOT_SIZE:.4f} ({EFFECTIVE_TEST_LOT_SOURCE})")
     print(f"max open orders:    {max(1, TEST_MAX_OPEN_ORDERS)}")
     print(f"model path:         {TEST_MODEL_PATH}")
     print(f"vecnorm path:       {TEST_VEC_NORM_PATH}")
