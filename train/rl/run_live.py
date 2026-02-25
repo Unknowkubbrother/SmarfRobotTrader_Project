@@ -45,6 +45,8 @@ TIMEFRAME_NAME = os.getenv("LIVE_TIMEFRAME", "H1").strip().upper()
 MAGIC_NUMBER = int(os.getenv("LIVE_MAGIC_NUMBER", "123456"))
 DEVIATION = int(os.getenv("LIVE_DEVIATION", "20"))
 POLL_SECONDS = float(os.getenv("LIVE_POLL_SECONDS", "1"))
+ORDER_TICK_RETRIES = int(os.getenv("LIVE_ORDER_TICK_RETRIES", "8"))
+ORDER_TICK_RETRY_SEC = float(os.getenv("LIVE_ORDER_TICK_RETRY_SEC", "0.25"))
 SYNC_EXTERNAL_LOT = os.getenv("LIVE_SYNC_EXTERNAL_LOT", "1").strip().lower() in {"1", "true", "yes"}
 EVAL_ON_START = os.getenv("LIVE_EVAL_ON_START", "1").strip().lower() in {"1", "true", "yes"}
 ENABLE_CATCHUP_REPLAY = os.getenv("LIVE_ENABLE_CATCHUP_REPLAY", "1").strip().lower() in {"1", "true", "yes"}
@@ -758,8 +760,9 @@ class LiveTradingBot:
             return
 
         for pos in positions:
-            tick = mt5.symbol_info_tick(SYMBOL)
+            tick = self._get_trade_tick()
             if tick is None:
+                print(" Close Skipped: no live tick")
                 continue
 
             price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
@@ -782,10 +785,25 @@ class LiveTradingBot:
                 comment = res.comment if res else "No response"
                 print(f" Close Failed | ticket={pos.ticket} | {comment}")
 
+    def _get_trade_tick(self):
+        retries = max(1, int(ORDER_TICK_RETRIES))
+        wait_sec = max(0.0, float(ORDER_TICK_RETRY_SEC))
+
+        for _ in range(retries):
+            if not mt5.symbol_select(SYMBOL, True):
+                time.sleep(wait_sec)
+                continue
+
+            tick = mt5.symbol_info_tick(SYMBOL)
+            if tick is not None and float(getattr(tick, "bid", 0.0)) > 0.0 and float(getattr(tick, "ask", 0.0)) > 0.0:
+                return tick
+            time.sleep(wait_sec)
+        return None
+
     def send_order(self, order_type):
-        tick = mt5.symbol_info_tick(SYMBOL)
+        tick = self._get_trade_tick()
         if tick is None:
-            print(" Order Failed: no symbol tick")
+            print(" Order Skipped: no live tick (market closed or quote unavailable)")
             return
 
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
