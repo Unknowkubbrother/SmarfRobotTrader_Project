@@ -8,3 +8,9 @@ tensorboard
 .codex
 llm-rag.zip
 Archive.zip
+
+# Chroma artifacts
+**/chroma_db/
+**/chroma_db_old/
+**/chroma_store_images/
+**/chroma_store_text_bge_1024/
