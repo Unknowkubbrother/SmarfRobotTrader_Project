@@ -27,7 +27,8 @@ from .utils import norm_path, dataset_unique_paths
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_NAME = "openai/clip-vit-large-patch14"
 
-PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_store_images")
+_LLM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", os.path.join(_LLM_ROOT, "chroma_store_images"))
 COLLECTION = os.getenv("CHROMA_COLLECTION", "chart_clip_images")
 
 ROI_CUT = dict(left=0.02, top=0.06, right=0.14, bottom=0.12)

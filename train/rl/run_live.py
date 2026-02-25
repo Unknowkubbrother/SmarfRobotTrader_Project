@@ -4,6 +4,8 @@ import time
 import json
 from datetime import datetime, timedelta
 
+import joblib
+import numpy as np
 import pandas as pd
 from mt5linux import MetaTrader5
 from stable_baselines3 import PPO
@@ -13,7 +15,8 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 RL_ROOT = os.path.dirname(os.path.abspath(__file__))
 CORE_DIR = os.path.join(RL_ROOT, "core")
 TEST_DIR = os.path.join(RL_ROOT, "test")
-for _path in (CORE_DIR, TEST_DIR):
+LLM_DIR = os.path.join(os.path.dirname(RL_ROOT), "llm")
+for _path in (CORE_DIR, TEST_DIR, LLM_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
@@ -32,6 +35,8 @@ from backtest_features import build_feature_columns, build_gate_stats
 from backtest_semantic import SemanticRuntime
 from env_trading import TradingEnv
 
+from use_llm import generate_llm_cls_for_bar
+
 
 MT5_HOST = os.getenv("MT5_HOST", "localhost").strip() or "localhost"
 MT5_PORT = int(os.getenv("MT5_PORT", "8001"))
@@ -41,10 +46,19 @@ MAGIC_NUMBER = int(os.getenv("LIVE_MAGIC_NUMBER", "123456"))
 DEVIATION = int(os.getenv("LIVE_DEVIATION", "20"))
 POLL_SECONDS = float(os.getenv("LIVE_POLL_SECONDS", "1"))
 SYNC_EXTERNAL_LOT = os.getenv("LIVE_SYNC_EXTERNAL_LOT", "1").strip().lower() in {"1", "true", "yes"}
-EVAL_ON_START = os.getenv("LIVE_EVAL_ON_START", "0").strip().lower() in {"1", "true", "yes"}
+EVAL_ON_START = os.getenv("LIVE_EVAL_ON_START", "1").strip().lower() in {"1", "true", "yes"}
 ENABLE_CATCHUP_REPLAY = os.getenv("LIVE_ENABLE_CATCHUP_REPLAY", "1").strip().lower() in {"1", "true", "yes"}
 MAX_CATCHUP_BARS = int(os.getenv("LIVE_CATCHUP_MAX_BARS", "0"))
 EXECUTE_STALE_REPLAY_ORDERS = os.getenv("LIVE_CATCHUP_EXECUTE_STALE", "0").strip().lower() in {"1", "true", "yes"}
+LLM_DATASET_JSON = os.getenv("LIVE_LLM_DATASET_JSON", "").strip()
+LLM_SEMANTIC_CACHE_FILE = os.getenv(
+    "LIVE_LLM_SEMANTIC_CACHE_FILE",
+    os.path.join(MODELS_DIR, "time_to_embedding_llm_cls.joblib"),
+).strip() or os.path.join(MODELS_DIR, "time_to_embedding_llm_cls.joblib")
+LLM_TEXT_LOG_FILE = os.getenv(
+    "LIVE_LLM_TEXT_LOG_FILE",
+    os.path.join(MODELS_DIR, "time_to_llm_text.jsonl"),
+).strip() or os.path.join(MODELS_DIR, "time_to_llm_text.jsonl")
 STATE_FILE = os.getenv("LIVE_STATE_FILE", os.path.join(MODELS_DIR, "run_live_state.json")).strip() or os.path.join(
     MODELS_DIR, "run_live_state.json"
 )
@@ -219,6 +233,9 @@ class LiveTradingBot:
         self.last_known_ticket = 0
         self.state_file = STATE_FILE
         self.state_loaded = False
+        self.llm_semantic_cache_file = LLM_SEMANTIC_CACHE_FILE
+        self.llm_text_log_file = LLM_TEXT_LOG_FILE
+        self.llm_semantic_cache = {}
 
         tf_attr = f"TIMEFRAME_{TIMEFRAME_NAME}"
         self.timeframe = getattr(mt5, tf_attr, mt5.TIMEFRAME_H1)
@@ -248,6 +265,65 @@ class LiveTradingBot:
         print(f" MT5 Connected. Account: {account_info.login}")
         print(f" Symbol={SYMBOL} | Timeframe={TIMEFRAME_NAME} | Point={self.point} | Digits={self.digits}")
         print(f" Balance={self.initial_balance:.2f} | AutoLot={self.current_lot}")
+
+    def _load_llm_semantic_cache(self):
+        self.llm_semantic_cache = {}
+        cache_file = self.llm_semantic_cache_file
+        if not cache_file or not os.path.exists(cache_file):
+            return
+        try:
+            payload = joblib.load(cache_file)
+        except Exception as exc:
+            print(f" LLM semantic cache skipped (invalid file): {exc}")
+            return
+        if not isinstance(payload, dict):
+            return
+
+        restored = {}
+        for key, vec in payload.items():
+            if not isinstance(key, str):
+                continue
+            arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+            if arr.size == 0:
+                continue
+            restored[key] = arr
+        self.llm_semantic_cache = restored
+        if restored:
+            print(f" Loaded LLM semantic cache: {len(restored)} rows")
+
+    def _save_llm_semantic_cache(self, reason: str = "periodic"):
+        if not self.llm_semantic_cache:
+            return
+        cache_file = self.llm_semantic_cache_file
+        try:
+            cache_dir = os.path.dirname(cache_file)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+            tmp_path = f"{cache_file}.tmp"
+            serializable = {k: np.asarray(v, dtype=np.float32) for k, v in self.llm_semantic_cache.items()}
+            joblib.dump(serializable, tmp_path)
+            os.replace(tmp_path, cache_file)
+        except Exception as exc:
+            print(f" LLM semantic cache save failed ({reason}): {exc}")
+
+    def _append_llm_text_log(self, ts_key: str, llm_text: str):
+        if not self.llm_text_log_file:
+            return
+        try:
+            log_dir = os.path.dirname(self.llm_text_log_file)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            record = {
+                "time": ts_key,
+                "symbol": SYMBOL,
+                "timeframe": TIMEFRAME_NAME,
+                "text": str(llm_text or "").strip(),
+                "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            with open(self.llm_text_log_file, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            print(f" LLM text log failed: {exc}")
 
     def _load_model(self):
         self.semantic_runtime = SemanticRuntime(models_dir=MODELS_DIR)
@@ -293,11 +369,64 @@ class LiveTradingBot:
             gate_stats={},
         )
 
+        self._load_llm_semantic_cache()
+        if self.llm_semantic_cache:
+            self.semantic_runtime.global_time_to_vec.update(self.llm_semantic_cache)
+            print(
+                " Merged LLM semantic cache into runtime embeddings: "
+                f"{len(self.llm_semantic_cache)}"
+            )
+
         print(" Model + VecNormalize loaded")
         print(
-            " Pipeline: test-aligned (semantic fallback + adaptive gate) | "
+            " Pipeline: test-aligned (LLM-CLS semantic + adaptive gate) | "
             f"features={len(self.feature_columns)}"
         )
+        print(" LLM semantic mode enabled (strict): raw text -> cls embedding")
+
+    def _resolve_live_llm_semantic(self, ts_key: str):
+        if self.semantic_runtime is None:
+            return
+        if ts_key in self.semantic_runtime.global_time_to_vec:
+            return
+
+        cached_vec = self.llm_semantic_cache.get(ts_key)
+        if cached_vec is not None:
+            self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(cached_vec, dtype=np.float32)
+            return
+
+        dataset_json = LLM_DATASET_JSON if LLM_DATASET_JSON else None
+        bar_dt = datetime.strptime(ts_key, "%Y-%m-%d %H:%M:%S")
+        print(f" LLM semantic: building cls for {ts_key}")
+        try:
+            llm_text, llm_cls = generate_llm_cls_for_bar(
+                date_time=bar_dt,
+                symbol=SYMBOL,
+                dataset_json=dataset_json,
+            )
+            cls_vec = np.asarray(llm_cls, dtype=np.float32).reshape(-1)
+            expected_dim = int(self.semantic_runtime._embedding_dim())
+            if cls_vec.size != expected_dim:
+                raise RuntimeError(f"CLS dim mismatch expected={expected_dim} got={cls_vec.size}")
+
+            self.llm_semantic_cache[ts_key] = cls_vec
+            self.semantic_runtime.global_time_to_vec[ts_key] = cls_vec
+            self._append_llm_text_log(ts_key, llm_text)
+            self._save_llm_semantic_cache(reason="llm_update")
+            print(f" LLM semantic ready | ts={ts_key} | dim={cls_vec.size}")
+        except Exception as exc:
+            raise RuntimeError(f"LLM semantic failed for {ts_key}: {exc}") from exc
+
+    def _ensure_window_real_semantic(self, window_df: pd.DataFrame):
+        if self.semantic_runtime is None:
+            return
+        tail_df = window_df.tail(int(max(1, WINDOW_SIZE)))
+        ts_keys = pd.to_datetime(tail_df["time"]).dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+        missing = [ts for ts in ts_keys if ts not in self.semantic_runtime.global_time_to_vec]
+        if missing:
+            print(f" LLM semantic: resolving missing window embeddings={len(missing)}")
+        for ts_key in missing:
+            self._resolve_live_llm_semantic(ts_key)
 
     def _runtime_state_payload(self):
         if self.bridge is None:
@@ -735,6 +864,8 @@ class LiveTradingBot:
             print(" Not enough bars yet for model window")
             return
 
+        self._ensure_window_real_semantic(window_df)
+
         delta_tick, delta_price = self._calc_delta_for_closed_bar(bar_end_ts)
         self.bridge.gate_stats = self.gate_provider.update(window_df)
 
@@ -793,6 +924,7 @@ class LiveTradingBot:
             print("\n Stopped by user")
         finally:
             self._save_runtime_state(reason="shutdown")
+            self._save_llm_semantic_cache(reason="shutdown")
             try:
                 mt5.shutdown()
             except Exception:

@@ -1,9 +1,12 @@
 import os
 import base64
 from io import BytesIO
+from typing import Optional, Tuple
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage
+import numpy as np
+from FlagEmbedding import BGEM3FlagModel
 
 from datetime import datetime, timedelta
 
@@ -36,9 +39,16 @@ load_dotenv()
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+LLM_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DATASET_JSON = os.getenv("LLM_DATASET_JSON", os.path.join(LLM_ROOT, "dataset.json"))
+DEFAULT_EMBED_MODEL = os.getenv("LLM_EMBED_MODEL", "BAAI/bge-m3")
+
 UTC_TO_BROKER = 7
 BROKER_TO_TARGET = 7
 TOTAL_OFFSET = UTC_TO_BROKER + BROKER_TO_TARGET
+
+_runtime_cache = {}
+_embedder = None
 
 class VisionLLMClient:
     def __init__(self):
@@ -69,6 +79,67 @@ class VisionLLMClient:
         response = self.llm.invoke(messages)
         return strip_markdown(response.content)
 
+def _normalize_dataset_json(dataset_json: Optional[str]) -> str:
+    path = (dataset_json or DEFAULT_DATASET_JSON).strip() or DEFAULT_DATASET_JSON
+    if not os.path.isabs(path):
+        path = os.path.join(LLM_ROOT, path)
+    return os.path.abspath(path)
+
+
+def _get_runtime(dataset_json: Optional[str] = None):
+    dataset_path = _normalize_dataset_json(dataset_json)
+    runtime = _runtime_cache.get(dataset_path)
+    if runtime is not None:
+        return runtime
+
+    chart_db = upsert_image_dataset(dataset_path)
+    text_db = upsert_text_dataset(dataset_path)
+    vision_llm = VisionLLMClient()
+    runtime = {
+        "dataset_json": dataset_path,
+        "chart_db": chart_db,
+        "text_db": text_db,
+        "vision_llm": vision_llm,
+    }
+    _runtime_cache[dataset_path] = runtime
+    return runtime
+
+
+def _get_embedder() -> BGEM3FlagModel:
+    global _embedder
+    if _embedder is None:
+        _embedder = BGEM3FlagModel(DEFAULT_EMBED_MODEL, use_fp16=True)
+    return _embedder
+
+
+def _l2_normalize(vec: np.ndarray) -> np.ndarray:
+    arr = np.asarray(vec, dtype=np.float32)
+    norm = float(np.linalg.norm(arr))
+    if norm <= 1e-12:
+        return arr
+    return (arr / norm).astype(np.float32)
+
+
+def text_to_cls_embedding(text: str) -> np.ndarray:
+    embedder = _get_embedder()
+    clean = str(text or "").strip()
+    out = embedder.encode(
+        [clean],
+        return_dense=True,
+        return_sparse=False,
+        return_colbert_vecs=True,
+    )
+
+    colbert = out.get("colbert_vecs", [])
+    if len(colbert) > 0:
+        token_vecs = np.asarray(colbert[0], dtype=np.float32)
+        if token_vecs.ndim == 2 and token_vecs.shape[0] > 0:
+            return _l2_normalize(token_vecs[0])
+
+    dense = out.get("dense_vecs", [])
+    if len(dense) > 0:
+        return _l2_normalize(np.asarray(dense[0], dtype=np.float32))
+    return np.zeros(1024, dtype=np.float32)
 
 def run_rag_pipeline(chart_db, text_db, vision_llm, DATASET_JSON ,base64_image : str) -> str:
 
@@ -194,21 +265,39 @@ def generate_image(date_time: datetime, symbol: str = "EURUSD") -> str:
         mt5.shutdown()
 
 
-    
+def generate_llm_text_for_bar(date_time: datetime, symbol: str = "EURUSD", dataset_json: Optional[str] = None) -> str:
+    runtime = _get_runtime(dataset_json)
+    base64_image = generate_image(date_time, symbol=symbol)
+    final_answer = run_rag_pipeline(
+        chart_db=runtime["chart_db"],
+        text_db=runtime["text_db"],
+        vision_llm=runtime["vision_llm"],
+        DATASET_JSON=runtime["dataset_json"],
+        base64_image=base64_image,
+    )
+    return str(final_answer or "").strip()
+
+
+def generate_llm_cls_for_bar(
+    date_time: datetime,
+    symbol: str = "EURUSD",
+    dataset_json: Optional[str] = None,
+) -> Tuple[str, np.ndarray]:
+    llm_text = generate_llm_text_for_bar(date_time=date_time, symbol=symbol, dataset_json=dataset_json)
+    cls_vec = text_to_cls_embedding(llm_text)
+    return llm_text, cls_vec
+
 
 def use_llm() -> str:
-    DATASET_JSON = "dataset.json"
-
-    chart_db = upsert_image_dataset(DATASET_JSON)
-    text_db = upsert_text_dataset(DATASET_JSON)
-
-    vision_llm = VisionLLMClient()
-
+    runtime = _get_runtime(DEFAULT_DATASET_JSON)
     base64_image = generate_image(datetime.now())
-
-    print(base64_image)
-
-    return run_rag_pipeline(chart_db, text_db, vision_llm, DATASET_JSON, base64_image)
+    return run_rag_pipeline(
+        runtime["chart_db"],
+        runtime["text_db"],
+        runtime["vision_llm"],
+        runtime["dataset_json"],
+        base64_image,
+    )
 
 
 if __name__ == "__main__":

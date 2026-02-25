@@ -17,8 +17,24 @@ def norm_path(p: str) -> str:
 
 
 def load_dataset(json_path: str) -> List[Dict[str, Any]]:
-    with open(json_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    abs_json = os.path.abspath(json_path)
+    base_dir = os.path.dirname(abs_json)
+    with open(abs_json, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    normalized: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        image = row.get("image")
+        if image:
+            image_path = str(image).strip()
+            if image_path and not os.path.isabs(image_path):
+                image_path = os.path.join(base_dir, image_path)
+            row["image"] = norm_path(image_path)
+        normalized.append(row)
+    return normalized
 
 
 def dataset_unique_paths(dataset_json: str) -> Tuple[List[Dict[str, Any]], List[str]]:

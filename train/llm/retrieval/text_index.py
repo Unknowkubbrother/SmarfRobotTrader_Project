@@ -12,7 +12,8 @@ from .utils import norm_path, load_dataset
 
 
 TEXT_MODEL_NAME = "BAAI/bge-m3"
-TEXT_PERSIST_BASE = "chroma_store_text_bge"
+_LLM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEXT_PERSIST_BASE = os.path.join(_LLM_ROOT, "chroma_store_text_bge")
 TEXT_COLLECTION_BASE = "chart_text_bge_m3"
 
 CHUNK_SIZE = 512
