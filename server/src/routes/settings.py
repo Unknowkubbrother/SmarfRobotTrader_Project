@@ -7,7 +7,7 @@ import time
 
 from ..database.client import db, r_cache
 from lib.untils import random_with_N_digits, send_otp_email
-from ..models.settings import (
+from ..models.settings_model import (
     UserProfileResponse, 
     NotificationConfigResponse, 
     UpdateProfileRequest, 

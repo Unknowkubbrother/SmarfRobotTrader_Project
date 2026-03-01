@@ -1,10 +1,14 @@
 from fastapi import APIRouter, HTTPException, Depends, status, Response, Request, Form
 from pydantic import BaseModel
 from prisma import Json
-from ..models.bot import (
-    Create_Bot_Version, Create_Bot_Configuration, RiskLevelEnum,
-    Update_Bot_Status, Update_Bot_Risk, Update_Bot_Schedule,
-    Change_Bot_Model, Delete_Bot, Apply_Bot_Update
+from ..models.bot_model import (
+    Create_Bot_Configuration,
+    Update_Bot_Status,
+    Update_Bot_Risk,
+    Update_Bot_Schedule,
+    Change_Bot_Model,
+    Delete_Bot,
+    Apply_Bot_Update
 )
 from ..database.client import db
 

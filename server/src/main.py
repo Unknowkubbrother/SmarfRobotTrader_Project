@@ -7,7 +7,7 @@ import jwt
 import os
 from fastapi.staticfiles import StaticFiles
 
-from .routes import authentication, bot, trading, settings, notification, search, subscription, admin
+from .routes import authentication, bot, trading, settings, notification, search, subscription, admin, vision_llm
 from .database.client import db
 
 SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
@@ -32,6 +32,9 @@ PUBLIC_PATHS = [
     "/auth/google/register/complete",
     "/auth/check-user",
     "/auth/login/otp-init",
+
+    # TEST VISION LLM
+    "/vision_llm/",
 ]
 
 
@@ -110,6 +113,7 @@ app.include_router(notification.notification_router, prefix="/notifications")
 app.include_router(search.search_router, prefix="/search")
 app.include_router(subscription.subscription_router, prefix="/subscription")
 app.include_router(admin.admin_router, prefix="/admin")
+app.include_router(vision_llm.vision_llm_router, prefix="/vision_llm")
 
 # uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 # cloudflared tunnel --url http://localhost:8000

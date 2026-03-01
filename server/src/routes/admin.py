@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from lib.untils import send_email
 
 from ..database.client import db
-from ..models.admin import (
+from ..models.admin_model import (
     AdminBotVersionItemResponse,
     AdminStatsResponse,
     AdminUserBillingSummaryResponse,

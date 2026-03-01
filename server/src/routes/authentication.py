@@ -11,7 +11,7 @@ import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 
 from ..database.client import r_cache, db
-from ..models.authentication_model import Register_OTP, Register_Verify, Register_Complete, Login_Verify, Google_Register_OTP, Google_Register_Verify, Google_Register_Complete, CheckUser_Request, Login_OTP_Init, SetPassword_Request
+from ..models.auth_model import Register_OTP, Register_Verify, Register_Complete, Login_Verify, Google_Register_OTP, Google_Register_Verify, Google_Register_Complete, CheckUser_Request, Login_OTP_Init, SetPassword_Request
 from lib.untils import random_with_N_digits, send_otp_email
 from ..utils.turnstile import verify_turnstile
 

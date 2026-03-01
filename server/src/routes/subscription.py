@@ -7,7 +7,7 @@ from typing import Annotated, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from ..database.client import db
-from ..models.subscription import (
+from ..models.subscription_model import (
     AdminBillingConfigResponse,
     AdminSubscriptionItemResponse,
     AdminSubscriptionManagementResponse,
