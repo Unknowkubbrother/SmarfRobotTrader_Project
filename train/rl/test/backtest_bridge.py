@@ -36,10 +36,9 @@ from backtest_config import (
     OPEN_PROB_THRESHOLD,
     PIP_SIZE,
     PIP_VALUE,
+    RISK_PIPS,
     RISK_PERCENT,
-    SL_PIPS,
     SPREAD_PIPS,
-    TP_PIPS,
     TRADE_COOLDOWN_BARS,
     TREND_HOLD_RELAX,
     TREND_RELAX,
@@ -52,9 +51,9 @@ from backtest_config import (
 from backtest_features import calculate_features
 
 
-def calc_auto_lot(balance, risk_pct=RISK_PERCENT, sl_pips=SL_PIPS, pip_value_per_lot=PIP_VALUE, min_lot=0.01, lot_step=0.01):
+def calc_auto_lot(balance, risk_pct=RISK_PERCENT, risk_pips=RISK_PIPS, pip_value_per_lot=PIP_VALUE, min_lot=0.01, lot_step=0.01):
     risk_amount = balance * risk_pct / 100.0
-    lot = risk_amount / (sl_pips * pip_value_per_lot)
+    lot = risk_amount / (risk_pips * pip_value_per_lot)
     lot = max(min_lot, lot_step * int(lot / lot_step))
     return round(lot, 2)
 
@@ -78,8 +77,6 @@ class PPOBridge:
         self.wins = 0
         self.total_pnl = 0.0
         self.total_fees = 0.0
-        self.sl_hits = 0
-        self.tp_hits = 0
         self.max_equity = INITIAL_BALANCE
         self.lot_size = calc_auto_lot(INITIAL_BALANCE)
         self.spread_cost = SPREAD_PIPS * PIP_VALUE * self.lot_size
@@ -256,40 +253,14 @@ class PPOBridge:
         ts_key = last_bar["time"].strftime("%Y-%m-%d %H:%M:%S")
         semantic_quality = self.semantic_runtime.get_quality(ts_key)
         current_price = last_bar["close"]
-        bar_high = last_bar["high"]
-        bar_low = last_bar["low"]
 
-        sl_tp_closed = False
+        max_hold_closed = False
 
-        if self.position != 0 and self.entry_price > 0 and not self.first_bar:
-            if self.position == 1:
-                sl_price = self.entry_price - SL_PIPS * PIP_SIZE
-                tp_price = self.entry_price + TP_PIPS * PIP_SIZE
-                hit_sl = bar_low <= sl_price
-                hit_tp = bar_high >= tp_price
-            else:
-                sl_price = self.entry_price + SL_PIPS * PIP_SIZE
-                tp_price = self.entry_price - TP_PIPS * PIP_SIZE
-                hit_sl = bar_high >= sl_price
-                hit_tp = bar_low <= tp_price
+        if self.position != 0 and self.entry_price > 0 and not self.first_bar and self.hold_steps >= MAX_HOLD_STEPS:
+            self._close(current_price)
+            max_hold_closed = True
 
-            if hit_sl and hit_tp:
-                self._close(sl_price)
-                self.sl_hits += 1
-                sl_tp_closed = True
-            elif hit_sl:
-                self._close(sl_price)
-                self.sl_hits += 1
-                sl_tp_closed = True
-            elif hit_tp:
-                self._close(tp_price)
-                self.tp_hits += 1
-                sl_tp_closed = True
-            elif self.hold_steps >= MAX_HOLD_STEPS:
-                self._close(current_price)
-                sl_tp_closed = True
-
-        if self.position != 0 and not sl_tp_closed:
+        if self.position != 0 and not max_hold_closed:
             self.unrealized_pnl = self._calc_pnl(self.entry_price, current_price, self.position)
             self.equity = self.balance + self.unrealized_pnl
             self.hold_steps += 1
@@ -369,7 +340,7 @@ class PPOBridge:
         elif action == 3 and self.position == 0:
             action = 0
 
-        if sl_tp_closed:
+        if max_hold_closed:
             self.trade_cooldown = max(self.trade_cooldown, cooldown_after_trade)
             self.first_bar = True
             return 3, current_price

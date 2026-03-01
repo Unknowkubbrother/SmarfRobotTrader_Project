@@ -23,9 +23,7 @@ from backtest_config import (
     MODELS_DIR,
     PIP_VALUE,
     RISK_PERCENT,
-    SL_PIPS,
     SPREAD_PIPS,
-    TP_PIPS,
     WINDOW_SIZE,
 )
 from backtest_features import build_feature_columns, build_gate_stats
@@ -272,8 +270,6 @@ class LiveTradingBot:
                 lambda: TradingEnv(
                     mock_df,
                     lot_size=max(0.01, calc_auto_lot(self.initial_balance or 100.0)),
-                    sl_pips=SL_PIPS,
-                    tp_pips=TP_PIPS,
                 )
             ]
         )
@@ -642,15 +638,6 @@ class LiveTradingBot:
             return
 
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
-        sl_distance = SL_PIPS * self.pip_size
-        tp_distance = TP_PIPS * self.pip_size
-
-        if order_type == mt5.ORDER_TYPE_BUY:
-            sl_price = round(price - sl_distance, self.digits)
-            tp_price = round(price + tp_distance, self.digits)
-        else:
-            sl_price = round(price + sl_distance, self.digits)
-            tp_price = round(price - tp_distance, self.digits)
 
         account = mt5.account_info()
         if account is not None:
@@ -662,8 +649,6 @@ class LiveTradingBot:
             "volume": self.current_lot,
             "type": order_type,
             "price": price,
-            "sl": sl_price,
-            "tp": tp_price,
             "deviation": DEVIATION,
             "magic": MAGIC_NUMBER,
             "comment": "AI Trade",
@@ -676,7 +661,7 @@ class LiveTradingBot:
             side = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
             print(
                 f" Opened {side} @ {price:.{self.digits}f} | "
-                f"Lot={self.current_lot} | SL={sl_price:.{self.digits}f} | TP={tp_price:.{self.digits}f}"
+                f"Lot={self.current_lot}"
             )
         else:
             comment = res.comment if res else "No response"

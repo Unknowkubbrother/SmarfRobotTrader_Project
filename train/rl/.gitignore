@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 train/tensorboard/
 test/outputs/
+
+time_to_embedding_cls.joblib
+models/

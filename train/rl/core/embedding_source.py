@@ -3,8 +3,6 @@ import os
 import joblib
 import numpy as np
 
-from chroma_client import ChromaDBClient
-
 
 EMBED_SOURCE_MODE = "cls"
 
@@ -49,6 +47,8 @@ def _save_cached_map(cache_file: str, time_to_vec: dict):
 
 
 def _load_chroma_rows(models_dir: str):
+    from chroma_client import ChromaDBClient
+
     client = ChromaDBClient(persist_path=os.path.join(models_dir, "chroma_db"))
     docs = client.collection.get(include=["metadatas", "embeddings", "documents"])
 

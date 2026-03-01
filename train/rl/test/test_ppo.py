@@ -30,11 +30,9 @@ from backtest_config import (
     PIP_SIZE,
     PIP_VALUE,
     RISK_PERCENT,
-    SL_PIPS,
     TEST_DATA_FILE,
     TEST_DATE_FROM,
     TEST_DATE_TO,
-    TP_PIPS,
     TRADE_COOLDOWN_BARS,
     WINDOW_SIZE,
     MAX_HOLD_STEPS,
@@ -87,7 +85,7 @@ def _load_model():
 
     mock_df = pd.DataFrame(dummy_data)
     dummy_env = DummyVecEnv(
-        [lambda: TradingEnv(mock_df, lot_size=calc_auto_lot(INITIAL_BALANCE), sl_pips=SL_PIPS, tp_pips=TP_PIPS)]
+        [lambda: TradingEnv(mock_df, lot_size=calc_auto_lot(INITIAL_BALANCE))]
     )
 
     vec_norm = VecNormalize.load(os.path.join(MODELS_DIR, "vec_normalize.pkl"), dummy_env)
@@ -111,8 +109,6 @@ def _print_results(df, bridge, equity_history, gate_stats):
     print(f"Win Rate:         {(bridge.wins / bridge.trades * 100) if bridge.trades > 0 else 0:.2f}%")
     print(f"Max Drawdown:     {max_dd * 100:.2f}%")
     print(f"Total Fees Paid:  ${bridge.total_fees:.2f}")
-    print(f"SL Hits:          {bridge.sl_hits}")
-    print(f"TP Hits:          {bridge.tp_hits}")
     print("=" * 50)
     print(f"Start Time: {df['time'].iloc[BAR_HISTORY]}")
     print(f"End Time:   {df['time'].iloc[-1]}")

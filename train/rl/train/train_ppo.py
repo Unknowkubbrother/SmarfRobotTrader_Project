@@ -38,6 +38,7 @@ class TrainConfig:
     ae_lr: float
     ae_weight_decay: float
     total_timesteps: int
+    max_hold_steps: int
     recent_bias: float
     recent_lookback: int
     min_episode_bars: int
@@ -57,6 +58,7 @@ def _build_config() -> TrainConfig:
     ae_lr = float(os.getenv("TRAIN_AE_LR", "0.001"))
     ae_weight_decay = float(os.getenv("TRAIN_AE_WEIGHT_DECAY", "0.00001"))
     total_timesteps = int(os.getenv("TRAIN_TIMESTEPS", "300000"))
+    max_hold_steps = int(os.getenv("TRAIN_MAX_HOLD_STEPS", "16"))
     recent_bias = float(os.getenv("TRAIN_RECENT_BIAS", "0.65"))
     recent_lookback = int(os.getenv("TRAIN_RECENT_LOOKBACK", "1200"))
     min_episode_bars = int(os.getenv("TRAIN_MIN_EPISODE_BARS", "250"))
@@ -77,6 +79,7 @@ def _build_config() -> TrainConfig:
         ae_lr=ae_lr,
         ae_weight_decay=ae_weight_decay,
         total_timesteps=total_timesteps,
+        max_hold_steps=max_hold_steps,
         recent_bias=recent_bias,
         recent_lookback=recent_lookback,
         min_episode_bars=min_episode_bars,
@@ -179,13 +182,6 @@ class TradingMetricsCallback(BaseCallback):
 
         if self.episode_drawdowns:
             self.logger.record("trading/max_drawdown", np.max(self.episode_drawdowns[-100:]) * 100)
-
-        infos = self.locals.get("infos", [{}])
-        for info in infos:
-            if info:
-                self.logger.record("trading/sl_hits", info.get("sl_hits", 0))
-                self.logger.record("trading/tp_hits", info.get("tp_hits", 0))
-
 
 def load_training_data() -> pd.DataFrame:
     base_file = os.getenv("TRAIN_DATA_FILE", "h1_ohlc_delta.csv").strip() or "h1_ohlc_delta.csv"
@@ -383,8 +379,7 @@ def build_train_env(df: pd.DataFrame, cfg: TrainConfig):
             df,
             random_start=True,
             lot_size=0.1,
-            sl_pips=50,
-            tp_pips=50,
+            max_hold_steps=cfg.max_hold_steps,
             recent_bias=cfg.recent_bias,
             recent_lookback=cfg.recent_lookback,
             min_episode_bars=cfg.min_episode_bars,
@@ -432,7 +427,7 @@ def print_training_banner(cfg: TrainConfig, feature_list: list[str]):
     print(" Starting Training (Trend-Aware Mode)")
     print("=" * 50)
     print(" TensorBoard: tensorboard --logdir=./tensorboard/")
-    print(" SL=50 pips | TP=50 pips | Lot=0.1 | MaxHold=30 | RandomStart=ON")
+    print(f" Lot=0.1 | MaxHold={cfg.max_hold_steps} | RandomStart=ON")
     print(
         " Projector: "
         f"mode={cfg.projector_mode}, latent={cfg.sem_latent_dim}, source={cfg.embed_source_mode}, "

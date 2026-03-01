@@ -13,8 +13,6 @@ class TradingEnv(gym.Env):
         lot_size=0.1,
         pip_size=0.0001,
         pip_value=10.0,
-        sl_pips=30,
-        tp_pips=60,
         spread_pips=2,
         commission_per_lot=0.0,
         max_dd=0.30,
@@ -36,8 +34,6 @@ class TradingEnv(gym.Env):
         self.lot_size = lot_size
         self.pip_size = pip_size
         self.pip_value = pip_value
-        self.sl_pips = sl_pips
-        self.tp_pips = tp_pips
         self.spread_pips = spread_pips
         self.commission_per_lot = commission_per_lot
         self.max_dd = max_dd
@@ -138,10 +134,6 @@ class TradingEnv(gym.Env):
         self.total_pnl = 0.0
 
 
-        self.sl_hits = 0
-        self.tp_hits = 0
-
-
         self.correct_predictions = 0
         self.total_predictions = 0
 
@@ -197,59 +189,23 @@ class TradingEnv(gym.Env):
 
 
         next_bar = self.df.iloc[self.step_idx + 1]
-        next_high = next_bar['high']
-        next_low = next_bar['low']
         next_close = next_bar['close']
 
         reward = 0.0
         trade_executed = False
-        sl_tp_closed = False
+        timed_out_closed = False
         close_pnl = 0.0
         opened_new_position = False
 
 
-        if self.position != 0 and self.entry_price > 0:
-            if self.position == 1:
-                sl_price = self.entry_price - self.sl_pips * self.pip_size
-                tp_price = self.entry_price + self.tp_pips * self.pip_size
-                bar_hit_sl = next_low <= sl_price
-                bar_hit_tp = next_high >= tp_price
-            else:
-                sl_price = self.entry_price + self.sl_pips * self.pip_size
-                tp_price = self.entry_price - self.tp_pips * self.pip_size
-                bar_hit_sl = next_high >= sl_price
-                bar_hit_tp = next_low <= tp_price
-
-            if bar_hit_sl and bar_hit_tp:
-
-                close_pnl = self._calc_pnl_pips(self.entry_price, sl_price, self.position)
-                self._close_position_at(sl_price)
-                self.sl_hits += 1
-                sl_tp_closed = True
-                trade_executed = True
-            elif bar_hit_sl:
-
-                close_pnl = self._calc_pnl_pips(self.entry_price, sl_price, self.position)
-                self._close_position_at(sl_price)
-                self.sl_hits += 1
-                sl_tp_closed = True
-                trade_executed = True
-            elif bar_hit_tp:
-
-                close_pnl = self._calc_pnl_pips(self.entry_price, tp_price, self.position)
-                self._close_position_at(tp_price)
-                self.tp_hits += 1
-                sl_tp_closed = True
-                trade_executed = True
-            elif self.hold_steps >= self.max_hold_steps:
-
-                close_pnl = self._calc_pnl_pips(self.entry_price, next_close, self.position)
-                self._close_position_at(next_close)
-                sl_tp_closed = True
-                trade_executed = True
+        if self.position != 0 and self.entry_price > 0 and self.hold_steps >= self.max_hold_steps:
+            close_pnl = self._calc_pnl_pips(self.entry_price, next_close, self.position)
+            self._close_position_at(next_close)
+            timed_out_closed = True
+            trade_executed = True
 
 
-        if sl_tp_closed:
+        if timed_out_closed:
             pass
         elif action == 0:
             pass
@@ -280,7 +236,7 @@ class TradingEnv(gym.Env):
                 opened_new_position = True
 
         elif action == 3:
-            if self.position != 0 and not sl_tp_closed:
+            if self.position != 0:
                 close_pnl = self._calc_pnl_pips(self.entry_price, current_price, self.position)
                 self._close_position_at(current_price)
                 trade_executed = True
@@ -320,7 +276,7 @@ class TradingEnv(gym.Env):
             reward += 0.05
 
 
-        if opened_new_position and not sl_tp_closed:
+        if opened_new_position:
             reward -= self.entry_penalty
 
             row = self.df.iloc[self.step_idx]
@@ -354,13 +310,6 @@ class TradingEnv(gym.Env):
                 reward += min(close_pips / self.win_close_scale, 1.0)
             else:
                 reward -= min(abs(close_pips) / self.loss_close_scale, 1.2)
-
-
-        if sl_tp_closed:
-            if close_pnl > 0:
-                reward += 1.0
-            else:
-                reward -= 0.5
 
 
         if self.position != 0 and self.hold_steps >= self.max_hold_steps * 0.9:
@@ -417,8 +366,6 @@ class TradingEnv(gym.Env):
             "total_pnl": self.total_pnl,
             "accuracy": accuracy,
             "action": action,
-            "sl_hits": self.sl_hits,
-            "tp_hits": self.tp_hits,
         }
 
         return self._get_obs(), reward, terminated, truncated, info
