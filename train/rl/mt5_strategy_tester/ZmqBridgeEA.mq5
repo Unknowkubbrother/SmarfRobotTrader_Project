@@ -139,6 +139,7 @@ string BuildDataString(int dTick, double dPrice) {
   int position = 0;
   double unrealized_pnl = 0;
   double entry_price = 0;
+  double position_volume = 0.0;
 
   if (PositionSelect(_Symbol)) {
     long posType = PositionGetInteger(POSITION_TYPE);
@@ -148,6 +149,7 @@ string BuildDataString(int dTick, double dPrice) {
       position = -1;
     unrealized_pnl = PositionGetDouble(POSITION_PROFIT);
     entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
+    position_volume = PositionGetDouble(POSITION_VOLUME);
   }
 
   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -156,7 +158,8 @@ string BuildDataString(int dTick, double dPrice) {
           "," + DoubleToString(unrealized_pnl, 2) + ",0," +
           DoubleToString(entry_price, _Digits) + "," + IntegerToString(dTick) +
           "," + DoubleToString(dPrice, _Digits) + "," +
-          DoubleToString(currentLot, 2);
+          DoubleToString(currentLot, 2) + "," +
+          DoubleToString(position_volume, 2);
 
   return data;
 }
@@ -178,8 +181,10 @@ void ExecuteAction(int action) {
     if (hasPosition && posType == POSITION_TYPE_SELL) {
       trade.PositionClose(_Symbol);
       Sleep(100);
+      hasPosition = PositionSelect(_Symbol);
+      posType = hasPosition ? PositionGetInteger(POSITION_TYPE) : -1;
     }
-    if (!hasPosition || posType == POSITION_TYPE_SELL) {
+    if (!hasPosition || posType == POSITION_TYPE_BUY) {
       price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       // No SL/TP on order — Python server manages SL/TP
       trade.Buy(currentLot, _Symbol, price, 0, 0, "PPO_BUY");
@@ -191,15 +196,18 @@ void ExecuteAction(int action) {
     if (hasPosition && posType == POSITION_TYPE_BUY) {
       trade.PositionClose(_Symbol);
       Sleep(100);
+      hasPosition = PositionSelect(_Symbol);
+      posType = hasPosition ? PositionGetInteger(POSITION_TYPE) : -1;
     }
-    if (!hasPosition || posType == POSITION_TYPE_BUY) {
+    if (!hasPosition || posType == POSITION_TYPE_SELL) {
       price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       trade.Sell(currentLot, _Symbol, price, 0, 0, "PPO_SELL");
       Print("📉 SELL @ ", price, " | Lot: ", currentLot, " (auto-sized)");
     }
     break;
 
-  case 3: // CLOSE
+  case 3: // CLOSE_ONE (net-position mode => close all)
+  case 4: // CLOSE_ALL
     if (hasPosition) {
       trade.PositionClose(_Symbol);
       Print("🔒 CLOSE position");
@@ -245,12 +253,12 @@ void OnTick() {
 
   int action = GetPPOAction(data);
 
-  if (action < 0 || action > 3) {
+  if (action < 0 || action > 4) {
     Print("⚠️ Invalid action: ", action);
     return;
   }
 
-  string actionNames[] = {"HOLD", "BUY", "SELL", "CLOSE"};
+  string actionNames[] = {"HOLD", "BUY", "SELL", "CLOSE_ONE", "CLOSE_ALL"};
   Print("🤖 PPO Action: ", actionNames[action], " (", action, ")");
 
   ExecuteAction(action);

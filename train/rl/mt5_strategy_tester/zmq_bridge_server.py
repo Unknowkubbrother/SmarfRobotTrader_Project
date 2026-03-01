@@ -255,7 +255,7 @@ def parse_mt5_data(data_str: str):
         parts = data_str.strip().split(";")
         bars_raw = parts[0].split("|") if parts and parts[0] else []
         if not bars_raw:
-            return None, 0, 0.0, 0.0
+            return None, 0, 0.0, {}
 
         fallback_times = _fallback_times(len(bars_raw))
         rows = []
@@ -288,20 +288,27 @@ def parse_mt5_data(data_str: str):
             )
 
         if not rows:
-            return None, 0, 0.0, 0.0
+            return None, 0, 0.0, {}
 
         df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
 
         state_str = parts[1] if len(parts) > 1 else ""
         state_values = [v.strip() for v in state_str.split(",")] if state_str else []
+        broker_state = {
+            "position": int(float(state_values[0])) if len(state_values) > 0 and state_values[0] else 0,
+            "equity": float(state_values[1]) if len(state_values) > 1 and state_values[1] else 0.0,
+            "unrealized_pnl": float(state_values[2]) if len(state_values) > 2 and state_values[2] else 0.0,
+            "entry_price": float(state_values[4]) if len(state_values) > 4 and state_values[4] else 0.0,
+            "lot_size": float(state_values[7]) if len(state_values) > 7 and state_values[7] else 0.0,
+            "position_volume": float(state_values[8]) if len(state_values) > 8 and state_values[8] else 0.0,
+        }
         delta_tick = int(float(state_values[5])) if len(state_values) > 5 and state_values[5] else 0
         delta_price = float(state_values[6]) if len(state_values) > 6 and state_values[6] else 0.0
-        lot_size = float(state_values[7]) if len(state_values) > 7 and state_values[7] else 0.0
 
-        return df, delta_tick, delta_price, lot_size
+        return df, delta_tick, delta_price, broker_state
     except Exception as exc:
         print(f" Parse error: {exc}")
-        return None, 0, 0.0, 0.0
+        return None, 0, 0.0, {}
 
 
 def main():
@@ -326,7 +333,7 @@ def main():
     socket.bind(endpoint)
 
     bar_count = 0
-    action_names = ["HOLD", "BUY", "SELL", "CLOSE"]
+    action_names = ["HOLD", "BUY", "SELL", "CLOSE_ONE", "CLOSE_ALL"]
 
     print("\n" + "=" * 70)
     print(" PPO ZMQ Server (MT5) - Test-Logic Aligned")
@@ -353,16 +360,40 @@ def main():
                 socket.send_string("0")
                 continue
 
-            df, delta_tick, delta_price, lot_from_ea = parse_mt5_data(data_str)
+            df, delta_tick, delta_price, broker_state = parse_mt5_data(data_str)
             if df is None or len(df) < WINDOW_SIZE:
                 socket.send_string("0")
                 continue
 
             bridge.gate_stats = gate_stats_provider.update(df)
 
-            if SYNC_EXTERNAL_LOT and lot_from_ea > 0:
-                bridge.lot_size = lot_from_ea
-                bridge.spread_cost = SPREAD_PIPS * PIP_VALUE * lot_from_ea
+            state_lot = float(broker_state.get("lot_size", 0.0))
+            state_pos = int(broker_state.get("position", 0))
+            state_entry = float(broker_state.get("entry_price", 0.0))
+            state_pos_vol = float(broker_state.get("position_volume", 0.0))
+            state_unrealized = float(broker_state.get("unrealized_pnl", 0.0))
+            state_equity = float(broker_state.get("equity", 0.0))
+
+            if SYNC_EXTERNAL_LOT and state_lot > 0:
+                bridge.lot_size = state_lot
+                bridge.spread_cost = SPREAD_PIPS * PIP_VALUE * state_lot
+
+            if hasattr(bridge, "sync_from_broker"):
+                vol = state_pos_vol if state_pos_vol > 0 else (state_lot if state_pos != 0 else 0.0)
+                prev_pos = int(getattr(bridge, "position", 0))
+                reset_hold = prev_pos != state_pos
+                bridge.sync_from_broker(
+                    direction=state_pos,
+                    entry_price=state_entry,
+                    volume=vol,
+                    reset_hold=reset_hold,
+                    order_lot=state_lot if state_lot > 0 else bridge.lot_size,
+                )
+                if state_equity > 0:
+                    bridge.equity = state_equity
+                    bridge.unrealized_pnl = state_unrealized
+                    bridge.balance = state_equity - state_unrealized
+                    bridge.max_equity = max(float(bridge.max_equity), float(bridge.equity))
 
             try:
                 action, current_price = bridge.process_bar(df, delta_tick, delta_price)
@@ -371,6 +402,10 @@ def main():
                 print(f" process_bar error: {exc}")
                 socket.send_string("0")
                 continue
+
+            if action < 0 or action >= len(action_names):
+                print(f" Invalid action from model: {action} -> fallback HOLD(0)")
+                action = 0
 
             bar_count += 1
             win_rate = (bridge.wins / bridge.trades * 100.0) if bridge.trades > 0 else 0.0

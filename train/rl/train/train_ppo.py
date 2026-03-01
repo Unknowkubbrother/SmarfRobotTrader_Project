@@ -54,7 +54,6 @@ class TrainConfig:
     recent_bias: float
     recent_lookback: int
     min_episode_bars: int
-    max_open_orders: int
     initial_balance: float
     lot_size: float
     lot_risk_pips: float
@@ -80,7 +79,6 @@ def _build_config() -> TrainConfig:
     recent_bias = float(os.getenv("TRAIN_RECENT_BIAS", "0.65"))
     recent_lookback = int(os.getenv("TRAIN_RECENT_LOOKBACK", "1200"))
     min_episode_bars = int(os.getenv("TRAIN_MIN_EPISODE_BARS", "250"))
-    max_open_orders = int(os.getenv("TRAIN_MAX_OPEN_ORDERS", os.getenv("MAX_OPEN_ORDERS", "1")))
     initial_balance = float(os.getenv("TRAIN_INITIAL_BALANCE", "10000"))
     lot_risk_pips = float(os.getenv("LOT_RISK_PIPS", "50"))
     risk_percent_low = float(os.getenv("RISK_PERCENT_LOW", "0.5"))
@@ -133,7 +131,6 @@ def _build_config() -> TrainConfig:
         recent_bias=recent_bias,
         recent_lookback=recent_lookback,
         min_episode_bars=min_episode_bars,
-        max_open_orders=max(1, max_open_orders),
         initial_balance=initial_balance,
         lot_size=lot_size,
         lot_risk_pips=lot_risk_pips,
@@ -242,9 +239,9 @@ class TradingMetricsCallback(BaseCallback):
             self.logger.record("trading/max_drawdown", np.max(self.episode_drawdowns[-100:]) * 100)
 
 def load_training_data() -> pd.DataFrame:
-    base_file = os.getenv("TRAIN_DATA_FILE", "h1_ohlc_delta.csv").strip() or "h1_ohlc_delta.csv"
+    base_file = os.getenv("TRAIN_DATA_FILE", "h1_ohlc_delta1.csv").strip() or "h1_ohlc_delta1.csv"
     train_date_from = os.getenv("TRAIN_DATE_FROM", "2025-01-01 00:00:00").strip()
-    train_date_to = os.getenv("TRAIN_DATE_TO", "2025-12-31 23:00:00").strip()
+    train_date_to = os.getenv("TRAIN_DATE_TO", "2026-02-20 23:00:00").strip()
     data_path = os.path.join(DATASETS_DIR, base_file)
     df = pd.read_csv(data_path)
 
@@ -438,7 +435,6 @@ def build_train_env(df: pd.DataFrame, cfg: TrainConfig):
             random_start=True,
             initial_balance=cfg.initial_balance,
             lot_size=cfg.lot_size,
-            max_open_orders=cfg.max_open_orders,
             recent_bias=cfg.recent_bias,
             recent_lookback=cfg.recent_lookback,
             min_episode_bars=cfg.min_episode_bars,
@@ -498,7 +494,7 @@ def print_training_banner(cfg: TrainConfig, feature_list: list[str]):
     print("=" * 50)
     print(" TensorBoard: tensorboard --logdir=./tensorboard/")
     print(" No forced auto-close (RL handles close/hold) | RandomStart=ON")
-    print(f" Multi-order mode: max_open_orders={cfg.max_open_orders} (action buy/sell = add 1 order)")
+    print(" Actions: 0=hold, 1=buy(add), 2=sell(add), 3=close-all")
     print(
         " Lot config: "
         f"source={cfg.lot_source} | initial_balance={cfg.initial_balance:.2f} | "

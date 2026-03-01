@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 train/tensorboard/
 test/outputs/
+logs/*.*

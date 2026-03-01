@@ -12,6 +12,7 @@ if CORE_DIR not in sys.path:
     sys.path.insert(0, CORE_DIR)
 
 from backtest_config import (
+    BAR_HISTORY,
     MODELS_DIR,
     DATASETS_DIR,
     OUTPUT_DIR,
@@ -31,7 +32,7 @@ from backtest_config import (
     RISK_PERCENT,
     WINDOW_SIZE,
 )
-from backtest_bridge import calc_auto_lot
+from backtest_bridge import PPOBridge, calc_auto_lot
 from backtest_features import build_feature_columns, build_gate_stats, calculate_features as _calculate_features
 from backtest_semantic import SemanticRuntime
 from env_trading import TradingEnv
@@ -45,9 +46,10 @@ TEST_MODEL_PATH = os.getenv("TEST_MODEL_PATH", os.path.join(MODELS_DIR, "ppo_tra
 TEST_VEC_NORM_PATH = os.getenv("TEST_VEC_NORM_PATH", os.path.join(MODELS_DIR, "vec_normalize.pkl")).strip() or os.path.join(
     MODELS_DIR, "vec_normalize.pkl"
 )
-TEST_MAX_OPEN_ORDERS = int(
-    os.getenv("TEST_MAX_OPEN_ORDERS", os.getenv("TRAIN_MAX_OPEN_ORDERS", os.getenv("MAX_OPEN_ORDERS", "1")))
-)
+TEST_EXECUTION_MODE = os.getenv("TEST_EXECUTION_MODE", "mt5_bridge").strip().lower() or "mt5_bridge"
+if TEST_EXECUTION_MODE not in {"mt5_bridge", "train_env"}:
+    print(f" Invalid TEST_EXECUTION_MODE={TEST_EXECUTION_MODE!r}, fallback to 'mt5_bridge'")
+    TEST_EXECUTION_MODE = "mt5_bridge"
 TEST_LOT_MIN = float(os.getenv("TEST_LOT_MIN", os.getenv("LOT_MIN", "0.0001")))
 TEST_LOT_STEP = float(os.getenv("TEST_LOT_STEP", os.getenv("LOT_STEP", "0.0001")))
 EFFECTIVE_TEST_LOT_SIZE = (
@@ -90,7 +92,7 @@ def _print_data_filtering(df_full, df, data_path):
     if TEST_DATE_FROM or TEST_DATE_TO:
         print(f"ช่วงที่เลือก:       from={TEST_DATE_FROM or '-'} to={TEST_DATE_TO or '-'}")
     print(f"lot config:         {EFFECTIVE_TEST_LOT_SIZE:.4f} ({EFFECTIVE_TEST_LOT_SOURCE})")
-    print(f"max open orders:    {max(1, TEST_MAX_OPEN_ORDERS)}")
+    print(f"execution mode:     {TEST_EXECUTION_MODE} ({'MT5/Live parity' if TEST_EXECUTION_MODE == 'mt5_bridge' else 'Train-Env parity'})")
     print(f"model path:         {TEST_MODEL_PATH}")
     print(f"vecnorm path:       {TEST_VEC_NORM_PATH}")
     print("=" * 50 + "\n")
@@ -120,7 +122,6 @@ def _load_model():
                 pip_size=PIP_SIZE,
                 pip_value=PIP_VALUE,
                 spread_pips=SPREAD_PIPS,
-                max_open_orders=max(1, TEST_MAX_OPEN_ORDERS),
                 random_start=False,
             )
         ]
@@ -134,22 +135,32 @@ def _load_model():
     return model, vec_norm
 
 
-def _print_results(df, env, equity_history, gate_stats):
+def _print_results(result, gate_stats):
+    df = result["df_ref"]
+    start_time = result["start_time"]
+    end_time = result["end_time"]
+    final_equity = float(result["final_equity"])
+    trades = int(result["trades"])
+    wins = int(result["wins"])
+    total_fees = float(result["total_fees"])
+    equity_history = result["equity_history"]
+
     max_dd = max((max(equity_history[: i + 1]) - equity_history[i]) / max(equity_history[: i + 1]) for i in range(len(equity_history)))
     avg_quality, low_quality, quality_count = SEMANTIC_RUNTIME.quality_summary()
+    mode_name = "MT5-Bridge Parity" if TEST_EXECUTION_MODE == "mt5_bridge" else "Train-Env Parity"
 
     print("\n" + "=" * 50)
-    print(" TEST RESULTS (Train-Env Parity)")
+    print(f" TEST RESULTS ({mode_name})")
     print("=" * 50)
-    print(f"Final Equity:     ${env.equity:.2f}")
-    print(f"Return:           {((env.equity / TEST_INITIAL_BALANCE - 1) * 100):.2f}%")
-    print(f"Total Trades:     {env.trades}")
-    print(f"Win Rate:         {(env.wins / env.trades * 100) if env.trades > 0 else 0:.2f}%")
+    print(f"Final Equity:     ${final_equity:.2f}")
+    print(f"Return:           {((final_equity / TEST_INITIAL_BALANCE - 1) * 100):.2f}%")
+    print(f"Total Trades:     {trades}")
+    print(f"Win Rate:         {(wins / trades * 100) if trades > 0 else 0:.2f}%")
     print(f"Max Drawdown:     {max_dd * 100:.2f}%")
-    print(f"Total Fees Paid:  ${env.total_fees:.2f}")
+    print(f"Total Fees Paid:  ${total_fees:.2f}")
     print("=" * 50)
-    print(f"Start Time: {df['time'].iloc[WINDOW_SIZE]}")
-    print(f"End Time:   {df['time'].iloc[min(env.step_idx, len(df) - 1)]}")
+    print(f"Start Time: {start_time}")
+    print(f"End Time:   {end_time}")
 
     print(
         " Semantic cache: "
@@ -163,7 +174,7 @@ def _print_results(df, env, equity_history, gate_stats):
     )
 
     print(
-        " Action policy: model.predict(deterministic=True) on TradingEnv (train-parity) | "
+        f" Action policy: model.predict(deterministic=True) on {mode_name} | "
         f"sem_q_min={EMBED_QUALITY_MIN:.2f}"
     )
 
@@ -187,7 +198,8 @@ def _plot_if_enabled(time_history, equity_history, buy_signals, sell_signals, cl
         print("\n Generating Strategy Tester Graph...")
 
         plt.figure(figsize=(14, 7))
-        plt.title(f"PPO Backtest - Train-Env Parity (Return: {((final_equity / TEST_INITIAL_BALANCE - 1) * 100):.2f}%)")
+        mode_name = "MT5-Bridge Parity" if TEST_EXECUTION_MODE == "mt5_bridge" else "Train-Env Parity"
+        plt.title(f"PPO Backtest - {mode_name} (Return: {((final_equity / TEST_INITIAL_BALANCE - 1) * 100):.2f}%)")
         plt.plot(time_history, equity_history, label="Equity", color="blue", linewidth=1.5)
 
         if buy_signals:
@@ -224,7 +236,7 @@ def _prepare_feature_frame(df):
     return df_features
 
 
-def _run_backtest(df):
+def _run_backtest_train_env(df):
     gate_stats = build_gate_stats(df)
     model, vec_norm = _load_model()
 
@@ -236,7 +248,6 @@ def _run_backtest(df):
         pip_size=PIP_SIZE,
         pip_value=PIP_VALUE,
         spread_pips=SPREAD_PIPS,
-        max_open_orders=max(1, TEST_MAX_OPEN_ORDERS),
         random_start=False,
     )
 
@@ -268,13 +279,96 @@ def _run_backtest(df):
             buy_signals.append((step_time, float(info["equity"])))
         elif action == 2:
             sell_signals.append((step_time, float(info["equity"])))
-        elif action == 3:
+        elif action in (3, 4):
             close_signals.append((step_time, float(info["equity"])))
 
         done = bool(terminated or truncated)
 
     return {
-        "env": env,
+        "df_ref": df,
+        "start_time": df["time"].iloc[WINDOW_SIZE],
+        "end_time": df["time"].iloc[min(env.step_idx, len(df) - 1)],
+        "final_equity": float(env.equity),
+        "trades": int(env.trades),
+        "wins": int(env.wins),
+        "total_fees": float(env.total_fees),
+        "gate_stats": gate_stats,
+        "equity_history": equity_history,
+        "time_history": time_history,
+        "buy_signals": buy_signals,
+        "sell_signals": sell_signals,
+        "close_signals": close_signals,
+    }
+
+
+def _run_backtest_mt5_bridge(df):
+    gate_stats = build_gate_stats(df)
+    model, vec_norm = _load_model()
+
+    bridge = PPOBridge(
+        model=model,
+        vec_norm=vec_norm,
+        feature_columns=FEATURE_COLUMNS,
+        semantic_runtime=SEMANTIC_RUNTIME,
+        semantic_feature_count=SEMANTIC_RUNTIME.semantic_feature_count,
+        gate_stats=gate_stats,
+    )
+    bridge.equity = TEST_INITIAL_BALANCE
+    bridge.balance = TEST_INITIAL_BALANCE
+    bridge.max_equity = TEST_INITIAL_BALANCE
+    bridge.lot_size = EFFECTIVE_TEST_LOT_SIZE
+    bridge.spread_cost = SPREAD_PIPS * PIP_VALUE * bridge.lot_size
+
+    min_bars = max(BAR_HISTORY, WINDOW_SIZE)
+    if len(df) < min_bars:
+        raise ValueError(f"Not enough bars for mt5_bridge mode. Need >= {min_bars}, got {len(df)}.")
+
+    start_idx = min_bars - 1
+    print(
+        f" Processing {len(df) - start_idx} bars "
+        f"(PPOBridge window={WINDOW_SIZE}, bar_history={BAR_HISTORY})..."
+    )
+
+    equity_history = [float(bridge.equity)]
+    time_history = [df["time"].iloc[start_idx]]
+    buy_signals = []
+    sell_signals = []
+    close_signals = []
+
+    for idx in range(start_idx, len(df)):
+        window_df = df.iloc[idx - BAR_HISTORY + 1 : idx + 1].copy()
+        step_time = df["time"].iloc[idx]
+        row = df.iloc[idx]
+        if "delta_tick" in df.columns and pd.notna(row.get("delta_tick")):
+            delta_tick = int(float(row.get("delta_tick", 0.0)))
+        else:
+            delta_tick = 0
+        if "delta_price" in df.columns and pd.notna(row.get("delta_price")):
+            delta_price = float(row.get("delta_price", 0.0))
+        else:
+            delta_price = 0.0
+
+        action, _ = bridge.process_bar(window_df, delta_tick=delta_tick, delta_price=delta_price)
+        action = int(action)
+
+        equity_history.append(float(bridge.equity))
+        time_history.append(step_time)
+
+        if action == 1:
+            buy_signals.append((step_time, float(bridge.equity)))
+        elif action == 2:
+            sell_signals.append((step_time, float(bridge.equity)))
+        elif action in (3, 4):
+            close_signals.append((step_time, float(bridge.equity)))
+
+    return {
+        "df_ref": df,
+        "start_time": df["time"].iloc[start_idx],
+        "end_time": df["time"].iloc[len(df) - 1],
+        "final_equity": float(bridge.equity),
+        "trades": int(bridge.trades),
+        "wins": int(bridge.wins),
+        "total_fees": float(bridge.total_fees),
         "gate_stats": gate_stats,
         "equity_history": equity_history,
         "time_history": time_history,
@@ -305,18 +399,19 @@ def main():
     if "has_delta" in df.columns:
         df = df.drop(columns=["has_delta"])
 
-    feature_df = _prepare_feature_frame(df)
-    if len(feature_df) <= (WINDOW_SIZE + 1):
-        raise ValueError(
-            f"Not enough bars after feature prep for WINDOW_SIZE={WINDOW_SIZE}. Need > {WINDOW_SIZE + 1}, got {len(feature_df)}."
-        )
-
-    result = _run_backtest(feature_df)
+    if TEST_EXECUTION_MODE == "train_env":
+        feature_df = _prepare_feature_frame(df)
+        if len(feature_df) <= (WINDOW_SIZE + 1):
+            raise ValueError(
+                f"Not enough bars after feature prep for WINDOW_SIZE={WINDOW_SIZE}. "
+                f"Need > {WINDOW_SIZE + 1}, got {len(feature_df)}."
+            )
+        result = _run_backtest_train_env(feature_df)
+    else:
+        result = _run_backtest_mt5_bridge(df)
 
     _print_results(
-        df=feature_df,
-        env=result["env"],
-        equity_history=result["equity_history"],
+        result=result,
         gate_stats=result["gate_stats"],
     )
 
@@ -326,7 +421,7 @@ def main():
         buy_signals=result["buy_signals"],
         sell_signals=result["sell_signals"],
         close_signals=result["close_signals"],
-        final_equity=result["env"].equity,
+        final_equity=float(result["final_equity"]),
     )
 
 

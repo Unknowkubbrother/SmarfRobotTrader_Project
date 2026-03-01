@@ -16,11 +16,14 @@ class TradingEnv(gym.Env):
         spread_pips=2,
         commission_per_lot=0.0,
         max_dd=0.30,
-        max_open_orders=5,
         random_start=False,
         recent_bias=0.0,
         recent_lookback=1200,
         min_episode_bars=250,
+        scale_in_loss_only=True,
+        scale_in_trigger_pips=0.0,
+        net_units_obs_scale=5.0,
+        open_orders_obs_scale=5.0,
     ):
         self.df = df.reset_index(drop=True)
         self.window_size = window_size
@@ -32,11 +35,17 @@ class TradingEnv(gym.Env):
         self.spread_pips = spread_pips
         self.commission_per_lot = commission_per_lot
         self.max_dd = max_dd
-        self.max_open_orders = int(max(1, max_open_orders))
         self.random_start = random_start
         self.recent_bias = float(np.clip(recent_bias, 0.0, 1.0))
         self.recent_lookback = int(max(recent_lookback, window_size + 1))
         self.min_episode_bars = int(max(min_episode_bars, window_size + 1))
+        self.net_units_obs_scale = float(max(net_units_obs_scale, 1.0))
+        self.open_orders_obs_scale = float(max(open_orders_obs_scale, 1.0))
+        if isinstance(scale_in_loss_only, str):
+            self.scale_in_loss_only = scale_in_loss_only.strip().lower() not in {"0", "false", "no"}
+        else:
+            self.scale_in_loss_only = bool(scale_in_loss_only)
+        self.scale_in_trigger_pips = float(max(scale_in_trigger_pips, 0.0))
 
         self.spread_cost = self.spread_pips * self.pip_value * self.lot_size
         self.commission_cost = self.commission_per_lot * self.lot_size
@@ -145,8 +154,8 @@ class TradingEnv(gym.Env):
         unrealized_pnl_ratio = self.unrealized_pnl / self.balance_scale
 
         state_data = np.array([
-            np.clip((self.net_units / float(self.max_open_orders) + 1.0) * 0.5, 0.0, 1.0),
-            self.open_orders / float(self.max_open_orders),
+            self._ratio_to_unit01(self.net_units, full_scale=self.net_units_obs_scale),
+            np.tanh(self.open_orders / self.open_orders_obs_scale),
             self._ratio_to_unit01(total_pnl_ratio, full_scale=0.20),
             self._ratio_to_unit01(unrealized_pnl_ratio, full_scale=0.05),
             np.tanh(self.hold_steps / max(float(self.window_size), 1.0)),
@@ -162,6 +171,48 @@ class TradingEnv(gym.Env):
         pips_moved = price_diff / self.pip_size
         pnl = direction * pips_moved * self.pip_value * self.lot_size
         return pnl
+
+    def _positions_by_direction(self, direction):
+        return [pos for pos in self.open_positions if pos["direction"] == int(direction)]
+
+    def _mean_entry_by_direction(self, direction):
+        positions = self._positions_by_direction(direction)
+        if not positions:
+            return None
+        return float(np.mean([pos["entry_price"] for pos in positions]))
+
+    def _direction_unrealized_pnl(self, direction, mark_price):
+        positions = self._positions_by_direction(direction)
+        if not positions:
+            return 0.0
+        return float(sum(self._calc_pnl_pips(pos["entry_price"], mark_price, direction) for pos in positions))
+
+    def _is_adverse_price_for_direction(self, direction, price):
+        mean_entry = self._mean_entry_by_direction(direction)
+        if mean_entry is None:
+            return False
+        trigger = self.scale_in_trigger_pips * self.pip_size
+        if direction == 1:
+            return float(price) <= (mean_entry - trigger)
+        return float(price) >= (mean_entry + trigger)
+
+    def _can_open_directional_order(self, direction, price):
+        same_side_positions = self._positions_by_direction(direction)
+        if not same_side_positions:
+            return True
+
+        if not self.scale_in_loss_only:
+            return True
+
+        same_side_pnl = self._direction_unrealized_pnl(direction, price)
+        if same_side_pnl >= 0:
+            return False
+        return self._is_adverse_price_for_direction(direction, price)
+
+    def _apply_directional_action(self, direction, price):
+        if self._can_open_directional_order(direction, price):
+            return self._open_position(direction, price)
+        return False
 
     def _refresh_position_summary(self):
         self.long_units = sum(1 for pos in self.open_positions if pos["direction"] == 1)
@@ -212,10 +263,10 @@ class TradingEnv(gym.Env):
 
         if action == 1:
             directional_action = 1
-            trade_executed = self._open_position(1, current_price)
+            trade_executed = self._apply_directional_action(1, current_price)
         elif action == 2:
             directional_action = -1
-            trade_executed = self._open_position(-1, current_price)
+            trade_executed = self._apply_directional_action(-1, current_price)
         elif action == 3:
             trade_executed = self._close_positions_at(current_price)
 
@@ -266,9 +317,6 @@ class TradingEnv(gym.Env):
         return self._get_obs(), reward, terminated, truncated, info
 
     def _open_position(self, direction, price):
-        if len(self.open_positions) >= self.max_open_orders:
-            return False
-
         self.open_positions.append({
             "direction": int(direction),
             "entry_price": float(price),
@@ -281,22 +329,41 @@ class TradingEnv(gym.Env):
         self._refresh_position_summary()
         return True
 
+    def _realize_closed_position(self, position, exit_price):
+        realized_pnl = self._calc_pnl_pips(position["entry_price"], exit_price, position["direction"])
+        self.total_pnl += realized_pnl
+        self.balance += realized_pnl
+        self.trades += 1
+        if realized_pnl > 0:
+            self.wins += 1
+        if self.commission_cost > 0:
+            self.balance -= self.commission_cost
+            self.total_fees += self.commission_cost
+
+    def _close_oldest_position_at(self, exit_price):
+        if not self.open_positions:
+            return False
+
+        oldest_pos = self.open_positions.pop(0)
+        self._realize_closed_position(oldest_pos, exit_price)
+
+        if self.open_positions:
+            self.unrealized_pnl = self._calc_unrealized_pnl_at(exit_price)
+            self.equity = self.balance + self.unrealized_pnl
+        else:
+            self.unrealized_pnl = 0.0
+            self.equity = self.balance
+        self._refresh_position_summary()
+        return True
+
     def _close_positions_at(self, exit_price):
         if not self.open_positions:
             return False
 
-        for pos in self.open_positions:
-            realized_pnl = self._calc_pnl_pips(pos["entry_price"], exit_price, pos["direction"])
-            self.total_pnl += realized_pnl
-            self.balance += realized_pnl
-            self.trades += 1
-            if realized_pnl > 0:
-                self.wins += 1
-            if self.commission_cost > 0:
-                self.balance -= self.commission_cost
-                self.total_fees += self.commission_cost
+        while self.open_positions:
+            pos = self.open_positions.pop(0)
+            self._realize_closed_position(pos, exit_price)
 
-        self.open_positions = []
         self.unrealized_pnl = 0.0
         self.equity = self.balance
         self._refresh_position_summary()
@@ -312,5 +379,5 @@ class TradingEnv(gym.Env):
 
         print(f"Step: {self.step_idx} | {pos_str} | "
               f"Equity: ${self.equity:.2f} | PnL: ${self.total_pnl:.2f} | "
-              f"Open: {self.open_orders}/{self.max_open_orders} | "
+              f"Open: {self.open_orders} | "
               f"Trades: {self.trades} | WR: {(self.wins/self.trades*100) if self.trades > 0 else 0:.1f}%")

@@ -561,26 +561,36 @@ class LiveTradingBot:
         prev_pos = int(self.bridge.position)
         current_pos, pos = self._get_mt5_position()
         current_ticket = int(pos.ticket) if pos is not None else 0
+        current_volume = float(pos.volume) if pos is not None else 0.0
+        next_lot = max(0.01, calc_auto_lot(float(account.balance)))
+        self.bridge.lot_size = next_lot
 
-        self.bridge.position = current_pos
-        if current_pos != 0 and pos is not None:
-            self.bridge.entry_price = float(pos.price_open)
-            if prev_pos != current_pos or (self.last_known_ticket != 0 and self.last_known_ticket != current_ticket):
-                self.bridge.hold_steps = 0
+        reset_hold = prev_pos != current_pos or (self.last_known_ticket != 0 and self.last_known_ticket != current_ticket)
+        if hasattr(self.bridge, "sync_from_broker"):
+            self.bridge.sync_from_broker(
+                direction=current_pos,
+                entry_price=float(pos.price_open) if pos is not None else 0.0,
+                volume=current_volume,
+                reset_hold=bool(reset_hold),
+                order_lot=next_lot,
+            )
         else:
-            self.bridge.entry_price = 0.0
-            self.bridge.hold_steps = 0
-            self.bridge.unrealized_pnl = 0.0
+            self.bridge.position = current_pos
+            if current_pos != 0 and pos is not None:
+                self.bridge.entry_price = float(pos.price_open)
+                if reset_hold:
+                    self.bridge.hold_steps = 0
+            else:
+                self.bridge.entry_price = 0.0
+                self.bridge.hold_steps = 0
+                self.bridge.unrealized_pnl = 0.0
 
         self.bridge.balance = float(account.balance)
         self.bridge.equity = float(account.equity)
+        self.bridge.unrealized_pnl = float(account.equity - account.balance)
         self.bridge.total_pnl = float(account.balance - self.initial_balance)
         self.bridge.max_equity = max(float(self.bridge.max_equity), float(self.bridge.equity))
 
-        if SYNC_EXTERNAL_LOT and pos is not None and float(pos.volume) > 0:
-            self.bridge.lot_size = float(pos.volume)
-        else:
-            self.bridge.lot_size = max(0.01, calc_auto_lot(float(account.balance)))
         self.bridge.spread_cost = SPREAD_PIPS * PIP_VALUE * self.bridge.lot_size
 
         self.current_lot = self.bridge.lot_size
@@ -812,7 +822,7 @@ class LiveTradingBot:
         if action == 0:
             return True
 
-        if action == 3:
+        if action in (3, 4):
             if current_pos != 0:
                 return self.close_all()
             return True
@@ -824,7 +834,7 @@ class LiveTradingBot:
                 current_pos, _ = self._get_mt5_position()
                 if not closed_ok and current_pos == -1:
                     return False
-            if current_pos <= 0:
+            if current_pos >= 0:
                 return self.send_order(mt5.ORDER_TYPE_BUY)
             return True
 
@@ -835,7 +845,7 @@ class LiveTradingBot:
                 current_pos, _ = self._get_mt5_position()
                 if not closed_ok and current_pos == 1:
                     return False
-            if current_pos >= 0:
+            if current_pos <= 0:
                 return self.send_order(mt5.ORDER_TYPE_SELL)
             return True
         return False
@@ -848,7 +858,7 @@ class LiveTradingBot:
         broker_pos_before: int,
         broker_pos_after: int,
     ):
-        if self.bridge is None or not execute_orders or action not in (1, 2, 3):
+        if self.bridge is None or not execute_orders or action not in (1, 2, 3, 4):
             return
 
         expected_after = broker_pos_before
@@ -856,7 +866,7 @@ class LiveTradingBot:
             expected_after = 1
         elif action == 2:
             expected_after = -1
-        elif action == 3:
+        elif action in (3, 4):
             expected_after = 0
 
         mismatch = broker_pos_after != expected_after
@@ -869,10 +879,13 @@ class LiveTradingBot:
         )
 
         if broker_pos_after == 0:
-            self.bridge.position = 0
-            self.bridge.entry_price = 0.0
-            self.bridge.hold_steps = 0
-            self.bridge.unrealized_pnl = 0.0
+            if hasattr(self.bridge, "sync_from_broker"):
+                self.bridge.sync_from_broker(direction=0, entry_price=0.0, volume=0.0, reset_hold=True)
+            else:
+                self.bridge.position = 0
+                self.bridge.entry_price = 0.0
+                self.bridge.hold_steps = 0
+                self.bridge.unrealized_pnl = 0.0
 
         # Roll back synthetic spread fee if an open from flat did not fill.
         if action in (1, 2) and broker_pos_before == 0 and broker_pos_after == 0:
@@ -918,7 +931,7 @@ class LiveTradingBot:
         action, model_price = self.bridge.process_bar(window_df, delta_tick, delta_price)
         action = int(action)
 
-        action_name = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}.get(action, "?")
+        action_name = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE_ONE", 4: "CLOSE_ALL"}.get(action, "?")
         print(
             f" Model Action: {action_name} | Price={model_price:.5f} | "
             f"dTick={delta_tick} | dPrice={delta_price:.5f}"
