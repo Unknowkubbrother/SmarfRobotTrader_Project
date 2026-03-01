@@ -5,6 +5,7 @@ from datetime import datetime
 class VisionLLMRequest(BaseModel):
     date_time: datetime
     symbol: str
+    timeframe: str = "H1"
 
     @field_validator("date_time", mode="before")
     @classmethod

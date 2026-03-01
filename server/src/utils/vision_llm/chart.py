@@ -37,6 +37,10 @@ _CHART_STYLE = mpf.make_mpf_style(
 )
 
 
+class NoMarketDataError(ValueError):
+    """Raised when MT5 returns no candles for requested interval."""
+
+
 def generate_image(date_time: datetime, symbol: str = "EURUSD") -> str:
     """Return a base64-encoded PNG candlestick chart for one 1-hour bar.
 
@@ -68,7 +72,7 @@ def generate_image(date_time: datetime, symbol: str = "EURUSD") -> str:
             symbol, mt5.TIMEFRAME_M1, start_utc, end_utc,
         )
         if rates is None or len(rates) == 0:
-            raise ValueError(f"No M1 data for {symbol} at {date_time}")
+            raise NoMarketDataError(f"No M1 data for {symbol} at {date_time}")
 
         # Build OHLCV DataFrame
         df = pd.DataFrame(rates)

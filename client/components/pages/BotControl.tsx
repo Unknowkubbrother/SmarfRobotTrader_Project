@@ -7,6 +7,7 @@ import { AccountSelector, AccountWithBots } from "@/components/dashboard/Account
 import { BotSelector } from "@/components/dashboard/BotSelector";
 import { AddBotDialog } from "@/components/dialogs/AddBotDialog";
 import { useTradingAccounts, BotConfigWithVersion, BotVersion } from "@/hooks/useTradingAccounts";
+import { useBotLiveState } from "@/hooks/useBotLiveState";
 import {
   Dialog,
   DialogContent,
@@ -36,7 +37,64 @@ const defaultSchedule = [
   { day: "Wed", enabled: true },
   { day: "Thu", enabled: true },
   { day: "Fri", enabled: true },
+  { day: "Sat", enabled: false },
+  { day: "Sun", enabled: false },
 ];
+
+const DAY_ALIAS_TO_KEY: Record<string, string> = {
+  mon: "mon",
+  monday: "mon",
+  tue: "tue",
+  tues: "tue",
+  tuesday: "tue",
+  wed: "wed",
+  weds: "wed",
+  wednesday: "wed",
+  thu: "thu",
+  thur: "thu",
+  thurs: "thu",
+  thursday: "thu",
+  fri: "fri",
+  friday: "fri",
+  sat: "sat",
+  saturday: "sat",
+  sun: "sun",
+  sunday: "sun",
+};
+
+const normalizeTradingSchedule = (value: unknown): Record<string, boolean> => {
+  const normalized: Record<string, boolean> = {
+    mon: true,
+    tue: true,
+    wed: true,
+    thu: true,
+    fri: true,
+    sat: false,
+    sun: false,
+  };
+
+  let payload: Record<string, unknown> = {};
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object") {
+        payload = parsed as Record<string, unknown>;
+      }
+    } catch {
+      payload = {};
+    }
+  } else if (value && typeof value === "object") {
+    payload = value as Record<string, unknown>;
+  }
+
+  for (const [rawKey, rawValue] of Object.entries(payload)) {
+    const dayKey = DAY_ALIAS_TO_KEY[String(rawKey).trim().toLowerCase()];
+    if (!dayKey) continue;
+    normalized[dayKey] = Boolean(rawValue);
+  }
+
+  return normalized;
+};
 
 export default function BotControl() {
   const {
@@ -72,6 +130,34 @@ export default function BotControl() {
   const [updateConfirmOpen, setUpdateConfirmOpen] = useState(false);
 
   const [availableModels, setAvailableModels] = useState<BotVersion[]>([]);
+
+  const { getBotState } = useBotLiveState();
+  const liveState = selectedBot ? getBotState(selectedBot.id) : undefined;
+
+  // Safe live state properties with fallbacks
+  const botTodayPnl = selectedBot?.today_pnl ?? 0;
+  const liveEquity = liveState?.equity ?? selectedAccount?.equity ?? selectedAccount?.balance ?? 0;
+  const liveTotalPnl = liveState?.total_pnl ?? botTodayPnl;
+  const liveUnrealized = liveState?.unrealized_pnl ?? botTodayPnl;
+  const liveWins = liveState?.wins ?? 0;
+  const liveTrades = liveState?.trades ?? 0;
+  const livePosition = liveState?.position ?? 0;
+  const liveLotSize = liveState?.lot_size ?? 0;
+  const liveAction = liveState?.last_action || "—";
+  const liveScheduleSummary = (() => {
+    const src = normalizeTradingSchedule(liveState?.trading_schedule ?? selectedBot?.trading_schedule);
+    const days = [
+      ["mon", "Mon"],
+      ["tue", "Tue"],
+      ["wed", "Wed"],
+      ["thu", "Thu"],
+      ["fri", "Fri"],
+      ["sat", "Sat"],
+      ["sun", "Sun"],
+    ] as const;
+    const enabled = days.filter(([k]) => src[k]).map(([, l]) => l);
+    return enabled.length > 0 ? enabled.join(" ") : "None";
+  })();
 
   // Load available bot versions on mount
   useEffect(() => {
@@ -120,13 +206,11 @@ export default function BotControl() {
   useEffect(() => {
     if (selectedBot) {
       setSelectedRisk(selectedBot.risk_level || "medium");
-      const savedSchedule = selectedBot.trading_schedule as Record<string, boolean> | null;
-      if (savedSchedule) {
-        setSchedule(defaultSchedule.map(s => ({
-          ...s,
-          enabled: savedSchedule[s.day.toLowerCase()] ?? s.enabled
-        })));
-      }
+      const savedSchedule = normalizeTradingSchedule(selectedBot.trading_schedule);
+      setSchedule(defaultSchedule.map((s) => ({
+        ...s,
+        enabled: savedSchedule[s.day.toLowerCase()] ?? s.enabled,
+      })));
     }
   }, [selectedBot]);
 
@@ -160,11 +244,6 @@ export default function BotControl() {
     setPanicConfirmOpen(false);
   };
 
-  const matchDay = (dayName: string) => {
-    // Helper to match localized day names if needed, but here simple match
-    return dayName;
-  }
-
   const handleDayClick = (day: string) => {
     if (!selectedBot) return;
     setPendingDay(day);
@@ -177,12 +256,10 @@ export default function BotControl() {
     const newSchedule = schedule.map(s => s.day === pendingDay ? { ...s, enabled: !s.enabled } : s);
     setSchedule(newSchedule);
 
-    // Convert to lowercase for API: "Mon" -> "mon"
-    const scheduleObj = Object.fromEntries(newSchedule.map(s => [s.day.toLowerCase(), s.enabled]));
+    const scheduleObj = Object.fromEntries(
+      newSchedule.map((s) => [DAY_ALIAS_TO_KEY[s.day.toLowerCase()] || s.day.toLowerCase(), s.enabled]),
+    );
     await updateBotSchedule(selectedBot.id, scheduleObj);
-
-    const isEnabled = newSchedule.find(s => s.day === pendingDay)?.enabled;
-    toast.success(`Trading for ${pendingDay} is now ${isEnabled ? "enabled" : "disabled"}`);
 
     setScheduleConfirmOpen(false);
     setPendingDay(null);
@@ -198,7 +275,6 @@ export default function BotControl() {
     if (!selectedBot || !pendingRiskId) return;
     setSelectedRisk(pendingRiskId);
     await updateBotRisk(selectedBot.id, pendingRiskId);
-    toast.success(`Risk level updated to ${pendingRiskId}`);
     setRiskConfirmOpen(false);
     setPendingRiskId(null);
   };
@@ -213,7 +289,6 @@ export default function BotControl() {
     if (!selectedBot || !pendingModelId) return;
     const success = await changeModel(selectedBot.id, pendingModelId);
     if (success) {
-      toast.success("Trading model updated successfully");
       setShowModelDialog(false);
     }
     setModelConfirmOpen(false);
@@ -320,8 +395,13 @@ export default function BotControl() {
                     )}
                     <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-secondary">
                       <TrendingUp className="w-4 h-4 text-success" />
-                      <span className={cn("font-mono font-medium text-success")}>
-                        +${selectedBot.today_pnl.toFixed(2)}
+                      <span
+                        className={cn(
+                          "font-mono font-medium",
+                          selectedBot.today_pnl >= 0 ? "text-success" : "text-destructive"
+                        )}
+                      >
+                        {selectedBot.today_pnl >= 0 ? "+" : ""}${selectedBot.today_pnl.toFixed(2)}
                       </span>
                     </div>
                     <Button
@@ -358,6 +438,97 @@ export default function BotControl() {
               </div>
             </div>
           </div>
+
+          {/* Live Status Card */}
+          {selectedBot && (
+            <div className="glass-card p-5 animate-slide-up" style={{ animationDelay: "25ms" }}>
+              <div className="flex items-center gap-2 mb-4">
+                <Activity className="w-5 h-5 text-primary" />
+                <h3 className="font-semibold">Live Status</h3>
+                {liveState?.connected ? (
+                  <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-success/10 text-success">
+                    <span className="w-1.5 h-1.5 rounded-full bg-success animate-pulse" />
+                    Live
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-muted text-muted-foreground">
+                    Offline
+                  </span>
+                )}
+              </div>
+              {liveState ? (
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  <div className="p-3 rounded-xl bg-secondary/50">
+                    <p className="text-xs text-muted-foreground mb-1">Position</p>
+                    <p className={cn(
+                      "text-lg font-semibold font-mono",
+                      livePosition === 1 ? "text-success" : livePosition === -1 ? "text-destructive" : "text-muted-foreground"
+                    )}>
+                      {livePosition === 1 ? "LONG" : livePosition === -1 ? "SHORT" : "FLAT"}
+                    </p>
+                  </div>
+                  <div className="p-3 rounded-xl bg-secondary/50">
+                    <p className="text-xs text-muted-foreground mb-1">Total PnL</p>
+                    <p className={cn(
+                      "text-lg font-semibold font-mono",
+                      liveTotalPnl >= 0 ? "text-success" : "text-destructive"
+                    )}>
+                      {liveTotalPnl >= 0 ? "+" : ""}{liveTotalPnl.toFixed(2)}
+                    </p>
+                  </div>
+                  <div className="p-3 rounded-xl bg-secondary/50">
+                    <p className="text-xs text-muted-foreground mb-1">Unrealized PnL</p>
+                    <p className={cn(
+                      "text-lg font-semibold font-mono",
+                      liveUnrealized >= 0 ? "text-success" : "text-destructive"
+                    )}>
+                      {liveUnrealized >= 0 ? "+" : ""}{liveUnrealized.toFixed(2)}
+                    </p>
+                  </div>
+                  <div className="p-3 rounded-xl bg-secondary/50">
+                    <p className="text-xs text-muted-foreground mb-1">Equity</p>
+                    <p className="text-lg font-semibold font-mono">${liveEquity.toFixed(2)}</p>
+                  </div>
+                  <div className="p-3 rounded-xl bg-secondary/50">
+                    <p className="text-xs text-muted-foreground mb-1">Trades / Wins</p>
+                    <p className="text-lg font-semibold font-mono">
+                      {liveTrades} / <span className="text-success">{liveWins}</span>
+                    </p>
+                  </div>
+                  <div className="p-3 rounded-xl bg-secondary/50">
+                    <p className="text-xs text-muted-foreground mb-1">Win Rate</p>
+                    <p className="text-lg font-semibold font-mono">
+                      {liveTrades > 0 ? ((liveWins / liveTrades) * 100).toFixed(1) : "0.0"}%
+                    </p>
+                  </div>
+                  <div className="p-3 rounded-xl bg-secondary/50">
+                    <p className="text-xs text-muted-foreground mb-1">Last Action</p>
+                    <p className={cn(
+                      "text-lg font-semibold",
+                      liveAction === "BUY" ? "text-success" : liveAction === "SELL" ? "text-destructive" : "text-muted-foreground"
+                    )}>
+                      {liveAction}
+                    </p>
+                  </div>
+                  <div className="p-3 rounded-xl bg-secondary/50">
+                    <p className="text-xs text-muted-foreground mb-1">Lot / Last Bar</p>
+                    <p className="text-sm font-mono">
+                      {liveLotSize.toFixed(2)} · <span className="text-muted-foreground">{liveState?.last_bar_time?.slice(11, 19) || "—"}</span>
+                    </p>
+                  </div>
+                  <div className="p-3 rounded-xl bg-secondary/50 md:col-span-2">
+                    <p className="text-xs text-muted-foreground mb-1">Trading Schedule</p>
+                    <p className="text-sm font-mono">{liveScheduleSummary}</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-center py-6 text-muted-foreground">
+                  <p className="text-sm">Bot is not connected to the live hub</p>
+                  <p className="text-xs mt-1">Set <code className="bg-secondary px-1 rounded">BOT_CONFIG_ID</code> and <code className="bg-secondary px-1 rounded">BOT_WS_URL</code> in the bot&apos;s environment</p>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Risk Level & Schedule */}
           {selectedBot && (
@@ -424,7 +595,7 @@ export default function BotControl() {
                   <Clock className="w-5 h-5 text-primary" />
                   <h3 className="font-semibold">Trading Schedule</h3>
                 </div>
-                <div className="grid grid-cols-5 gap-2 mb-6">
+                <div className="grid grid-cols-4 sm:grid-cols-7 gap-2 mb-6">
                   {schedule.map((day) => (
                     <button
                       key={day.day}

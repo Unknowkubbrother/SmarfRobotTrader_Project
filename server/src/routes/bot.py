@@ -11,6 +11,8 @@ from ..models.bot_model import (
     Apply_Bot_Update
 )
 from ..database.client import db
+from ..utils.trading_schedule import normalize_trading_schedule
+from ..utils.ws_manager import bot_hub
 
 bot_router = APIRouter()
 
@@ -99,13 +101,7 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
 
     botInstanceId = 1000 + bot_configuration_count
     
-    tradingSchedule = {
-        "mon": True,
-        "tue": True,
-        "wed": True,
-        "thu": True,
-        "fri": True
-    }
+    tradingSchedule = normalize_trading_schedule({})
 
     bot_configuration = await db.botconfiguration.create(
         data={
@@ -181,6 +177,10 @@ async def update_bot_risk(request: Request, data: Update_Bot_Risk):
         where={"id": data.botConfigId},
         data={"riskLevel": data.riskLevel.value}
     )
+    await bot_hub.send_bot_config(
+        data.botConfigId,
+        {"risk_level": data.riskLevel.value},
+    )
 
     # Log Activity
     try:
@@ -208,9 +208,15 @@ async def update_bot_schedule(request: Request, data: Update_Bot_Schedule):
 
     await verify_bot_ownership(data.botConfigId, request.state.user_id)
 
+    normalized_schedule = normalize_trading_schedule(data.tradingSchedule)
+
     await db.botconfiguration.update(
         where={"id": data.botConfigId},
-        data={"tradingSchedule": Json(data.tradingSchedule)}
+        data={"tradingSchedule": Json(normalized_schedule)}
+    )
+    await bot_hub.send_bot_config(
+        data.botConfigId,
+        {"trading_schedule": normalized_schedule},
     )
 
     # Log Activity

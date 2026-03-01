@@ -4,7 +4,10 @@ from typing import Dict, List, Any, Optional
 
 import torch
 from FlagEmbedding import BGEM3FlagModel
-from langchain_community.vectorstores import Chroma
+try:
+    from langchain_chroma import Chroma
+except Exception:  # fallback for older envs
+    from langchain_community.vectorstores import Chroma
 from langchain.embeddings.base import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 

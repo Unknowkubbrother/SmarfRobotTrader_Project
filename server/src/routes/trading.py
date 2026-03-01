@@ -7,8 +7,110 @@ import os
 from datetime import date, datetime
 from ..models.trading_model import Create_Trading_Account
 from ..database.client import db
+from ..utils.trading_schedule import normalize_trading_schedule
 
 trading_router = APIRouter()
+
+
+def _as_date(value) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    return value
+
+
+def _to_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+async def _sync_daily_aggregates_from_orders(
+    user_id: str,
+    start_date: date,
+    end_date: date,
+):
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt = datetime.combine(end_date, datetime.min.time())
+
+    accounts = await db.tradingaccount.find_many(
+        where={"userId": user_id},
+    )
+    account_ids = [str(a.id) for a in accounts]
+    if not account_ids:
+        return {}
+
+    orders = await db.orderhistory.find_many(
+        where={
+            "accountId": {"in": account_ids},
+            "closeTime": {"gte": start_dt, "lt": end_dt},
+        },
+    )
+
+    account_day = {}
+    day_rollup = {}
+    for order in orders:
+        close_time = getattr(order, "closeTime", None)
+        if close_time is None:
+            continue
+        trade_day = _as_date(close_time)
+        if trade_day < start_date or trade_day >= end_date:
+            continue
+
+        account_id = str(order.accountId)
+        pnl = _to_float(getattr(order, "profit", 0.0))
+
+        acc_key = (account_id, trade_day)
+        acc_item = account_day.setdefault(
+            acc_key,
+            {"profit": 0.0, "trades": 0},
+        )
+        acc_item["profit"] += pnl
+        acc_item["trades"] += 1
+
+        day_item = day_rollup.setdefault(
+            int(trade_day.day),
+            {"wins": 0, "trades": 0},
+        )
+        day_item["trades"] += 1
+        if pnl > 0:
+            day_item["wins"] += 1
+
+    existing_rows = await db.dailyaggregate.find_many(
+        where={
+            "accountId": {"in": account_ids},
+            "date": {"gte": start_dt, "lt": end_dt},
+        },
+    )
+    existing_by_key = {
+        (str(row.accountId), _as_date(row.date)): row
+        for row in existing_rows
+    }
+
+    for (account_id, trade_day), stats in account_day.items():
+        day_dt = datetime.combine(trade_day, datetime.min.time())
+        daily_profit = round(float(stats["profit"]), 2)
+        total_trades = int(stats["trades"])
+        existing = existing_by_key.get((account_id, trade_day))
+        if existing:
+            await db.dailyaggregate.update(
+                where={"id": existing.id},
+                data={
+                    "dailyNetProfit": daily_profit,
+                    "totalTrades": total_trades,
+                },
+            )
+        else:
+            await db.dailyaggregate.create(
+                data={
+                    "account": {"connect": {"id": account_id}},
+                    "date": day_dt,
+                    "dailyNetProfit": daily_profit,
+                    "totalTrades": total_trades,
+                }
+            )
+
+    return day_rollup
 
 @trading_router.get("/calendar", tags=["trading"])
 async def get_trading_calendar(request: Request, year: int, month: int):
@@ -25,6 +127,17 @@ async def get_trading_calendar(request: Request, year: int, month: int):
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid year or month")
     
+    # Pull monthly trade history into daily_aggregates so calendar stays synced
+    try:
+        day_rollup = await _sync_daily_aggregates_from_orders(
+            user_id=request.state.user_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except Exception as e:
+        print(f"[WARN] trading calendar sync failed: {e}")
+        day_rollup = {}
+
     # Fetch aggregates for all user's accounts within the date range
     aggregates = await db.dailyaggregate.find_many(
         where={
@@ -52,16 +165,41 @@ async def get_trading_calendar(request: Request, year: int, month: int):
             }
         
         # safely add values
-        profit = float(agg.dailyNetProfit) if agg.dailyNetProfit else 0.0
+        profit = _to_float(agg.dailyNetProfit, 0.0)
         trades = agg.totalTrades if agg.totalTrades else 0
         
         calendar_data[day]["profit"] += profit
         calendar_data[day]["trades"] += trades
-        
-    # Convert to list
+
+    for day, payload in calendar_data.items():
+        payload["profit"] = round(float(payload["profit"]), 2)
+        wins = int(day_rollup.get(day, {}).get("wins", 0))
+        trades = int(payload["trades"] or 0)
+        payload["winRate"] = round((wins / trades) * 100, 1) if trades > 0 else 0.0
+
+    data = [calendar_data[d] for d in sorted(calendar_data.keys())]
+    total_profit = round(sum(float(d["profit"]) for d in data), 2)
+    total_trades = int(sum(int(d["trades"]) for d in data))
+    trading_days = int(sum(1 for d in data if int(d["trades"]) > 0))
+    profitable_days = int(sum(1 for d in data if int(d["trades"]) > 0 and float(d["profit"]) > 0))
+    average_win_rate = round(
+        (sum(float(d["winRate"]) for d in data if int(d["trades"]) > 0) / trading_days)
+        if trading_days > 0 else 0.0,
+        1,
+    )
+
     return {
         "status_code": 200,
-        "data": list(calendar_data.values())
+        "data": data,
+        "summary": {
+            "month": month,
+            "year": year,
+            "totalProfit": total_profit,
+            "totalTrades": total_trades,
+            "tradingDays": trading_days,
+            "profitableDays": profitable_days,
+            "averageWinRate": average_win_rate,
+        }
     }
 
 @trading_router.get("/accounts_with_bots", tags=["trading"])
@@ -124,7 +262,7 @@ async def get_accounts_with_bots(request: Request):
                     "model_id": str(config.modelId),
                     "bot_instance_id": config.botInstanceId,
                     "risk_level": config.riskLevel if config.riskLevel else None,
-                    "trading_schedule": config.tradingSchedule,
+                    "trading_schedule": normalize_trading_schedule(config.tradingSchedule),
                     "is_active": config.isActive,
                     "docker_container_id": config.dockerContainerId,
                     "installed_docker_image_id": effective_installed_image_id,

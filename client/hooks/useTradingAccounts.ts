@@ -77,6 +77,61 @@ export interface AccountWithBot {
   today_pnl: number;
 }
 
+const DAY_ALIAS_TO_KEY: Record<string, string> = {
+  mon: "mon",
+  monday: "mon",
+  tue: "tue",
+  tues: "tue",
+  tuesday: "tue",
+  wed: "wed",
+  weds: "wed",
+  wednesday: "wed",
+  thu: "thu",
+  thur: "thu",
+  thurs: "thu",
+  thursday: "thu",
+  fri: "fri",
+  friday: "fri",
+  sat: "sat",
+  saturday: "sat",
+  sun: "sun",
+  sunday: "sun",
+};
+
+const normalizeTradingSchedule = (value: unknown): Record<string, boolean> => {
+  const normalized: Record<string, boolean> = {
+    mon: true,
+    tue: true,
+    wed: true,
+    thu: true,
+    fri: true,
+    sat: false,
+    sun: false,
+  };
+
+  let payload: Record<string, unknown> = {};
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object") {
+        payload = parsed as Record<string, unknown>;
+      }
+    } catch {
+      payload = {};
+    }
+  } else if (value && typeof value === "object") {
+    payload = value as Record<string, unknown>;
+  }
+
+  for (const [rawKey, rawValue] of Object.entries(payload)) {
+    const key = DAY_ALIAS_TO_KEY[String(rawKey).trim().toLowerCase()];
+    if (!key) continue;
+    normalized[key] = Boolean(rawValue);
+  }
+
+  return normalized;
+};
+
 export function useTradingAccounts() {
   const { user, loading: authLoading } = useAuth();
   const [accounts, setAccounts] = useState<AccountWithBots[]>([]);
@@ -100,6 +155,7 @@ export function useTradingAccounts() {
         ...account,
         bot_configurations: (account.bot_configurations || []).map((config: any) => ({
           ...config,
+          trading_schedule: normalizeTradingSchedule(config.trading_schedule),
           status: config.container_status || "stopped",
           has_pending_update: Boolean(config.has_pending_update),
           installed_docker_image_id: config.installed_docker_image_id || null,

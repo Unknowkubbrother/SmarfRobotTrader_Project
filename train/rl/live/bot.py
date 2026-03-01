@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 
 import joblib
@@ -38,15 +39,20 @@ from .config import (
     PIP_VALUE,
     POLL_SECONDS,
     RISK_PERCENT,
+    RISK_LEVEL,
+    RISK_PROFILE_MAP,
     SPREAD_PIPS,
     STATE_FILE,
     SYMBOL,
     SYNC_EXTERNAL_LOT,
     TEST_DIR,
+    TRADING_SCHEDULE_DEFAULT,
     TIMEFRAME_NAME,
     TIMEFRAME_SECONDS_MAP,
     USE_LLM_SEMANTIC,
     VEC_NORM_PATH,
+    BOT_WS_URL,
+    BOT_CONFIG_ID,
     WINDOW_SIZE,
 )
 from .gate_stats import GateStatsProvider
@@ -93,6 +99,15 @@ class LiveTradingBot:
         self.llm_semantic_cache_file = LLM_SEMANTIC_CACHE_FILE
         self.llm_text_log_file = LLM_TEXT_LOG_FILE
         self.llm_semantic_cache = {}
+        self._ws_cache = {}       # ts_key -> {llm_text, cls_vec} from WebSocket
+        self._ws_connected = False
+        self.last_action = "HOLD"
+        self.risk_profile_map = dict(RISK_PROFILE_MAP or {"low": 0.5, "medium": 1.0, "high": 1.5})
+        self.risk_level = str(RISK_LEVEL or "medium").lower()
+        self.risk_percent = float(RISK_PERCENT)
+        if self.risk_level not in self.risk_profile_map:
+            self.risk_level = "medium"
+        self.trading_schedule = dict(TRADING_SCHEDULE_DEFAULT)
 
         tf_attr = f"TIMEFRAME_{TIMEFRAME_NAME}"
         self.timeframe = getattr(mt5, tf_attr, mt5.TIMEFRAME_H1)
@@ -114,14 +129,24 @@ class LiveTradingBot:
             raise RuntimeError(f"symbol_select({SYMBOL}) failed")
 
         self.initial_balance = float(account_info.balance)
-        self.current_lot = max(0.01, calc_auto_lot(self.initial_balance))
+        self.current_lot = max(
+            0.01,
+            calc_auto_lot(self.initial_balance, risk_pct=self._resolve_runtime_risk_percent()),
+        )
         self.point = float(symbol_info.point)
         self.digits = int(symbol_info.digits)
         self.pip_size = self.point * 10 if self.digits in (3, 5) else self.point
 
         print(f" MT5 Connected. Account: {account_info.login}")
         print(f" Symbol={SYMBOL} | Timeframe={TIMEFRAME_NAME} | Point={self.point} | Digits={self.digits}")
-        print(f" Balance={self.initial_balance:.2f} | AutoLot={self.current_lot}")
+        print(
+            f" Balance={self.initial_balance:.2f} | AutoLot={self.current_lot} | "
+            f"Risk={self.risk_level}:{self.risk_percent:.2f}%"
+        )
+        self._add_log(
+            "success",
+            f"MT5 connected | account={account_info.login} | risk={self.risk_level}:{self.risk_percent:.2f}%",
+        )
 
     def _load_llm_semantic_cache(self):
         if not self.use_llm_semantic:
@@ -227,7 +252,13 @@ class LiveTradingBot:
             [
                 lambda: TradingEnv(
                     mock_df,
-                    lot_size=max(0.01, calc_auto_lot(self.initial_balance or 100.0)),
+                    lot_size=max(
+                        0.01,
+                        calc_auto_lot(
+                            self.initial_balance or 100.0,
+                            risk_pct=self._resolve_runtime_risk_percent(),
+                        ),
+                    ),
                 )
             ]
         )
@@ -277,6 +308,294 @@ class LiveTradingBot:
             f"bridge_lot={self.bridge.lot_size:.2f}"
         )
 
+    def _start_ws_listener(self):
+        """Start a background thread: unified WebSocket to BotHub.
+
+        1. Connect to server WS
+        2. Send register message (bot_config_id, symbol, timeframe)
+        3. Listen for llm_result pushes
+        """
+        if not BOT_WS_URL or not BOT_CONFIG_ID:
+            print(" WS skipped: BOT_WS_URL or BOT_CONFIG_ID not set")
+            return
+
+        def _listener():
+            import websockets.sync.client as ws_sync
+            while True:
+                try:
+                    print(f" WS connecting to {BOT_WS_URL}")
+                    with ws_sync.connect(BOT_WS_URL) as ws:
+                        self._ws = ws
+                        self._ws_connected = True
+                        # Register
+                        ws.send(json.dumps({
+                            "type": "register",
+                            "bot_config_id": BOT_CONFIG_ID,
+                            "symbol": SYMBOL.upper(),
+                            "timeframe": TIMEFRAME_NAME.upper(),
+                        }))
+                        print(f" WS registered: {BOT_CONFIG_ID} {SYMBOL}/{TIMEFRAME_NAME}")
+                        while True:
+                            raw = ws.recv()
+                            try:
+                                msg = json.loads(raw)
+                            except Exception:
+                                continue
+                            msg_type = msg.get("type")
+                            if msg_type == "llm_result":
+                                ts_key = msg.get("date_time", "")
+                                cls_vec = msg.get("cls_vec")
+                                llm_text = msg.get("llm_text", "")
+                                if ts_key and cls_vec is not None:
+                                    self._ws_cache[ts_key] = {
+                                        "cls_vec": np.asarray(cls_vec, dtype=np.float32),
+                                        "llm_text": llm_text,
+                                    }
+                                    print(f" WS received LLM result for {ts_key}")
+                            elif msg_type == "bot_config":
+                                self._apply_runtime_config(msg, source="ws")
+                except Exception as exc:
+                    self._ws = None
+                    self._ws_connected = False
+                    print(f" WS disconnected: {exc} | reconnecting in 5s")
+                    time.sleep(5)
+
+        t = threading.Thread(target=_listener, daemon=True, name="ws-bot-hub")
+        t.start()
+
+    def _resolve_runtime_risk_percent(self, risk_level: str | None = None) -> float:
+        level = str(risk_level or self.risk_level or "medium").strip().lower()
+        if level in self.risk_profile_map:
+            pct = float(self.risk_profile_map[level])
+            if pct > 0:
+                return pct
+        if self.risk_percent > 0:
+            return float(self.risk_percent)
+        return 1.0
+
+    def _refresh_lot_from_account(self):
+        if not self.dynamic_lot:
+            return
+        account = mt5.account_info()
+        if account is None:
+            return
+        next_lot = max(
+            0.01,
+            calc_auto_lot(float(account.balance), risk_pct=self._resolve_runtime_risk_percent()),
+        )
+        self.current_lot = float(next_lot)
+        if self.bridge is not None:
+            self.bridge.lot_size = float(next_lot)
+            self.bridge.spread_cost = SPREAD_PIPS * PIP_VALUE * self.bridge.lot_size
+
+    def _normalize_schedule(self, schedule) -> dict[str, bool]:
+        defaults = {
+            "mon": True,
+            "tue": True,
+            "wed": True,
+            "thu": True,
+            "fri": True,
+            "sat": False,
+            "sun": False,
+        }
+        alias_to_key = {
+            "mon": "mon",
+            "monday": "mon",
+            "tue": "tue",
+            "tues": "tue",
+            "tuesday": "tue",
+            "wed": "wed",
+            "weds": "wed",
+            "wednesday": "wed",
+            "thu": "thu",
+            "thur": "thu",
+            "thurs": "thu",
+            "thursday": "thu",
+            "fri": "fri",
+            "friday": "fri",
+            "sat": "sat",
+            "saturday": "sat",
+            "sun": "sun",
+            "sunday": "sun",
+        }
+        if isinstance(schedule, str):
+            try:
+                parsed = json.loads(schedule)
+            except Exception:
+                parsed = None
+            schedule = parsed if isinstance(parsed, dict) else None
+        if not isinstance(schedule, dict):
+            return defaults
+        for raw_key, raw_value in schedule.items():
+            key = alias_to_key.get(str(raw_key).strip().lower())
+            if key:
+                defaults[key] = bool(raw_value)
+        return defaults
+
+    def _is_trading_day_enabled(self, bar_end_ts: int) -> bool:
+        dt = datetime.fromtimestamp(int(bar_end_ts), tz=timezone.utc)
+        day_key = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[dt.weekday()]
+        return bool(self.trading_schedule.get(day_key, True))
+
+    def _apply_runtime_config(self, payload: dict, source: str = "ws"):
+        if not isinstance(payload, dict):
+            return
+
+        changed = False
+
+        incoming_map = payload.get("risk_profile_map")
+        if isinstance(incoming_map, dict):
+            merged = dict(self.risk_profile_map)
+            for key, value in incoming_map.items():
+                lvl = str(key).strip().lower()
+                if lvl not in {"low", "medium", "high"}:
+                    continue
+                try:
+                    pct = float(value)
+                except Exception:
+                    continue
+                if pct > 0:
+                    merged[lvl] = pct
+                    changed = True
+            self.risk_profile_map = merged
+
+        incoming_level = payload.get("risk_level")
+        if incoming_level is not None:
+            lvl = str(incoming_level).strip().lower()
+            if lvl in {"low", "medium", "high"} and lvl != self.risk_level:
+                self.risk_level = lvl
+                changed = True
+
+        incoming_percent = payload.get("risk_percent")
+        if incoming_percent is not None:
+            try:
+                pct = float(incoming_percent)
+                if pct > 0 and pct != self.risk_percent:
+                    self.risk_percent = pct
+                    changed = True
+            except Exception:
+                pass
+
+        incoming_schedule = payload.get("trading_schedule")
+        if incoming_schedule is not None:
+            next_schedule = self._normalize_schedule(incoming_schedule)
+            if next_schedule != self.trading_schedule:
+                self.trading_schedule = next_schedule
+                changed = True
+
+        if changed:
+            effective_risk = self._resolve_runtime_risk_percent()
+            self.risk_percent = float(effective_risk)
+            self._refresh_lot_from_account()
+            self._add_log(
+                "info",
+                f"Runtime config updated ({source}) | risk={self.risk_level}:{self.risk_percent:.2f}%",
+            )
+            print(
+                " Runtime config applied | "
+                f"source={source} risk_level={self.risk_level} risk_percent={self.risk_percent:.2f}"
+            )
+
+    def _push_state_to_server(self, action_name: str = ""):
+        """Push full MT5 state to server via WebSocket."""
+        if not self._ws_connected or not hasattr(self, '_ws') or self._ws is None:
+            return
+        try:
+            resolved_action = str(action_name or self.last_action or "").strip() or "HOLD"
+            self.last_action = resolved_action
+            current_pos, pos = self._get_mt5_position()
+
+            # ── MT5 Account info ──
+            account = mt5.account_info()
+            account_data = {}
+            if account is not None:
+                account_data = {
+                    "balance": float(account.balance),
+                    "equity": float(account.equity),
+                    "margin": float(account.margin),
+                    "free_margin": float(account.margin_free),
+                    "margin_level": float(account.margin_level) if account.margin_level else 0.0,
+                    "leverage": int(account.leverage),
+                    "profit": float(account.profit),
+                    "currency": str(account.currency),
+                    "server": str(account.server),
+                    "login": int(account.login),
+                }
+
+            # ── MT5 Active positions ──
+            all_positions = mt5.positions_get()
+            positions_data = []
+            if all_positions:
+                for p in all_positions:
+                    opened_at_utc = datetime.fromtimestamp(p.time, tz=timezone.utc)
+                    positions_data.append({
+                        "ticket": int(p.ticket),
+                        "symbol": str(p.symbol),
+                        "type": "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
+                        "volume": float(p.volume),
+                        "price_open": float(p.price_open),
+                        "price_current": float(p.price_current),
+                        "profit": float(p.profit),
+                        "swap": float(p.swap),
+                        "sl": float(p.sl),
+                        "tp": float(p.tp),
+                        "opened_at": opened_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                        "opened_at_ts": int(p.time),
+                        "time": datetime.fromtimestamp(
+                            p.time, tz=timezone.utc
+                        ).strftime("%H:%M:%S"),
+                        "comment": str(p.comment) if p.comment else "",
+                    })
+
+            state = {
+                "type": "state",
+                "bot_config_id": BOT_CONFIG_ID,
+                "symbol": SYMBOL,
+                "timeframe": TIMEFRAME_NAME,
+                # Bot model state
+                "position": int(current_pos),
+                "entry_price": float(self.bridge.entry_price) if self.bridge else 0.0,
+                "total_pnl": float(self.bridge.total_pnl) if self.bridge else 0.0,
+                "trades": int(self.bridge.trades) if self.bridge else 0,
+                "wins": int(self.bridge.wins) if self.bridge else 0,
+                "loss_streak": int(self.bridge.loss_streak) if self.bridge else 0,
+                "last_action": resolved_action,
+                "last_bar_time": datetime.fromtimestamp(
+                    max(1, self.last_bar_time), tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S") if self.last_bar_time else "",
+                "lot_size": float(self.current_lot),
+                "unrealized_pnl": float(pos.profit) if pos is not None else 0.0,
+                "risk_level": self.risk_level,
+                "risk_percent": float(self.risk_percent),
+                "risk_profile_map": self.risk_profile_map,
+                "trading_schedule": self.trading_schedule,
+                # MT5 Account
+                **account_data,
+                # MT5 Positions
+                "positions": positions_data,
+                # Logs
+                "llm_text": getattr(self, "last_llm_text", ""),
+                "recent_logs": getattr(self, "recent_logs", []),
+                "ws_connected": True,
+            }
+            self._ws.send(json.dumps(state, ensure_ascii=False))
+        except Exception as exc:
+            print(f" WS state push failed: {exc}")
+
+    def _add_log(self, log_type: str, message: str):
+        """Add a log entry to be sent to the dashboard Activity Log."""
+        if not hasattr(self, "recent_logs"):
+            self.recent_logs = []
+        now_str = datetime.now().strftime("%H:%M:%S")
+        self.recent_logs.append({
+            "timestamp": now_str,
+            "type": log_type,
+            "message": message
+        })
+        # Keep only the last 50 logs
+        if len(self.recent_logs) > 50:
+            self.recent_logs.pop(0)
+
     def _resolve_live_llm_semantic(self, ts_key: str):
         if not self.use_llm_semantic:
             return
@@ -284,18 +603,38 @@ class LiveTradingBot:
             return
         if ts_key in self.semantic_runtime.global_time_to_vec:
             return
-        if generate_llm_cls_for_bar is None:
-            print(" LLM semantic skipped: use_llm module unavailable")
-            return
 
+        # 1. Check local disk cache
         cached_vec = self.llm_semantic_cache.get(ts_key)
         if cached_vec is not None:
             self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(cached_vec, dtype=np.float32)
             return
 
+        # 2. Check WebSocket push cache
+        ws_data = self._ws_cache.pop(ts_key, None)
+        if ws_data is not None:
+            cls_vec = np.asarray(ws_data["cls_vec"], dtype=np.float32).reshape(-1)
+            expected_dim = int(self.semantic_runtime._embedding_dim())
+            if cls_vec.size == expected_dim:
+                self.llm_semantic_cache[ts_key] = cls_vec
+                self.semantic_runtime.global_time_to_vec[ts_key] = cls_vec
+                self.last_llm_text = ws_data.get("llm_text", "")
+                self._add_log("analysis", f"Received AI Analysis for {ts_key[-8:]}")
+                self._append_llm_text_log(ts_key, self.last_llm_text)
+                self._save_llm_semantic_cache(reason="ws_push")
+                print(f" LLM semantic ready (WS push) | ts={ts_key} | dim={cls_vec.size}")
+                return
+            else:
+                print(f" WS CLS dim mismatch expected={expected_dim} got={cls_vec.size}")
+
+        # 3. Fallback: compute directly (if module available)
+        if generate_llm_cls_for_bar is None:
+            print(" LLM semantic skipped: use_llm module unavailable & no WS data")
+            return
+
         dataset_json = LLM_DATASET_JSON if LLM_DATASET_JSON else None
         bar_dt = datetime.strptime(ts_key, "%Y-%m-%d %H:%M:%S")
-        print(f" LLM semantic: building cls for {ts_key}")
+        print(f" LLM semantic: building cls for {ts_key} (direct fallback)")
         try:
             llm_text, llm_cls = generate_llm_cls_for_bar(
                 date_time=bar_dt,
@@ -309,6 +648,8 @@ class LiveTradingBot:
 
             self.llm_semantic_cache[ts_key] = cls_vec
             self.semantic_runtime.global_time_to_vec[ts_key] = cls_vec
+            self.last_llm_text = llm_text
+            self._add_log("analysis", f"Generated AI Analysis for {ts_key[-8:]}")
             self._append_llm_text_log(ts_key, llm_text)
             self._save_llm_semantic_cache(reason="llm_update")
             print(f" LLM semantic ready | ts={ts_key} | dim={cls_vec.size}")
@@ -338,6 +679,12 @@ class LiveTradingBot:
             "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": SYMBOL,
             "timeframe": TIMEFRAME_NAME,
+            "runtime_config": {
+                "risk_level": self.risk_level,
+                "risk_percent": float(self.risk_percent),
+                "risk_profile_map": dict(self.risk_profile_map),
+                "trading_schedule": dict(self.trading_schedule),
+            },
             "last_bar_time": int(self.last_bar_time),
             "last_known_ticket": int(current_ticket or self.last_known_ticket),
             "bridge": {
@@ -434,6 +781,11 @@ class LiveTradingBot:
         self.last_bar_time = int(max(0, payload.get("last_bar_time", self.last_bar_time)))
         self.last_known_ticket = int(max(0, payload.get("last_known_ticket", self.last_known_ticket)))
         self.gate_provider.load_records(payload.get("gate_history", []))
+
+        runtime_cfg = payload.get("runtime_config", {})
+        if isinstance(runtime_cfg, dict):
+            self._apply_runtime_config(runtime_cfg, source="state")
+
         self.state_loaded = True
         print(
             " Runtime state restored | "
@@ -503,7 +855,13 @@ class LiveTradingBot:
             self.bridge.lot_size = float(pos.volume)
         elif self.dynamic_lot:
             if account is not None:
-                self.bridge.lot_size = max(0.01, calc_auto_lot(float(account.balance)))
+                self.bridge.lot_size = max(
+                    0.01,
+                    calc_auto_lot(
+                        float(account.balance),
+                        risk_pct=self._resolve_runtime_risk_percent(),
+                    ),
+                )
             else:
                 self.bridge.lot_size = max(0.01, float(self.bridge.lot_size))
         else:
@@ -646,8 +1004,10 @@ class LiveTradingBot:
     def close_all(self):
         positions = mt5.positions_get(symbol=SYMBOL)
         if positions is None:
+            self._add_log("warning", "Close skipped: positions_get returned None")
             return False
         if len(positions) == 0:
+            self._add_log("info", "Close requested: no open positions")
             return True
 
         all_ok = True
@@ -655,6 +1015,7 @@ class LiveTradingBot:
             tick = self._get_trade_tick()
             if tick is None:
                 print(" Close Skipped: no live tick")
+                self._add_log("warning", f"Close skipped: no live tick for ticket {pos.ticket}")
                 all_ok = False
                 continue
 
@@ -674,9 +1035,11 @@ class LiveTradingBot:
             res = mt5.order_send(req)
             if res and res.retcode == mt5.TRADE_RETCODE_DONE:
                 print(f" Closed Position | ticket={pos.ticket} | PnL={pos.profit:+.2f}")
+                self._add_log("action", f"Closed position #{pos.ticket} | PnL {pos.profit:+.2f}")
             else:
                 comment = res.comment if res else "No response"
                 print(f" Close Failed | ticket={pos.ticket} | {comment}")
+                self._add_log("warning", f"Close failed #{pos.ticket}: {comment}")
                 all_ok = False
         return all_ok
 
@@ -706,7 +1069,13 @@ class LiveTradingBot:
         if self.dynamic_lot:
             account = mt5.account_info()
             if account is not None:
-                self.current_lot = max(0.01, calc_auto_lot(float(account.balance), risk_pct=RISK_PERCENT))
+                self.current_lot = max(
+                    0.01,
+                    calc_auto_lot(
+                        float(account.balance),
+                        risk_pct=self._resolve_runtime_risk_percent(),
+                    ),
+                )
         elif self.bridge is not None:
             self.current_lot = max(0.01, float(self.bridge.lot_size))
 
@@ -733,10 +1102,12 @@ class LiveTradingBot:
                 f" Opened {side} @ {price:.{self.digits}f} | "
                 f"Lot={self.current_lot}"
             )
+            self._add_log("action", f"Opened {side} @ {price:.{self.digits}f} | lot={self.current_lot:.2f}")
             return True
         else:
             comment = res.comment if res else "No response"
             print(f" Order Failed: {comment}")
+            self._add_log("warning", f"Order failed: {comment}")
             return False
 
     def execute_action(self, action):
@@ -800,6 +1171,10 @@ class LiveTradingBot:
             " Broker reconcile: action not reflected on broker "
             f"(action={action} expected_pos={expected_after} actual_pos={broker_pos_after})"
         )
+        self._add_log(
+            "warning",
+            f"Broker reconcile mismatch | action={action} expected={expected_after} actual={broker_pos_after}",
+        )
 
         # Prevent virtual bridge cooldown from blocking entries when order failed.
         self.bridge.trade_cooldown = 0
@@ -856,10 +1231,25 @@ class LiveTradingBot:
         action = int(action)
 
         action_name = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}.get(action, "?")
+        self.last_action = action_name
         print(
             f" Model Action: {action_name} | Price={model_price:.5f} | "
             f"dTick={delta_tick} | dPrice={delta_price:.5f}"
         )
+        self._add_log(
+            "analysis",
+            f"{mode} | action={action_name} | price={model_price:.5f} | dTick={delta_tick}",
+        )
+
+        if execute_orders and not self._is_trading_day_enabled(bar_end_ts):
+            if action in (1, 2):
+                self._add_log(
+                    "warning",
+                    f"Schedule blocked new order ({action_name}) on disabled trading day",
+                )
+                action = 0
+                action_name = "HOLD"
+        self.last_action = action_name
 
         broker_pos_before, _ = self._get_mt5_position()
         order_ok = True
@@ -867,6 +1257,7 @@ class LiveTradingBot:
             order_ok = bool(self.execute_action(action))
         elif action != 0:
             print(" No-order mode: action skipped")
+            self._add_log("info", f"{mode}: action {action_name} skipped in no-order mode")
         self._sync_bridge_from_mt5()
         broker_pos_after, _ = self._get_mt5_position()
         self._reconcile_broker_execution(
@@ -877,15 +1268,17 @@ class LiveTradingBot:
             broker_pos_after=int(broker_pos_after),
         )
         self._save_runtime_state(reason="bar_close")
+        self._push_state_to_server(action_name=action_name)
 
     def run(self):
         self.connect()
         self._load_model()
         self._load_runtime_state()
         self._sync_bridge_from_mt5()
+        self._start_ws_listener()
         startup_eval_pending = bool(EVAL_ON_START)
 
-        print(" Waiting for new H1 candles...")
+        print(f" Waiting for new {TIMEFRAME_NAME} candles...")
 
         try:
             while True:
@@ -900,6 +1293,7 @@ class LiveTradingBot:
                         self.last_bar_time = current_bar_time
                         self._process_closed_bar(current_bar_time, mode="Startup", execute_orders=True)
                         self._sync_bridge_from_mt5()
+                        self._push_state_to_server()
                         self._print_status_line()
                         time.sleep(POLL_SECONDS)
                         continue
@@ -908,6 +1302,7 @@ class LiveTradingBot:
                         print("\n Startup eval: current bar already processed; running no-order refresh")
                         self._process_closed_bar(current_bar_time, mode="Startup", execute_orders=False)
                         self._sync_bridge_from_mt5()
+                        self._push_state_to_server()
                         self._print_status_line()
                         time.sleep(POLL_SECONDS)
                         continue
@@ -917,6 +1312,7 @@ class LiveTradingBot:
                 if self.last_bar_time == 0:
                     self.last_bar_time = current_bar_time
                     self._sync_bridge_from_mt5()
+                    self._push_state_to_server()
                     self._print_status_line()
                     time.sleep(POLL_SECONDS)
                     continue
@@ -928,6 +1324,7 @@ class LiveTradingBot:
                         self._process_closed_bar(current_bar_time, mode="New Candle", execute_orders=True)
 
                 self._sync_bridge_from_mt5()
+                self._push_state_to_server()
                 self._print_status_line()
                 time.sleep(POLL_SECONDS)
 

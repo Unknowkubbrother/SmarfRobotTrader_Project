@@ -25,6 +25,7 @@ pillow
 # LangChain Ecosystem
 langchain
 langchain-community
+langchain-chroma
 langchain-ollama
 
 # Vector Database

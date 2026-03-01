@@ -11,7 +11,7 @@ from datetime import datetime
 
 import numpy as np
 
-from .chart import generate_image                       # noqa: F401
+from .chart import NoMarketDataError, generate_image   # noqa: F401
 from .llm_client import (                               # noqa: F401
     get_runtime,
     run_rag_pipeline,

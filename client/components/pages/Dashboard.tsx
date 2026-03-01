@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Power, Play, TrendingUp, TrendingDown, Activity, Wallet, Target, BarChart3, Calculator, Plus, BellRing, DownloadCloud } from "lucide-react";
+import { TrendingUp, TrendingDown, Activity, Wallet, Target, BarChart3, Plus, BellRing, DownloadCloud } from "lucide-react";
 import { PerformanceChart } from "@/components/dashboard/PerformanceChart";
 import { StatusPanel } from "@/components/dashboard/StatusPanel";
 import { ActivePositions } from "@/components/dashboard/ActivePositions";
@@ -12,7 +12,8 @@ import { AddAccountDialog } from "@/components/dialogs/AddAccountDialog";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { useTradingAccounts, BotConfigWithVersion } from "@/hooks/useTradingAccounts";
+import { useTradingAccounts } from "@/hooks/useTradingAccounts";
+import { useBotLiveState } from "@/hooks/useBotLiveState";
 import { BotSelector } from "@/components/dashboard/BotSelector";
 import Link from "next/link";
 
@@ -59,14 +60,72 @@ export default function Dashboard() {
     }
   };
 
-  // Mock stats data matching the design
+  const { getBotState } = useBotLiveState();
+  const liveState = selectedBotId ? getBotState(selectedBotId) : undefined;
+  const isLive = !!liveState?.connected;
+
+  // Safe live state properties with fallbacks
+  const accountBalance = selectedAccount?.balance ?? 0;
+  const accountEquity = selectedAccount?.equity ?? accountBalance;
+  const accountTodayPnl = selectedAccount?.total_today_pnl ?? 0;
+  const liveEquity = liveState?.equity ?? accountEquity;
+  const liveTotalPnl = liveState?.total_pnl ?? accountTodayPnl;
+  const liveUnrealized = liveState?.unrealized_pnl ?? accountTodayPnl;
+  const liveWins = liveState?.wins ?? 0;
+  const liveTrades = liveState?.trades ?? 0;
+  const livePosition = liveState?.position ?? 0;
+  const liveLotSize = liveState?.lot_size ?? 0;
+  const liveAction = liveState?.last_action || "—";
+  const liveMarginLevel = liveState?.margin_level ?? selectedAccount?.margin_level ?? 0;
+
+  // Live stats — use WS data when available, otherwise show static/DB data
   const stats = [
-    { icon: Wallet, label: "Total Balance", value: "$12,482.35", change: "+8.24%", changeType: "positive" as const },
-    { icon: TrendingUp, label: "Today's P&L", value: `$${(selectedAccount?.total_today_pnl || 0).toFixed(2)}`, change: "+2.35%", changeType: "positive" as const },
-    { icon: Target, label: "Win Rate", value: "72.4%", change: "+3.2%", changeType: "positive" as const },
-    { icon: TrendingDown, label: "Max Drawdown", value: "-4.2%", change: "-0.8%", changeType: "negative" as const },
-    { icon: BarChart3, label: "Total Trades", value: "1,247", change: "+12", changeType: "positive" as const },
-    { icon: Calculator, label: "Profit Factor", value: "2.14", change: "+0.12", changeType: "positive" as const },
+    {
+      icon: Wallet,
+      label: "Total Balance",
+      value: `$${liveEquity.toFixed(2)}`,
+      change: liveTotalPnl >= 0 ? `+${liveTotalPnl.toFixed(2)}` : liveTotalPnl.toFixed(2),
+      changeType: liveTotalPnl >= 0 ? "positive" as const : "negative" as const,
+    },
+    {
+      icon: TrendingUp,
+      label: "Today's P&L",
+      value: `$${liveUnrealized.toFixed(2)}`,
+      change: (liveUnrealized >= 0 ? "+" : "") + liveUnrealized.toFixed(2),
+      changeType: liveUnrealized >= 0 ? "positive" as const : "negative" as const,
+    },
+    {
+      icon: Target,
+      label: "Win Rate",
+      value: isLive && liveTrades > 0
+        ? `${((liveWins / liveTrades) * 100).toFixed(1)}%`
+        : "—",
+      change: isLive ? `${liveWins}W` : "—",
+      changeType: "positive" as const,
+    },
+    {
+      icon: TrendingDown,
+      label: "Position",
+      value: isLive
+        ? (livePosition === 1 ? "LONG" : livePosition === -1 ? "SHORT" : "FLAT")
+        : "—",
+      change: isLive ? `Lot ${liveLotSize.toFixed(2)}` : "",
+      changeType: (isLive && livePosition === 1) ? "positive" as const : (isLive && livePosition === -1) ? "negative" as const : "positive" as const,
+    },
+    {
+      icon: BarChart3,
+      label: "Total Trades",
+      value: isLive ? `${liveTrades}` : "0",
+      change: isLive ? `${liveWins} wins` : "",
+      changeType: "positive" as const,
+    },
+    {
+      icon: Activity,
+      label: "Last Action",
+      value: isLive ? liveAction : "—",
+      change: isLive && liveState?.last_bar_time ? liveState.last_bar_time.slice(11, 19) : "",
+      changeType: (isLive && (liveAction === "BUY")) ? "positive" as const : (isLive && liveAction === "SELL") ? "negative" as const : "positive" as const,
+    },
   ];
 
   const bots = selectedAccount?.bot_configurations || [];
@@ -198,6 +257,14 @@ export default function Dashboard() {
             </Button>
           </div>
           {/* Stats Grid */}
+          <div className="flex items-center gap-2 mb-1">
+            {isLive && (
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-success/10 text-success">
+                <span className="w-1.5 h-1.5 rounded-full bg-success animate-pulse" />
+                Live
+              </span>
+            )}
+          </div>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
             {stats.map((stat, index) => (
               <div
@@ -229,7 +296,7 @@ export default function Dashboard() {
 
             {/* Account Status (1/3) */}
             <div className="lg:col-span-1">
-              <StatusPanel account={selectedAccount} />
+              <StatusPanel account={selectedAccount} liveState={liveState} />
             </div>
           </div>
 
@@ -237,17 +304,20 @@ export default function Dashboard() {
           <div className="grid lg:grid-cols-3 gap-6">
             {/* Portfolio Performance (2/3) */}
             <div className="lg:col-span-2">
-              <PerformanceChart />
+              <PerformanceChart liveState={liveState} />
             </div>
             {/* Activity Log (1/3) */}
             <div className="lg:col-span-1">
-              <AIConsole botName={bots.find(b => b.id === selectedBotId)?.bot_version?.label || "Trading Bot"} />
+              <AIConsole
+                botName={bots.find(b => b.id === selectedBotId)?.bot_version?.label || "Trading Bot"}
+                liveState={liveState}
+              />
             </div>
           </div>
 
           {/* Active Positions (Full width at bottom) */}
           <div className="bg-white border rounded-xl shadow-sm overflow-hidden">
-            <ActivePositions accountId={selectedAccount?.id} />
+            <ActivePositions accountId={selectedAccount?.id} liveState={liveState} />
           </div>
         </div>
       )}

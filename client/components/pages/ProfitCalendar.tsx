@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { ChevronLeft, ChevronRight, TrendingUp, TrendingDown, BarChart3, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { api } from "@/lib/api";
 
 interface DayData {
   date: number;
@@ -10,12 +11,27 @@ interface DayData {
   winRate: number;
 }
 
+interface CalendarSummary {
+  totalProfit: number;
+  totalTrades: number;
+  tradingDays: number;
+  profitableDays: number;
+  averageWinRate: number;
+}
+
 const weekDays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 export default function ProfitCalendar() {
   const [currentDate, setCurrentDate] = useState(new Date());
   const [selectedDay, setSelectedDay] = useState<DayData | null>(null);
   const [monthData, setMonthData] = useState<DayData[]>([]);
+  const [summary, setSummary] = useState<CalendarSummary>({
+    totalProfit: 0,
+    totalTrades: 0,
+    tradingDays: 0,
+    profitableDays: 0,
+    averageWinRate: 0,
+  });
   const [loading, setLoading] = useState(true);
 
   const year = currentDate.getFullYear();
@@ -29,30 +45,57 @@ export default function ProfitCalendar() {
     const fetchCalendarData = async () => {
       setLoading(true);
       try {
-        const res = await fetch(`/trading/calendar?year=${year}&month=${month + 1}`); // API expects 1-12
-        if (res.ok) {
-          const result = await res.json();
-          const apiData: { date: number; profit: number; trades: number; winRate: number }[] = result.data;
-
-          // Merge API data with calendar structure
-          const data: DayData[] = [];
-          for (let day = 1; day <= daysInMonth; day++) {
-            const apiDay = apiData.find(d => d.date === day);
-
-            if (apiDay) {
-              data.push({
-                date: day,
-                profit: apiDay.profit,
-                trades: apiDay.trades,
-                winRate: apiDay.winRate
-              });
-            } else {
-              // Check if future or weekend logic needed? 
-              // For now, just show empty if no data
-              data.push({ date: day, profit: null, trades: 0, winRate: 0 });
-            }
+        const res = await api.get("/trading/calendar", {
+          params: { year, month: month + 1 },
+        });
+        const result = res.data || {};
+        const apiData: { date: number; profit: number; trades: number; winRate: number }[] = Array.isArray(result.data)
+          ? result.data
+          : [];
+        const apiSummary: CalendarSummary | null = result.summary && typeof result.summary === "object"
+          ? {
+            totalProfit: Number(result.summary.totalProfit || 0),
+            totalTrades: Number(result.summary.totalTrades || 0),
+            tradingDays: Number(result.summary.tradingDays || 0),
+            profitableDays: Number(result.summary.profitableDays || 0),
+            averageWinRate: Number(result.summary.averageWinRate || 0),
           }
-          setMonthData(data);
+          : null;
+
+        const byDay = new Map(apiData.map((d) => [Number(d.date), d]));
+        const data: DayData[] = [];
+        for (let day = 1; day <= daysInMonth; day++) {
+          const apiDay = byDay.get(day);
+          if (apiDay) {
+            data.push({
+              date: day,
+              profit: Number(apiDay.profit || 0),
+              trades: Number(apiDay.trades || 0),
+              winRate: Number(apiDay.winRate || 0),
+            });
+          } else {
+            data.push({ date: day, profit: null, trades: 0, winRate: 0 });
+          }
+        }
+        setMonthData(data);
+
+        if (apiSummary) {
+          setSummary(apiSummary);
+        } else {
+          const fallbackProfit = data.reduce((sum, d) => sum + (d.profit || 0), 0);
+          const fallbackTrades = data.reduce((sum, d) => sum + d.trades, 0);
+          const fallbackTradingDays = data.filter((d) => d.profit !== null && d.trades > 0).length;
+          const fallbackProfitDays = data.filter((d) => d.profit !== null && d.trades > 0 && (d.profit || 0) > 0).length;
+          const fallbackAvgWin = fallbackTradingDays > 0
+            ? data.reduce((sum, d) => sum + (d.trades > 0 ? d.winRate : 0), 0) / fallbackTradingDays
+            : 0;
+          setSummary({
+            totalProfit: fallbackProfit,
+            totalTrades: fallbackTrades,
+            tradingDays: fallbackTradingDays,
+            profitableDays: fallbackProfitDays,
+            averageWinRate: fallbackAvgWin,
+          });
         }
       } catch (error) {
         console.error("Failed to fetch calendar data", error);
@@ -63,14 +106,6 @@ export default function ProfitCalendar() {
 
     fetchCalendarData();
   }, [year, month, daysInMonth]);
-
-  const totalProfit = monthData.reduce((sum, day) => sum + (day.profit || 0), 0);
-  const tradingDays = monthData.filter((d) => d.profit !== null && d.trades > 0).length;
-  const profitableDays = monthData.filter((d) => d.profit !== null && d.profit > 0).length;
-  const totalTrades = monthData.reduce((sum, day) => sum + day.trades, 0);
-  const averageWinRate = tradingDays > 0
-    ? monthData.reduce((sum, day) => sum + (day.profit !== null ? day.winRate : 0), 0) / tradingDays
-    : 0;
 
   const navigateMonth = (direction: number) => {
     setCurrentDate(new Date(year, month + direction, 1));
@@ -108,23 +143,25 @@ export default function ProfitCalendar() {
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div className="bg-white border text-card-foreground shadow-sm rounded-xl p-4 animate-slide-up">
               <p className="text-sm text-muted-foreground mb-1">Monthly P&L</p>
-              <p className={cn("text-2xl font-bold font-mono", totalProfit >= 0 ? "text-success" : "text-destructive")}>
-                {totalProfit >= 0 ? "+" : ""}${totalProfit.toFixed(2)}
+              <p className={cn("text-2xl font-bold font-mono", summary.totalProfit >= 0 ? "text-success" : "text-destructive")}>
+                {summary.totalProfit >= 0 ? "+" : ""}${summary.totalProfit.toFixed(2)}
               </p>
             </div>
             <div className="bg-white border text-card-foreground shadow-sm rounded-xl p-4 animate-slide-up" style={{ animationDelay: "50ms" }}>
               <p className="text-sm text-muted-foreground mb-1">Total Trades</p>
-              <p className="text-2xl font-bold font-mono text-foreground">{totalTrades}</p>
+              <p className="text-2xl font-bold font-mono text-foreground">{summary.totalTrades}</p>
             </div>
             <div className="bg-white border text-card-foreground shadow-sm rounded-xl p-4 animate-slide-up" style={{ animationDelay: "100ms" }}>
               <p className="text-sm text-muted-foreground mb-1">Avg Win Rate</p>
               <p className="text-2xl font-bold font-mono text-success">
-                {averageWinRate.toFixed(1)}%
+                {summary.averageWinRate.toFixed(1)}%
               </p>
             </div>
             <div className="bg-white border text-card-foreground shadow-sm rounded-xl p-4 animate-slide-up" style={{ animationDelay: "150ms" }}>
-              <p className="text-sm text-muted-foreground mb-1">Trading Days</p>
-              <p className="text-2xl font-bold font-mono text-foreground">{tradingDays}</p>
+              <p className="text-sm text-muted-foreground mb-1">Trading / Profit Days</p>
+              <p className="text-2xl font-bold font-mono text-foreground">
+                {summary.tradingDays} / {summary.profitableDays}
+              </p>
             </div>
           </div>
 

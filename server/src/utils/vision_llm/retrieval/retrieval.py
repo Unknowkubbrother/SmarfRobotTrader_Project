@@ -1,7 +1,10 @@
 from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
-from langchain_community.vectorstores import Chroma
+try:
+    from langchain_chroma import Chroma
+except Exception:  # fallback for older envs
+    from langchain_community.vectorstores import Chroma
 from .utils import norm_path, build_text_lookup
 
 import torch

@@ -14,7 +14,10 @@ import torch.nn.functional as F
 from PIL import Image
 
 from transformers import CLIPProcessor, CLIPModel
-from langchain_community.vectorstores import Chroma
+try:
+    from langchain_chroma import Chroma
+except Exception:  # fallback for older envs
+    from langchain_community.vectorstores import Chroma
 from langchain.embeddings.base import Embeddings
 from langchain_core.documents import Document
 

@@ -1,29 +1,14 @@
-import { useState, useEffect } from "react";
+import { useMemo } from "react";
 import { Terminal, Bot, TrendingUp, AlertTriangle, CheckCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
+import type { BotLiveState } from "@/hooks/useBotLiveState";
 
 interface LogEntry {
-  id: number;
+  id: string;
   timestamp: string;
   type: "info" | "analysis" | "action" | "warning" | "success";
   message: string;
 }
-
-const generateInitialLogs = (botName: string): LogEntry[] => [
-  { id: 1, timestamp: "14:05:23", type: "analysis", message: `Analysing XAUUSD... Found support at 2030.00` },
-  { id: 2, timestamp: "14:05:24", type: "info", message: `Processing chart pattern recognition` },
-  { id: 3, timestamp: "14:05:25", type: "success", message: `Bullish engulfing pattern detected on H4` },
-  { id: 4, timestamp: "14:05:26", type: "action", message: `Opening BUY position: XAUUSD @ 2028.45` },
-  { id: 5, timestamp: "14:05:27", type: "info", message: `Confidence: 87.3%` },
-];
-
-const generateNewLogMessages = () => [
-  { type: "info" as const, message: `Market sentiment: Bullish bias on majors` },
-  { type: "analysis" as const, message: `Evaluating momentum indicators...` },
-  { type: "success" as const, message: `Take profit triggered +$200` },
-  { type: "action" as const, message: `Adjusting stop loss to break even` },
-  { type: "warning" as const, message: `Approaching daily risk limit (78%)` },
-];
 
 const typeConfig = {
   info: { icon: Bot, color: "text-primary" },
@@ -35,34 +20,37 @@ const typeConfig = {
 
 interface AIConsoleProps {
   botName?: string;
+  liveState?: BotLiveState;
 }
 
-export function AIConsole({ botName = "Bot" }: AIConsoleProps) {
-  const [logs, setLogs] = useState<LogEntry[]>(() => generateInitialLogs(botName));
+export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
+  const isLive = !!liveState?.connected;
+  const llmText = liveState?.llm_text || "";
 
-  useEffect(() => {
-    setLogs(generateInitialLogs(botName));
-  }, [botName]);
+  const logs = useMemo<LogEntry[]>(() => {
+    const wsLogs = Array.isArray(liveState?.recent_logs) ? liveState!.recent_logs : [];
+    const dedup = new Set<string>();
+    const rows: LogEntry[] = [];
 
-  useEffect(() => {
-    const newLogMessages = generateNewLogMessages();
-    const interval = setInterval(() => {
-      const randomLog = newLogMessages[Math.floor(Math.random() * newLogMessages.length)];
-      const now = new Date();
-      const timestamp = `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}:${now.getSeconds().toString().padStart(2, "0")}`;
+    for (let i = 0; i < wsLogs.length; i += 1) {
+      const row = wsLogs[i];
+      const type = row?.type && row.type in typeConfig ? row.type : "info";
+      const timestamp = String(row?.timestamp || "");
+      const message = String(row?.message || "").trim();
+      if (!message) continue;
+      const key = `${timestamp}|${type}|${message}`;
+      if (dedup.has(key)) continue;
+      dedup.add(key);
+      rows.push({
+        id: `${key}|${i}`,
+        timestamp: timestamp || "--:--:--",
+        type,
+        message,
+      });
+    }
 
-      setLogs((prev) => [
-        ...prev.slice(-8),
-        {
-          id: Date.now(),
-          timestamp,
-          ...randomLog,
-        },
-      ]);
-    }, 4000);
-
-    return () => clearInterval(interval);
-  }, [botName]);
+    return rows.slice(-80);
+  }, [liveState?.recent_logs]);
 
   return (
     <div className="bg-white border rounded-xl shadow-sm p-6 animate-slide-up h-full flex flex-col" style={{ animationDelay: "150ms" }}>
@@ -71,30 +59,49 @@ export function AIConsole({ botName = "Bot" }: AIConsoleProps) {
           <Terminal className="w-4 h-4 text-muted-foreground" />
           <h3 className="font-semibold text-foreground">Activity Log</h3>
         </div>
-        <div className="flex items-center gap-2">
-          <span className="w-1.5 h-1.5 rounded-full bg-success" />
-          <span className="text-xs text-muted-foreground">Live</span>
-        </div>
+        {isLive && (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-success/10 text-success">
+            <span className="w-1.5 h-1.5 rounded-full bg-success animate-pulse" />
+            Live
+          </span>
+        )}
       </div>
 
-      <div className="bg-secondary/50 rounded-lg p-3 flex-1 overflow-y-auto scrollbar-thin min-h-[200px]">
-        {logs.map((log, index) => {
-          const config = typeConfig[log.type];
-          const Icon = config.icon;
-          return (
-            <div
-              key={log.id}
-              className={cn(
-                "flex items-start gap-2 py-1.5 text-sm",
-                index === logs.length - 1 && "bg-primary/5 -mx-1 px-1 rounded"
-              )}
-            >
-              <span className="text-xs text-muted-foreground font-mono shrink-0">{log.timestamp}</span>
-              <Icon className={cn("w-3.5 h-3.5 shrink-0 mt-0.5", config.color)} />
-              <span className={cn("text-sm", config.color)}>{log.message}</span>
+      <div className="flex flex-col gap-2 flex-1 min-h-[220px] h-[300px]">
+        {isLive && llmText && (
+          <div className="bg-primary/5 border border-primary/20 rounded-lg p-3 text-xs text-foreground/80 font-mono whitespace-pre-wrap flex-shrink-0 max-h-[110px] overflow-y-auto scrollbar-thin">
+            <div className="text-primary font-semibold mb-1 flex items-center gap-1.5">
+              <Bot className="w-3.5 h-3.5" /> AI Analysis
             </div>
-          );
-        })}
+            {llmText}
+          </div>
+        )}
+
+        <div className="bg-secondary/50 rounded-lg p-3 flex-1 overflow-y-auto scrollbar-thin">
+          {logs.length === 0 ? (
+            <div className="h-full flex items-center justify-center text-xs text-muted-foreground">
+              {isLive ? `Waiting for runtime logs from ${botName}` : `Connect ${botName} to stream logs`}
+            </div>
+          ) : (
+            logs.map((log, index) => {
+              const config = typeConfig[log.type];
+              const Icon = config.icon;
+              return (
+                <div
+                  key={log.id}
+                  className={cn(
+                    "flex items-start gap-2 py-1.5 text-sm transition-colors",
+                    index === logs.length - 1 && "bg-primary/5 -mx-1 px-1 rounded font-medium"
+                  )}
+                >
+                  <span className="text-xs text-muted-foreground font-mono shrink-0">{log.timestamp}</span>
+                  <Icon className={cn("w-3.5 h-3.5 shrink-0 mt-0.5", config.color)} />
+                  <span className={cn("text-sm", config.color)}>{log.message}</span>
+                </div>
+              );
+            })
+          )}
+        </div>
       </div>
     </div>
   );
