@@ -1,18 +1,26 @@
 import json
 import os
-import sys
+from urllib.parse import urlparse
 
 
 RL_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CORE_DIR = os.path.join(RL_ROOT, "core")
-TEST_DIR = os.path.join(RL_ROOT, "test")
-LLM_DIR = os.path.join(os.path.dirname(RL_ROOT), "llm")
-if TEST_DIR not in sys.path:
-    sys.path.insert(0, TEST_DIR)
+MODELS_DIR = os.getenv("LIVE_MODELS_DIR", os.path.join(RL_ROOT, "models")).strip() or os.path.join(
+    RL_ROOT,
+    "models",
+)
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name, "").strip()
+def _env_first(*names: str) -> str:
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if raw:
+            return raw
+    return ""
+
+
+def _env_float(default: float, *names: str) -> float:
+    raw = _env_first(*names)
     if not raw:
         return float(default)
     try:
@@ -21,8 +29,8 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
+def _env_int(default: int, *names: str) -> int:
+    raw = _env_first(*names)
     if not raw:
         return int(default)
     try:
@@ -31,19 +39,11 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name, "").strip().lower()
+def _env_bool(default: bool, *names: str) -> bool:
+    raw = _env_first(*names).lower()
     if not raw:
         return bool(default)
     return raw in {"1", "true", "yes", "on"}
-
-
-def _forward_live_override(base_name: str) -> None:
-    """Map LIVE_<NAME> to <NAME> for shared backtest modules."""
-    base_raw = os.getenv(base_name, "").strip()
-    live_raw = os.getenv(f"LIVE_{base_name}", "").strip()
-    if not base_raw and live_raw:
-        os.environ[base_name] = live_raw
 
 
 def _parse_risk_profile(raw: str) -> dict[str, float]:
@@ -115,129 +115,150 @@ def _parse_trading_schedule(raw: str) -> dict[str, bool]:
     return default
 
 
-# Forward selected live-only env vars to shared backtest config
-for _name in (
-    "BAR_HISTORY",
-    "WINDOW_SIZE",
-    "SPREAD_PIPS",
-    "RISK_PIPS",
-    "TEST_DATA_FILE",
-    "TEST_DATE_FROM",
-    "TEST_DATE_TO",
-    "OPEN_PROB_THRESHOLD",
-    "OPEN_EDGE_THRESHOLD",
-    "MIN_ACTION_MARGIN",
-    "HOLD_EDGE_THRESHOLD",
-    "TRADE_COOLDOWN_BARS",
-):
-    _forward_live_override(_name)
-
-
-_risk_profile_raw = (
-    os.getenv("LIVE_RISK_PROFILE_JSON", "").strip()
-    or os.getenv("LIVE_RISK_MAP_JSON", "").strip()
-)
+# ---- Trading profile / runtime controls
+_risk_profile_raw = _env_first("LIVE_RISK_PROFILE_JSON", "LIVE_RISK_MAP_JSON")
 RISK_PROFILE_MAP = _parse_risk_profile(_risk_profile_raw)
-RISK_LEVEL = (os.getenv("LIVE_RISK_LEVEL", "medium").strip().lower() or "medium")
+RISK_LEVEL = (_env_first("LIVE_RISK_LEVEL") or "medium").lower()
 if RISK_LEVEL not in RISK_PROFILE_MAP:
     RISK_LEVEL = "medium"
 
 _default_risk = float(RISK_PROFILE_MAP.get(RISK_LEVEL, 1.0))
-RISK_PERCENT = _env_float("LIVE_RISK_PERCENT", _default_risk)
+RISK_PERCENT = _env_float(_default_risk, "LIVE_RISK_PERCENT", "RISK_PERCENT")
 if RISK_PERCENT <= 0:
     RISK_PERCENT = _default_risk
 
-# Keep shared backtest modules (imported by live runtime) aligned with live risk.
-os.environ["RISK_PERCENT"] = str(RISK_PERCENT)
-TRADING_SCHEDULE_DEFAULT = _parse_trading_schedule(
-    os.getenv("LIVE_TRADING_SCHEDULE_JSON", "").strip()
+TRADING_SCHEDULE_DEFAULT = _parse_trading_schedule(_env_first("LIVE_TRADING_SCHEDULE_JSON"))
+
+
+# ---- MT5 / bot runtime
+MT5_HOST = _env_first("MT5_HOST") or "localhost"
+MT5_PORT = _env_int(8001, "MT5_PORT")
+SYMBOL = _env_first("LIVE_SYMBOL") or "EURUSD"
+TIMEFRAME_NAME = (_env_first("LIVE_TIMEFRAME") or "H1").upper()
+MAGIC_NUMBER = _env_int(123456, "LIVE_MAGIC_NUMBER")
+DEVIATION = _env_int(20, "LIVE_DEVIATION")
+POLL_SECONDS = _env_float(1.0, "LIVE_POLL_SECONDS")
+ORDER_TICK_RETRIES = _env_int(8, "LIVE_ORDER_TICK_RETRIES")
+ORDER_TICK_RETRY_SEC = _env_float(0.25, "LIVE_ORDER_TICK_RETRY_SEC")
+SYNC_EXTERNAL_LOT = _env_bool(True, "LIVE_SYNC_EXTERNAL_LOT")
+EVAL_ON_START = _env_bool(True, "LIVE_EVAL_ON_START")
+ENABLE_CATCHUP_REPLAY = _env_bool(True, "LIVE_ENABLE_CATCHUP_REPLAY")
+MAX_CATCHUP_BARS = _env_int(0, "LIVE_CATCHUP_MAX_BARS")
+EXECUTE_STALE_REPLAY_ORDERS = _env_bool(False, "LIVE_CATCHUP_EXECUTE_STALE")
+LIVE_SYNC_ACCOUNT_STATE = _env_bool(True, "LIVE_SYNC_ACCOUNT_STATE")
+LIVE_DYNAMIC_LOT = _env_bool(True, "LIVE_DYNAMIC_LOT")
+
+BOT_WS_URL = _env_first("BOT_WS_URL") or "ws://localhost:8000/bot/ws"
+BOT_CONFIG_ID = _env_first("BOT_CONFIG_ID") or "182bdab8-9274-4a4e-922f-700645086705"
+
+
+def _derive_vision_llm_api_url(bot_ws_url: str) -> str:
+    explicit = _env_first("VISION_LLM_API_URL")
+    if explicit:
+        return explicit
+
+    try:
+        parsed = urlparse(bot_ws_url)
+        if parsed.netloc:
+            scheme = "https" if parsed.scheme == "wss" else "http"
+            return f"{scheme}://{parsed.netloc}/vision_llm/"
+    except Exception:
+        pass
+    return "http://localhost:8000/vision_llm/"
+
+
+VISION_LLM_API_URL = _derive_vision_llm_api_url(BOT_WS_URL)
+VISION_LLM_TIMEOUT_SEC = _env_float(75.0, "VISION_LLM_TIMEOUT_SEC")
+
+
+# ---- Live feature / gate / bridge parameters (owned by live config)
+WINDOW_SIZE = _env_int(20, "LIVE_WINDOW_SIZE", "WINDOW_SIZE")
+BAR_HISTORY = _env_int(167, "LIVE_BAR_HISTORY", "BAR_HISTORY")
+INITIAL_BALANCE = _env_float(100.0, "LIVE_INITIAL_BALANCE", "INITIAL_BALANCE")
+PIP_SIZE = _env_float(0.0001, "LIVE_PIP_SIZE", "PIP_SIZE")
+PIP_VALUE = _env_float(10.0, "LIVE_PIP_VALUE", "PIP_VALUE")
+RISK_PIPS = _env_int(50, "LIVE_RISK_PIPS", "RISK_PIPS")
+SPREAD_PIPS = _env_float(2.0, "LIVE_SPREAD_PIPS", "SPREAD_PIPS")
+MAX_HOLD_STEPS = _env_int(16, "LIVE_MAX_HOLD_STEPS", "MAX_HOLD_STEPS")
+EMBED_SOURCE_MODE = (_env_first("LIVE_EMBED_SOURCE_MODE", "EMBED_SOURCE_MODE") or "cls").strip().lower()
+
+OPEN_PROB_THRESHOLD = _env_float(0.93, "LIVE_OPEN_PROB_THRESHOLD", "OPEN_PROB_THRESHOLD")
+OPEN_EDGE_THRESHOLD = _env_float(0.24, "LIVE_OPEN_EDGE_THRESHOLD", "OPEN_EDGE_THRESHOLD")
+MIN_ACTION_MARGIN = _env_float(0.24, "LIVE_MIN_ACTION_MARGIN", "MIN_ACTION_MARGIN")
+HOLD_EDGE_THRESHOLD = _env_float(0.10, "LIVE_HOLD_EDGE_THRESHOLD", "HOLD_EDGE_THRESHOLD")
+TRADE_COOLDOWN_BARS = _env_int(4, "LIVE_TRADE_COOLDOWN_BARS", "TRADE_COOLDOWN_BARS")
+
+ADAPTIVE_GATE = _env_bool(True, "LIVE_ADAPTIVE_GATE", "ADAPTIVE_GATE")
+DEF_LOOKBACK_TRADES = _env_int(20, "LIVE_DEF_LOOKBACK_TRADES", "DEF_LOOKBACK_TRADES")
+DEF_MIN_WINRATE = _env_float(0.50, "LIVE_DEF_MIN_WINRATE", "DEF_MIN_WINRATE")
+DEF_MIN_AVG_PIPS = _env_float(1.0, "LIVE_DEF_MIN_AVG_PIPS", "DEF_MIN_AVG_PIPS")
+DEF_MAX_LOSS_STREAK = _env_int(3, "LIVE_DEF_MAX_LOSS_STREAK", "DEF_MAX_LOSS_STREAK")
+DEF_BARS = _env_int(48, "LIVE_DEF_BARS", "DEF_BARS")
+DEF_CONF_BONUS = _env_float(0.08, "LIVE_DEF_CONF_BONUS", "DEF_CONF_BONUS")
+DEF_EDGE_BONUS = _env_float(0.05, "LIVE_DEF_EDGE_BONUS", "DEF_EDGE_BONUS")
+DEF_MARGIN_BONUS = _env_float(0.04, "LIVE_DEF_MARGIN_BONUS", "DEF_MARGIN_BONUS")
+DEF_COOLDOWN_BONUS = _env_int(2, "LIVE_DEF_COOLDOWN_BONUS", "DEF_COOLDOWN_BONUS")
+VOL_CONF_BONUS = _env_float(0.04, "LIVE_VOL_CONF_BONUS", "VOL_CONF_BONUS")
+VOL_EDGE_BONUS = _env_float(0.03, "LIVE_VOL_EDGE_BONUS", "VOL_EDGE_BONUS")
+VOL_MARGIN_BONUS = _env_float(0.02, "LIVE_VOL_MARGIN_BONUS", "VOL_MARGIN_BONUS")
+FLAT_CONF_BONUS = _env_float(0.03, "LIVE_FLAT_CONF_BONUS", "FLAT_CONF_BONUS")
+FLAT_EDGE_BONUS = _env_float(0.02, "LIVE_FLAT_EDGE_BONUS", "FLAT_EDGE_BONUS")
+FLAT_MARGIN_BONUS = _env_float(0.03, "LIVE_FLAT_MARGIN_BONUS", "FLAT_MARGIN_BONUS")
+TREND_RELAX = _env_float(0.02, "LIVE_TREND_RELAX", "TREND_RELAX")
+COUNTER_TREND_CONF_BONUS = _env_float(0.05, "LIVE_COUNTER_TREND_CONF_BONUS", "COUNTER_TREND_CONF_BONUS")
+COUNTER_TREND_EDGE_BONUS = _env_float(0.04, "LIVE_COUNTER_TREND_EDGE_BONUS", "COUNTER_TREND_EDGE_BONUS")
+COUNTER_TREND_MARGIN_BONUS = _env_float(0.04, "LIVE_COUNTER_TREND_MARGIN_BONUS", "COUNTER_TREND_MARGIN_BONUS")
+COUNTER_TREND_HOLD_EDGE_BONUS = _env_float(
+    0.03,
+    "LIVE_COUNTER_TREND_HOLD_EDGE_BONUS",
+    "COUNTER_TREND_HOLD_EDGE_BONUS",
+)
+DEF_HOLD_EDGE_BONUS = _env_float(0.03, "LIVE_DEF_HOLD_EDGE_BONUS", "DEF_HOLD_EDGE_BONUS")
+VOL_HOLD_EDGE_BONUS = _env_float(0.02, "LIVE_VOL_HOLD_EDGE_BONUS", "VOL_HOLD_EDGE_BONUS")
+FLAT_HOLD_EDGE_BONUS = _env_float(0.02, "LIVE_FLAT_HOLD_EDGE_BONUS", "FLAT_HOLD_EDGE_BONUS")
+TREND_HOLD_RELAX = _env_float(0.01, "LIVE_TREND_HOLD_RELAX", "TREND_HOLD_RELAX")
+
+EMBED_QUALITY_MIN = _env_float(0.25, "LIVE_EMBED_QUALITY_MIN", "EMBED_QUALITY_MIN")
+EMBED_QUALITY_CONF_BONUS = _env_float(0.10, "LIVE_EMBED_QUALITY_CONF_BONUS", "EMBED_QUALITY_CONF_BONUS")
+EMBED_QUALITY_EDGE_BONUS = _env_float(0.08, "LIVE_EMBED_QUALITY_EDGE_BONUS", "EMBED_QUALITY_EDGE_BONUS")
+EMBED_QUALITY_MARGIN_BONUS = _env_float(0.06, "LIVE_EMBED_QUALITY_MARGIN_BONUS", "EMBED_QUALITY_MARGIN_BONUS")
+EMBED_QUALITY_HOLD_EDGE_BONUS = _env_float(
+    0.05,
+    "LIVE_EMBED_QUALITY_HOLD_EDGE_BONUS",
+    "EMBED_QUALITY_HOLD_EDGE_BONUS",
+)
+EMBED_QUALITY_COOLDOWN_BONUS = _env_int(
+    2,
+    "LIVE_EMBED_QUALITY_COOLDOWN_BONUS",
+    "EMBED_QUALITY_COOLDOWN_BONUS",
 )
 
-MT5_HOST = os.getenv("MT5_HOST", "localhost").strip() or "localhost"
-MT5_PORT = int(os.getenv("MT5_PORT", "8001"))
-SYMBOL = os.getenv("LIVE_SYMBOL", "EURUSD").strip() or "EURUSD"
-TIMEFRAME_NAME = os.getenv("LIVE_TIMEFRAME", "H1").strip().upper()
-MAGIC_NUMBER = int(os.getenv("LIVE_MAGIC_NUMBER", "123456"))
-DEVIATION = int(os.getenv("LIVE_DEVIATION", "20"))
-POLL_SECONDS = float(os.getenv("LIVE_POLL_SECONDS", "1"))
-ORDER_TICK_RETRIES = int(os.getenv("LIVE_ORDER_TICK_RETRIES", "8"))
-ORDER_TICK_RETRY_SEC = float(os.getenv("LIVE_ORDER_TICK_RETRY_SEC", "0.25"))
-SYNC_EXTERNAL_LOT = os.getenv("LIVE_SYNC_EXTERNAL_LOT", "1").strip().lower() in {"1", "true", "yes"}
-EVAL_ON_START = os.getenv("LIVE_EVAL_ON_START", "1").strip().lower() in {"1", "true", "yes"}
-ENABLE_CATCHUP_REPLAY = os.getenv("LIVE_ENABLE_CATCHUP_REPLAY", "1").strip().lower() in {"1", "true", "yes"}
-MAX_CATCHUP_BARS = int(os.getenv("LIVE_CATCHUP_MAX_BARS", "0"))
-EXECUTE_STALE_REPLAY_ORDERS = os.getenv("LIVE_CATCHUP_EXECUTE_STALE", "0").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-}
-USE_LLM_SEMANTIC = os.getenv("LIVE_USE_LLM_SEMANTIC", "1").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-ALIGN_TEST_LOGIC = os.getenv("LIVE_ALIGN_TEST_LOGIC", "1").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-LIVE_GATE_STATS_MODE = (
-    os.getenv("LIVE_GATE_STATS_MODE", "dataset" if ALIGN_TEST_LOGIC else "dynamic").strip().lower()
-    or ("dataset" if ALIGN_TEST_LOGIC else "dynamic")
+BASE_COLUMNS = [
+    "return",
+    "range",
+    "delta_tick",
+    "delta_price",
+    "body_ratio",
+    "momentum",
+    "sma_cross",
+    "rsi_norm",
+    "atr_norm",
+    "trend",
+    "adx",
+]
+
+
+# ---- Runtime artifacts
+LLM_SEMANTIC_CACHE_FILE = (
+    _env_first("LIVE_LLM_SEMANTIC_CACHE_FILE")
+    or os.path.join(MODELS_DIR, "time_to_embedding_llm_cls.joblib")
 )
-LIVE_SYNC_ACCOUNT_STATE = os.getenv("LIVE_SYNC_ACCOUNT_STATE", "1").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-LIVE_DYNAMIC_LOT = os.getenv("LIVE_DYNAMIC_LOT", "1").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-LLM_DATASET_JSON = os.getenv("LIVE_LLM_DATASET_JSON", "").strip()
-VISION_LLM_WS_URL = os.getenv(
-    "VISION_LLM_WS_URL",
-    "ws://localhost:8000/vision_llm/ws",
-).strip()
-BOT_WS_URL = os.getenv(
-    "BOT_WS_URL",
-    "ws://localhost:8000/bot/ws",
-).strip()
-BOT_CONFIG_ID = os.getenv("BOT_CONFIG_ID", "182bdab8-9274-4a4e-922f-700645086705").strip()
-
-
-from backtest_config import (  # noqa: E402
-    BAR_HISTORY,
-    DATASETS_DIR,
-    MODELS_DIR,
-    PIP_VALUE,
-    SPREAD_PIPS,
-    TEST_DATA_FILE,
-    TEST_DATE_FROM,
-    TEST_DATE_TO,
-    WINDOW_SIZE,
+LLM_TEXT_LOG_FILE = (
+    _env_first("LIVE_LLM_TEXT_LOG_FILE")
+    or os.path.join(MODELS_DIR, "time_to_llm_text.jsonl")
 )
-
-
-LLM_SEMANTIC_CACHE_FILE = os.getenv(
-    "LIVE_LLM_SEMANTIC_CACHE_FILE",
-    os.path.join(MODELS_DIR, "time_to_embedding_llm_cls.joblib"),
-).strip() or os.path.join(MODELS_DIR, "time_to_embedding_llm_cls.joblib")
-LLM_TEXT_LOG_FILE = os.getenv(
-    "LIVE_LLM_TEXT_LOG_FILE",
-    os.path.join(MODELS_DIR, "time_to_llm_text.jsonl"),
-).strip() or os.path.join(MODELS_DIR, "time_to_llm_text.jsonl")
 LLM_SEMANTIC_CACHE_SCHEMA = "utc_v2"
-STATE_FILE = os.getenv("LIVE_STATE_FILE", os.path.join(MODELS_DIR, "run_live_state.json")).strip() or os.path.join(
-    MODELS_DIR,
-    "run_live_state.json",
-)
-
+STATE_FILE = _env_first("LIVE_STATE_FILE") or os.path.join(MODELS_DIR, "run_live_state.json")
 MODEL_PATH = os.path.join(MODELS_DIR, "ppo_trading.zip")
 VEC_NORM_PATH = os.path.join(MODELS_DIR, "vec_normalize.pkl")
 
