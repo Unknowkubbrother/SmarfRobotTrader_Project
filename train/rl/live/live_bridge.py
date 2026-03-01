@@ -98,8 +98,6 @@ class PPOBridge:
         self.recent_trade_pips = deque(maxlen=max(DEF_LOOKBACK_TRADES, 5))
         self.semantic_skips = 0
 
-        print(f"\n Auto Lot: {self.lot_size} (Balance: ${INITIAL_BALANCE}, Risk: {RISK_PERCENT}%)")
-
     def _calc_pnl(self, entry, exit_price, direction):
         pips = (exit_price - entry) / PIP_SIZE
         return direction * pips * PIP_VALUE * self.lot_size

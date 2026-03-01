@@ -280,8 +280,7 @@ class LiveTradingBot:
         print(
             " Live runtime: "
             f"sync_account_state={self.sync_account_state} "
-            f"dynamic_lot={self.dynamic_lot} "
-            f"bridge_lot={self.bridge.lot_size:.2f}"
+            f"dynamic_lot={self.dynamic_lot}"
         )
 
     def _start_ws_listener(self):
@@ -1310,6 +1309,13 @@ class LiveTradingBot:
         self._load_model()
         self._load_runtime_state()
         self._sync_bridge_from_mt5()
+        if self.bridge is not None:
+            print(
+                " Runtime synced from MT5: "
+                f"balance={self.bridge.balance:.2f} "
+                f"equity={self.bridge.equity:.2f} "
+                f"lot={self.bridge.lot_size:.2f}"
+            )
         self._start_ws_listener()
         startup_eval_pending = bool(EVAL_ON_START)
 
