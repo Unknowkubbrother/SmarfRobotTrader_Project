@@ -1,204 +1,73 @@
+import json
 import os
 import sys
 import time
-import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
+import joblib
+import numpy as np
 import pandas as pd
 from mt5linux import MetaTrader5
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
+from .config import (
+    ALIGN_TEST_LOGIC,
+    BAR_HISTORY,
+    CORE_DIR,
+    DEVIATION,
+    ENABLE_CATCHUP_REPLAY,
+    EVAL_ON_START,
+    EXECUTE_STALE_REPLAY_ORDERS,
+    LIVE_DYNAMIC_LOT,
+    LIVE_GATE_STATS_MODE,
+    LIVE_SYNC_ACCOUNT_STATE,
+    LLM_DATASET_JSON,
+    LLM_SEMANTIC_CACHE_FILE,
+    LLM_SEMANTIC_CACHE_SCHEMA,
+    LLM_TEXT_LOG_FILE,
+    LLM_DIR,
+    MAGIC_NUMBER,
+    MAX_CATCHUP_BARS,
+    MODEL_PATH,
+    MODELS_DIR,
+    MT5_HOST,
+    MT5_PORT,
+    ORDER_TICK_RETRIES,
+    ORDER_TICK_RETRY_SEC,
+    PIP_VALUE,
+    POLL_SECONDS,
+    RISK_PERCENT,
+    SPREAD_PIPS,
+    STATE_FILE,
+    SYMBOL,
+    SYNC_EXTERNAL_LOT,
+    TEST_DIR,
+    TIMEFRAME_NAME,
+    TIMEFRAME_SECONDS_MAP,
+    USE_LLM_SEMANTIC,
+    VEC_NORM_PATH,
+    WINDOW_SIZE,
+)
+from .gate_stats import GateStatsProvider
+from .numpy_compat import patch_numpy_bitgenerator_compat as _patch_numpy_bitgenerator_compat
 
-RL_ROOT = os.path.dirname(os.path.abspath(__file__))
-CORE_DIR = os.path.join(RL_ROOT, "core")
-TEST_DIR = os.path.join(RL_ROOT, "test")
-for _path in (CORE_DIR, TEST_DIR):
+for _path in (CORE_DIR, TEST_DIR, LLM_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
 from backtest_bridge import PPOBridge, calc_auto_lot
-from backtest_config import (
-    BAR_HISTORY,
-    MODELS_DIR,
-    PIP_VALUE,
-    RISK_PERCENT,
-    SPREAD_PIPS,
-    WINDOW_SIZE,
-)
-from backtest_features import build_feature_columns, build_gate_stats
+from backtest_features import build_feature_columns
 from backtest_semantic import SemanticRuntime
 from env_trading import TradingEnv
 
-
-MT5_HOST = os.getenv("MT5_HOST", "localhost").strip() or "localhost"
-MT5_PORT = int(os.getenv("MT5_PORT", "8001"))
-SYMBOL = os.getenv("LIVE_SYMBOL", "EURUSD").strip() or "EURUSD"
-TIMEFRAME_NAME = os.getenv("LIVE_TIMEFRAME", "H1").strip().upper()
-MAGIC_NUMBER = int(os.getenv("LIVE_MAGIC_NUMBER", "123456"))
-DEVIATION = int(os.getenv("LIVE_DEVIATION", "20"))
-POLL_SECONDS = float(os.getenv("LIVE_POLL_SECONDS", "1"))
-SYNC_EXTERNAL_LOT = os.getenv("LIVE_SYNC_EXTERNAL_LOT", "1").strip().lower() in {"1", "true", "yes"}
-EVAL_ON_START = os.getenv("LIVE_EVAL_ON_START", "0").strip().lower() in {"1", "true", "yes"}
-ENABLE_CATCHUP_REPLAY = os.getenv("LIVE_ENABLE_CATCHUP_REPLAY", "1").strip().lower() in {"1", "true", "yes"}
-MAX_CATCHUP_BARS = int(os.getenv("LIVE_CATCHUP_MAX_BARS", "0"))
-EXECUTE_STALE_REPLAY_ORDERS = os.getenv("LIVE_CATCHUP_EXECUTE_STALE", "0").strip().lower() in {"1", "true", "yes"}
-STATE_FILE = os.getenv("LIVE_STATE_FILE", os.path.join(MODELS_DIR, "run_live_state.json")).strip() or os.path.join(
-    MODELS_DIR, "run_live_state.json"
-)
-
-MODEL_PATH = os.path.join(MODELS_DIR, "ppo_trading.zip")
-VEC_NORM_PATH = os.path.join(MODELS_DIR, "vec_normalize.pkl")
+try:
+    from use_llm import generate_llm_cls_for_bar
+except Exception:
+    generate_llm_cls_for_bar = None
 
 
 mt5 = MetaTrader5(host=MT5_HOST, port=MT5_PORT)
-
-TIMEFRAME_SECONDS_MAP = {
-    "M1": 60,
-    "M2": 120,
-    "M3": 180,
-    "M4": 240,
-    "M5": 300,
-    "M6": 360,
-    "M10": 600,
-    "M12": 720,
-    "M15": 900,
-    "M20": 1200,
-    "M30": 1800,
-    "H1": 3600,
-    "H2": 7200,
-    "H3": 10800,
-    "H4": 14400,
-    "H6": 21600,
-    "H8": 28800,
-    "H12": 43200,
-    "D1": 86400,
-    "W1": 604800,
-}
-
-
-def _patch_numpy_bitgenerator_compat():
-    try:
-        import numpy.random._pickle as np_pickle
-    except Exception:
-        return
-
-    original_ctor = getattr(np_pickle, "__bit_generator_ctor", None)
-    if original_ctor is None:
-        return
-    if getattr(original_ctor, "__name__", "") == "_compat_bit_generator_ctor":
-        return
-
-    tolerant_cache = {}
-
-    def _normalize_bg_name(value):
-        if isinstance(value, type):
-            return value.__name__
-        if isinstance(value, str):
-            if "PCG64DXSM" in value:
-                return "PCG64DXSM"
-            if "PCG64" in value:
-                return "PCG64"
-            if "MT19937" in value:
-                return "MT19937"
-            if "Philox" in value:
-                return "Philox"
-            if "SFC64" in value:
-                return "SFC64"
-            return value
-        return str(value)
-
-    def _build_tolerant_bitgen(base_cls):
-        cached = tolerant_cache.get(base_cls)
-        if cached is not None:
-            return cached
-
-        class _TolerantBitGen(base_cls):
-            def __setstate__(self, state):
-                try:
-                    super().__setstate__(state)
-                    return
-                except Exception:
-                    pass
-
-                if isinstance(state, tuple):
-                    for candidate in state:
-                        if isinstance(candidate, dict):
-                            try:
-                                super().__setstate__(candidate)
-                                return
-                            except Exception:
-                                continue
-                return
-
-        _TolerantBitGen.__name__ = f"Compat{base_cls.__name__}"
-        tolerant_cache[base_cls] = _TolerantBitGen
-        return _TolerantBitGen
-
-    def _compat_bit_generator_ctor(bit_generator_name="MT19937"):
-        normalized = _normalize_bg_name(bit_generator_name)
-        base_cls = None
-        if isinstance(bit_generator_name, type):
-            base_cls = bit_generator_name
-        elif hasattr(np_pickle, "BitGenerators") and normalized in np_pickle.BitGenerators:
-            base_cls = np_pickle.BitGenerators[normalized]
-
-        if base_cls is None:
-            return original_ctor(normalized)
-
-        tolerant_cls = _build_tolerant_bitgen(base_cls)
-        return tolerant_cls()
-
-    np_pickle.__bit_generator_ctor = _compat_bit_generator_ctor
-
-
-class GateStatsProvider:
-    def __init__(self):
-        self._history = pd.DataFrame(columns=["time", "open", "high", "low", "close"])
-
-    def update(self, window_df: pd.DataFrame):
-        incremental = (
-            window_df[["time", "open", "high", "low", "close"]]
-            .copy()
-            .sort_values("time")
-            .drop_duplicates(subset=["time"], keep="last")
-        )
-        if self._history.empty:
-            self._history = incremental.reset_index(drop=True)
-        else:
-            self._history = (
-                pd.concat([self._history, incremental], ignore_index=True)
-                .sort_values("time")
-                .drop_duplicates(subset=["time"], keep="last")
-                .reset_index(drop=True)
-            )
-        if len(self._history) < WINDOW_SIZE:
-            return {}
-        return build_gate_stats(self._history)
-
-    def to_records(self, max_rows: int = 800):
-        if self._history.empty:
-            return []
-        tail = self._history.tail(max_rows).copy()
-        tail["time"] = pd.to_datetime(tail["time"]).dt.strftime("%Y-%m-%d %H:%M:%S")
-        return tail.to_dict(orient="records")
-
-    def load_records(self, rows):
-        if not rows:
-            self._history = pd.DataFrame(columns=["time", "open", "high", "low", "close"])
-            return
-        df = pd.DataFrame(rows)
-        expected = ["time", "open", "high", "low", "close"]
-        missing = [c for c in expected if c not in df.columns]
-        if missing:
-            self._history = pd.DataFrame(columns=expected)
-            return
-        df = df[expected].copy()
-        df["time"] = pd.to_datetime(df["time"], errors="coerce")
-        df = df.dropna(subset=["time"]).sort_values("time").drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
-        self._history = df
-
-
 class LiveTradingBot:
     def __init__(self):
         self.model = None
@@ -206,7 +75,7 @@ class LiveTradingBot:
         self.bridge = None
         self.semantic_runtime = None
         self.feature_columns = None
-        self.gate_provider = GateStatsProvider()
+        self.gate_provider = GateStatsProvider(mode=LIVE_GATE_STATS_MODE)
 
         self.initial_balance = 0.0
         self.current_lot = 0.01
@@ -217,6 +86,13 @@ class LiveTradingBot:
         self.last_known_ticket = 0
         self.state_file = STATE_FILE
         self.state_loaded = False
+        self.use_llm_semantic = bool(USE_LLM_SEMANTIC)
+        self.align_test_logic = bool(ALIGN_TEST_LOGIC)
+        self.sync_account_state = bool(LIVE_SYNC_ACCOUNT_STATE)
+        self.dynamic_lot = bool(LIVE_DYNAMIC_LOT)
+        self.llm_semantic_cache_file = LLM_SEMANTIC_CACHE_FILE
+        self.llm_text_log_file = LLM_TEXT_LOG_FILE
+        self.llm_semantic_cache = {}
 
         tf_attr = f"TIMEFRAME_{TIMEFRAME_NAME}"
         self.timeframe = getattr(mt5, tf_attr, mt5.TIMEFRAME_H1)
@@ -246,6 +122,88 @@ class LiveTradingBot:
         print(f" MT5 Connected. Account: {account_info.login}")
         print(f" Symbol={SYMBOL} | Timeframe={TIMEFRAME_NAME} | Point={self.point} | Digits={self.digits}")
         print(f" Balance={self.initial_balance:.2f} | AutoLot={self.current_lot}")
+
+    def _load_llm_semantic_cache(self):
+        if not self.use_llm_semantic:
+            return
+        self.llm_semantic_cache = {}
+        cache_file = self.llm_semantic_cache_file
+        if not cache_file or not os.path.exists(cache_file):
+            return
+        try:
+            payload = joblib.load(cache_file)
+        except Exception as exc:
+            print(f" LLM semantic cache skipped (invalid file): {exc}")
+            return
+        if not isinstance(payload, dict):
+            return
+
+        rows = None
+        if payload.get("schema") == LLM_SEMANTIC_CACHE_SCHEMA and isinstance(payload.get("rows"), dict):
+            rows = payload.get("rows")
+        elif payload and all(isinstance(k, str) for k in payload.keys()):
+            print(
+                " LLM semantic cache ignored: legacy schema detected "
+                "(pre-UTC fix). Cache will be rebuilt."
+            )
+            return
+        else:
+            return
+
+        restored = {}
+        for key, vec in rows.items():
+            if not isinstance(key, str):
+                continue
+            arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+            if arr.size == 0:
+                continue
+            restored[key] = arr
+        self.llm_semantic_cache = restored
+        if restored:
+            print(f" Loaded LLM semantic cache: {len(restored)} rows")
+
+    def _save_llm_semantic_cache(self, reason: str = "periodic"):
+        if not self.use_llm_semantic:
+            return
+        if not self.llm_semantic_cache:
+            return
+        cache_file = self.llm_semantic_cache_file
+        try:
+            cache_dir = os.path.dirname(cache_file)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+            tmp_path = f"{cache_file}.tmp"
+            serializable = {k: np.asarray(v, dtype=np.float32) for k, v in self.llm_semantic_cache.items()}
+            payload = {
+                "schema": LLM_SEMANTIC_CACHE_SCHEMA,
+                "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "rows": serializable,
+            }
+            joblib.dump(payload, tmp_path)
+            os.replace(tmp_path, cache_file)
+        except Exception as exc:
+            print(f" LLM semantic cache save failed ({reason}): {exc}")
+
+    def _append_llm_text_log(self, ts_key: str, llm_text: str):
+        if not self.use_llm_semantic:
+            return
+        if not self.llm_text_log_file:
+            return
+        try:
+            log_dir = os.path.dirname(self.llm_text_log_file)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            record = {
+                "time": ts_key,
+                "symbol": SYMBOL,
+                "timeframe": TIMEFRAME_NAME,
+                "text": str(llm_text or "").strip(),
+                "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            with open(self.llm_text_log_file, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            print(f" LLM text log failed: {exc}")
 
     def _load_model(self):
         self.semantic_runtime = SemanticRuntime(models_dir=MODELS_DIR)
@@ -286,14 +244,89 @@ class LiveTradingBot:
             feature_columns=self.feature_columns,
             semantic_runtime=self.semantic_runtime,
             semantic_feature_count=self.semantic_runtime.semantic_feature_count,
-            gate_stats={},
+            gate_stats=self.gate_provider.initial(),
         )
 
+        if self.use_llm_semantic:
+            self._load_llm_semantic_cache()
+            if self.llm_semantic_cache:
+                self.semantic_runtime.global_time_to_vec.update(self.llm_semantic_cache)
+                print(
+                    " Merged LLM semantic cache into runtime embeddings: "
+                    f"{len(self.llm_semantic_cache)}"
+                )
+
         print(" Model + VecNormalize loaded")
+        if self.use_llm_semantic:
+            print(
+                " Pipeline: live (LLM-CLS semantic + adaptive gate) | "
+                f"features={len(self.feature_columns)}"
+            )
+            print(" LLM semantic mode enabled (best-effort): raw text -> cls embedding")
+        else:
+            print(
+                " Pipeline: test_ppo-aligned (semantic_map fallback + adaptive gate) | "
+                f"features={len(self.feature_columns)}"
+            )
         print(
-            " Pipeline: test-aligned (semantic fallback + adaptive gate) | "
-            f"features={len(self.feature_columns)}"
+            " Live alignment: "
+            f"align={self.align_test_logic} "
+            f"gate_mode={self.gate_provider.mode} "
+            f"sync_account_state={self.sync_account_state} "
+            f"dynamic_lot={self.dynamic_lot} "
+            f"bridge_lot={self.bridge.lot_size:.2f}"
         )
+
+    def _resolve_live_llm_semantic(self, ts_key: str):
+        if not self.use_llm_semantic:
+            return
+        if self.semantic_runtime is None:
+            return
+        if ts_key in self.semantic_runtime.global_time_to_vec:
+            return
+        if generate_llm_cls_for_bar is None:
+            print(" LLM semantic skipped: use_llm module unavailable")
+            return
+
+        cached_vec = self.llm_semantic_cache.get(ts_key)
+        if cached_vec is not None:
+            self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(cached_vec, dtype=np.float32)
+            return
+
+        dataset_json = LLM_DATASET_JSON if LLM_DATASET_JSON else None
+        bar_dt = datetime.strptime(ts_key, "%Y-%m-%d %H:%M:%S")
+        print(f" LLM semantic: building cls for {ts_key}")
+        try:
+            llm_text, llm_cls = generate_llm_cls_for_bar(
+                date_time=bar_dt,
+                symbol=SYMBOL,
+                dataset_json=dataset_json,
+            )
+            cls_vec = np.asarray(llm_cls, dtype=np.float32).reshape(-1)
+            expected_dim = int(self.semantic_runtime._embedding_dim())
+            if cls_vec.size != expected_dim:
+                raise RuntimeError(f"CLS dim mismatch expected={expected_dim} got={cls_vec.size}")
+
+            self.llm_semantic_cache[ts_key] = cls_vec
+            self.semantic_runtime.global_time_to_vec[ts_key] = cls_vec
+            self._append_llm_text_log(ts_key, llm_text)
+            self._save_llm_semantic_cache(reason="llm_update")
+            print(f" LLM semantic ready | ts={ts_key} | dim={cls_vec.size}")
+        except Exception as exc:
+            print(f" LLM semantic failed for {ts_key}: {exc} | fallback=semantic_map")
+
+    def _ensure_window_real_semantic(self, window_df: pd.DataFrame):
+        if not self.use_llm_semantic:
+            return
+        if self.semantic_runtime is None:
+            return
+        tail_df = window_df.tail(int(max(1, WINDOW_SIZE)))
+        ts_keys = pd.to_datetime(tail_df["time"]).dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+        missing = [ts for ts in ts_keys if ts not in self.semantic_runtime.global_time_to_vec]
+        if missing:
+            print(f" LLM semantic: resolving missing window embeddings={len(missing)}")
+        for ts_key in missing:
+            self._resolve_live_llm_semantic(ts_key)
 
     def _runtime_state_payload(self):
         if self.bridge is None:
@@ -437,18 +470,18 @@ class LiveTradingBot:
         if self.bridge is None:
             return
 
-        account = mt5.account_info()
-        if account is None:
-            return
-
         prev_pos = int(self.bridge.position)
         current_pos, pos = self._get_mt5_position()
         current_ticket = int(pos.ticket) if pos is not None else 0
 
         self.bridge.position = current_pos
         if current_pos != 0 and pos is not None:
-            self.bridge.entry_price = float(pos.price_open)
-            if prev_pos != current_pos or (self.last_known_ticket != 0 and self.last_known_ticket != current_ticket):
+            position_changed = (
+                prev_pos != current_pos
+                or (self.last_known_ticket != 0 and self.last_known_ticket != current_ticket)
+            )
+            if position_changed or float(self.bridge.entry_price) <= 0.0:
+                self.bridge.entry_price = float(pos.price_open)
                 self.bridge.hold_steps = 0
                 self.bridge.first_bar = True
         else:
@@ -457,15 +490,24 @@ class LiveTradingBot:
             self.bridge.unrealized_pnl = 0.0
             self.bridge.first_bar = False
 
-        self.bridge.balance = float(account.balance)
-        self.bridge.equity = float(account.equity)
-        self.bridge.total_pnl = float(account.balance - self.initial_balance)
-        self.bridge.max_equity = max(float(self.bridge.max_equity), float(self.bridge.equity))
+        account = mt5.account_info()
+        if self.sync_account_state and account is not None:
+            self.bridge.balance = float(account.balance)
+            self.bridge.equity = float(account.equity)
+            self.bridge.total_pnl = float(account.balance - self.initial_balance)
+            self.bridge.max_equity = max(float(self.bridge.max_equity), float(self.bridge.equity))
+        else:
+            self.bridge.max_equity = max(float(self.bridge.max_equity), float(self.bridge.equity))
 
         if SYNC_EXTERNAL_LOT and pos is not None and float(pos.volume) > 0:
             self.bridge.lot_size = float(pos.volume)
+        elif self.dynamic_lot:
+            if account is not None:
+                self.bridge.lot_size = max(0.01, calc_auto_lot(float(account.balance)))
+            else:
+                self.bridge.lot_size = max(0.01, float(self.bridge.lot_size))
         else:
-            self.bridge.lot_size = max(0.01, calc_auto_lot(float(account.balance)))
+            self.bridge.lot_size = max(0.01, float(self.bridge.lot_size))
         self.bridge.spread_cost = SPREAD_PIPS * PIP_VALUE * self.bridge.lot_size
 
         self.current_lot = self.bridge.lot_size
@@ -473,7 +515,7 @@ class LiveTradingBot:
 
     def _fetch_window(self, bar_end_ts: int):
         rates = None
-        anchor_dt = datetime.fromtimestamp(max(1, int(bar_end_ts) - 1))
+        anchor_dt = datetime.fromtimestamp(max(1, int(bar_end_ts) - 1), tz=timezone.utc)
 
         if hasattr(mt5, "copy_rates_from"):
             try:
@@ -499,14 +541,14 @@ class LiveTradingBot:
         if len(df) < BAR_HISTORY:
             return None
 
-        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(None)
         df = df[["time", "open", "high", "low", "close"]].sort_values("time").reset_index(drop=True)
         if len(df) > BAR_HISTORY:
             df = df.tail(BAR_HISTORY).reset_index(drop=True)
         return df
 
     def _calc_delta_for_closed_bar(self, current_bar_ts: int):
-        end_dt = datetime.fromtimestamp(current_bar_ts)
+        end_dt = datetime.fromtimestamp(current_bar_ts, tz=timezone.utc)
         start_dt = end_dt - timedelta(seconds=self.timeframe_seconds)
         ticks = mt5.copy_ticks_range(SYMBOL, start_dt, end_dt, mt5.COPY_TICKS_ALL)
 
@@ -541,8 +583,8 @@ class LiveTradingBot:
         bar_times = []
         if hasattr(mt5, "copy_rates_range"):
             try:
-                start_dt = datetime.fromtimestamp(prev_bar_time)
-                end_dt = datetime.fromtimestamp(current_bar_time)
+                start_dt = datetime.fromtimestamp(prev_bar_time, tz=timezone.utc)
+                end_dt = datetime.fromtimestamp(current_bar_time, tz=timezone.utc)
                 rates = mt5.copy_rates_range(SYMBOL, self.timeframe, start_dt, end_dt)
                 if rates is not None and len(rates) > 0:
                     rdf = pd.DataFrame(rates)
@@ -604,11 +646,16 @@ class LiveTradingBot:
     def close_all(self):
         positions = mt5.positions_get(symbol=SYMBOL)
         if positions is None:
-            return
+            return False
+        if len(positions) == 0:
+            return True
 
+        all_ok = True
         for pos in positions:
-            tick = mt5.symbol_info_tick(SYMBOL)
+            tick = self._get_trade_tick()
             if tick is None:
+                print(" Close Skipped: no live tick")
+                all_ok = False
                 continue
 
             price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
@@ -630,18 +677,38 @@ class LiveTradingBot:
             else:
                 comment = res.comment if res else "No response"
                 print(f" Close Failed | ticket={pos.ticket} | {comment}")
+                all_ok = False
+        return all_ok
+
+    def _get_trade_tick(self):
+        retries = max(1, int(ORDER_TICK_RETRIES))
+        wait_sec = max(0.0, float(ORDER_TICK_RETRY_SEC))
+
+        for _ in range(retries):
+            if not mt5.symbol_select(SYMBOL, True):
+                time.sleep(wait_sec)
+                continue
+
+            tick = mt5.symbol_info_tick(SYMBOL)
+            if tick is not None and float(getattr(tick, "bid", 0.0)) > 0.0 and float(getattr(tick, "ask", 0.0)) > 0.0:
+                return tick
+            time.sleep(wait_sec)
+        return None
 
     def send_order(self, order_type):
-        tick = mt5.symbol_info_tick(SYMBOL)
+        tick = self._get_trade_tick()
         if tick is None:
-            print(" Order Failed: no symbol tick")
-            return
+            print(" Order Skipped: no live tick (market closed or quote unavailable)")
+            return False
 
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
-        account = mt5.account_info()
-        if account is not None:
-            self.current_lot = max(0.01, calc_auto_lot(float(account.balance), risk_pct=RISK_PERCENT))
+        if self.dynamic_lot:
+            account = mt5.account_info()
+            if account is not None:
+                self.current_lot = max(0.01, calc_auto_lot(float(account.balance), risk_pct=RISK_PERCENT))
+        elif self.bridge is not None:
+            self.current_lot = max(0.01, float(self.bridge.lot_size))
 
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -659,41 +726,94 @@ class LiveTradingBot:
         res = mt5.order_send(req)
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
             side = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
+            if self.bridge is not None:
+                self.bridge.lot_size = float(self.current_lot)
+                self.bridge.spread_cost = SPREAD_PIPS * PIP_VALUE * self.bridge.lot_size
             print(
                 f" Opened {side} @ {price:.{self.digits}f} | "
                 f"Lot={self.current_lot}"
             )
+            return True
         else:
             comment = res.comment if res else "No response"
             print(f" Order Failed: {comment}")
+            return False
 
     def execute_action(self, action):
         current_pos, _ = self._get_mt5_position()
 
         if action == 0:
-            return
+            return True
 
         if action == 3:
             if current_pos != 0:
-                self.close_all()
-            return
+                return self.close_all()
+            return True
 
         if action == 1:
             if current_pos == -1:
-                self.close_all()
+                closed_ok = self.close_all()
                 time.sleep(0.2)
                 current_pos, _ = self._get_mt5_position()
+                if not closed_ok and current_pos == -1:
+                    return False
             if current_pos <= 0:
-                self.send_order(mt5.ORDER_TYPE_BUY)
-            return
+                return self.send_order(mt5.ORDER_TYPE_BUY)
+            return True
 
         if action == 2:
             if current_pos == 1:
-                self.close_all()
+                closed_ok = self.close_all()
                 time.sleep(0.2)
                 current_pos, _ = self._get_mt5_position()
+                if not closed_ok and current_pos == 1:
+                    return False
             if current_pos >= 0:
-                self.send_order(mt5.ORDER_TYPE_SELL)
+                return self.send_order(mt5.ORDER_TYPE_SELL)
+            return True
+        return False
+
+    def _reconcile_broker_execution(
+        self,
+        action: int,
+        execute_orders: bool,
+        order_ok: bool,
+        broker_pos_before: int,
+        broker_pos_after: int,
+    ):
+        if self.bridge is None or not execute_orders or action not in (1, 2, 3):
+            return
+
+        expected_after = broker_pos_before
+        if action == 1:
+            expected_after = 1
+        elif action == 2:
+            expected_after = -1
+        elif action == 3:
+            expected_after = 0
+
+        mismatch = broker_pos_after != expected_after
+        if order_ok and not mismatch:
+            return
+
+        print(
+            " Broker reconcile: action not reflected on broker "
+            f"(action={action} expected_pos={expected_after} actual_pos={broker_pos_after})"
+        )
+
+        # Prevent virtual bridge cooldown from blocking entries when order failed.
+        self.bridge.trade_cooldown = 0
+        self.bridge.first_bar = False
+
+        if broker_pos_after == 0:
+            self.bridge.position = 0
+            self.bridge.entry_price = 0.0
+            self.bridge.hold_steps = 0
+            self.bridge.unrealized_pnl = 0.0
+
+        # Roll back synthetic spread fee if an open from flat did not fill.
+        if action in (1, 2) and broker_pos_before == 0 and broker_pos_after == 0:
+            self.bridge.total_fees = max(0.0, float(self.bridge.total_fees) - float(self.bridge.spread_cost))
 
     def _print_status_line(self):
         tick = mt5.symbol_info_tick(SYMBOL)
@@ -703,22 +823,30 @@ class LiveTradingBot:
         current_pos, pos = self._get_mt5_position()
         pos_txt = {1: "LONG", -1: "SHORT", 0: "FLAT"}[current_pos]
         pnl_txt = f"{pos.profit:+.2f}" if pos is not None else "0.00"
-        server_time = datetime.fromtimestamp(tick.time).strftime("%H:%M:%S")
+        server_time_utc = datetime.fromtimestamp(tick.time, tz=timezone.utc).strftime("%H:%M:%SZ")
 
         line = (
             f"\r Pr:{tick.bid:.{self.digits}f} | Pos:{pos_txt:5s} | PnL:{pnl_txt:>8s} | "
-            f"Eq:{self.bridge.equity:8.2f} | T:{server_time}      "
+            f"Eq:{self.bridge.equity:8.2f} | T_UTC:{server_time_utc}      "
         )
         sys.stdout.write(line)
         sys.stdout.flush()
 
     def _process_closed_bar(self, bar_end_ts: int, mode: str = "New Candle", execute_orders: bool = True):
-        print(f"\n {mode}: processing closed bar -> {datetime.fromtimestamp(bar_end_ts)}")
+        bar_end_utc = datetime.fromtimestamp(bar_end_ts, tz=timezone.utc)
+        bar_open_utc = bar_end_utc - timedelta(seconds=self.timeframe_seconds)
+        print(
+            f"\n {mode}: processing closed bar -> "
+            f"open={bar_open_utc.strftime('%Y-%m-%d %H:%M:%SZ')} "
+            f"end={bar_end_utc.strftime('%Y-%m-%d %H:%M:%SZ')}"
+        )
 
         window_df = self._fetch_window(bar_end_ts)
         if window_df is None:
             print(" Not enough bars yet for model window")
             return
+
+        self._ensure_window_real_semantic(window_df)
 
         delta_tick, delta_price = self._calc_delta_for_closed_bar(bar_end_ts)
         self.bridge.gate_stats = self.gate_provider.update(window_df)
@@ -733,11 +861,21 @@ class LiveTradingBot:
             f"dTick={delta_tick} | dPrice={delta_price:.5f}"
         )
 
+        broker_pos_before, _ = self._get_mt5_position()
+        order_ok = True
         if execute_orders:
-            self.execute_action(action)
+            order_ok = bool(self.execute_action(action))
         elif action != 0:
-            print(" Replay mode: stale-bar order skipped")
+            print(" No-order mode: action skipped")
         self._sync_bridge_from_mt5()
+        broker_pos_after, _ = self._get_mt5_position()
+        self._reconcile_broker_execution(
+            action=action,
+            execute_orders=execute_orders,
+            order_ok=order_ok,
+            broker_pos_before=int(broker_pos_before),
+            broker_pos_after=int(broker_pos_after),
+        )
         self._save_runtime_state(reason="bar_close")
 
     def run(self):
@@ -745,6 +883,7 @@ class LiveTradingBot:
         self._load_model()
         self._load_runtime_state()
         self._sync_bridge_from_mt5()
+        startup_eval_pending = bool(EVAL_ON_START)
 
         print(" Waiting for new H1 candles...")
 
@@ -755,10 +894,28 @@ class LiveTradingBot:
                     time.sleep(POLL_SECONDS)
                     continue
 
+                if startup_eval_pending:
+                    startup_eval_pending = False
+                    if self.last_bar_time == 0:
+                        self.last_bar_time = current_bar_time
+                        self._process_closed_bar(current_bar_time, mode="Startup", execute_orders=True)
+                        self._sync_bridge_from_mt5()
+                        self._print_status_line()
+                        time.sleep(POLL_SECONDS)
+                        continue
+
+                    if self.last_bar_time == current_bar_time:
+                        print("\n Startup eval: current bar already processed; running no-order refresh")
+                        self._process_closed_bar(current_bar_time, mode="Startup", execute_orders=False)
+                        self._sync_bridge_from_mt5()
+                        self._print_status_line()
+                        time.sleep(POLL_SECONDS)
+                        continue
+
+                    print("\n Startup eval deferred: missed bars detected; catch-up replay will process first")
+
                 if self.last_bar_time == 0:
                     self.last_bar_time = current_bar_time
-                    if EVAL_ON_START:
-                        self._process_closed_bar(current_bar_time, mode="Startup", execute_orders=True)
                     self._sync_bridge_from_mt5()
                     self._print_status_line()
                     time.sleep(POLL_SECONDS)
@@ -778,12 +935,16 @@ class LiveTradingBot:
             print("\n Stopped by user")
         finally:
             self._save_runtime_state(reason="shutdown")
+            self._save_llm_semantic_cache(reason="shutdown")
             try:
                 mt5.shutdown()
             except Exception:
                 pass
 
-
-if __name__ == "__main__":
+def main():
     bot = LiveTradingBot()
     bot.run()
+
+
+if __name__ == "__main__":
+    main()
