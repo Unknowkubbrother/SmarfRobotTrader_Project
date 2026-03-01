@@ -37,7 +37,7 @@ HOST = os.getenv("ZMQ_HOST", "0.0.0.0")
 PORT = int(os.getenv("ZMQ_PORT", "5555"))
 MODEL_PATH = os.path.join(MODELS_DIR, "ppo_trading.zip")
 VEC_NORM_PATH = os.path.join(MODELS_DIR, "vec_normalize.pkl")
-SYNC_EXTERNAL_LOT = os.getenv("MT5_SYNC_EXTERNAL_LOT", "0").strip().lower() in {"1", "true", "yes"}
+SYNC_EXTERNAL_LOT = os.getenv("MT5_SYNC_EXTERNAL_LOT", "1").strip().lower() in {"1", "true", "yes"}
 
 
 def _patch_numpy_bitgenerator_compat():
@@ -352,7 +352,8 @@ def main():
                 continue
 
             df, delta_tick, delta_price, lot_from_ea = parse_mt5_data(data_str)
-            if df is None or len(df) < WINDOW_SIZE:
+            # Keep test_ppo alignment: require the same history depth as backtest windowing.
+            if df is None or len(df) < BAR_HISTORY:
                 socket.send_string("0")
                 continue
 

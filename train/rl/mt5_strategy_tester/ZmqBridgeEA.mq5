@@ -20,6 +20,7 @@ input int ZmqPort = 5555;
 input int MagicNumber = 12345;
 input double RiskPercent = 1.0; // Risk % per trade
 input int SL_Pips_Input = 50;   // SL in pips (for auto lot calculation)
+input int HistoryBars = 167;    // Must match BAR_HISTORY used by Python backtest
 
 //--- Global Variables
 Context context("PPO_ZMQ_Client");
@@ -116,10 +117,11 @@ int GetPPOAction(string data) {
 //+------------------------------------------------------------------+
 string BuildDataString(int dTick, double dPrice) {
   MqlRates rates[];
-  int copied = CopyRates(_Symbol, PERIOD_H1, 1, 200, rates);
+  int barsToSend = MathMax(60, HistoryBars);
+  int copied = CopyRates(_Symbol, PERIOD_H1, 1, barsToSend, rates);
 
-  if (copied < 200) {
-    Print("⚠️ Only got ", copied, " bars (need 200)");
+  if (copied < barsToSend) {
+    Print("⚠️ Only got ", copied, " bars (need ", barsToSend, ")");
     return "";
   }
 
@@ -166,45 +168,62 @@ void ExecuteAction(int action) {
   double price;
 
   bool hasPosition = PositionSelect(_Symbol);
-  long posType = -1;
-  if (hasPosition)
-    posType = PositionGetInteger(POSITION_TYPE);
+  long posType = hasPosition ? PositionGetInteger(POSITION_TYPE) : -1;
 
-  switch (action) {
-  case 0: // HOLD
-    break;
+  // HOLD
+  if (action == 0)
+    return;
 
-  case 1: // BUY
-    if (hasPosition && posType == POSITION_TYPE_SELL) {
-      trade.PositionClose(_Symbol);
-      Sleep(100);
-    }
-    if (!hasPosition || posType == POSITION_TYPE_SELL) {
-      price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      // No SL/TP on order — Python server manages SL/TP
-      trade.Buy(currentLot, _Symbol, price, 0, 0, "PPO_BUY");
-      Print("📈 BUY @ ", price, " | Lot: ", currentLot, " (auto-sized)");
-    }
-    break;
-
-  case 2: // SELL
-    if (hasPosition && posType == POSITION_TYPE_BUY) {
-      trade.PositionClose(_Symbol);
-      Sleep(100);
-    }
-    if (!hasPosition || posType == POSITION_TYPE_BUY) {
-      price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      trade.Sell(currentLot, _Symbol, price, 0, 0, "PPO_SELL");
-      Print("📉 SELL @ ", price, " | Lot: ", currentLot, " (auto-sized)");
-    }
-    break;
-
-  case 3: // CLOSE
+  // CLOSE
+  if (action == 3) {
     if (hasPosition) {
-      trade.PositionClose(_Symbol);
-      Print("🔒 CLOSE position");
+      if (trade.PositionClose(_Symbol))
+        Print("🔒 CLOSE position");
+      else
+        Print("⚠️ CLOSE failed: ", trade.ResultRetcodeDescription());
     }
-    break;
+    return;
+  }
+
+  // BUY / SELL: close opposite first, then verify position state before open.
+  if (action == 1 && hasPosition && posType == POSITION_TYPE_SELL) {
+    if (!trade.PositionClose(_Symbol)) {
+      Print("⚠️ CLOSE SELL failed before BUY: ", trade.ResultRetcodeDescription());
+      return;
+    }
+    Sleep(100);
+  }
+  if (action == 2 && hasPosition && posType == POSITION_TYPE_BUY) {
+    if (!trade.PositionClose(_Symbol)) {
+      Print("⚠️ CLOSE BUY failed before SELL: ", trade.ResultRetcodeDescription());
+      return;
+    }
+    Sleep(100);
+  }
+
+  hasPosition = PositionSelect(_Symbol);
+  posType = hasPosition ? PositionGetInteger(POSITION_TYPE) : -1;
+
+  if (action == 1) {
+    if (hasPosition && posType == POSITION_TYPE_BUY)
+      return;
+    price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    if (trade.Buy(currentLot, _Symbol, price, 0, 0, "PPO_BUY"))
+      Print("📈 BUY @ ", price, " | Lot: ", currentLot, " (auto-sized)");
+    else
+      Print("⚠️ BUY failed: ", trade.ResultRetcodeDescription());
+    return;
+  }
+
+  if (action == 2) {
+    if (hasPosition && posType == POSITION_TYPE_SELL)
+      return;
+    price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    if (trade.Sell(currentLot, _Symbol, price, 0, 0, "PPO_SELL"))
+      Print("📉 SELL @ ", price, " | Lot: ", currentLot, " (auto-sized)");
+    else
+      Print("⚠️ SELL failed: ", trade.ResultRetcodeDescription());
+    return;
   }
 }
 
@@ -212,7 +231,45 @@ void ExecuteAction(int action) {
 void OnTick() {
   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+  datetime currentBarTime = iTime(_Symbol, PERIOD_H1, 0);
+  if (lastBarTime == 0) {
+    lastBarTime = currentBarTime;
+    lastBid = bid;
+    lastAsk = ask;
+    return;
+  }
 
+  bool isNewBar = (currentBarTime != lastBarTime);
+  if (isNewBar) {
+    lastBarTime = currentBarTime;
+
+    // Recalculate lot size once per closed bar
+    currentLot = CalculateLotSize();
+
+    int deltaTickToSend = accumDeltaTick;
+    double deltaPriceToSend = accumDeltaPrice;
+    accumDeltaTick = 0;
+    accumDeltaPrice = 0.0;
+
+    string data = BuildDataString(deltaTickToSend, deltaPriceToSend);
+    if (data != "") {
+      int action = GetPPOAction(data);
+      if (action < 0 || action > 3) {
+        Print("⚠️ Invalid action: ", action);
+      } else {
+        string actionNames[] = {"HOLD", "BUY", "SELL", "CLOSE"};
+        Print("🤖 PPO Action: ", actionNames[action], " (", action, ")");
+        ExecuteAction(action);
+      }
+    }
+
+    // Start new bar accumulation baseline from this tick (do not count cross-bar jump).
+    lastBid = bid;
+    lastAsk = ask;
+    return;
+  }
+
+  // Accumulate tick delta only inside the current bar (test/live aligned semantics).
   if (lastBid > 0.0 && lastAsk > 0.0) {
     if (bid > lastBid || (bid == lastBid && ask > lastAsk))
       accumDeltaTick++;
@@ -222,37 +279,5 @@ void OnTick() {
   }
   lastBid = bid;
   lastAsk = ask;
-
-  datetime currentBarTime = iTime(_Symbol, PERIOD_H1, 0);
-  if (currentBarTime == lastBarTime || lastBarTime == 0) {
-    if (lastBarTime == 0)
-      lastBarTime = currentBarTime;
-    return;
-  }
-  lastBarTime = currentBarTime;
-
-  // Recalculate lot size each bar (adapts to balance changes)
-  currentLot = CalculateLotSize();
-
-  int deltaTickToSend = accumDeltaTick;
-  double deltaPriceToSend = accumDeltaPrice;
-  accumDeltaTick = 0;
-  accumDeltaPrice = 0.0;
-
-  string data = BuildDataString(deltaTickToSend, deltaPriceToSend);
-  if (data == "")
-    return;
-
-  int action = GetPPOAction(data);
-
-  if (action < 0 || action > 3) {
-    Print("⚠️ Invalid action: ", action);
-    return;
-  }
-
-  string actionNames[] = {"HOLD", "BUY", "SELL", "CLOSE"};
-  Print("🤖 PPO Action: ", actionNames[action], " (", action, ")");
-
-  ExecuteAction(action);
 }
 //+------------------------------------------------------------------+
