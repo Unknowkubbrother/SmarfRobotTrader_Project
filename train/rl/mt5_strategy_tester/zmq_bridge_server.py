@@ -41,14 +41,6 @@ SYNC_EXTERNAL_LOT = os.getenv("MT5_SYNC_EXTERNAL_LOT", "1").strip().lower() in {
 
 
 def _patch_numpy_bitgenerator_compat():
-    """
-    Handle cross-version NumPy pickle differences.
-
-    Some vec_normalize.pkl files store bit generators as class objects
-    (e.g. <class 'numpy.random._pcg64.PCG64'>) while older NumPy expects
-    a short string name ("PCG64"). This patch normalizes the input before
-    delegating to NumPy's original constructor.
-    """
     try:
         import numpy.random._pickle as np_pickle
     except Exception:
