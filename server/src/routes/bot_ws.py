@@ -10,6 +10,7 @@ Endpoints:
 import asyncio
 import json
 import logging
+import math
 import time
 from datetime import datetime, timezone
 
@@ -29,6 +30,9 @@ bot_ws_router = APIRouter()
 _CACHE_TTL = 3900  # 65 minutes
 _BOT_CONTEXT: dict[str, dict] = {}
 _BOT_OPEN_POSITIONS: dict[str, dict[int, dict]] = {}
+_BOT_ACCOUNT_SYNC_CACHE: dict[str, dict] = {}
+_ACCOUNT_SYNC_MIN_INTERVAL_SEC = 5.0
+_ACCOUNT_SYNC_FORCE_INTERVAL_SEC = 60.0
 
 
 def _cache_key(symbol: str, timeframe: str, dt_str: str) -> str:
@@ -51,6 +55,16 @@ def _safe_int(value, default: int = 0) -> int:
         return int(value)
     except Exception:
         return int(default)
+
+
+def _safe_finite_float(value, default: float | None = None) -> float | None:
+    try:
+        parsed = float(value)
+    except Exception:
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return parsed
 
 
 def _parse_open_time(raw_pos: dict) -> datetime | None:
@@ -198,6 +212,78 @@ async def _persist_closed_orders_only(bot_config_id: str, account_id: str, bot_i
     _BOT_OPEN_POSITIONS[bot_config_id] = current_positions
 
 
+def _build_account_update_payload(state: dict) -> dict:
+    payload: dict = {}
+
+    balance = _safe_finite_float(state.get("balance"), None)
+    if balance is not None:
+        payload["balance"] = round(balance, 2)
+
+    equity = _safe_finite_float(state.get("equity"), None)
+    if equity is not None:
+        payload["equity"] = round(equity, 2)
+
+    margin = _safe_finite_float(state.get("margin"), None)
+    if margin is not None:
+        payload["margin"] = round(margin, 2)
+
+    margin_free = _safe_finite_float(state.get("free_margin"), None)
+    if margin_free is not None:
+        payload["marginFree"] = round(margin_free, 2)
+
+    margin_level = _safe_finite_float(state.get("margin_level"), None)
+    if margin_level is not None:
+        payload["marginLevel"] = round(margin_level, 2)
+
+    leverage = _safe_int(state.get("leverage"), 0)
+    if leverage > 0:
+        payload["leverage"] = leverage
+
+    login = _safe_int(state.get("login"), 0)
+    if login > 0:
+        payload["mt5LoginId"] = str(login)
+
+    server_name = str(state.get("server", "") or "").strip()
+    if server_name:
+        payload["serverName"] = server_name[:100]
+
+    return payload
+
+
+def _should_sync_account_snapshot(bot_config_id: str, payload: dict) -> bool:
+    if not payload:
+        return False
+
+    now = time.time()
+    previous = _BOT_ACCOUNT_SYNC_CACHE.get(bot_config_id) or {}
+    previous_ts = _safe_finite_float(previous.get("ts"), 0.0) or 0.0
+    previous_payload = previous.get("payload") if isinstance(previous.get("payload"), dict) else {}
+    elapsed = max(0.0, now - previous_ts)
+
+    if elapsed < _ACCOUNT_SYNC_MIN_INTERVAL_SEC:
+        return False
+
+    if payload != previous_payload:
+        return True
+
+    return elapsed >= _ACCOUNT_SYNC_FORCE_INTERVAL_SEC
+
+
+async def _persist_account_snapshot(bot_config_id: str, account_id: str, state: dict) -> None:
+    payload = _build_account_update_payload(state)
+    if not _should_sync_account_snapshot(bot_config_id, payload):
+        return
+
+    await db.tradingaccount.update(
+        where={"id": account_id},
+        data=payload,
+    )
+    _BOT_ACCOUNT_SYNC_CACHE[bot_config_id] = {
+        "ts": time.time(),
+        "payload": payload,
+    }
+
+
 async def _persist_bot_state(bot_config_id: str, state: dict) -> None:
     context = await _get_bot_context(bot_config_id)
     if not context:
@@ -208,7 +294,15 @@ async def _persist_bot_state(bot_config_id: str, state: dict) -> None:
     if not account_id:
         return
 
-    await _persist_closed_orders_only(bot_config_id, account_id, bot_instance_id, state)
+    try:
+        await _persist_account_snapshot(bot_config_id, account_id, state)
+    except Exception as exc:
+        logger.warning("account snapshot sync failed for %s: %s", bot_config_id, exc)
+
+    try:
+        await _persist_closed_orders_only(bot_config_id, account_id, bot_instance_id, state)
+    except Exception as exc:
+        logger.warning("closed orders sync failed for %s: %s", bot_config_id, exc)
 
 
 def _get_cached(symbol: str, timeframe: str, dt_str: str) -> dict | None:
@@ -307,6 +401,7 @@ async def bot_websocket(websocket: WebSocket):
         if bot_config_id:
             bot_hub.disconnect_bot(bot_config_id)
             _BOT_OPEN_POSITIONS.pop(bot_config_id, None)
+            _BOT_ACCOUNT_SYNC_CACHE.pop(bot_config_id, None)
 
 
 # ── WS /ws/dashboard — Dashboard connection ──────────────────────────
