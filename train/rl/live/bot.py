@@ -92,6 +92,9 @@ class LiveTradingBot:
         self._ws_cache = {}       # ts_key -> {llm_text, cls_vec} from WebSocket
         self._ws_connected = False
         self._ws_send_lock = threading.Lock()
+        self._ws_state_lock = threading.Lock()
+        self._ws_pending_state_payload = None
+        self._ws_last_enqueued_at = 0.0
         self._sem_retry_not_before = {}  # ts_key -> epoch seconds
         self.last_action = "HOLD"
         self.vision_llm_api_url = str(VISION_LLM_API_URL or "").strip()
@@ -348,13 +351,19 @@ class LiveTradingBot:
                         try:
                             self._sync_bridge_from_mt5()
                             self._push_state_to_server(action_name=self.last_action or "HOLD")
+                            self._flush_pending_state_to_server()
                         except Exception:
                             pass
                         while True:
-                            raw = ws.recv()
+                            try:
+                                raw = ws.recv(timeout=max(0.25, min(float(POLL_SECONDS), 1.0)))
+                            except TimeoutError:
+                                self._flush_pending_state_to_server()
+                                continue
                             try:
                                 msg = json.loads(raw)
                             except Exception:
+                                self._flush_pending_state_to_server()
                                 continue
                             msg_type = msg.get("type")
                             if msg_type == "llm_result":
@@ -376,9 +385,12 @@ class LiveTradingBot:
                                     )
                             elif msg_type == "bot_config":
                                 self._apply_runtime_config(msg, source="ws")
+                            self._flush_pending_state_to_server()
                 except Exception as exc:
                     self._ws = None
                     self._ws_connected = False
+                    with self._ws_state_lock:
+                        self._ws_pending_state_payload = None
                     print(f"\n [WS] disconnected: {exc} | reconnecting in 5s")
                     self._add_log(
                         "warning",
@@ -524,11 +536,31 @@ class LiveTradingBot:
                 meta={"source": source, "risk_level": self.risk_level, "risk_percent": float(self.risk_percent)},
             )
 
+    def _flush_pending_state_to_server(self):
+        """Flush queued state payload from WS thread."""
+        if not self._ws_connected or not hasattr(self, "_ws") or self._ws is None:
+            return
+
+        payload = None
+        with self._ws_state_lock:
+            payload = self._ws_pending_state_payload
+            self._ws_pending_state_payload = None
+        if not payload:
+            return
+
+        with self._ws_send_lock:
+            self._ws.send(payload)
+
     def _push_state_to_server(self, action_name: str = ""):
-        """Push full MT5 state to server via WebSocket."""
-        if not self._ws_connected or not hasattr(self, '_ws') or self._ws is None:
+        """Queue full MT5 state for WS thread (non-blocking for trading loop)."""
+        if not self._ws_connected or not hasattr(self, "_ws") or self._ws is None:
             return
         try:
+            now = time.time()
+            # Avoid flooding queue with HOLD heartbeats.
+            if now - float(self._ws_last_enqueued_at) < 0.25 and str(action_name or "").upper() == "HOLD":
+                return
+
             resolved_action = str(action_name or self.last_action or "").strip() or "HOLD"
             self.last_action = resolved_action
             current_pos, pos = self._get_mt5_position()
@@ -589,6 +621,10 @@ class LiveTradingBot:
                         "comment": str(p.comment) if p.comment else "",
                     })
 
+            llm_text = str(getattr(self, "last_llm_text", "") or "")
+            if len(llm_text) > 800:
+                llm_text = llm_text[:800] + " ..."
+
             state = {
                 "type": "state",
                 "bot_config_id": BOT_CONFIG_ID,
@@ -616,18 +652,21 @@ class LiveTradingBot:
                 # MT5 Positions
                 "positions": positions_data,
                 # Logs
-                "llm_text": getattr(self, "last_llm_text", ""),
-                "recent_logs": getattr(self, "recent_logs", []),
+                "llm_text": llm_text,
+                "recent_logs": list(getattr(self, "recent_logs", [])[-40:]),
                 "ws_connected": True,
             }
             payload = json.dumps(state, ensure_ascii=False)
-            with self._ws_send_lock:
-                self._ws.send(payload)
+            with self._ws_state_lock:
+                self._ws_pending_state_payload = payload
+                self._ws_last_enqueued_at = now
         except Exception as exc:
             print(f" WS state push failed: {exc}")
             self._ws_connected = False
             ws_ref = getattr(self, "_ws", None)
             self._ws = None
+            with self._ws_state_lock:
+                self._ws_pending_state_payload = None
             if ws_ref is not None:
                 try:
                     ws_ref.close()

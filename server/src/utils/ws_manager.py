@@ -15,6 +15,7 @@ from typing import Dict, Set
 from fastapi import WebSocket
 
 logger = logging.getLogger(__name__)
+_WS_SEND_TIMEOUT_SEC = 0.75
 
 
 @dataclass
@@ -129,7 +130,7 @@ class BotHub:
 
         async def _send(conn: BotConnection):
             try:
-                await conn.websocket.send_text(message)
+                await asyncio.wait_for(conn.websocket.send_text(message), timeout=_WS_SEND_TIMEOUT_SEC)
             except Exception:
                 disconnected.append(conn.bot_config_id)
 
@@ -160,7 +161,10 @@ class BotHub:
             **(config_data or {}),
         }
         try:
-            await conn.websocket.send_text(json.dumps(payload, ensure_ascii=False))
+            await asyncio.wait_for(
+                conn.websocket.send_text(json.dumps(payload, ensure_ascii=False)),
+                timeout=_WS_SEND_TIMEOUT_SEC,
+            )
             return True
         except Exception:
             self.disconnect_bot(bot_id)
@@ -176,7 +180,7 @@ class BotHub:
 
         async def _send(ws: WebSocket):
             try:
-                await ws.send_text(message)
+                await asyncio.wait_for(ws.send_text(message), timeout=_WS_SEND_TIMEOUT_SEC)
             except Exception:
                 disconnected.append(ws)
 
