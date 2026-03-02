@@ -10,6 +10,13 @@ export interface Create_Trading_Account {
   mt5Password: string;
 }
 
+export interface Update_Trading_Account {
+  brokerName?: string;
+  serverName?: string;
+  mt5LoginId?: string;
+  mt5Password?: string;
+}
+
 export interface BotVersion {
   model_id: string;
   label: string | null;
@@ -300,6 +307,52 @@ export function useTradingAccounts() {
     }
   };
 
+  // Update an existing trading account (and stop linked bots)
+  const updateAccount = async (accountId: string, data: Update_Trading_Account) => {
+    try {
+      const payload: Record<string, string> = { accountId };
+      if (data.brokerName !== undefined) payload.brokerName = data.brokerName;
+      if (data.serverName !== undefined) payload.serverName = data.serverName;
+      if (data.mt5LoginId !== undefined) payload.mt5LoginId = data.mt5LoginId;
+      if (data.mt5Password !== undefined) payload.mt5Password = data.mt5Password;
+
+      const response = await api.patch("/trading/update_account", payload);
+      await fetchAccounts();
+      const affectedBots = Number(response.data?.affected_bots || 0);
+      if (affectedBots > 0) {
+        toast.success(`Account updated. ${affectedBots} linked bot(s) stopped.`);
+      } else {
+        toast.success("Trading account updated successfully");
+      }
+      return { success: true, data: response.data };
+    } catch (error: any) {
+      console.error("Error updating account:", error);
+      toast.error(error.message || "Failed to update account");
+      return { success: false, error: error.message };
+    }
+  };
+
+  // Delete trading account (cascade delete linked bots)
+  const deleteAccount = async (accountId: string) => {
+    try {
+      const response = await api.delete("/trading/delete_account", {
+        data: { accountId },
+      });
+      await fetchAccounts();
+      const deletedBots = Number(response.data?.deleted_bots || 0);
+      toast.success(
+        deletedBots > 0
+          ? `Trading account removed. ${deletedBots} linked bot(s) were deleted.`
+          : "Trading account removed successfully"
+      );
+      return { success: true, data: response.data };
+    } catch (error: any) {
+      console.error("Error deleting account:", error);
+      toast.error(error.message || "Failed to delete account");
+      return { success: false, error: error.message };
+    }
+  };
+
   // Helper to get running bots count for an account
   const getRunningBotsCount = (account: AccountWithBots) => {
     return account.bot_configurations.filter((b) => b.container_status === "running").length;
@@ -325,6 +378,8 @@ export function useTradingAccounts() {
     loading,
     refetch: fetchAccounts,
     createAccount,
+    updateAccount,
+    deleteAccount,
     updateBotStatus,
     updateBotRisk,
     updateBotSchedule,

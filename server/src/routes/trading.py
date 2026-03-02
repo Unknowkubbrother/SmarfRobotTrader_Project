@@ -6,7 +6,12 @@ import base64
 import hashlib
 import os
 from datetime import date, datetime, timedelta
-from ..models.trading_model import Create_Trading_Account, UpsertTradingJournalRequest
+from ..models.trading_model import (
+    Create_Trading_Account,
+    Delete_Trading_Account,
+    Update_Trading_Account,
+    UpsertTradingJournalRequest,
+)
 from ..database.client import db
 from ..utils.trading_schedule import normalize_trading_schedule
 
@@ -41,6 +46,14 @@ def _normalize_string_list(value) -> list[str]:
         if txt:
             out.append(txt)
     return out
+
+
+def _encrypt_mt5_password(raw_password: str) -> str:
+    key = base64.urlsafe_b64encode(
+        hashlib.sha256(os.getenv("SECRET_KEY", "UknownmeInLove").encode()).digest()
+    )
+    fernet = Fernet(key)
+    return fernet.encrypt(raw_password.encode()).decode()
 
 
 async def _get_user_account_ids(user_id: str) -> list[str]:
@@ -635,11 +648,8 @@ async def get_accounts_with_bots(request: Request):
 async def create_account(request: Request, data: Create_Trading_Account):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
-    
-    key = base64.urlsafe_b64encode(hashlib.sha256(os.getenv("SECRET_KEY", "UknownmeInLove").encode()).digest())
-    fernet = Fernet(key)
-    
-    encrypted_password = fernet.encrypt(data.mt5Password.encode()).decode()
+
+    encrypted_password = _encrypt_mt5_password(data.mt5Password)
     userId = request.state.user_id
 
     trading_account = await db.tradingaccount.create(
@@ -668,6 +678,113 @@ async def create_account(request: Request, data: Create_Trading_Account):
         "status_code": 200,
         "message": "Trading account created successfully"
     }
+
+
+@trading_router.patch("/update_account", tags=["trading"])
+async def update_account(request: Request, data: Update_Trading_Account):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    account = await db.tradingaccount.find_first(
+        where={
+            "id": data.accountId,
+            "userId": request.state.user_id,
+        }
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="Trading account not found")
+
+    update_payload = {}
+
+    if data.brokerName is not None:
+        broker_name = str(data.brokerName).strip()
+        if not broker_name:
+            raise HTTPException(status_code=400, detail="brokerName cannot be empty")
+        update_payload["brokerName"] = broker_name
+
+    if data.serverName is not None:
+        server_name = str(data.serverName).strip()
+        if not server_name:
+            raise HTTPException(status_code=400, detail="serverName cannot be empty")
+        update_payload["serverName"] = server_name
+
+    if data.mt5LoginId is not None:
+        mt5_login_id = str(data.mt5LoginId).strip()
+        if not mt5_login_id:
+            raise HTTPException(status_code=400, detail="mt5LoginId cannot be empty")
+        update_payload["mt5LoginId"] = mt5_login_id
+
+    if data.mt5Password is not None:
+        mt5_password = str(data.mt5Password).strip()
+        if not mt5_password:
+            raise HTTPException(status_code=400, detail="mt5Password cannot be empty")
+        update_payload["mt5Password"] = _encrypt_mt5_password(mt5_password)
+
+    if not update_payload:
+        raise HTTPException(status_code=400, detail="No update fields provided")
+
+    linked_bots = await db.botconfiguration.count(
+        where={"accountId": data.accountId},
+    )
+
+    await db.tradingaccount.update(
+        where={"id": data.accountId},
+        data=update_payload,
+    )
+
+    if linked_bots > 0:
+        await db.botconfiguration.update_many(
+            where={"accountId": data.accountId},
+            data={
+                "containerStatus": "stopped",
+                "isActive": False,
+            },
+        )
+
+    return {
+        "status_code": 200,
+        "message": "Trading account updated successfully",
+        "affected_bots": int(linked_bots),
+    }
+
+
+@trading_router.delete("/delete_account", tags=["trading"])
+async def delete_account(request: Request, data: Delete_Trading_Account):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    account = await db.tradingaccount.find_first(
+        where={
+            "id": data.accountId,
+            "userId": request.state.user_id,
+        }
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="Trading account not found")
+
+    linked_bots = await db.botconfiguration.count(
+        where={"accountId": data.accountId},
+    )
+
+    if linked_bots > 0:
+        await db.botconfiguration.update_many(
+            where={"accountId": data.accountId},
+            data={
+                "containerStatus": "stopped",
+                "isActive": False,
+            },
+        )
+
+    await db.tradingaccount.delete(
+        where={"id": data.accountId},
+    )
+
+    return {
+        "status_code": 200,
+        "message": "Trading account deleted successfully",
+        "deleted_bots": int(linked_bots),
+    }
+
 
 @trading_router.get("/", tags=["trading"])
 async def trading_by_user(request: Request, accountId: str):

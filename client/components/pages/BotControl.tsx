@@ -106,6 +106,8 @@ export default function BotControl() {
     changeModel,
     applyBotUpdate,
     deleteBot,
+    updateAccount,
+    deleteAccount,
     refetch,
     getBotVersions
   } = useTradingAccounts();
@@ -187,6 +189,9 @@ export default function BotControl() {
             setSelectedBot(updated.bot_configurations[0] || null);
           }
         }
+      } else {
+        setSelectedAccount(accounts[0] || null);
+        setSelectedBot(null);
       }
     }
   }, [accounts]);
@@ -346,6 +351,14 @@ export default function BotControl() {
             accounts={accounts}
             isLoading={loading}
             onRefresh={refetch}
+            onUpdateAccount={updateAccount}
+            onDeleteAccount={deleteAccount}
+            onAccountDeleted={(accountId) => {
+              if (selectedAccount?.id === accountId) {
+                setSelectedAccount(null);
+                setSelectedBot(null);
+              }
+            }}
           />
           {selectedAccount && (
             <BotSelector

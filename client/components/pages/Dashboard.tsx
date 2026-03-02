@@ -18,7 +18,7 @@ import { BotSelector } from "@/components/dashboard/BotSelector";
 import Link from "next/link";
 
 export default function Dashboard() {
-  const { accounts, loading, updateBotStatus, deleteBot, refetch, getPendingUpdatesCount } = useTradingAccounts();
+  const { accounts, loading, updateBotStatus, deleteBot, updateAccount, deleteAccount, refetch, getPendingUpdatesCount } = useTradingAccounts();
   const [selectedAccount, setSelectedAccount] = useState<AccountWithBots | null>(null);
   const [selectedBotId, setSelectedBotId] = useState<string | null>(null);
   const [addBotOpen, setAddBotOpen] = useState(false);
@@ -37,6 +37,9 @@ export default function Dashboard() {
       const updated = accounts.find(a => a.id === selectedAccount.id);
       if (updated) {
         setSelectedAccount(updated);
+      } else {
+        setSelectedAccount(accounts[0] || null);
+        setSelectedBotId(null);
       }
     }
   }, [accounts, selectedAccount]);
@@ -154,6 +157,14 @@ export default function Dashboard() {
             accounts={accounts}
             isLoading={loading}
             onRefresh={refetch}
+            onUpdateAccount={updateAccount}
+            onDeleteAccount={deleteAccount}
+            onAccountDeleted={(accountId) => {
+              if (selectedAccount?.id === accountId) {
+                setSelectedAccount(null);
+                setSelectedBotId(null);
+              }
+            }}
           />
 
           {selectedAccount && (

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronDown, Server, Plus, Check } from "lucide-react";
+import { ChevronDown, Server, Plus, Check, Pencil, Trash2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
@@ -9,8 +9,19 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AddAccountDialog } from "@/components/dialogs/AddAccountDialog";
-import { AccountWithBots } from "@/hooks/useTradingAccounts";
+import { EditAccountDialog } from "@/components/dialogs/EditAccountDialog";
+import { AccountWithBots, Update_Trading_Account } from "@/hooks/useTradingAccounts";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 interface AccountSelectorProps {
   selectedAccount: AccountWithBots | null;
@@ -18,10 +29,25 @@ interface AccountSelectorProps {
   accounts: AccountWithBots[];
   isLoading: boolean;
   onRefresh: () => void;
+  onUpdateAccount: (accountId: string, data: Update_Trading_Account) => Promise<{ success: boolean; error?: string }>;
+  onDeleteAccount: (accountId: string) => Promise<{ success: boolean; error?: string }>;
+  onAccountDeleted?: (accountId: string) => void;
 }
 
-export function AccountSelector({ selectedAccount, onAccountChange, accounts, isLoading, onRefresh }: AccountSelectorProps) {
+export function AccountSelector({
+  selectedAccount,
+  onAccountChange,
+  accounts,
+  isLoading,
+  onRefresh,
+  onUpdateAccount,
+  onDeleteAccount,
+  onAccountDeleted,
+}: AccountSelectorProps) {
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [editDialogOpen, setEditDialogOpen] = useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   const getRunningBotsCount = (account: AccountWithBots) => {
     return account.bot_configurations.filter((b) => b.container_status === "running").length;
@@ -40,6 +66,21 @@ export function AccountSelector({ selectedAccount, onAccountChange, accounts, is
     if (total === 0) return "No bots";
     if (running > 0) return `${running}/${total} Running`;
     return `${total} Bots`;
+  };
+
+  const handleDeleteSelectedAccount = async () => {
+    if (!selectedAccount) return;
+    setDeleteLoading(true);
+    try {
+      const accountId = selectedAccount.id;
+      const result = await onDeleteAccount(accountId);
+      if (result.success) {
+        onAccountDeleted?.(accountId);
+        setDeleteConfirmOpen(false);
+      }
+    } finally {
+      setDeleteLoading(false);
+    }
   };
 
   if (isLoading) {
@@ -128,6 +169,24 @@ export function AccountSelector({ selectedAccount, onAccountChange, accounts, is
             <Plus className="w-4 h-4" />
             <span className="text-sm font-medium">Add New Account</span>
           </DropdownMenuItem>
+          {selectedAccount && (
+            <>
+              <DropdownMenuItem
+                onClick={() => setEditDialogOpen(true)}
+                className="flex items-center gap-3 p-3 cursor-pointer"
+              >
+                <Pencil className="w-4 h-4" />
+                <span className="text-sm font-medium">Edit Selected Account</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => setDeleteConfirmOpen(true)}
+                className="flex items-center gap-3 p-3 cursor-pointer text-destructive focus:text-destructive"
+              >
+                <Trash2 className="w-4 h-4" />
+                <span className="text-sm font-medium">Delete Selected Account</span>
+              </DropdownMenuItem>
+            </>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
 
@@ -139,6 +198,39 @@ export function AccountSelector({ selectedAccount, onAccountChange, accounts, is
           setDialogOpen(false);
         }}
       />
+      <EditAccountDialog
+        open={editDialogOpen}
+        onOpenChange={setEditDialogOpen}
+        account={selectedAccount}
+        onSave={onUpdateAccount}
+        onAccountUpdated={() => {
+          onRefresh();
+          setEditDialogOpen(false);
+        }}
+      />
+      <AlertDialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete trading account?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will delete this account and all linked bots permanently.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleteLoading}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void handleDeleteSelectedAccount();
+              }}
+              disabled={deleteLoading}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleteLoading ? "Deleting..." : "Delete Account"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
