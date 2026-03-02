@@ -63,9 +63,10 @@ const filterByTimeframe = (rows: ChartDataPoint[], timeframe: ChartTimeframe): C
 interface PerformanceChartProps {
   liveState?: BotLiveState;
   botId?: string;
+  className?: string;
 }
 
-export function PerformanceChart({ liveState, botId }: PerformanceChartProps) {
+export function PerformanceChart({ liveState, botId, className }: PerformanceChartProps) {
   const [selectedTimeframe, setSelectedTimeframe] = useState<ChartTimeframe>("1M");
   const [historyData, setHistoryData] = useState<ChartDataPoint[]>([]);
   const lastBotIdRef = useRef<string>("");
@@ -202,7 +203,7 @@ export function PerformanceChart({ liveState, botId }: PerformanceChartProps) {
   }, [historyData, selectedTimeframe]);
 
   return (
-    <div className="bg-white border rounded-xl shadow-sm p-6 animate-slide-up">
+    <div className={cn("bg-white border rounded-xl shadow-sm p-6 animate-slide-up h-full min-h-0 flex flex-col", className)}>
       <div className="flex items-center justify-between mb-6">
         <div>
           <div className="flex items-center gap-2">
@@ -234,7 +235,7 @@ export function PerformanceChart({ liveState, botId }: PerformanceChartProps) {
         </div>
       </div>
 
-      <div className="h-[280px]">
+      <div className="flex-1 min-h-[280px]">
         {chartData.length === 0 ? (
           <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
             <div className="text-center space-y-2">

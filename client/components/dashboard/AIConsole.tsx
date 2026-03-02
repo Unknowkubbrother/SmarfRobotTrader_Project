@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { Terminal, Bot, TrendingUp, AlertTriangle, CheckCircle } from "lucide-react";
+import { Terminal, TrendingUp, AlertTriangle, CheckCircle, Bot } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { BotLiveLogEntry, BotLiveState } from "@/hooks/useBotLiveState";
 
@@ -34,6 +34,13 @@ function toNum(value: unknown): number | null {
     if (Number.isFinite(parsed)) return parsed;
   }
   return null;
+}
+
+function compactLlmText(raw: string, limit = 280): string {
+  const cleaned = String(raw || "").replace(/\s+/g, " ").trim();
+  if (!cleaned) return "";
+  if (cleaned.length <= limit) return cleaned;
+  return `${cleaned.slice(0, Math.max(0, limit - 1))}...`;
 }
 
 function shouldHideLog(log: Partial<BotLiveLogEntry>): boolean {
@@ -171,11 +178,26 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
       });
     }
 
+    const llmSummary = compactLlmText(llmText);
+    if (llmSummary) {
+      const ts = rows.length > 0 ? rows[rows.length - 1].timestamp : "--:--:--";
+      const message = `AI Analysis: ${llmSummary}`;
+      rows.push({
+        id: `llm-analysis|${message}`,
+        timestamp: ts,
+        type: "analysis",
+        message,
+      });
+    }
+
     return rows.slice(-120);
-  }, [liveState?.recent_logs]);
+  }, [liveState?.recent_logs, llmText]);
 
   return (
-    <div className="bg-white border rounded-xl shadow-sm p-6 animate-slide-up h-full flex flex-col" style={{ animationDelay: "150ms" }}>
+    <div
+      className="bg-white border rounded-xl shadow-sm p-6 animate-slide-up h-full min-h-0 overflow-hidden flex flex-col"
+      style={{ animationDelay: "150ms" }}
+    >
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
           <Terminal className="w-4 h-4 text-muted-foreground" />
@@ -189,41 +211,32 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
         )}
       </div>
 
-      <div className="flex flex-col gap-2 flex-1 min-h-[220px] h-[300px]">
-        {isLive && llmText && (
-          <div className="bg-primary/5 border border-primary/20 rounded-lg p-3 text-xs text-foreground/80 font-mono whitespace-pre-wrap flex-shrink-0 max-h-[110px] overflow-y-auto scrollbar-thin">
-            <div className="text-primary font-semibold mb-1 flex items-center gap-1.5">
-              <Bot className="w-3.5 h-3.5" /> AI Analysis
-            </div>
-            {llmText}
+      <div className="bg-secondary/50 rounded-lg p-3 flex-1 min-h-0 overflow-auto overscroll-contain scrollbar-thin">
+        {logs.length === 0 ? (
+          <div className="h-full flex items-center justify-center text-xs text-muted-foreground">
+            {isLive ? `Waiting for runtime logs from ${botName}` : `Connect ${botName} to stream logs`}
           </div>
+        ) : (
+          logs.map((log, index) => {
+            const config = typeConfig[log.type];
+            const Icon = log.message.startsWith("AI Analysis:") ? Bot : config.icon;
+            const isLlmLog = log.message.startsWith("AI Analysis:");
+            return (
+              <div
+                key={log.id}
+                className={cn(
+                  "flex items-start gap-2 py-1.5 text-sm transition-colors",
+                  index === logs.length - 1 && "bg-primary/5 -mx-1 px-1 rounded font-medium",
+                  isLlmLog && "bg-primary/5 -mx-1 px-1 rounded"
+                )}
+              >
+                <span className="text-xs text-muted-foreground font-mono shrink-0">{log.timestamp}</span>
+                <Icon className={cn("w-3.5 h-3.5 shrink-0 mt-0.5", config.color)} />
+                <span className={cn("text-sm break-all", config.color)}>{log.message}</span>
+              </div>
+            );
+          })
         )}
-
-        <div className="bg-secondary/50 rounded-lg p-3 flex-1 overflow-y-auto scrollbar-thin">
-          {logs.length === 0 ? (
-            <div className="h-full flex items-center justify-center text-xs text-muted-foreground">
-              {isLive ? `Waiting for runtime logs from ${botName}` : `Connect ${botName} to stream logs`}
-            </div>
-          ) : (
-            logs.map((log, index) => {
-              const config = typeConfig[log.type];
-              const Icon = config.icon;
-              return (
-                <div
-                  key={log.id}
-                  className={cn(
-                    "flex items-start gap-2 py-1.5 text-sm transition-colors",
-                    index === logs.length - 1 && "bg-primary/5 -mx-1 px-1 rounded font-medium"
-                  )}
-                >
-                  <span className="text-xs text-muted-foreground font-mono shrink-0">{log.timestamp}</span>
-                  <Icon className={cn("w-3.5 h-3.5 shrink-0 mt-0.5", config.color)} />
-                  <span className={cn("text-sm", config.color)}>{log.message}</span>
-                </div>
-              );
-            })
-          )}
-        </div>
       </div>
     </div>
   );

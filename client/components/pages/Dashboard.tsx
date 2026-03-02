@@ -312,13 +312,13 @@ export default function Dashboard() {
           </div>
 
           {/* Performance & Activity Grid */}
-          <div className="grid lg:grid-cols-3 gap-6">
+          <div className="grid lg:grid-cols-3 gap-6 items-stretch lg:h-[430px]">
             {/* Portfolio Performance (2/3) */}
-            <div className="lg:col-span-2">
+            <div className="lg:col-span-2 h-full min-h-0">
               <PerformanceChart liveState={liveState} botId={selectedBotId || undefined} />
             </div>
             {/* Activity Log (1/3) */}
-            <div className="lg:col-span-1">
+            <div className="lg:col-span-1 h-full min-h-0">
               <AIConsole
                 botName={bots.find(b => b.id === selectedBotId)?.bot_version?.label || "Trading Bot"}
                 liveState={liveState}
