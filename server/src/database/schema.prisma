@@ -325,10 +325,10 @@ model BotConfiguration {
   isActive        Boolean    @default(false) @map("is_active")
 
   // Container Control
-  dockerContainerId String?          @map("docker_container_id") @db.VarChar(100)
-  installedDockerImageId String?     @map("installed_docker_image_id") @db.VarChar(255)
-  containerStatus   ContainerStatus? @map("container_status")
-  updatedAt         DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  dockerContainerId      String?          @map("docker_container_id") @db.VarChar(100)
+  installedDockerImageId String?          @map("installed_docker_image_id") @db.VarChar(255)
+  containerStatus        ContainerStatus? @map("container_status")
+  updatedAt              DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
   // Relations
   account    TradingAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)

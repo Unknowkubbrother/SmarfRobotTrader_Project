@@ -1176,8 +1176,47 @@ class LiveTradingBot:
             delta_price_m1 = float(price_move * 2.0)
             return delta_tick_m1, delta_price_m1, f"m1_fallback(n={len(mdf)})"
 
+        def _fallback_from_tf_bar():
+            try:
+                rates_tf = mt5.copy_rates_range(SYMBOL, self.timeframe, start_dt, end_dt)
+            except Exception:
+                rates_tf = None
+            if rates_tf is None or len(rates_tf) == 0:
+                return None
+            tdf = pd.DataFrame(rates_tf)
+            if len(tdf) == 0 or "open" not in tdf.columns or "close" not in tdf.columns:
+                return None
+            if "time" not in tdf.columns:
+                return None
+            try:
+                tdf["time"] = pd.to_datetime(tdf["time"], unit="s", utc=True)
+            except Exception:
+                return None
+            tdf = tdf.sort_values("time").reset_index(drop=True)
+            start_ts = int(start_dt.timestamp())
+            row_ts = (tdf["time"].astype("int64") // 10**9).astype(int)
+            selected = tdf[row_ts == start_ts]
+            if len(selected) == 0:
+                selected = tdf.iloc[[0]]
+
+            row = selected.iloc[-1]
+            open_px = float(row.get("open", 0.0))
+            close_px = float(row.get("close", 0.0))
+            if open_px <= 0.0 or close_px <= 0.0:
+                return None
+            move = float(close_px - open_px)
+            if abs(move) <= max(self.point * 0.1, 1e-10):
+                delta_tick_tf = 0
+            else:
+                delta_tick_tf = int(round(move / max(self.point, 1e-10)))
+            delta_price_tf = float(move * 2.0)
+            return delta_tick_tf, delta_price_tf, f"tf_fallback({TIMEFRAME_NAME},n={len(tdf)})"
+
         if ticks is None:
             fallback = _fallback_from_m1()
+            if fallback is not None:
+                return fallback
+            fallback = _fallback_from_tf_bar()
             if fallback is not None:
                 return fallback
             return 0, 0.0, "ticks_unavailable"
@@ -1185,6 +1224,9 @@ class LiveTradingBot:
         tick_count = len(ticks)
         if tick_count <= 1:
             fallback = _fallback_from_m1()
+            if fallback is not None:
+                return fallback
+            fallback = _fallback_from_tf_bar()
             if fallback is not None:
                 return fallback
             return 0, 0.0, f"ticks_insufficient(n={tick_count})"
