@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { Users, Bot, CreditCard, Activity, AlertTriangle } from "lucide-react";
+import { Users, Bot, CreditCard, Activity, Ticket, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useAuth } from "@/contexts/AuthContext";
@@ -76,7 +76,7 @@ export default function Admin() {
     { id: "users" as AdminTab, label: "Users", icon: Users },
     { id: "bots" as AdminTab, label: "Bot Versions", icon: Bot },
     { id: "subscriptions" as AdminTab, label: "Subscriptions", icon: CreditCard },
-    { id: "monitoring" as AdminTab, label: "Monitoring", icon: AlertTriangle },
+    { id: "monitoring" as AdminTab, label: "Support Tickets", icon: Ticket },
   ];
 
   return (
@@ -172,7 +172,7 @@ export default function Admin() {
               </Button>
               <Button variant="outline" onClick={() => setActiveTab("monitoring")} className="justify-start">
                 <Activity className="w-4 h-4 mr-2" />
-                System Health
+                Ticket Queue
               </Button>
             </div>
           </div>
