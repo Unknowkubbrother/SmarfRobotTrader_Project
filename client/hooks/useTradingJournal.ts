@@ -1,156 +1,150 @@
-import { useState, useEffect, useCallback } from "react";
-import { supabase } from "@/lib/integrations/supabase/client";
-import { useAuth } from "@/contexts/AuthContext";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
-import type { Database } from "@/lib/integrations/supabase/types";
 
-type TradingJournal = Database["public"]["Tables"]["trading_journals"]["Row"];
-type OrderHistory = Database["public"]["Tables"]["orders_history"]["Row"];
+import { api } from "@/lib/api";
+import { useAuth } from "@/contexts/AuthContext";
 
-export interface JournalWithOrder extends TradingJournal {
-  order?: OrderHistory | null;
+export interface TradingJournalRow {
+  journalId: string | null;
+  ticketId: number;
+  accountId: string;
+  symbol: string;
+  type: string;
+  status: string;
+  volume: number;
+  openPrice: number;
+  closePrice: number;
+  profit: number;
+  commission: number;
+  swap: number;
+  openTime: string | null;
+  closeTime: string | null;
+  tradeRationale: string | null;
+  mistakeLesson: string | null;
+  tags: string[];
+  attachmentUrls: string[];
+  journalCreatedAt: string | null;
+  journalUpdatedAt: string | null;
+}
+
+export interface TradingJournalSummary {
+  totalRows: number;
+  withJournal: number;
+  withoutJournal: number;
+}
+
+export interface UpsertTradingJournalPayload {
+  ticketId: number;
+  tradeRationale?: string;
+  mistakeLesson?: string;
+  tags?: string[];
+  attachmentUrls?: string[];
 }
 
 export function useTradingJournal() {
-  const { user } = useAuth();
-  const [journals, setJournals] = useState<JournalWithOrder[]>([]);
-  const [orders, setOrders] = useState<OrderHistory[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { user, loading: authLoading } = useAuth();
+  const [rows, setRows] = useState<TradingJournalRow[]>([]);
+  const [summary, setSummary] = useState<TradingJournalSummary>({
+    totalRows: 0,
+    withJournal: 0,
+    withoutJournal: 0,
+  });
+  const [loading, setLoading] = useState<boolean>(true);
+  const [query, setQuery] = useState<string>("");
 
-  const fetchJournals = useCallback(async () => {
-    if (!user) {
-      setJournals([]);
-      setOrders([]);
-      setLoading(false);
-      return;
-    }
-
-    try {
-      // Fetch journals
-      const { data: journalsData, error: journalsError } = await supabase
-        .from("trading_journals")
-        .select("*")
-        .eq("user_id", user.id)
-        .order("created_at", { ascending: false });
-
-      if (journalsError) throw journalsError;
-
-      // Get user's trading accounts to fetch orders
-      const { data: accounts } = await supabase
-        .from("trading_accounts")
-        .select("id")
-        .eq("user_id", user.id);
-
-      const accountIds = accounts?.map(a => a.id) || [];
-
-      // Fetch orders for user's accounts
-      let ordersData: OrderHistory[] = [];
-      if (accountIds.length > 0) {
-        const { data } = await supabase
-          .from("orders_history")
-          .select("*")
-          .in("account_id", accountIds)
-          .order("open_time", { ascending: false });
-        ordersData = data || [];
+  const fetchJournalFeed = useCallback(
+    async (nextQuery?: string) => {
+      if (authLoading) return;
+      if (!user) {
+        setRows([]);
+        setSummary({ totalRows: 0, withJournal: 0, withoutJournal: 0 });
+        setLoading(false);
+        return;
       }
 
-      setOrders(ordersData);
-
-      // Combine journals with orders
-      const journalsWithOrders: JournalWithOrder[] = (journalsData || []).map(journal => ({
-        ...journal,
-        order: ordersData.find(o => o.id === journal.ticket_id) || null,
-      }));
-
-      setJournals(journalsWithOrders);
-    } catch (error) {
-      console.error("Error fetching journals:", error);
-      toast.error("Failed to fetch journal entries");
-    } finally {
-      setLoading(false);
-    }
-  }, [user]);
+      try {
+        setLoading(true);
+        const q = typeof nextQuery === "string" ? nextQuery : query;
+        const res = await api.get("/trading/journal_feed", {
+          params: {
+            q: q || undefined,
+            limit: 400,
+          },
+        });
+        const data = Array.isArray(res.data?.data) ? res.data.data : [];
+        const s = res.data?.summary || {};
+        setRows(data as TradingJournalRow[]);
+        setSummary({
+          totalRows: Number(s.totalRows || data.length || 0),
+          withJournal: Number(s.withJournal || 0),
+          withoutJournal: Number(s.withoutJournal || 0),
+        });
+      } catch (error: any) {
+        console.error("Error fetching trading journal feed:", error);
+        toast.error(error?.message || "Failed to fetch trading journal");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [authLoading, query, user]
+  );
 
   useEffect(() => {
-    fetchJournals();
-  }, [fetchJournals]);
+    fetchJournalFeed();
+  }, [fetchJournalFeed]);
 
-  const createJournal = async (data: {
-    trade_rationale?: string;
-    mistake_lesson?: string;
-    tags?: string[];
-    ticket_id?: string;
-    attachment_urls?: string[];
-  }) => {
-    if (!user) return null;
+  const upsertJournal = useCallback(
+    async (payload: UpsertTradingJournalPayload) => {
+      try {
+        await api.post("/trading/journal/upsert", payload);
+        toast.success("Journal saved");
+        await fetchJournalFeed();
+        return true;
+      } catch (error: any) {
+        console.error("Error saving journal:", error);
+        toast.error(error?.message || "Failed to save journal");
+        return false;
+      }
+    },
+    [fetchJournalFeed]
+  );
 
-    try {
-      const { data: journal, error } = await supabase
-        .from("trading_journals")
-        .insert({
-          user_id: user.id,
-          ...data,
-        })
-        .select()
-        .single();
+  const deleteJournal = useCallback(
+    async (journalId: string) => {
+      try {
+        await api.delete(`/trading/journal/${journalId}`);
+        toast.success("Journal deleted");
+        await fetchJournalFeed();
+        return true;
+      } catch (error: any) {
+        console.error("Error deleting journal:", error);
+        toast.error(error?.message || "Failed to delete journal");
+        return false;
+      }
+    },
+    [fetchJournalFeed]
+  );
 
-      if (error) throw error;
-
-      toast.success("Journal entry created");
-      await fetchJournals();
-      return journal;
-    } catch (error) {
-      console.error("Error creating journal:", error);
-      toast.error("Failed to create journal entry");
-      return null;
-    }
-  };
-
-  const updateJournal = async (id: string, data: Partial<TradingJournal>) => {
-    try {
-      const { error } = await supabase
-        .from("trading_journals")
-        .update(data)
-        .eq("id", id);
-
-      if (error) throw error;
-
-      toast.success("Journal entry updated");
-      await fetchJournals();
-      return true;
-    } catch (error) {
-      console.error("Error updating journal:", error);
-      toast.error("Failed to update journal entry");
-      return false;
-    }
-  };
-
-  const deleteJournal = async (id: string) => {
-    try {
-      const { error } = await supabase
-        .from("trading_journals")
-        .delete()
-        .eq("id", id);
-
-      if (error) throw error;
-
-      toast.success("Journal entry deleted");
-      await fetchJournals();
-      return true;
-    } catch (error) {
-      console.error("Error deleting journal:", error);
-      toast.error("Failed to delete journal entry");
-      return false;
-    }
-  };
+  const stats = useMemo(() => {
+    const totalProfit = rows.reduce((acc, row) => acc + Number(row.profit || 0), 0);
+    const wins = rows.filter((row) => Number(row.profit || 0) > 0).length;
+    const losses = rows.filter((row) => Number(row.profit || 0) < 0).length;
+    return {
+      totalProfit,
+      wins,
+      losses,
+    };
+  }, [rows]);
 
   return {
-    journals,
-    orders,
+    rows,
+    summary,
+    stats,
     loading,
-    refetch: fetchJournals,
-    createJournal,
-    updateJournal,
+    query,
+    setQuery,
+    refetch: fetchJournalFeed,
+    upsertJournal,
     deleteJournal,
   };
 }

@@ -75,6 +75,50 @@ def _next_monday(today: date) -> date:
     return today + timedelta(days=days_until)
 
 
+def _parse_iso_date_or_none(raw_value: Optional[str], field_name: str) -> Optional[date]:
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be in YYYY-MM-DD format")
+
+
+def _extract_date(value) -> Optional[date]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return None
+
+
+def _roll_weekly_forward(base_date: date, today: date) -> date:
+    # Keep weekly cadence and move to the nearest non-past cycle.
+    candidate = base_date
+    while candidate < today:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def _resolve_default_next_billing_date(config, today: date) -> date:
+    configured = _extract_date(getattr(config, "defaultNextBillingDate", None)) if config else None
+    if configured:
+        return _roll_weekly_forward(configured, today)
+    return _next_monday(today)
+
+
+def _resolve_subscription_next_billing_date(subscription_date_value, config, today: date) -> date:
+    sub_date = _extract_date(subscription_date_value)
+    if sub_date:
+        return _roll_weekly_forward(sub_date, today)
+    return _resolve_default_next_billing_date(config=config, today=today)
+
+
 def _calculate_estimated_fee(
     net_profit: float,
     fee_type: str,
@@ -124,6 +168,7 @@ async def _get_or_create_subscription(user_id: str):
     default_min_threshold = (
         config.defaultMinThreshold if config and config.defaultMinThreshold is not None else Decimal("0.00")
     )
+    next_billing_date = _resolve_default_next_billing_date(config=config, today=date.today())
 
     return await db.subscription.create(
         data={
@@ -132,7 +177,7 @@ async def _get_or_create_subscription(user_id: str):
             "feeType": default_fee_type,
             "feeValue": default_fee_value,
             "minProfitThreshold": default_min_threshold,
-            "nextBillingDate": datetime.combine(_next_monday(date.today()), datetime.min.time()),
+            "nextBillingDate": datetime.combine(next_billing_date, datetime.min.time()),
         }
     )
 
@@ -304,6 +349,19 @@ async def get_subscription_summary(
     today = date.today()
 
     subscription = await _get_or_create_subscription(user_id)
+    config = await db.systembillingconfig.find_first(order={"updatedAt": "desc"})
+
+    current_next_billing_date = _extract_date(subscription.nextBillingDate)
+    resolved_next_billing_date = _resolve_subscription_next_billing_date(
+        subscription.nextBillingDate,
+        config=config,
+        today=today,
+    )
+    if current_next_billing_date != resolved_next_billing_date:
+        subscription = await db.subscription.update(
+            where={"id": str(subscription.id)},
+            data={"nextBillingDate": datetime.combine(resolved_next_billing_date, datetime.min.time())},
+        )
 
     if _stripe_enabled() and current_user.stripeCustomerId:
         try:
@@ -356,6 +414,7 @@ async def get_subscription_summary(
         fee_value=fee_value,
         min_profit_threshold=min_profit_threshold,
     )
+    next_billing_date = resolved_next_billing_date.isoformat()
 
     mapped_subscription = SubscriptionResponse(
         id=str(subscription.id),
@@ -363,7 +422,7 @@ async def get_subscription_summary(
         fee_type=fee_type,
         fee_value=round(fee_value, 2),
         min_profit_threshold=round(min_profit_threshold, 2),
-        next_billing_date=_to_date_string(subscription.nextBillingDate) or _next_monday(today).isoformat(),
+        next_billing_date=next_billing_date,
         default_payment_method_id=subscription.defaultPaymentMethodId,
     )
 
@@ -556,6 +615,7 @@ def _map_billing_config(config) -> AdminBillingConfigResponse:
         default_fee_type=_enum_value(config.defaultFeeType) if config and config.defaultFeeType else "percentage",
         default_fee_value=round(_to_float(config.defaultFeeValue), 2) if config else 20.0,
         default_min_threshold=round(_to_float(config.defaultMinThreshold), 2) if config else 0.0,
+        default_next_billing_date=_to_date_string(getattr(config, "defaultNextBillingDate", None)) if config else None,
         updated_at=_to_datetime_string(config.updatedAt) if config else None,
     )
 
@@ -566,11 +626,28 @@ async def get_admin_subscription_management(
 ):
     _require_admin(current_user)
 
+    today = date.today()
     config = await db.systembillingconfig.find_first(order={"updatedAt": "desc"})
     subscriptions = await db.subscription.find_many(
         order={"createdAt": "desc"},
         include={"user": True},
     )
+
+    normalized_subscriptions = []
+    for sub in subscriptions:
+        current_next_billing_date = _extract_date(sub.nextBillingDate)
+        resolved_next_billing_date = _resolve_subscription_next_billing_date(
+            sub.nextBillingDate,
+            config=config,
+            today=today,
+        )
+        if current_next_billing_date != resolved_next_billing_date:
+            sub = await db.subscription.update(
+                where={"id": str(sub.id)},
+                data={"nextBillingDate": datetime.combine(resolved_next_billing_date, datetime.min.time())},
+                include={"user": True},
+            )
+        normalized_subscriptions.append(sub)
 
     mapped_subscriptions = [
         AdminSubscriptionItemResponse(
@@ -584,7 +661,7 @@ async def get_admin_subscription_management(
             next_billing_date=_to_date_string(sub.nextBillingDate),
             created_at=_to_datetime_string(sub.createdAt),
         )
-        for sub in subscriptions
+        for sub in normalized_subscriptions
     ]
 
     return AdminSubscriptionManagementResponse(
@@ -607,6 +684,15 @@ async def update_admin_billing_config(
         raise HTTPException(status_code=400, detail="default_fee_value must be greater than or equal to 0")
     if data.default_min_threshold < 0:
         raise HTTPException(status_code=400, detail="default_min_threshold must be greater than or equal to 0")
+    default_next_billing_in_payload = "default_next_billing_date" in getattr(data, "model_fields_set", set())
+    parsed_default_next_billing_date = None
+    if default_next_billing_in_payload:
+        parsed_default_next_billing_date = _parse_iso_date_or_none(
+            data.default_next_billing_date,
+            field_name="default_next_billing_date",
+        )
+        if parsed_default_next_billing_date and parsed_default_next_billing_date < date.today():
+            raise HTTPException(status_code=400, detail="default_next_billing_date must be today or in the future")
 
     config = await db.systembillingconfig.find_first(order={"updatedAt": "desc"})
     payload = {
@@ -614,6 +700,12 @@ async def update_admin_billing_config(
         "defaultFeeValue": Decimal(str(data.default_fee_value)),
         "defaultMinThreshold": Decimal(str(data.default_min_threshold)),
     }
+    if default_next_billing_in_payload:
+        payload["defaultNextBillingDate"] = (
+            datetime.combine(parsed_default_next_billing_date, datetime.min.time())
+            if parsed_default_next_billing_date
+            else None
+        )
 
     if config:
         updated_config = await db.systembillingconfig.update(

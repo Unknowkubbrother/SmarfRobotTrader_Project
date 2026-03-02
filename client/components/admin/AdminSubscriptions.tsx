@@ -15,6 +15,7 @@ interface AdminBillingConfig {
   default_fee_type: "percentage" | "fixed";
   default_fee_value: number;
   default_min_threshold: number;
+  default_next_billing_date: string | null;
   updated_at: string | null;
 }
 
@@ -41,10 +42,13 @@ export function AdminSubscriptions() {
   const [loading, setLoading] = useState(true);
   const [savingConfig, setSavingConfig] = useState(false);
   const [updatingSubId, setUpdatingSubId] = useState<string | null>(null);
+  const [savingNextBillingSubId, setSavingNextBillingSubId] = useState<string | null>(null);
+  const [nextBillingDrafts, setNextBillingDrafts] = useState<Record<string, string>>({});
   const [configForm, setConfigForm] = useState({
     fee_type: "percentage" as "percentage" | "fixed",
     fee_value: 20,
     min_threshold: 0,
+    next_billing_date: "",
   });
 
   useEffect(() => {
@@ -55,12 +59,20 @@ export function AdminSubscriptions() {
     try {
       setLoading(true);
       const { data } = await api.get<AdminSubscriptionManagementResponse>("/subscription/admin/management");
-      setSubscriptions(data.subscriptions || []);
+      const rows = data.subscriptions || [];
+      setSubscriptions(rows);
+      setNextBillingDrafts(
+        rows.reduce<Record<string, string>>((acc, row) => {
+          acc[row.id] = row.next_billing_date ?? "";
+          return acc;
+        }, {})
+      );
       setBillingConfig(data.billing_config || null);
       setConfigForm({
         fee_type: (data.billing_config?.default_fee_type ?? "percentage") as "percentage" | "fixed",
         fee_value: data.billing_config?.default_fee_value ?? 20,
         min_threshold: data.billing_config?.default_min_threshold ?? 0,
+        next_billing_date: data.billing_config?.default_next_billing_date ?? "",
       });
     } catch (error: any) {
       console.error("Error fetching admin subscription data:", error);
@@ -77,6 +89,7 @@ export function AdminSubscriptions() {
         default_fee_type: configForm.fee_type,
         default_fee_value: configForm.fee_value,
         default_min_threshold: configForm.min_threshold,
+        default_next_billing_date: configForm.next_billing_date || null,
       });
       setBillingConfig(data);
       toast.success("Billing config saved");
@@ -103,6 +116,25 @@ export function AdminSubscriptions() {
       toast.error(error?.message || "Failed to update subscription");
     } finally {
       setUpdatingSubId(null);
+    }
+  };
+
+  const updateSubscriptionNextBilling = async (sub: AdminSubscriptionItem) => {
+    setSavingNextBillingSubId(sub.id);
+    try {
+      await api.patch(`/admin/users/${sub.user_id}/subscriptions/${sub.id}/billing`, {
+        fee_type: sub.fee_type,
+        fee_value: sub.fee_value,
+        min_profit_threshold: sub.min_profit_threshold,
+        next_billing_date: nextBillingDrafts[sub.id] || null,
+      });
+      toast.success("Next billing updated");
+      await fetchData();
+    } catch (error: any) {
+      console.error("Error updating next billing date:", error);
+      toast.error(error?.message || "Failed to update next billing date");
+    } finally {
+      setSavingNextBillingSubId(null);
     }
   };
 
@@ -135,7 +167,7 @@ export function AdminSubscriptions() {
           <h3 className="font-semibold">Default Billing Configuration</h3>
         </div>
 
-        <div className="grid md:grid-cols-3 gap-6">
+        <div className="grid md:grid-cols-4 gap-6">
           <div>
             <Label className="mb-3 block">Fee Type</Label>
             <RadioGroup
@@ -189,6 +221,19 @@ export function AdminSubscriptions() {
               className="mt-2"
             />
           </div>
+
+          <div>
+            <Label htmlFor="default_next_billing_date">Default Next Billing Date</Label>
+            <Input
+              id="default_next_billing_date"
+              type="date"
+              value={configForm.next_billing_date}
+              onChange={(event) =>
+                setConfigForm({ ...configForm, next_billing_date: event.target.value })
+              }
+              className="mt-2"
+            />
+          </div>
         </div>
 
         <div className="mt-4 text-xs text-muted-foreground">
@@ -228,12 +273,24 @@ export function AdminSubscriptions() {
                 </TableCell>
                 <TableCell>${sub.min_profit_threshold}</TableCell>
                 <TableCell>
-                  {sub.next_billing_date
-                    ? new Date(sub.next_billing_date).toLocaleDateString()
-                    : "-"}
+                  <Input
+                    type="date"
+                    value={nextBillingDrafts[sub.id] ?? ""}
+                    onChange={(event) =>
+                      setNextBillingDrafts((prev) => ({ ...prev, [sub.id]: event.target.value }))
+                    }
+                    className="h-8 w-[155px]"
+                  />
                 </TableCell>
                 <TableCell>
                   <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      disabled={savingNextBillingSubId === sub.id}
+                      onClick={() => updateSubscriptionNextBilling(sub)}
+                    >
+                      {savingNextBillingSubId === sub.id ? "Saving..." : "Save Billing Date"}
+                    </Button>
                     <Button
                       size="sm"
                       variant="outline"
@@ -268,4 +325,3 @@ export function AdminSubscriptions() {
     </div>
   );
 }
-

@@ -89,7 +89,6 @@ class LiveTradingBot:
         self.llm_semantic_cache_file = LLM_SEMANTIC_CACHE_FILE
         self.llm_text_log_file = LLM_TEXT_LOG_FILE
         self.llm_semantic_cache = {}
-        self._ws_cache = {}       # ts_key -> {llm_text, cls_vec} from WebSocket
         self._ws_connected = False
         self._ws_send_lock = threading.Lock()
         self._ws_state_lock = threading.Lock()
@@ -367,22 +366,9 @@ class LiveTradingBot:
                                 continue
                             msg_type = msg.get("type")
                             if msg_type == "llm_result":
-                                ts_key = msg.get("date_time", "")
-                                cls_vec = msg.get("cls_vec")
-                                llm_text = msg.get("llm_text", "")
-                                if ts_key and cls_vec is not None:
-                                    self._ws_cache[ts_key] = {
-                                        "cls_vec": np.asarray(cls_vec, dtype=np.float32),
-                                        "llm_text": llm_text,
-                                    }
-                                    print(f"\n [WS] received llm_result ts={ts_key}")
-                                    self._add_log(
-                                        "analysis",
-                                        f"WS received LLM result for {ts_key}",
-                                        phase="ws",
-                                        event="llm_result",
-                                        meta={"ts": ts_key, "source": "ws_push"},
-                                    )
+                                # Live semantic path is HTTP endpoint + shared cache.
+                                # Ignore ws-pushed llm_result to keep one deterministic source.
+                                pass
                             elif msg_type == "bot_config":
                                 self._apply_runtime_config(msg, source="ws")
                             self._flush_pending_state_to_server()
@@ -826,45 +812,12 @@ class LiveTradingBot:
 
         beat_sec = max(0.5, min(float(POLL_SECONDS), 2.0))
         while not done.wait(timeout=beat_sec):
-            ws_data = self._ws_cache.pop(ts_key, None)
-            if ws_data is not None:
-                try:
-                    cls_vec = np.asarray(ws_data.get("cls_vec"), dtype=np.float32).reshape(-1)
-                    llm_text = str(ws_data.get("llm_text", "") or "")
-                    print(f"\n [SEM] ready (ws_wait) ts={ts_key} dim={cls_vec.size}")
-                    self._add_log(
-                        "analysis",
-                        f"Semantic received via WS while waiting ({ts_key})",
-                        phase="sem",
-                        event="ws_hit_while_waiting",
-                        meta={"ts": ts_key},
-                    )
-                    return llm_text, cls_vec
-                except Exception:
-                    pass
-
             self.last_action = "HOLD"
             self._sync_bridge_from_mt5()
             self._push_state_to_server(action_name="HOLD")
             self._print_status_line(current_bar_time=self.last_bar_time)
 
         if "exc" in error:
-            ws_data = self._ws_cache.pop(ts_key, None)
-            if ws_data is not None:
-                try:
-                    cls_vec = np.asarray(ws_data.get("cls_vec"), dtype=np.float32).reshape(-1)
-                    llm_text = str(ws_data.get("llm_text", "") or "")
-                    print(f"\n [SEM] ready (ws_timeout_fallback) ts={ts_key} dim={cls_vec.size}")
-                    self._add_log(
-                        "analysis",
-                        f"Semantic received via WS after HTTP timeout ({ts_key})",
-                        phase="sem",
-                        event="ws_hit_after_timeout",
-                        meta={"ts": ts_key},
-                    )
-                    return llm_text, cls_vec
-                except Exception:
-                    pass
             raise error["exc"]
         return result["llm_text"], result["cls_vec"]
 
@@ -892,25 +845,7 @@ class LiveTradingBot:
             )
             return
 
-        # 2. Check WebSocket push cache
-        ws_data = self._ws_cache.pop(ts_key, None)
-        if ws_data is not None:
-            cls_vec = np.asarray(ws_data.get("cls_vec"), dtype=np.float32).reshape(-1)
-            llm_text = str(ws_data.get("llm_text", "") or "")
-            try:
-                self._save_llm_semantic_entry(ts_key, cls_vec, llm_text, source="ws_push")
-                return
-            except Exception as exc:
-                print(f" WS CLS invalid for {ts_key}: {exc}")
-                self._add_log(
-                    "warning",
-                    f"WS semantic payload invalid for {ts_key}",
-                    phase="sem",
-                    event="ws_payload_invalid",
-                    meta={"ts": ts_key, "error": str(exc)},
-                )
-
-        # 3. Fallback: request from server HTTP endpoint
+        # 2. Request from server HTTP endpoint
         print(f"\n [SEM] requesting server ts={ts_key}")
         self._add_log(
             "analysis",
@@ -953,19 +888,51 @@ class LiveTradingBot:
             self._resolve_live_llm_semantic(ts_key)
         unresolved = [ts for ts in ts_keys if ts not in self.semantic_runtime.global_time_to_vec]
         if unresolved:
+            now_epoch = time.time()
+            retry_waits = []
+            for ts_key in unresolved:
+                retry_not_before = float(self._sem_retry_not_before.get(ts_key, 0.0) or 0.0)
+                if retry_not_before > now_epoch:
+                    retry_waits.append(retry_not_before - now_epoch)
+            next_retry_sec = min(retry_waits) if retry_waits else 0.0
+            retry_text = f" | next_retry_in={next_retry_sec:.1f}s" if next_retry_sec > 0 else ""
             print(
                 "\n [SEM] pending unresolved real embeddings="
                 f"{len(unresolved)} | oldest={unresolved[0]} newest={unresolved[-1]}"
+                f"{retry_text}"
             )
             self._add_log(
                 "warning",
                 f"Pending unresolved real embeddings={len(unresolved)}",
                 phase="sem",
                 event="window_unresolved_embeddings",
-                meta={"missing_count": int(len(unresolved)), "oldest": unresolved[0], "newest": unresolved[-1]},
+                meta={
+                    "missing_count": int(len(unresolved)),
+                    "oldest": unresolved[0],
+                    "newest": unresolved[-1],
+                    "next_retry_sec": float(next_retry_sec),
+                },
             )
             return False
         return True
+
+    def _recommended_semantic_wait(self, window_df: pd.DataFrame) -> float:
+        base_wait = max(0.5, min(float(POLL_SECONDS), 5.0))
+        if self.semantic_runtime is None:
+            return base_wait
+        ts_keys = pd.to_datetime(window_df["time"]).dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+        unresolved = [ts for ts in ts_keys if ts not in self.semantic_runtime.global_time_to_vec]
+        if not unresolved:
+            return base_wait
+        now_epoch = time.time()
+        retry_waits = []
+        for ts_key in unresolved:
+            retry_not_before = float(self._sem_retry_not_before.get(ts_key, 0.0) or 0.0)
+            if retry_not_before > now_epoch:
+                retry_waits.append(retry_not_before - now_epoch)
+        if not retry_waits:
+            return base_wait
+        return max(base_wait, min(min(retry_waits) + 0.05, 8.0))
 
     def _wait_until_real_semantic_ready(self, window_df: pd.DataFrame):
         attempt = 0
@@ -993,7 +960,7 @@ class LiveTradingBot:
                 )
                 return True
 
-            wait_sec = max(0.5, min(float(POLL_SECONDS), 5.0))
+            wait_sec = self._recommended_semantic_wait(window_df)
             self.last_action = "HOLD"
             self._sync_bridge_from_mt5()
             self._add_log(

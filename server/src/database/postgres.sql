@@ -211,6 +211,7 @@ CREATE TABLE "system_billing_config" (
   "default_fee_type" fee_type_enum,
   "default_fee_value" NUMERIC(10, 2),
   "default_min_threshold" NUMERIC(10, 2),
+  "default_next_billing_date" DATE,
   "updated_at" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 

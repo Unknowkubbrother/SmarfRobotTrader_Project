@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, List, Optional
 
@@ -62,6 +62,59 @@ def _to_date_string(value) -> Optional[str]:
     if isinstance(value, date):
         return value.isoformat()
     return str(value)
+
+
+def _parse_iso_date_or_none(raw_value: Optional[str], field_name: str) -> Optional[date]:
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} must be in YYYY-MM-DD format",
+        )
+
+
+def _next_monday(today: date) -> date:
+    days_until = (7 - today.weekday()) % 7
+    if days_until == 0:
+        days_until = 7
+    return today + timedelta(days=days_until)
+
+
+def _extract_date(value) -> Optional[date]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return None
+
+
+def _roll_weekly_forward(base_date: date, today: date) -> date:
+    candidate = base_date
+    while candidate < today:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def _resolve_default_next_billing_date(config, today: date) -> date:
+    configured = _extract_date(getattr(config, "defaultNextBillingDate", None)) if config else None
+    if configured:
+        return _roll_weekly_forward(configured, today)
+    return _next_monday(today)
+
+
+def _resolve_subscription_next_billing_date(subscription_date_value, config, today: date) -> date:
+    sub_date = _extract_date(subscription_date_value)
+    if sub_date:
+        return _roll_weekly_forward(sub_date, today)
+    return _resolve_default_next_billing_date(config=config, today=today)
 
 
 def _require_admin(current_user):
@@ -430,8 +483,25 @@ async def get_admin_user_detail(
         where={"userId": user_id},
         order={"createdAt": "desc"},
     )
-    mapped_subscriptions = [_map_user_subscription(subscription) for subscription in subscriptions]
-    subscription_ids = [str(sub.id) for sub in subscriptions]
+    today = date.today()
+    billing_config = await db.systembillingconfig.find_first(order={"updatedAt": "desc"})
+    normalized_subscriptions = []
+    for sub in subscriptions:
+        current_next_billing_date = _extract_date(sub.nextBillingDate)
+        resolved_next_billing_date = _resolve_subscription_next_billing_date(
+            sub.nextBillingDate,
+            config=billing_config,
+            today=today,
+        )
+        if current_next_billing_date != resolved_next_billing_date:
+            sub = await db.subscription.update(
+                where={"id": str(sub.id)},
+                data={"nextBillingDate": datetime.combine(resolved_next_billing_date, datetime.min.time())},
+            )
+        normalized_subscriptions.append(sub)
+
+    mapped_subscriptions = [_map_user_subscription(subscription) for subscription in normalized_subscriptions]
+    subscription_ids = [str(sub.id) for sub in normalized_subscriptions]
 
     pending_count = 0
     paid_count = 0
@@ -574,6 +644,13 @@ async def update_admin_user_subscription_billing(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="min_profit_threshold must be greater than or equal to 0",
         )
+    next_billing_in_payload = "next_billing_date" in getattr(data, "model_fields_set", set())
+    parsed_next_billing_date = None
+    if next_billing_in_payload:
+        parsed_next_billing_date = _parse_iso_date_or_none(
+            data.next_billing_date,
+            field_name="next_billing_date",
+        )
 
     subscription = await db.subscription.find_first(
         where={"id": subscription_id, "userId": user_id}
@@ -591,13 +668,21 @@ async def update_admin_user_subscription_billing(
             detail="Subscription status is invalid for update",
         )
 
+    update_payload = {
+        "feeType": fee_type,
+        "feeValue": Decimal(str(data.fee_value)),
+        "minProfitThreshold": Decimal(str(data.min_profit_threshold)),
+    }
+    if next_billing_in_payload:
+        update_payload["nextBillingDate"] = (
+            datetime.combine(parsed_next_billing_date, datetime.min.time())
+            if parsed_next_billing_date
+            else None
+        )
+
     updated_subscription = await db.subscription.update(
         where={"id": subscription_id},
-        data={
-            "feeType": fee_type,
-            "feeValue": Decimal(str(data.fee_value)),
-            "minProfitThreshold": Decimal(str(data.min_profit_threshold)),
-        },
+        data=update_payload,
     )
 
     return _map_user_subscription(updated_subscription)

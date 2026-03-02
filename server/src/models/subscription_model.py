@@ -65,6 +65,7 @@ class AdminBillingConfigResponse(BaseModel):
     default_fee_type: str = "percentage"
     default_fee_value: float = 20.0
     default_min_threshold: float = 0.0
+    default_next_billing_date: Optional[str] = None
     updated_at: Optional[str] = None
 
 
@@ -89,6 +90,7 @@ class UpdateBillingConfigRequest(BaseModel):
     default_fee_type: str
     default_fee_value: float
     default_min_threshold: float
+    default_next_billing_date: Optional[str] = None
 
 
 class UpdateSubscriptionStatusRequest(BaseModel):

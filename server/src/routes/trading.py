@@ -1,11 +1,12 @@
 from fastapi import APIRouter, HTTPException, Depends, status, Response, Request, Form
 from pydantic import BaseModel
 from cryptography.fernet import Fernet
+from prisma import Json
 import base64
 import hashlib
 import os
 from datetime import date, datetime, timedelta
-from ..models.trading_model import Create_Trading_Account
+from ..models.trading_model import Create_Trading_Account, UpsertTradingJournalRequest
 from ..database.client import db
 from ..utils.trading_schedule import normalize_trading_schedule
 
@@ -23,6 +24,30 @@ def _to_float(value, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _normalize_string_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if not isinstance(value, (list, tuple)):
+        return []
+
+    out: list[str] = []
+    for item in value:
+        txt = str(item or "").strip()
+        if txt:
+            out.append(txt)
+    return out
+
+
+async def _get_user_account_ids(user_id: str) -> list[str]:
+    accounts = await db.tradingaccount.find_many(
+        where={"userId": user_id},
+    )
+    return [str(a.id) for a in accounts]
 
 
 async def _sync_daily_aggregates_from_orders(
@@ -284,6 +309,222 @@ async def get_trading_history_by_day(request: Request, year: int, month: int, da
             "wins": int(wins),
             "losses": int(losses),
         },
+    }
+
+
+@trading_router.get("/journal_feed", tags=["trading"])
+async def get_trading_journal_feed(
+    request: Request,
+    q: str = "",
+    limit: int = 200,
+):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    safe_limit = max(1, min(int(limit), 1000))
+    account_ids = await _get_user_account_ids(request.state.user_id)
+    if not account_ids:
+        return {
+            "status_code": 200,
+            "data": [],
+            "summary": {
+                "totalRows": 0,
+                "withJournal": 0,
+                "withoutJournal": 0,
+            },
+        }
+
+    fetch_size = max(safe_limit * 3, 400)
+    orders = await db.orderhistory.find_many(
+        where={
+            "accountId": {"in": account_ids},
+            "closeTime": {"not": None},
+        },
+        order={"closeTime": "desc"},
+        take=fetch_size,
+    )
+    if not orders:
+        return {
+            "status_code": 200,
+            "data": [],
+            "summary": {
+                "totalRows": 0,
+                "withJournal": 0,
+                "withoutJournal": 0,
+            },
+        }
+
+    ticket_ids = [int(getattr(o, "ticketId", 0) or 0) for o in orders if int(getattr(o, "ticketId", 0) or 0) > 0]
+    journals = await db.tradingjournal.find_many(
+        where={"ticketId": {"in": ticket_ids}},
+    ) if ticket_ids else []
+    journal_by_ticket = {
+        int(getattr(j, "ticketId", 0) or 0): j
+        for j in journals
+        if int(getattr(j, "ticketId", 0) or 0) > 0
+    }
+
+    query = str(q or "").strip().lower()
+    rows = []
+    with_journal = 0
+
+    for order in orders:
+        ticket_id = int(getattr(order, "ticketId", 0) or 0)
+        journal = journal_by_ticket.get(ticket_id)
+
+        tags = _normalize_string_list(getattr(journal, "tags", [])) if journal else []
+        attachment_urls = _normalize_string_list(getattr(journal, "attachmentUrls", [])) if journal else []
+        trade_rationale = str(getattr(journal, "tradeRationale", "") or "").strip() if journal else ""
+        mistake_lesson = str(getattr(journal, "mistakeLesson", "") or "").strip() if journal else ""
+
+        row = {
+            "journalId": str(getattr(journal, "id", "") or "") if journal else None,
+            "ticketId": int(ticket_id),
+            "accountId": str(getattr(order, "accountId", "") or ""),
+            "symbol": str(getattr(order, "symbol", "") or ""),
+            "type": str(getattr(order, "type", "") or "").upper(),
+            "status": str(getattr(order, "status", "") or ""),
+            "volume": _to_float(getattr(order, "volume", 0.0), 0.0),
+            "openPrice": _to_float(getattr(order, "openPrice", 0.0), 0.0),
+            "closePrice": _to_float(getattr(order, "closePrice", 0.0), 0.0),
+            "profit": round(_to_float(getattr(order, "profit", 0.0), 0.0), 2),
+            "commission": _to_float(getattr(order, "commission", 0.0), 0.0),
+            "swap": _to_float(getattr(order, "swap", 0.0), 0.0),
+            "openTime": getattr(order, "openTime", None).isoformat() if getattr(order, "openTime", None) else None,
+            "closeTime": getattr(order, "closeTime", None).isoformat() if getattr(order, "closeTime", None) else None,
+            "tradeRationale": trade_rationale or None,
+            "mistakeLesson": mistake_lesson or None,
+            "tags": tags,
+            "attachmentUrls": attachment_urls,
+            "journalCreatedAt": getattr(journal, "createdAt", None).isoformat() if journal and getattr(journal, "createdAt", None) else None,
+            "journalUpdatedAt": getattr(journal, "updatedAt", None).isoformat() if journal and getattr(journal, "updatedAt", None) else None,
+        }
+
+        if query:
+            haystack = " ".join([
+                str(row["ticketId"]),
+                str(row["symbol"]),
+                str(row["type"]),
+                str(row["tradeRationale"] or ""),
+                str(row["mistakeLesson"] or ""),
+                " ".join(tags),
+            ]).lower()
+            if query not in haystack:
+                continue
+
+        if journal:
+            with_journal += 1
+        rows.append(row)
+        if len(rows) >= safe_limit:
+            break
+
+    return {
+        "status_code": 200,
+        "data": rows,
+        "summary": {
+            "totalRows": int(len(rows)),
+            "withJournal": int(with_journal),
+            "withoutJournal": int(len(rows) - with_journal),
+        },
+    }
+
+
+@trading_router.post("/journal/upsert", tags=["trading"])
+async def upsert_trading_journal(request: Request, data: UpsertTradingJournalRequest):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    ticket_id = int(data.ticketId or 0)
+    if ticket_id <= 0:
+        raise HTTPException(status_code=400, detail="ticketId is required")
+
+    account_ids = await _get_user_account_ids(request.state.user_id)
+    if not account_ids:
+        raise HTTPException(status_code=404, detail="Trading account not found")
+
+    owned_order = await db.orderhistory.find_first(
+        where={
+            "ticketId": ticket_id,
+            "accountId": {"in": account_ids},
+        },
+    )
+    if not owned_order:
+        raise HTTPException(status_code=404, detail="Order not found for this user")
+
+    trade_rationale = str(data.tradeRationale or "").strip() or None
+    mistake_lesson = str(data.mistakeLesson or "").strip() or None
+    tags = _normalize_string_list(data.tags)
+    attachment_urls = _normalize_string_list(data.attachmentUrls)
+
+    existing = await db.tradingjournal.find_unique(
+        where={"ticketId": ticket_id},
+    )
+    payload = {
+        "tradeRationale": trade_rationale,
+        "mistakeLesson": mistake_lesson,
+        "tags": Json(tags),
+        "attachmentUrls": Json(attachment_urls),
+    }
+    if existing:
+        journal = await db.tradingjournal.update(
+            where={"id": existing.id},
+            data=payload,
+        )
+    else:
+        payload["ticketId"] = ticket_id
+        journal = await db.tradingjournal.create(
+            data=payload,
+        )
+
+    return {
+        "status_code": 200,
+        "data": {
+            "id": str(journal.id),
+            "ticketId": int(getattr(journal, "ticketId", 0) or 0),
+            "tradeRationale": str(getattr(journal, "tradeRationale", "") or ""),
+            "mistakeLesson": str(getattr(journal, "mistakeLesson", "") or ""),
+            "tags": _normalize_string_list(getattr(journal, "tags", [])),
+            "attachmentUrls": _normalize_string_list(getattr(journal, "attachmentUrls", [])),
+            "createdAt": getattr(journal, "createdAt", None).isoformat() if getattr(journal, "createdAt", None) else None,
+            "updatedAt": getattr(journal, "updatedAt", None).isoformat() if getattr(journal, "updatedAt", None) else None,
+        },
+    }
+
+
+@trading_router.delete("/journal/{journal_id}", tags=["trading"])
+async def delete_trading_journal(request: Request, journal_id: str):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    journal = await db.tradingjournal.find_unique(
+        where={"id": journal_id},
+    )
+    if not journal:
+        raise HTTPException(status_code=404, detail="Journal entry not found")
+
+    ticket_id = int(getattr(journal, "ticketId", 0) or 0)
+    if ticket_id <= 0:
+        raise HTTPException(status_code=403, detail="Journal entry cannot be verified")
+
+    account_ids = await _get_user_account_ids(request.state.user_id)
+    if not account_ids:
+        raise HTTPException(status_code=404, detail="Trading account not found")
+
+    owned_order = await db.orderhistory.find_first(
+        where={
+            "ticketId": ticket_id,
+            "accountId": {"in": account_ids},
+        },
+    )
+    if not owned_order:
+        raise HTTPException(status_code=403, detail="Not allowed to delete this journal entry")
+
+    await db.tradingjournal.delete(
+        where={"id": journal_id},
+    )
+    return {
+        "status_code": 200,
+        "message": "Journal entry deleted",
     }
 
 @trading_router.get("/accounts_with_bots", tags=["trading"])

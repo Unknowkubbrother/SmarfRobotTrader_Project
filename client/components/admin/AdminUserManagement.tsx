@@ -120,6 +120,7 @@ interface SubscriptionDraft {
   fee_type: "percentage" | "fixed";
   fee_value: string;
   min_profit_threshold: string;
+  next_billing_date: string;
 }
 
 const currencyFormatter = new Intl.NumberFormat("en-US", {
@@ -183,6 +184,7 @@ export function AdminUserManagement() {
           fee_type: subscription.fee_type,
           fee_value: String(subscription.fee_value ?? 0),
           min_profit_threshold: String(subscription.min_profit_threshold ?? 0),
+          next_billing_date: subscription.next_billing_date ?? "",
         };
       });
       setSubscriptionDrafts(nextDrafts);
@@ -262,6 +264,7 @@ export function AdminUserManagement() {
         fee_type: "percentage",
         fee_value: "0",
         min_profit_threshold: "0",
+        next_billing_date: "",
       };
       return {
         ...prev,
@@ -292,6 +295,7 @@ export function AdminUserManagement() {
         fee_type: draft.fee_type,
         fee_value: feeValue,
         min_profit_threshold: minProfitThreshold,
+        next_billing_date: draft.next_billing_date || null,
       });
       toast.success("Subscription billing updated");
       await fetchUserDetail(selectedUser.id);
@@ -697,6 +701,7 @@ export function AdminUserManagement() {
                             fee_type: subscription.fee_type,
                             fee_value: String(subscription.fee_value),
                             min_profit_threshold: String(subscription.min_profit_threshold),
+                            next_billing_date: subscription.next_billing_date ?? "",
                           };
 
                           return (
@@ -705,7 +710,7 @@ export function AdminUserManagement() {
                                 <div>
                                   <p className="text-sm font-semibold">{shortId(subscription.id)}</p>
                                   <p className="text-xs text-muted-foreground">
-                                    Next billing: {subscription.next_billing_date || "-"}
+                                    Next billing: {formatDate(subscription.next_billing_date)}
                                   </p>
                                 </div>
                                 <Badge variant="outline" className="capitalize">
@@ -713,7 +718,7 @@ export function AdminUserManagement() {
                                 </Badge>
                               </div>
 
-                              <div className="grid gap-3 md:grid-cols-3">
+                              <div className="grid gap-3 md:grid-cols-4">
                                 <div>
                                   <p className="text-xs text-muted-foreground mb-1">Fee Type</p>
                                   <select
@@ -756,6 +761,21 @@ export function AdminUserManagement() {
                                       updateSubscriptionDraft(
                                         subscription.id,
                                         "min_profit_threshold",
+                                        event.target.value
+                                      )
+                                    }
+                                  />
+                                </div>
+
+                                <div>
+                                  <p className="text-xs text-muted-foreground mb-1">Next Billing Date</p>
+                                  <Input
+                                    type="date"
+                                    value={draft.next_billing_date}
+                                    onChange={(event) =>
+                                      updateSubscriptionDraft(
+                                        subscription.id,
+                                        "next_billing_date",
                                         event.target.value
                                       )
                                     }

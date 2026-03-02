@@ -39,6 +39,7 @@ class UpdateAdminUserSubscriptionBillingRequest(BaseModel):
     fee_type: str
     fee_value: float
     min_profit_threshold: float
+    next_billing_date: Optional[str] = None
 
 
 class UpdateAdminBotVersionActiveRequest(BaseModel):

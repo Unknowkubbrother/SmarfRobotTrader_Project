@@ -346,6 +346,7 @@ model SystemBillingConfig {
   defaultFeeType      FeeType? @map("default_fee_type")
   defaultFeeValue     Decimal? @map("default_fee_value") @db.Decimal(10, 2)
   defaultMinThreshold Decimal? @map("default_min_threshold") @db.Decimal(10, 2)
+  defaultNextBillingDate DateTime? @map("default_next_billing_date") @db.Date
   updatedAt           DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
   @@map("system_billing_config")
