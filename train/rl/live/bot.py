@@ -96,6 +96,7 @@ class LiveTradingBot:
         self._ws_last_enqueued_at = 0.0
         self._sem_retry_not_before = {}  # ts_key -> epoch seconds
         self.last_action = "HOLD"
+        self._last_status_tick = None  # {"bid": float, "ask": float, "time": int}
         self.vision_llm_api_url = str(VISION_LLM_API_URL or "").strip()
         # Live real-only semantic can take long on model warmup; avoid false timeout loops.
         self.vision_llm_timeout_sec = max(180.0, float(VISION_LLM_TIMEOUT_SEC or 180.0))
@@ -815,7 +816,10 @@ class LiveTradingBot:
             self.last_action = "HOLD"
             self._sync_bridge_from_mt5()
             self._push_state_to_server(action_name="HOLD")
-            self._print_status_line(current_bar_time=self.last_bar_time)
+            active_bar_ts = self._current_bar_time()
+            if active_bar_ts <= 0:
+                active_bar_ts = self.last_bar_time
+            self._print_status_line(current_bar_time=active_bar_ts)
 
         if "exc" in error:
             raise error["exc"]
@@ -971,6 +975,10 @@ class LiveTradingBot:
                 meta={"attempt": int(attempt), "wait_sec": float(wait_sec)},
             )
             self._push_state_to_server(action_name="HOLD")
+            active_bar_ts = self._current_bar_time()
+            if active_bar_ts <= 0:
+                active_bar_ts = self.last_bar_time
+            self._print_status_line(current_bar_time=active_bar_ts)
             time.sleep(wait_sec)
 
     def _runtime_state_payload(self):
@@ -1665,6 +1673,23 @@ class LiveTradingBot:
             time.sleep(wait_sec)
         return None
 
+    def _get_status_tick(self):
+        try:
+            mt5.symbol_select(SYMBOL, True)
+        except Exception:
+            pass
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if tick is not None and float(getattr(tick, "bid", 0.0)) > 0.0:
+            self._last_status_tick = {
+                "bid": float(getattr(tick, "bid", 0.0)),
+                "ask": float(getattr(tick, "ask", 0.0)),
+                "time": int(getattr(tick, "time", 0) or 0),
+            }
+            return self._last_status_tick, False
+        if isinstance(self._last_status_tick, dict):
+            return self._last_status_tick, True
+        return None, False
+
     def send_order(self, order_type):
         tick = self._get_trade_tick()
         if tick is None:
@@ -1818,24 +1843,29 @@ class LiveTradingBot:
             self.bridge.total_fees = max(0.0, float(self.bridge.total_fees) - float(self.bridge.spread_cost))
 
     def _print_status_line(self, current_bar_time: int | None = None):
-        tick = mt5.symbol_info_tick(SYMBOL)
-        if tick is None:
+        tick_data, stale_tick = self._get_status_tick()
+        if tick_data is None:
             return
 
         current_pos, pos = self._get_mt5_position()
         pos_txt = {1: "LONG", -1: "SHORT", 0: "FLAT"}[current_pos]
         pnl_txt = f"{pos.profit:+.2f}" if pos is not None else "0.00"
-        server_time_utc = datetime.fromtimestamp(tick.time, tz=timezone.utc).strftime("%H:%M:%SZ")
+        tick_time_ts = int(tick_data.get("time", 0) or 0)
+        if tick_time_ts > 0:
+            server_time_utc = datetime.fromtimestamp(tick_time_ts, tz=timezone.utc).strftime("%H:%M:%SZ")
+        else:
+            server_time_utc = "--:--:--Z"
         rt_delta_tick, rt_delta_price, _ = self._calc_realtime_delta_for_open_bar(
-            tick_time_ts=int(getattr(tick, "time", 0) or 0),
+            tick_time_ts=tick_time_ts,
             current_bar_ts=current_bar_time,
         )
 
         # Keep the status line compact to avoid terminal wrap.
+        stale_note = " | stale_tick" if stale_tick else ""
         line = (
-            f"Pr:{tick.bid:.{self.digits}f} | Pos:{pos_txt} | PnL:{pnl_txt} | "
+            f"Pr:{float(tick_data.get('bid', 0.0)):.{self.digits}f} | Pos:{pos_txt} | PnL:{pnl_txt} | "
             f"Eq:{self.bridge.equity:.2f} | dT:{rt_delta_tick:d} | dP:{rt_delta_price:.5f} | "
-            f"{server_time_utc}"
+            f"{server_time_utc}{stale_note}"
         )
         width = max(40, int(shutil.get_terminal_size(fallback=(120, 20)).columns) - 1)
         if len(line) > width:
