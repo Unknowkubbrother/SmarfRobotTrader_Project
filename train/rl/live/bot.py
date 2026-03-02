@@ -4,6 +4,7 @@ import shutil
 import sys
 import time
 import threading
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -97,9 +98,13 @@ class LiveTradingBot:
         self._sem_retry_not_before = {}  # ts_key -> epoch seconds
         self.last_action = "HOLD"
         self._last_status_tick = None  # {"bid": float, "ask": float, "time": int}
+        self.trade_tick_wait_timeout_sec = max(
+            20.0,
+            float(max(1, int(ORDER_TICK_RETRIES)) * max(0.05, float(ORDER_TICK_RETRY_SEC))),
+        )
         self.vision_llm_api_url = str(VISION_LLM_API_URL or "").strip()
         # Live real-only semantic can take long on model warmup; avoid false timeout loops.
-        self.vision_llm_timeout_sec = max(180.0, float(VISION_LLM_TIMEOUT_SEC or 180.0))
+        self.vision_llm_timeout_sec = max(420.0, float(VISION_LLM_TIMEOUT_SEC or 420.0))
         self.risk_profile_map = dict(RISK_PROFILE_MAP or {"low": 0.5, "medium": 1.0, "high": 1.5})
         self.risk_level = str(RISK_LEVEL or "medium").lower()
         self.risk_percent = float(RISK_PERCENT)
@@ -1659,18 +1664,77 @@ class LiveTradingBot:
         return all_ok
 
     def _get_trade_tick(self):
-        retries = max(1, int(ORDER_TICK_RETRIES))
-        wait_sec = max(0.0, float(ORDER_TICK_RETRY_SEC))
+        wait_sec = max(0.05, float(ORDER_TICK_RETRY_SEC))
+        deadline = time.time() + max(1.0, float(self.trade_tick_wait_timeout_sec))
+        next_beat_at = 0.0
+        last_err = None
 
-        for _ in range(retries):
-            if not mt5.symbol_select(SYMBOL, True):
-                time.sleep(wait_sec)
-                continue
+        while time.time() < deadline:
+            try:
+                mt5.symbol_select(SYMBOL, True)
+            except Exception:
+                pass
 
             tick = mt5.symbol_info_tick(SYMBOL)
             if tick is not None and float(getattr(tick, "bid", 0.0)) > 0.0 and float(getattr(tick, "ask", 0.0)) > 0.0:
+                self._last_status_tick = {
+                    "bid": float(getattr(tick, "bid", 0.0)),
+                    "ask": float(getattr(tick, "ask", 0.0)),
+                    "time": int(getattr(tick, "time", 0) or 0),
+                }
                 return tick
+
+            try:
+                last_err = mt5.last_error()
+            except Exception:
+                last_err = None
+
+            now_epoch = time.time()
+            if now_epoch >= next_beat_at:
+                self._sync_bridge_from_mt5()
+                self._push_state_to_server(action_name=self.last_action or "HOLD")
+                active_bar_ts = self._current_bar_time()
+                if active_bar_ts <= 0:
+                    active_bar_ts = self.last_bar_time
+                self._print_status_line(current_bar_time=active_bar_ts)
+                next_beat_at = now_epoch + 1.0
+
             time.sleep(wait_sec)
+
+        # Final fallback: use very recent cached status tick to avoid skipping entry on transient quote gaps.
+        if isinstance(self._last_status_tick, dict):
+            bid = float(self._last_status_tick.get("bid", 0.0) or 0.0)
+            ask = float(self._last_status_tick.get("ask", 0.0) or 0.0)
+            ts = int(self._last_status_tick.get("time", 0) or 0)
+            age_sec = time.time() - float(ts) if ts > 0 else 9999.0
+            if bid > 0.0 and ask > 0.0 and age_sec <= 10.0:
+                print(f"\n [ORDER] using cached tick fallback age={age_sec:.1f}s")
+                self._add_log(
+                    "warning",
+                    "Using cached tick fallback for order send",
+                    phase="order",
+                    event="tick_fallback",
+                    meta={"age_sec": float(age_sec)},
+                )
+                return SimpleNamespace(bid=bid, ask=ask, time=ts)
+
+        err_text = ""
+        if isinstance(last_err, tuple) and len(last_err) >= 2:
+            err_text = f" | mt5_error={last_err[0]}:{last_err[1]}"
+        print(
+            "\n [ORDER] trade tick unavailable after "
+            f"{self.trade_tick_wait_timeout_sec:.1f}s{err_text}"
+        )
+        self._add_log(
+            "warning",
+            "Trade tick unavailable after timeout",
+            phase="order",
+            event="no_live_tick_timeout",
+            meta={
+                "timeout_sec": float(self.trade_tick_wait_timeout_sec),
+                "last_error": str(last_err),
+            },
+        )
         return None
 
     def _get_status_tick(self):
@@ -1694,6 +1758,13 @@ class LiveTradingBot:
         tick = self._get_trade_tick()
         if tick is None:
             print(" Order Skipped: no live tick (market closed or quote unavailable)")
+            self._add_log(
+                "warning",
+                "Order skipped: no live tick",
+                phase="order",
+                event="open_skipped_no_tick",
+                meta={"order_type": "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"},
+            )
             return False
 
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
@@ -2099,6 +2170,8 @@ class LiveTradingBot:
             broker_pos_before=int(broker_pos_before),
             broker_pos_after=int(broker_pos_after),
         )
+        # Re-sync account/equity after reconcile corrections so dashboard and status line stay aligned.
+        self._sync_bridge_from_mt5()
         if persist_state:
             self._save_runtime_state(reason="bar_close")
         summary_type = "info"
