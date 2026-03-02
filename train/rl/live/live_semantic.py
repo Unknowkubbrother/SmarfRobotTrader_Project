@@ -39,7 +39,6 @@ class SemanticRuntime:
 
     def _load_chroma(self):
         try:
-            print(f" Loading embeddings from ChromaDB... source={self.embed_source_mode}")
             time_to_vec, resolved_mode = load_time_to_embedding_map(
                 models_dir=self.models_dir,
                 source_mode=self.embed_source_mode,
@@ -47,7 +46,6 @@ class SemanticRuntime:
             )
             self.global_time_to_vec = {key: np.asarray(vec, dtype=np.float32) for key, vec in time_to_vec.items()}
             self.embed_source_mode = resolved_mode
-            print(f" Loaded {len(self.global_time_to_vec)} embeddings globally.")
         except Exception as exc:
             print(f" Could not load ChromaDB: {exc}")
             self.global_time_to_vec = {}
@@ -55,12 +53,7 @@ class SemanticRuntime:
     def _load_projector(self):
         try:
             self.embed_projector = load_projector(self.models_dir)
-            if self.embed_projector is not None:
-                print(
-                    " Loaded embedding projector successfully. "
-                    f"mode={self.embed_projector.mode}, latent_dim={self.embed_projector.latent_dim}"
-                )
-            else:
+            if self.embed_projector is None:
                 print(" Could not load embedding projector! Fallback to zero semantic features.")
         except Exception as exc:
             print(f" Could not load embedding projector! Fallback to zeros. Error: {exc}")

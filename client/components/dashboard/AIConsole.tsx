@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { Terminal, Bot, TrendingUp, AlertTriangle, CheckCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { BotLiveState } from "@/hooks/useBotLiveState";
+import type { BotLiveLogEntry, BotLiveState } from "@/hooks/useBotLiveState";
 
 interface LogEntry {
   id: string;
@@ -17,6 +17,127 @@ const typeConfig = {
   warning: { icon: AlertTriangle, color: "text-warning" },
   success: { icon: CheckCircle, color: "text-success" },
 };
+
+const HIDDEN_PHASES = new Set(["SEM", "MODEL", "GATE", "DECISION"]);
+
+function normalizeMeta(meta: unknown): Record<string, unknown> | undefined {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return undefined;
+  const entries = Object.entries(meta as Record<string, unknown>);
+  if (entries.length === 0) return undefined;
+  return Object.fromEntries(entries.map(([k, v]) => [String(k), v]));
+}
+
+function toNum(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function shouldHideLog(log: Partial<BotLiveLogEntry>): boolean {
+  const phase = String(log?.phase || "").trim().toUpperCase();
+  const event = String(log?.event || "").trim().toLowerCase();
+  if (HIDDEN_PHASES.has(phase)) return true;
+  if (phase === "WS" && event === "llm_result") return true;
+  return false;
+}
+
+function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
+  const phase = String(log?.phase || "").trim().toUpperCase();
+  const event = String(log?.event || "").trim().toLowerCase();
+  const message = String(log?.message || "").trim();
+  const meta = normalizeMeta(log?.meta);
+
+  if (phase === "BOOT" && event === "start") return "Live trading runtime started";
+  if (phase === "BOOT" && event === "mt5_connected") {
+    const symbol = String(meta?.symbol || "").trim();
+    const timeframe = String(meta?.timeframe || "").trim();
+    if (symbol && timeframe) return `Connected to MT5 (${symbol}/${timeframe})`;
+    return "Connected to MT5";
+  }
+  if (phase === "BOOT" && event === "ready") return "System is ready";
+
+  if (phase === "WS" && event === "connected") return "Connected to server";
+  if (phase === "WS" && event === "registered") return "Bot registered with server";
+  if (phase === "WS" && event === "disconnected") return "Server disconnected, reconnecting";
+
+  if (phase === "CLOCK" && event === "waiting_new_candle") return "Waiting for next candle";
+  if (phase === "CLOCK" && event === "new_closed_candle") {
+    const ts = String(meta?.closed_utc || "").trim();
+    return ts ? `New candle closed (${ts})` : "New candle closed";
+  }
+
+  if (phase === "STARTUP" && event === "snapshot_no_order") {
+    return "Open exposure found: startup runs without sending duplicate orders";
+  }
+  if (phase === "STARTUP" && event === "startup_immediate") {
+    return "No open exposure: startup can execute immediately";
+  }
+  if (phase === "STARTUP" && event === "no_state_bar") {
+    return "No previous state: processing latest closed bar";
+  }
+
+  if (phase === "FLOW" && event === "catchup_replay") {
+    const bars = toNum(meta?.bars);
+    return bars !== null ? `Running catch-up for ${bars} bar(s)` : "Running catch-up replay";
+  }
+  if (phase === "BAR" && event === "bar_start") {
+    const endUtc = String(meta?.end_utc || "").trim();
+    return endUtc ? `Evaluating closed bar (${endUtc})` : "Evaluating closed bar";
+  }
+  if (phase === "BAR" && event === "bar_complete") {
+    const finalAction = String(meta?.final_action || "").trim().toUpperCase();
+    const status = String(meta?.status || "").trim().toLowerCase();
+    const orderOk = meta?.order_ok;
+    const statusText = status ? ` | ${status}` : "";
+    if (typeof orderOk === "boolean" && finalAction && finalAction !== "HOLD") {
+      return `Bar evaluation completed: ${finalAction}${statusText} | order ${orderOk ? "sent" : "failed"}`;
+    }
+    if (finalAction) {
+      return `Bar evaluation completed: ${finalAction}${statusText}`;
+    }
+    return "Bar evaluation completed";
+  }
+
+  if (phase === "ORDER" && event === "open_done") {
+    const side = String(meta?.side || "").toUpperCase().trim();
+    const price = toNum(meta?.price);
+    const lot = toNum(meta?.lot);
+    const sideText = side || "ORDER";
+    const priceText = price !== null ? price.toFixed(5) : "-";
+    const lotText = lot !== null ? lot.toFixed(2) : "-";
+    return `Opened ${sideText} @ ${priceText} (lot=${lotText})`;
+  }
+  if (phase === "ORDER" && event === "close_done") {
+    const ticket = String(meta?.ticket || "").trim();
+    const pnl = toNum(meta?.pnl);
+    const pnlText = pnl !== null ? pnl.toFixed(2) : "-";
+    return ticket ? `Closed position #${ticket} (PnL ${pnlText})` : `Closed position (PnL ${pnlText})`;
+  }
+  if (phase === "ORDER" && event === "open_failed") {
+    const reason = String(meta?.reason || "").trim();
+    return reason ? `Open order failed: ${reason}` : "Open order failed";
+  }
+  if (phase === "ORDER" && event === "close_failed") {
+    const reason = String(meta?.reason || "").trim();
+    return reason ? `Close order failed: ${reason}` : "Close order failed";
+  }
+  if (phase === "ORDER" && event === "close_no_positions") return "No open positions to close";
+  if (phase === "ORDER" && event === "close_skipped_no_tick") return "Close skipped: live tick is unavailable";
+
+  if (phase === "SCHEDULE" && event === "blocked") return "New order blocked by trading schedule";
+
+  if (phase === "CONFIG" && event === "runtime_updated") {
+    const riskLevel = String(meta?.risk_level || "").trim();
+    const riskPercent = toNum(meta?.risk_percent);
+    if (riskLevel && riskPercent !== null) return `Risk updated: ${riskLevel} (${riskPercent.toFixed(2)}%)`;
+    return "Runtime configuration updated";
+  }
+
+  return message;
+}
 
 interface AIConsoleProps {
   botName?: string;
@@ -36,7 +157,8 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
       const row = wsLogs[i];
       const type = row?.type && row.type in typeConfig ? row.type : "info";
       const timestamp = String(row?.timestamp || "");
-      const message = String(row?.message || "").trim();
+      if (shouldHideLog(row)) continue;
+      const message = toFriendlyMessage(row);
       if (!message) continue;
       const key = `${timestamp}|${type}|${message}`;
       if (dedup.has(key)) continue;
@@ -49,7 +171,7 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
       });
     }
 
-    return rows.slice(-80);
+    return rows.slice(-120);
   }, [liveState?.recent_logs]);
 
   return (

@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import {
   AreaChart,
   Area,
@@ -24,27 +24,6 @@ interface ChartRenderPoint extends ChartDataPoint {
 
 const timeframes = ["1D", "1W", "1M", "3M", "1Y", "ALL"] as const;
 type ChartTimeframe = (typeof timeframes)[number];
-
-const generateMockData = (): ChartDataPoint[] => {
-  const data: ChartDataPoint[] = [];
-  let balance = 10000;
-  let equity = 10000;
-
-  for (let i = 0; i < 120; i += 1) {
-    const ts = Date.now() - (119 - i) * 6 * 60 * 60 * 1000;
-    balance += (Math.random() - 0.45) * 90;
-    equity = balance + (Math.random() - 0.5) * 180;
-
-    data.push({
-      balance: Math.round(balance * 100) / 100,
-      equity: Math.round(equity * 100) / 100,
-      timestamp: ts,
-    });
-  }
-  return data;
-};
-
-const initialMockData = generateMockData();
 
 const timeframeMs: Record<Exclude<ChartTimeframe, "ALL">, number> = {
   "1D": 24 * 60 * 60 * 1000,
@@ -78,29 +57,46 @@ interface PerformanceChartProps {
 
 export function PerformanceChart({ liveState }: PerformanceChartProps) {
   const [selectedTimeframe, setSelectedTimeframe] = useState<ChartTimeframe>("1M");
-  const [historyData, setHistoryData] = useState<ChartDataPoint[]>(initialMockData);
+  const [historyData, setHistoryData] = useState<ChartDataPoint[]>([]);
+  const lastBotIdRef = useRef<string>("");
 
   const isLive = !!liveState?.connected;
+  const activeBotId = String(liveState?.bot_config_id || "").trim();
+
+  useEffect(() => {
+    if (!activeBotId) return;
+    if (lastBotIdRef.current && lastBotIdRef.current !== activeBotId) {
+      // Avoid mixing equity histories when user switches selected bot.
+      setHistoryData([]);
+    }
+    lastBotIdRef.current = activeBotId;
+  }, [activeBotId]);
 
   useEffect(() => {
     if (!isLive || !liveState) return;
+    const balance = Number(liveState.balance);
+    const equity = Number(liveState.equity);
+    if (!Number.isFinite(balance) || !Number.isFinite(equity) || balance <= 0 || equity <= 0) {
+      return;
+    }
 
     setHistoryData((prev) => {
       const now = Date.now();
       const newPoint: ChartDataPoint = {
-        balance: liveState.balance ?? 0,
-        equity: liveState.equity ?? 0,
+        balance,
+        equity,
         timestamp: now,
       };
 
       const last = prev[prev.length - 1];
-      if (
-        last &&
-        last.balance === newPoint.balance &&
-        last.equity === newPoint.equity &&
-        now - last.timestamp < 5000
-      ) {
+      if (!last) return [newPoint];
+      const sameValue = last.balance === newPoint.balance && last.equity === newPoint.equity;
+      if (sameValue && now - last.timestamp < 5000) {
         return prev;
+      }
+      if (now - last.timestamp < 2000) {
+        // Replace latest point when updates are too frequent to keep chart smooth.
+        return [...prev.slice(0, -1), newPoint];
       }
 
       const next = [...prev, newPoint];
@@ -108,12 +104,6 @@ export function PerformanceChart({ liveState }: PerformanceChartProps) {
       return next.length > maxKeep ? next.slice(next.length - maxKeep) : next;
     });
   }, [isLive, liveState?.balance, liveState?.equity]);
-
-  useEffect(() => {
-    if (!isLive) {
-      setHistoryData(initialMockData);
-    }
-  }, [isLive]);
 
   const chartData = useMemo<ChartRenderPoint[]>(() => {
     const scoped = filterByTimeframe(historyData, selectedTimeframe);
@@ -157,73 +147,79 @@ export function PerformanceChart({ liveState }: PerformanceChartProps) {
       </div>
 
       <div className="h-[280px]">
-        <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
-            <defs>
-              <linearGradient id="balanceGradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="hsl(220, 90%, 56%)" stopOpacity={0.2} />
-                <stop offset="100%" stopColor="hsl(220, 90%, 56%)" stopOpacity={0} />
-              </linearGradient>
-              <linearGradient id="equityGradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="hsl(142, 72%, 42%)" stopOpacity={0.2} />
-                <stop offset="100%" stopColor="hsl(142, 72%, 42%)" stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="hsl(220, 13%, 91%)" vertical={false} />
-            <XAxis
-              dataKey="label"
-              axisLine={false}
-              tickLine={false}
-              tick={{ fill: "hsl(220, 9%, 46%)", fontSize: 11 }}
-              minTickGap={18}
-            />
-            <YAxis
-              axisLine={false}
-              tickLine={false}
-              tick={{ fill: "hsl(220, 9%, 46%)", fontSize: 11 }}
-              tickFormatter={(value) => `$${Number(value).toLocaleString()}`}
-              domain={["auto", "auto"]}
-            />
-            <Tooltip
-              contentStyle={{
-                backgroundColor: "hsl(0, 0%, 100%)",
-                border: "1px solid hsl(220, 13%, 91%)",
-                borderRadius: "8px",
-                boxShadow: "0 4px 12px rgba(0,0,0,0.1)",
-              }}
-              labelFormatter={(_, payload) => {
-                const ts = payload?.[0]?.payload?.timestamp;
-                if (!ts) return "";
-                return new Date(ts).toLocaleString("en-US", { hour12: false });
-              }}
-              formatter={(value: number, name: string) => [`$${value.toLocaleString()}`, name]}
-            />
-            <Legend
-              verticalAlign="top"
-              align="right"
-              height={36}
-              iconType="circle"
-            />
-            <Area
-              type="monotone"
-              dataKey="balance"
-              name="Balance"
-              stroke="hsl(220, 90%, 56%)"
-              strokeWidth={2}
-              fill="url(#balanceGradient)"
-              isAnimationActive={false}
-            />
-            <Area
-              type="monotone"
-              dataKey="equity"
-              name="Equity"
-              stroke="hsl(142, 72%, 42%)"
-              strokeWidth={2}
-              fill="url(#equityGradient)"
-              isAnimationActive={false}
-            />
-          </AreaChart>
-        </ResponsiveContainer>
+        {chartData.length === 0 ? (
+          <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
+            {isLive ? "Waiting for live balance/equity data..." : "Connect bot to show performance chart"}
+          </div>
+        ) : (
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+              <defs>
+                <linearGradient id="balanceGradient" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="hsl(220, 90%, 56%)" stopOpacity={0.2} />
+                  <stop offset="100%" stopColor="hsl(220, 90%, 56%)" stopOpacity={0} />
+                </linearGradient>
+                <linearGradient id="equityGradient" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="hsl(142, 72%, 42%)" stopOpacity={0.2} />
+                  <stop offset="100%" stopColor="hsl(142, 72%, 42%)" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="hsl(220, 13%, 91%)" vertical={false} />
+              <XAxis
+                dataKey="label"
+                axisLine={false}
+                tickLine={false}
+                tick={{ fill: "hsl(220, 9%, 46%)", fontSize: 11 }}
+                minTickGap={18}
+              />
+              <YAxis
+                axisLine={false}
+                tickLine={false}
+                tick={{ fill: "hsl(220, 9%, 46%)", fontSize: 11 }}
+                tickFormatter={(value) => `$${Number(value).toLocaleString()}`}
+                domain={["auto", "auto"]}
+              />
+              <Tooltip
+                contentStyle={{
+                  backgroundColor: "hsl(0, 0%, 100%)",
+                  border: "1px solid hsl(220, 13%, 91%)",
+                  borderRadius: "8px",
+                  boxShadow: "0 4px 12px rgba(0,0,0,0.1)",
+                }}
+                labelFormatter={(_, payload) => {
+                  const ts = payload?.[0]?.payload?.timestamp;
+                  if (!ts) return "";
+                  return new Date(ts).toLocaleString("en-US", { hour12: false });
+                }}
+                formatter={(value: number, name: string) => [`$${value.toLocaleString()}`, name]}
+              />
+              <Legend
+                verticalAlign="top"
+                align="right"
+                height={36}
+                iconType="circle"
+              />
+              <Area
+                type="monotone"
+                dataKey="balance"
+                name="Balance"
+                stroke="hsl(220, 90%, 56%)"
+                strokeWidth={2}
+                fill="url(#balanceGradient)"
+                isAnimationActive={false}
+              />
+              <Area
+                type="monotone"
+                dataKey="equity"
+                name="Equity"
+                stroke="hsl(142, 72%, 42%)"
+                strokeWidth={2}
+                fill="url(#equityGradient)"
+                isAnimationActive={false}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        )}
       </div>
     </div>
   );

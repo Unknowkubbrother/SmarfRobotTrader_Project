@@ -97,6 +97,7 @@ class PPOBridge:
         self.loss_streak = 0
         self.recent_trade_pips = deque(maxlen=max(DEF_LOOKBACK_TRADES, 5))
         self.semantic_skips = 0
+        self.last_decision = {}
 
     def _calc_pnl(self, entry, exit_price, direction):
         pips = (exit_price - entry) / PIP_SIZE
@@ -242,6 +243,8 @@ class PPOBridge:
         self.unrealized_pnl = 0.0
 
     def process_bar(self, df, delta_tick=0, delta_price=0.0):
+        trade_cooldown_before = int(self.trade_cooldown)
+        defensive_mode_before = int(self.defensive_mode_bars)
         if self.trade_cooldown > 0:
             self.trade_cooldown -= 1
         if self.defensive_mode_bars > 0:
@@ -309,10 +312,21 @@ class PPOBridge:
         obs_input = np.array([obs_norm], dtype=np.float32)
         obs_tensor = self.model.policy.obs_to_tensor(obs_input)[0]
         probs = self.model.policy.get_distribution(obs_tensor).distribution.probs.detach().cpu().numpy()[0]
-        action = int(np.argmax(probs))
+        raw_action = int(np.argmax(probs))
+        action = int(raw_action)
         cooldown_after_trade = TRADE_COOLDOWN_BARS
         if ADAPTIVE_GATE and self.defensive_mode_bars > 0:
             cooldown_after_trade += DEF_COOLDOWN_BONUS
+
+        confidence = None
+        edge = None
+        margin = None
+        hold_edge = None
+        conf_thr = None
+        edge_thr = None
+        margin_thr = None
+        hold_edge_thr = None
+        gate_reasons = []
 
         if action in (1, 2):
             opposite_action = 2 if action == 1 else 1
@@ -327,13 +341,22 @@ class PPOBridge:
                 last_bar,
                 semantic_quality,
             )
-            if (
-                self.trade_cooldown > 0
-                or confidence < conf_thr
-                or edge < edge_thr
-                or margin < margin_thr
-                or hold_edge < hold_edge_thr
-            ):
+            cooldown_block = self.trade_cooldown > 0
+            confidence_block = confidence < conf_thr
+            edge_block = edge < edge_thr
+            margin_block = margin < margin_thr
+            hold_edge_block = hold_edge < hold_edge_thr
+            if cooldown_block or confidence_block or edge_block or margin_block or hold_edge_block:
+                if cooldown_block:
+                    gate_reasons.append(f"cooldown={self.trade_cooldown}")
+                if confidence_block:
+                    gate_reasons.append(f"conf {confidence:.3f}<{conf_thr:.3f}")
+                if edge_block:
+                    gate_reasons.append(f"edge {edge:.3f}<{edge_thr:.3f}")
+                if margin_block:
+                    gate_reasons.append(f"margin {margin:.3f}<{margin_thr:.3f}")
+                if hold_edge_block:
+                    gate_reasons.append(f"hold_edge {hold_edge:.3f}<{hold_edge_thr:.3f}")
                 self.skipped_signals += 1
                 if margin < margin_thr:
                     self.margin_skips += 1
@@ -343,11 +366,43 @@ class PPOBridge:
                     self.defensive_skips += 1
                 action = 0
         elif action == 3 and self.position == 0:
+            gate_reasons.append("close_without_position")
             action = 0
+
+        probs_list = [float(x) for x in probs.tolist()]
+        decision = {
+            "ts_key": ts_key,
+            "raw_action": int(raw_action),
+            "final_action": int(action),
+            "probs": probs_list,
+            "semantic_quality": float(semantic_quality),
+            "cooldown_before": int(trade_cooldown_before),
+            "cooldown_after": int(self.trade_cooldown),
+            "defensive_mode_before": int(defensive_mode_before),
+            "defensive_mode_after": int(self.defensive_mode_bars),
+            "gate_reasons": list(gate_reasons),
+            "metrics": {
+                "confidence": None if confidence is None else float(confidence),
+                "edge": None if edge is None else float(edge),
+                "margin": None if margin is None else float(margin),
+                "hold_edge": None if hold_edge is None else float(hold_edge),
+            },
+            "thresholds": {
+                "conf_thr": None if conf_thr is None else float(conf_thr),
+                "edge_thr": None if edge_thr is None else float(edge_thr),
+                "margin_thr": None if margin_thr is None else float(margin_thr),
+                "hold_edge_thr": None if hold_edge_thr is None else float(hold_edge_thr),
+            },
+        }
 
         if max_hold_closed:
             self.trade_cooldown = max(self.trade_cooldown, cooldown_after_trade)
             self.first_bar = True
+            decision["final_action"] = 3
+            decision["gate_reasons"] = ["max_hold_steps"]
+            decision["cooldown_after"] = int(self.trade_cooldown)
+            decision["defensive_mode_after"] = int(self.defensive_mode_bars)
+            self.last_decision = decision
             return 3, current_price
 
         trade_changed = False
@@ -384,4 +439,7 @@ class PPOBridge:
         if action != 1 and action != 2:
             self.first_bar = False
 
+        decision["cooldown_after"] = int(self.trade_cooldown)
+        decision["defensive_mode_after"] = int(self.defensive_mode_bars)
+        self.last_decision = decision
         return action, current_price

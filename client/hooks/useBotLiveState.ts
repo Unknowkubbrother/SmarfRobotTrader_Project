@@ -17,6 +17,16 @@ export interface MT5Position {
     comment: string;
 }
 
+export interface BotLiveLogEntry {
+    timestamp: string;
+    type: "info" | "analysis" | "action" | "warning" | "success";
+    message: string;
+    phase?: string;
+    event?: string;
+    severity?: "info" | "warning" | "success" | "error";
+    meta?: Record<string, unknown>;
+}
+
 export interface BotLiveState {
     bot_config_id: string;
     symbol: string;
@@ -53,7 +63,7 @@ export interface BotLiveState {
     positions: MT5Position[];
     // Logs
     llm_text?: string;
-    recent_logs?: { timestamp: string; type: "info" | "analysis" | "action" | "warning" | "success"; message: string }[];
+    recent_logs?: BotLiveLogEntry[];
 }
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";

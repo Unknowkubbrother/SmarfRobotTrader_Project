@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import sys
 import time
 import threading
@@ -128,15 +129,26 @@ class LiveTradingBot:
         self.digits = int(symbol_info.digits)
         self.pip_size = self.point * 10 if self.digits in (3, 5) else self.point
 
-        print(f" MT5 Connected. Account: {account_info.login}")
-        print(f" Symbol={SYMBOL} | Timeframe={TIMEFRAME_NAME} | Point={self.point} | Digits={self.digits}")
         print(
-            f" Balance={self.initial_balance:.2f} | AutoLot={self.current_lot} | "
-            f"Risk={self.risk_level}:{self.risk_percent:.2f}%"
+            " [MT5] "
+            f"account={account_info.login} symbol={SYMBOL} tf={TIMEFRAME_NAME} "
+            f"balance={self.initial_balance:.2f} lot={self.current_lot:.2f} "
+            f"risk={self.risk_level}:{self.risk_percent:.2f}%"
         )
         self._add_log(
             "success",
             f"MT5 connected | account={account_info.login} | risk={self.risk_level}:{self.risk_percent:.2f}%",
+            phase="boot",
+            event="mt5_connected",
+            meta={
+                "account": int(account_info.login),
+                "symbol": SYMBOL,
+                "timeframe": TIMEFRAME_NAME,
+                "balance": float(self.initial_balance),
+                "lot": float(self.current_lot),
+                "risk_level": self.risk_level,
+                "risk_percent": float(self.risk_percent),
+            },
         )
 
     def _load_llm_semantic_cache(self):
@@ -173,8 +185,6 @@ class LiveTradingBot:
                 continue
             restored[key] = arr
         self.llm_semantic_cache = restored
-        if restored:
-            print(f" Loaded LLM semantic cache: {len(restored)} rows")
 
     def _save_llm_semantic_cache(self, reason: str = "periodic"):
         if not self.llm_semantic_cache:
@@ -264,23 +274,26 @@ class LiveTradingBot:
         )
 
         self._load_llm_semantic_cache()
+        llm_cache_rows = 0
         if self.llm_semantic_cache:
             self.semantic_runtime.global_time_to_vec.update(self.llm_semantic_cache)
-            print(
-                " Merged LLM semantic cache into runtime embeddings: "
-                f"{len(self.llm_semantic_cache)}"
-            )
+            llm_cache_rows = int(len(self.llm_semantic_cache))
 
-        print(" Model + VecNormalize loaded")
         print(
-            " Pipeline: live (LLM-CLS semantic + adaptive gate) | "
-            f"features={len(self.feature_columns)}"
+            " [MODEL] "
+            f"ready features={len(self.feature_columns)} sem_dim={self.semantic_runtime.semantic_feature_count} "
+            f"llm_cache_rows={llm_cache_rows}"
         )
-        print(" LLM semantic mode enabled (strict real-only): raw text -> cls embedding")
-        print(
-            " Live runtime: "
-            f"sync_account_state={self.sync_account_state} "
-            f"dynamic_lot={self.dynamic_lot}"
+        self._add_log(
+            "success",
+            "Model pipeline ready",
+            phase="model",
+            event="ready",
+            meta={
+                "features": int(len(self.feature_columns)),
+                "semantic_dim": int(self.semantic_runtime.semantic_feature_count),
+                "llm_cache_rows": int(llm_cache_rows),
+            },
         )
 
     def _start_ws_listener(self):
@@ -292,16 +305,18 @@ class LiveTradingBot:
         """
         if not BOT_WS_URL or not BOT_CONFIG_ID:
             print(" WS skipped: BOT_WS_URL or BOT_CONFIG_ID not set")
+            self._add_log("warning", "WS skipped: BOT_WS_URL or BOT_CONFIG_ID not set", phase="ws", event="disabled")
             return
 
         def _listener():
             import websockets.sync.client as ws_sync
             while True:
                 try:
-                    print(f" WS connecting to {BOT_WS_URL}")
+                    print(f"\n [WS] connecting to {BOT_WS_URL}")
                     with ws_sync.connect(BOT_WS_URL) as ws:
                         self._ws = ws
                         self._ws_connected = True
+                        self._add_log("info", "WS connected", phase="ws", event="connected", meta={"url": BOT_WS_URL})
                         # Register
                         ws.send(json.dumps({
                             "type": "register",
@@ -309,7 +324,19 @@ class LiveTradingBot:
                             "symbol": SYMBOL.upper(),
                             "timeframe": TIMEFRAME_NAME.upper(),
                         }))
-                        print(f" WS registered: {BOT_CONFIG_ID} {SYMBOL}/{TIMEFRAME_NAME}")
+                        print(f"\n [WS] registered: {BOT_CONFIG_ID} {SYMBOL}/{TIMEFRAME_NAME}")
+                        self._add_log(
+                            "success",
+                            "WS registered with BotHub",
+                            phase="ws",
+                            event="registered",
+                            meta={"bot_config_id": BOT_CONFIG_ID, "symbol": SYMBOL, "timeframe": TIMEFRAME_NAME},
+                        )
+                        try:
+                            self._sync_bridge_from_mt5()
+                            self._push_state_to_server(action_name=self.last_action or "HOLD")
+                        except Exception:
+                            pass
                         while True:
                             raw = ws.recv()
                             try:
@@ -326,13 +353,27 @@ class LiveTradingBot:
                                         "cls_vec": np.asarray(cls_vec, dtype=np.float32),
                                         "llm_text": llm_text,
                                     }
-                                    print(f" WS received LLM result for {ts_key}")
+                                    print(f"\n [WS] received llm_result ts={ts_key}")
+                                    self._add_log(
+                                        "analysis",
+                                        f"WS received LLM result for {ts_key}",
+                                        phase="ws",
+                                        event="llm_result",
+                                        meta={"ts": ts_key, "source": "ws_push"},
+                                    )
                             elif msg_type == "bot_config":
                                 self._apply_runtime_config(msg, source="ws")
                 except Exception as exc:
                     self._ws = None
                     self._ws_connected = False
-                    print(f" WS disconnected: {exc} | reconnecting in 5s")
+                    print(f"\n [WS] disconnected: {exc} | reconnecting in 5s")
+                    self._add_log(
+                        "warning",
+                        "WS disconnected; reconnecting in 5s",
+                        phase="ws",
+                        event="disconnected",
+                        meta={"error": str(exc or ""), "retry_sec": 5},
+                    )
                     time.sleep(5)
 
         t = threading.Thread(target=_listener, daemon=True, name="ws-bot-hub")
@@ -465,10 +506,9 @@ class LiveTradingBot:
             self._add_log(
                 "info",
                 f"Runtime config updated ({source}) | risk={self.risk_level}:{self.risk_percent:.2f}%",
-            )
-            print(
-                " Runtime config applied | "
-                f"source={source} risk_level={self.risk_level} risk_percent={self.risk_percent:.2f}"
+                phase="config",
+                event="runtime_updated",
+                meta={"source": source, "risk_level": self.risk_level, "risk_percent": float(self.risk_percent)},
             )
 
     def _push_state_to_server(self, action_name: str = ""):
@@ -557,18 +597,64 @@ class LiveTradingBot:
         except Exception as exc:
             print(f" WS state push failed: {exc}")
 
-    def _add_log(self, log_type: str, message: str):
+    def _sanitize_log_meta(self, meta):
+        if not isinstance(meta, dict):
+            return None
+        clean = {}
+        for raw_key, raw_value in meta.items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            if isinstance(raw_value, (str, int, float, bool)) or raw_value is None:
+                clean[key] = raw_value
+            elif isinstance(raw_value, np.generic):
+                clean[key] = raw_value.item()
+            elif isinstance(raw_value, datetime):
+                clean[key] = raw_value.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                clean[key] = str(raw_value)
+        return clean or None
+
+    def _add_log(
+        self,
+        log_type: str,
+        message: str,
+        phase: str = "",
+        event: str = "",
+        severity: str = "",
+        meta: dict | None = None,
+    ):
         """Add a log entry to be sent to the dashboard Activity Log."""
         if not hasattr(self, "recent_logs"):
             self.recent_logs = []
         now_str = datetime.now().strftime("%H:%M:%S")
-        self.recent_logs.append({
+        entry = {
             "timestamp": now_str,
-            "type": log_type,
-            "message": message
-        })
-        # Keep only the last 50 logs
-        if len(self.recent_logs) > 50:
+            "type": str(log_type or "info"),
+            "message": str(message or "").strip(),
+        }
+        phase_txt = str(phase or "").strip().upper()
+        if phase_txt:
+            entry["phase"] = phase_txt
+        event_txt = str(event or "").strip().lower()
+        if event_txt:
+            entry["event"] = event_txt
+        severity_txt = str(severity or "").strip().lower()
+        if not severity_txt:
+            severity_txt = {
+                "warning": "warning",
+                "success": "success",
+                "action": "success",
+                "analysis": "info",
+            }.get(entry["type"], "info")
+        entry["severity"] = severity_txt
+        clean_meta = self._sanitize_log_meta(meta)
+        if clean_meta:
+            entry["meta"] = clean_meta
+
+        self.recent_logs.append(entry)
+        # Keep only recent logs for dashboard
+        if len(self.recent_logs) > 120:
             self.recent_logs.pop(0)
 
     def _save_llm_semantic_entry(self, ts_key: str, cls_vec: np.ndarray, llm_text: str, source: str):
@@ -584,9 +670,15 @@ class LiveTradingBot:
         self.last_llm_text = str(llm_text or "")
         if self.last_llm_text:
             self._append_llm_text_log(ts_key, self.last_llm_text)
-        self._add_log("analysis", f"AI Analysis ready for {ts_key[-8:]} ({source})")
+        self._add_log(
+            "analysis",
+            f"AI Analysis ready for {ts_key[-8:]} ({source})",
+            phase="sem",
+            event="embedding_ready",
+            meta={"ts": ts_key, "source": source, "dim": int(vec.size)},
+        )
         self._save_llm_semantic_cache(reason=source)
-        print(f" LLM semantic ready ({source}) | ts={ts_key} | dim={vec.size}")
+        print(f"\n [SEM] ready ({source}) ts={ts_key} dim={vec.size}")
 
     def _request_llm_semantic_from_server(self, ts_key: str):
         if not self.vision_llm_api_url:
@@ -633,6 +725,39 @@ class LiveTradingBot:
         cls_vec = np.asarray(cls_raw, dtype=np.float32).reshape(-1)
         return llm_text, cls_vec
 
+    def _request_llm_semantic_from_server_with_heartbeat(self, ts_key: str):
+        result = {}
+        error = {}
+        done = threading.Event()
+
+        def _worker():
+            try:
+                llm_text, cls_vec = self._request_llm_semantic_from_server(ts_key)
+                result["llm_text"] = llm_text
+                result["cls_vec"] = cls_vec
+            except Exception as exc:
+                error["exc"] = exc
+            finally:
+                done.set()
+
+        worker = threading.Thread(
+            target=_worker,
+            daemon=True,
+            name=f"llm-http-{ts_key[-8:].replace(':', '')}",
+        )
+        worker.start()
+
+        beat_sec = max(0.5, min(float(POLL_SECONDS), 2.0))
+        while not done.wait(timeout=beat_sec):
+            self.last_action = "HOLD"
+            self._sync_bridge_from_mt5()
+            self._push_state_to_server(action_name="HOLD")
+            self._print_status_line(current_bar_time=self.last_bar_time)
+
+        if "exc" in error:
+            raise error["exc"]
+        return result["llm_text"], result["cls_vec"]
+
     def _resolve_live_llm_semantic(self, ts_key: str):
         if self.semantic_runtime is None:
             return
@@ -643,6 +768,13 @@ class LiveTradingBot:
         cached_vec = self.llm_semantic_cache.get(ts_key)
         if cached_vec is not None:
             self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(cached_vec, dtype=np.float32)
+            self._add_log(
+                "analysis",
+                f"Semantic cache hit for {ts_key}",
+                phase="sem",
+                event="cache_hit",
+                meta={"ts": ts_key, "source": "disk_cache"},
+            )
             return
 
         # 2. Check WebSocket push cache
@@ -655,14 +787,35 @@ class LiveTradingBot:
                 return
             except Exception as exc:
                 print(f" WS CLS invalid for {ts_key}: {exc}")
+                self._add_log(
+                    "warning",
+                    f"WS semantic payload invalid for {ts_key}",
+                    phase="sem",
+                    event="ws_payload_invalid",
+                    meta={"ts": ts_key, "error": str(exc)},
+                )
 
         # 3. Fallback: request from server HTTP endpoint
-        print(f" LLM semantic: requesting from server for {ts_key}")
+        print(f"\n [SEM] requesting server ts={ts_key}")
+        self._add_log(
+            "analysis",
+            f"Requesting semantic from server for {ts_key}",
+            phase="sem",
+            event="server_request",
+            meta={"ts": ts_key, "source": "server_post"},
+        )
         try:
-            llm_text, cls_vec = self._request_llm_semantic_from_server(ts_key)
+            llm_text, cls_vec = self._request_llm_semantic_from_server_with_heartbeat(ts_key)
             self._save_llm_semantic_entry(ts_key, cls_vec, llm_text, source="server_post")
         except Exception as exc:
-            print(f" LLM semantic failed for {ts_key}: {exc} | fallback=blocked_real_only")
+            print(f"\n [SEM] request failed ts={ts_key}: {exc} | fallback=blocked_real_only")
+            self._add_log(
+                "warning",
+                f"Semantic request failed for {ts_key}",
+                phase="sem",
+                event="server_request_failed",
+                meta={"ts": ts_key, "error": str(exc)},
+            )
 
     def _ensure_window_real_semantic(self, window_df: pd.DataFrame):
         if self.semantic_runtime is None:
@@ -671,14 +824,28 @@ class LiveTradingBot:
         ts_keys = pd.to_datetime(window_df["time"]).dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
         missing = [ts for ts in ts_keys if ts not in self.semantic_runtime.global_time_to_vec]
         if missing:
-            print(f" LLM semantic: resolving missing window embeddings={len(missing)}")
+            print(f"\n [SEM] resolving missing window embeddings={len(missing)}")
+            self._add_log(
+                "analysis",
+                f"Resolving missing window embeddings={len(missing)}",
+                phase="sem",
+                event="window_missing_embeddings",
+                meta={"missing_count": int(len(missing)), "oldest": missing[0], "newest": missing[-1]},
+            )
         for ts_key in missing:
             self._resolve_live_llm_semantic(ts_key)
         unresolved = [ts for ts in ts_keys if ts not in self.semantic_runtime.global_time_to_vec]
         if unresolved:
             print(
-                " LLM semantic pending: unresolved real embeddings="
+                "\n [SEM] pending unresolved real embeddings="
                 f"{len(unresolved)} | oldest={unresolved[0]} newest={unresolved[-1]}"
+            )
+            self._add_log(
+                "warning",
+                f"Pending unresolved real embeddings={len(unresolved)}",
+                phase="sem",
+                event="window_unresolved_embeddings",
+                meta={"missing_count": int(len(unresolved)), "oldest": unresolved[0], "newest": unresolved[-1]},
             )
             return False
         return True
@@ -690,7 +857,14 @@ class LiveTradingBot:
             ready = self._ensure_window_real_semantic(window_df)
             if ready:
                 if attempt > 1:
-                    print(f" LLM semantic ready after retry={attempt}")
+                    print(f"\n [SEM] ready after retry={attempt}")
+                    self._add_log(
+                        "success",
+                        f"Semantic window ready after retry={attempt}",
+                        phase="sem",
+                        event="window_ready_after_retry",
+                        meta={"attempt": int(attempt)},
+                    )
                 return True
 
             wait_sec = max(0.5, min(float(POLL_SECONDS), 5.0))
@@ -699,6 +873,9 @@ class LiveTradingBot:
             self._add_log(
                 "warning",
                 "Waiting for real LLM semantic (retrying; no synthetic fallback)",
+                phase="sem",
+                event="waiting_real_embedding",
+                meta={"attempt": int(attempt), "wait_sec": float(wait_sec)},
             )
             self._push_state_to_server(action_name="HOLD")
             time.sleep(wait_sec)
@@ -821,13 +998,6 @@ class LiveTradingBot:
             self._apply_runtime_config(runtime_cfg, source="state")
 
         self.state_loaded = True
-        print(
-            " Runtime state restored | "
-            f"cooldown={self.bridge.trade_cooldown} "
-            f"def_mode={self.bridge.defensive_mode_bars} "
-            f"loss_streak={self.bridge.loss_streak} "
-            f"hold_steps={self.bridge.hold_steps}"
-        )
 
     def _get_filling_mode(self):
         symbol_info = mt5.symbol_info(SYMBOL)
@@ -841,16 +1011,57 @@ class LiveTradingBot:
             return mt5.ORDER_FILLING_IOC
         return mt5.ORDER_FILLING_RETURNAL
 
+    def _get_symbol_positions_safe(self):
+        retries = 2
+        for attempt in range(retries + 1):
+            positions = mt5.positions_get(symbol=SYMBOL)
+            if positions is None:
+                if attempt < retries:
+                    time.sleep(0.05)
+                continue
+            if len(positions) == 0 and self.last_known_ticket != 0 and attempt < retries:
+                time.sleep(0.05)
+                continue
+            return list(positions)
+        try:
+            all_positions = mt5.positions_get()
+            if all_positions:
+                filtered = [
+                    p
+                    for p in all_positions
+                    if str(getattr(p, "symbol", "")).upper() == SYMBOL.upper()
+                ]
+                return list(filtered)
+        except Exception:
+            pass
+        return []
+
     def _get_mt5_position(self):
-        positions = mt5.positions_get(symbol=SYMBOL)
-        if positions is None or len(positions) == 0:
+        positions = self._get_symbol_positions_safe()
+        if not positions:
             return 0, None
-        pos = positions[0]
+        pos = max(positions, key=lambda p: int(getattr(p, "time", 0) or 0))
         if pos.type == mt5.ORDER_TYPE_BUY:
             return 1, pos
         if pos.type == mt5.ORDER_TYPE_SELL:
             return -1, pos
         return 0, pos
+
+    def _broker_exposure_summary(self):
+        pos_count = 0
+        order_count = 0
+        try:
+            pos_count = int(len(self._get_symbol_positions_safe()))
+        except Exception:
+            pos_count = 0
+        try:
+            orders = mt5.orders_get(symbol=SYMBOL)
+            if orders is not None:
+                order_count = int(len(orders))
+        except Exception:
+            order_count = 0
+        has_exposure = pos_count > 0 or order_count > 0
+        return has_exposure, pos_count, order_count
 
     def _sync_bridge_from_mt5(self):
         if self.bridge is None:
@@ -939,13 +1150,44 @@ class LiveTradingBot:
             df = df.tail(BAR_HISTORY).reset_index(drop=True)
         return df
 
-    def _calc_delta_for_closed_bar(self, current_bar_ts: int):
-        end_dt = datetime.fromtimestamp(current_bar_ts, tz=timezone.utc)
-        start_dt = end_dt - timedelta(seconds=self.timeframe_seconds)
+    def _calc_delta_between(self, start_dt: datetime, end_dt: datetime):
+        if end_dt <= start_dt:
+            return 0, 0.0, "range_empty"
         ticks = mt5.copy_ticks_range(SYMBOL, start_dt, end_dt, mt5.COPY_TICKS_ALL)
 
-        if ticks is None or len(ticks) <= 1:
-            return 0, 0.0
+        def _fallback_from_m1():
+            tf_m1 = getattr(mt5, "TIMEFRAME_M1", None)
+            if tf_m1 is None:
+                return None
+            try:
+                rates_m1 = mt5.copy_rates_range(SYMBOL, tf_m1, start_dt, end_dt)
+            except Exception:
+                rates_m1 = None
+            if rates_m1 is None:
+                return None
+            mdf = pd.DataFrame(rates_m1)
+            if len(mdf) < 2 or "close" not in mdf.columns:
+                return None
+            close_diff = mdf["close"].astype(float).diff().fillna(0.0)
+            buy = int((close_diff > 0).sum())
+            sell = int((close_diff < 0).sum())
+            delta_tick_m1 = int(buy - sell)
+            price_move = float(mdf["close"].iloc[-1] - mdf["close"].iloc[0])
+            delta_price_m1 = float(price_move * 2.0)
+            return delta_tick_m1, delta_price_m1, f"m1_fallback(n={len(mdf)})"
+
+        if ticks is None:
+            fallback = _fallback_from_m1()
+            if fallback is not None:
+                return fallback
+            return 0, 0.0, "ticks_unavailable"
+
+        tick_count = len(ticks)
+        if tick_count <= 1:
+            fallback = _fallback_from_m1()
+            if fallback is not None:
+                return fallback
+            return 0, 0.0, f"ticks_insufficient(n={tick_count})"
 
         tdf = pd.DataFrame(ticks)
         tdf["prev_bid"] = tdf["bid"].shift(1)
@@ -960,7 +1202,24 @@ class LiveTradingBot:
 
         delta_tick = int(buy.sum() - sell.sum())
         delta_price = float((tdf["bid"].iloc[-1] - tdf["bid"].iloc[0]) + (tdf["ask"].iloc[-1] - tdf["ask"].iloc[0]))
-        return delta_tick, delta_price
+        return delta_tick, delta_price, f"ticks(n={tick_count})"
+
+    def _calc_delta_for_closed_bar(self, current_bar_ts: int):
+        end_dt = datetime.fromtimestamp(current_bar_ts, tz=timezone.utc)
+        start_dt = end_dt - timedelta(seconds=self.timeframe_seconds)
+        return self._calc_delta_between(start_dt, end_dt)
+
+    def _calc_realtime_delta_for_open_bar(self, tick_time_ts: int, current_bar_ts: int | None = None):
+        bar_open_ts = int(current_bar_ts or 0)
+        if bar_open_ts <= 0:
+            bar_open_ts = self._current_bar_time()
+        if bar_open_ts <= 0:
+            return 0, 0.0, "bar_unavailable"
+
+        end_ts = int(max(bar_open_ts + 1, tick_time_ts))
+        start_dt = datetime.fromtimestamp(bar_open_ts, tz=timezone.utc)
+        end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+        return self._calc_delta_between(start_dt, end_dt)
 
     def _current_bar_time(self) -> int:
         latest = mt5.copy_rates_from_pos(SYMBOL, self.timeframe, 0, 1)
@@ -1017,17 +1276,36 @@ class LiveTradingBot:
             skipped = len(missed_bar_ends) - MAX_CATCHUP_BARS
             missed_bar_ends = missed_bar_ends[-MAX_CATCHUP_BARS:]
 
+        prev_utc = datetime.fromtimestamp(self.last_bar_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        curr_utc = datetime.fromtimestamp(current_bar_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
         print(
-            " Catch-up replay | "
+            " [FLOW] catch-up replay | "
+            f"prev_end={prev_utc} current_end={curr_utc} "
             f"bars={len(missed_bar_ends)} skipped={skipped} "
             f"execute_stale={int(EXECUTE_STALE_REPLAY_ORDERS)}"
+        )
+        self._add_log(
+            "info",
+            "Catch-up replay",
+            phase="flow",
+            event="catchup_replay",
+            meta={
+                "prev_end": prev_utc,
+                "current_end": curr_utc,
+                "bars": int(len(missed_bar_ends)),
+                "skipped": int(skipped),
+                "execute_stale": bool(EXECUTE_STALE_REPLAY_ORDERS),
+            },
         )
 
         total = len(missed_bar_ends)
         for idx, bar_end_ts in enumerate(missed_bar_ends, start=1):
             is_latest = idx == total
             execute_orders = is_latest or EXECUTE_STALE_REPLAY_ORDERS
-            mode = f"Catch-up {idx}/{total}"
+            if total == 1 and is_latest and execute_orders:
+                mode = "New Candle"
+            else:
+                mode = f"Catch-up {idx}/{total}"
             self.last_bar_time = int(bar_end_ts)
             self._process_closed_bar(
                 bar_end_ts=int(bar_end_ts),
@@ -1038,10 +1316,20 @@ class LiveTradingBot:
     def close_all(self):
         positions = mt5.positions_get(symbol=SYMBOL)
         if positions is None:
-            self._add_log("warning", "Close skipped: positions_get returned None")
+            self._add_log(
+                "warning",
+                "Close skipped: positions_get returned None",
+                phase="order",
+                event="close_skipped",
+            )
             return False
         if len(positions) == 0:
-            self._add_log("info", "Close requested: no open positions")
+            self._add_log(
+                "info",
+                "Close requested: no open positions",
+                phase="order",
+                event="close_no_positions",
+            )
             return True
 
         all_ok = True
@@ -1049,7 +1337,13 @@ class LiveTradingBot:
             tick = self._get_trade_tick()
             if tick is None:
                 print(" Close Skipped: no live tick")
-                self._add_log("warning", f"Close skipped: no live tick for ticket {pos.ticket}")
+                self._add_log(
+                    "warning",
+                    f"Close skipped: no live tick for ticket {pos.ticket}",
+                    phase="order",
+                    event="close_skipped_no_tick",
+                    meta={"ticket": int(pos.ticket)},
+                )
                 all_ok = False
                 continue
 
@@ -1069,11 +1363,23 @@ class LiveTradingBot:
             res = mt5.order_send(req)
             if res and res.retcode == mt5.TRADE_RETCODE_DONE:
                 print(f" Closed Position | ticket={pos.ticket} | PnL={pos.profit:+.2f}")
-                self._add_log("action", f"Closed position #{pos.ticket} | PnL {pos.profit:+.2f}")
+                self._add_log(
+                    "action",
+                    f"Closed position #{pos.ticket} | PnL {pos.profit:+.2f}",
+                    phase="order",
+                    event="close_done",
+                    meta={"ticket": int(pos.ticket), "pnl": float(pos.profit)},
+                )
             else:
                 comment = res.comment if res else "No response"
                 print(f" Close Failed | ticket={pos.ticket} | {comment}")
-                self._add_log("warning", f"Close failed #{pos.ticket}: {comment}")
+                self._add_log(
+                    "warning",
+                    f"Close failed #{pos.ticket}: {comment}",
+                    phase="order",
+                    event="close_failed",
+                    meta={"ticket": int(pos.ticket), "reason": str(comment)},
+                )
                 all_ok = False
         return all_ok
 
@@ -1136,12 +1442,24 @@ class LiveTradingBot:
                 f" Opened {side} @ {price:.{self.digits}f} | "
                 f"Lot={self.current_lot}"
             )
-            self._add_log("action", f"Opened {side} @ {price:.{self.digits}f} | lot={self.current_lot:.2f}")
+            self._add_log(
+                "action",
+                f"Opened {side} @ {price:.{self.digits}f} | lot={self.current_lot:.2f}",
+                phase="order",
+                event="open_done",
+                meta={"side": side, "price": float(price), "lot": float(self.current_lot)},
+            )
             return True
         else:
             comment = res.comment if res else "No response"
             print(f" Order Failed: {comment}")
-            self._add_log("warning", f"Order failed: {comment}")
+            self._add_log(
+                "warning",
+                f"Order failed: {comment}",
+                phase="order",
+                event="open_failed",
+                meta={"reason": str(comment)},
+            )
             return False
 
     def execute_action(self, action):
@@ -1208,6 +1526,14 @@ class LiveTradingBot:
         self._add_log(
             "warning",
             f"Broker reconcile mismatch | action={action} expected={expected_after} actual={broker_pos_after}",
+            phase="order",
+            event="broker_reconcile_mismatch",
+            meta={
+                "action": int(action),
+                "expected_pos": int(expected_after),
+                "actual_pos": int(broker_pos_after),
+                "order_ok": bool(order_ok),
+            },
         )
 
         # Prevent virtual bridge cooldown from blocking entries when order failed.
@@ -1224,7 +1550,7 @@ class LiveTradingBot:
         if action in (1, 2) and broker_pos_before == 0 and broker_pos_after == 0:
             self.bridge.total_fees = max(0.0, float(self.bridge.total_fees) - float(self.bridge.spread_cost))
 
-    def _print_status_line(self):
+    def _print_status_line(self, current_bar_time: int | None = None):
         tick = mt5.symbol_info_tick(SYMBOL)
         if tick is None:
             return
@@ -1233,57 +1559,195 @@ class LiveTradingBot:
         pos_txt = {1: "LONG", -1: "SHORT", 0: "FLAT"}[current_pos]
         pnl_txt = f"{pos.profit:+.2f}" if pos is not None else "0.00"
         server_time_utc = datetime.fromtimestamp(tick.time, tz=timezone.utc).strftime("%H:%M:%SZ")
-
-        line = (
-            f"\r Pr:{tick.bid:.{self.digits}f} | Pos:{pos_txt:5s} | PnL:{pnl_txt:>8s} | "
-            f"Eq:{self.bridge.equity:8.2f} | T_UTC:{server_time_utc}      "
+        rt_delta_tick, rt_delta_price, _ = self._calc_realtime_delta_for_open_bar(
+            tick_time_ts=int(getattr(tick, "time", 0) or 0),
+            current_bar_ts=current_bar_time,
         )
-        sys.stdout.write(line)
+
+        # Keep the status line compact to avoid terminal wrap.
+        line = (
+            f"Pr:{tick.bid:.{self.digits}f} | Pos:{pos_txt} | PnL:{pnl_txt} | "
+            f"Eq:{self.bridge.equity:.2f} | dT:{rt_delta_tick:d} | dP:{rt_delta_price:.5f} | "
+            f"{server_time_utc}"
+        )
+        width = max(40, int(shutil.get_terminal_size(fallback=(120, 20)).columns) - 1)
+        if len(line) > width:
+            line = line[:width]
+        # Clear whole current line before writing next snapshot.
+        sys.stdout.write("\r\033[2K" + line)
         sys.stdout.flush()
 
-    def _process_closed_bar(self, bar_end_ts: int, mode: str = "New Candle", execute_orders: bool = True):
+    def _phase_icon(self, mode: str) -> str:
+        text = str(mode or "").strip().lower()
+        if "startup" in text:
+            return "🚀"
+        if "new candle" in text:
+            return "🕐"
+        if "catch-up" in text:
+            return "⏩"
+        return "📊"
+
+    def _process_closed_bar(
+        self,
+        bar_end_ts: int,
+        mode: str = "New Candle",
+        execute_orders: bool = True,
+        persist_state: bool = True,
+    ):
         bar_end_utc = datetime.fromtimestamp(bar_end_ts, tz=timezone.utc)
         bar_open_utc = bar_end_utc - timedelta(seconds=self.timeframe_seconds)
+        icon = self._phase_icon(mode)
         print(
-            f"\n {mode}: processing closed bar -> "
-            f"open={bar_open_utc.strftime('%Y-%m-%d %H:%M:%SZ')} "
+            f"\n {icon} {'=' * 18} [BAR] {mode} {'=' * 18}\n"
+            f" {icon} [BAR] open={bar_open_utc.strftime('%Y-%m-%d %H:%M:%SZ')} "
             f"end={bar_end_utc.strftime('%Y-%m-%d %H:%M:%SZ')}"
+        )
+        self._add_log(
+            "info",
+            f"{mode}: processing closed bar",
+            phase="bar",
+            event="bar_start",
+            meta={
+                "mode": mode,
+                "open_utc": bar_open_utc.strftime("%Y-%m-%d %H:%M:%SZ"),
+                "end_utc": bar_end_utc.strftime("%Y-%m-%d %H:%M:%SZ"),
+            },
         )
 
         window_df = self._fetch_window(bar_end_ts)
         if window_df is None:
             print(" Not enough bars yet for model window")
+            self._add_log(
+                "warning",
+                "Not enough bars yet for model window",
+                phase="bar",
+                event="window_not_ready",
+                meta={"required": int(BAR_HISTORY)},
+            )
             return
 
         self._wait_until_real_semantic_ready(window_df)
 
-        delta_tick, delta_price = self._calc_delta_for_closed_bar(bar_end_ts)
+        delta_tick, delta_price, delta_note = self._calc_delta_for_closed_bar(bar_end_ts)
         self.bridge.gate_stats = self.gate_provider.update(window_df)
 
         self._sync_bridge_from_mt5()
         action, model_price = self.bridge.process_bar(window_df, delta_tick, delta_price)
         action = int(action)
+        decision = dict(getattr(self.bridge, "last_decision", {}) or {})
 
         action_name = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}.get(action, "?")
+        raw_action = int(decision.get("raw_action", action))
+        raw_action_name = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}.get(raw_action, "?")
         self.last_action = action_name
         print(
-            f" Model Action: {action_name} | Price={model_price:.5f} | "
-            f"dTick={delta_tick} | dPrice={delta_price:.5f}"
+            f" [MODEL] action={action_name} raw={raw_action_name} | price={model_price:.5f} | "
+            f"dTick={delta_tick} | dPrice={delta_price:.5f} | {delta_note}"
         )
+        probs = decision.get("probs")
+        if isinstance(probs, list) and len(probs) >= 4:
+            print(
+                " [MODEL] probs: "
+                f"HOLD={float(probs[0]):.3f} BUY={float(probs[1]):.3f} "
+                f"SELL={float(probs[2]):.3f} CLOSE={float(probs[3]):.3f}"
+            )
+        gate_reasons = [str(x) for x in decision.get("gate_reasons", []) if str(x).strip()]
+        if action == 0 and raw_action != 0 and gate_reasons:
+            print(f" [GATE] blocked -> HOLD | reasons: {', '.join(gate_reasons)}")
         self._add_log(
             "analysis",
-            f"{mode} | action={action_name} | price={model_price:.5f} | dTick={delta_tick}",
+            f"{mode} | action={action_name} raw={raw_action_name} | price={model_price:.5f} | dTick={delta_tick}",
+            phase="model",
+            event="bar_inference",
+            meta={
+                "mode": mode,
+                "final_action": action_name,
+                "raw_action": raw_action_name,
+                "price": float(model_price),
+                "delta_tick": int(delta_tick),
+                "delta_price": float(delta_price),
+                "delta_note": delta_note,
+            },
         )
+        if isinstance(probs, list) and len(probs) >= 4:
+            self._add_log(
+                "analysis",
+                "Model probabilities",
+                phase="model",
+                event="probabilities",
+                meta={
+                    "hold": float(probs[0]),
+                    "buy": float(probs[1]),
+                    "sell": float(probs[2]),
+                    "close": float(probs[3]),
+                },
+            )
+        if action == 0 and raw_action != 0 and gate_reasons:
+            self._add_log(
+                "warning",
+                "Gate blocked signal -> HOLD",
+                phase="gate",
+                event="blocked",
+                meta={"raw_action": raw_action_name, "reasons": " | ".join(gate_reasons)},
+            )
 
+        schedule_blocked = False
         if execute_orders and not self._is_trading_day_enabled(bar_end_ts):
             if action in (1, 2):
                 self._add_log(
                     "warning",
                     f"Schedule blocked new order ({action_name}) on disabled trading day",
+                    phase="schedule",
+                    event="blocked",
+                    meta={"action": action_name, "bar_end_ts": int(bar_end_ts)},
                 )
                 action = 0
                 action_name = "HOLD"
+                schedule_blocked = True
         self.last_action = action_name
+
+        decision_status = "pass"
+        if raw_action == 0 and action == 0:
+            decision_status = "model_hold"
+        elif raw_action != 0 and action == 0:
+            if schedule_blocked:
+                decision_status = "schedule_blocked"
+            elif gate_reasons:
+                decision_status = "gate_blocked"
+            else:
+                decision_status = "suppressed"
+        elif raw_action != action:
+            decision_status = "adjusted"
+
+        reason_parts = []
+        if gate_reasons:
+            reason_parts.append("gate:" + ", ".join(gate_reasons))
+        if schedule_blocked:
+            reason_parts.append("schedule")
+        if not reason_parts:
+            reason_parts.append("-")
+        sem_q = float(decision.get("semantic_quality", 0.0))
+        cooldown_after = int(decision.get("cooldown_after", 0))
+        print(
+            " [DECISION] "
+            f"raw={raw_action_name} final={action_name} "
+            f"status={decision_status} sem_q={sem_q:.2f} "
+            f"cooldown={cooldown_after} reasons={' | '.join(reason_parts)}"
+        )
+        self._add_log(
+            "analysis",
+            f"Decision {decision_status}: raw={raw_action_name} final={action_name}",
+            phase="decision",
+            event="summary",
+            meta={
+                "status": decision_status,
+                "raw_action": raw_action_name,
+                "final_action": action_name,
+                "semantic_quality": float(sem_q),
+                "cooldown_after": int(cooldown_after),
+                "reasons": " | ".join(reason_parts),
+            },
+        )
 
         broker_pos_before, _ = self._get_mt5_position()
         order_ok = True
@@ -1291,7 +1755,13 @@ class LiveTradingBot:
             order_ok = bool(self.execute_action(action))
         elif action != 0:
             print(" No-order mode: action skipped")
-            self._add_log("info", f"{mode}: action {action_name} skipped in no-order mode")
+            self._add_log(
+                "info",
+                f"{mode}: action {action_name} skipped in no-order mode",
+                phase="order",
+                event="skipped_no_order_mode",
+                meta={"mode": mode, "action": action_name},
+            )
         self._sync_bridge_from_mt5()
         broker_pos_after, _ = self._get_mt5_position()
         self._reconcile_broker_execution(
@@ -1301,25 +1771,66 @@ class LiveTradingBot:
             broker_pos_before=int(broker_pos_before),
             broker_pos_after=int(broker_pos_after),
         )
-        self._save_runtime_state(reason="bar_close")
+        if persist_state:
+            self._save_runtime_state(reason="bar_close")
+        summary_type = "info"
+        if action_name in ("BUY", "SELL", "CLOSE"):
+            summary_type = "action" if (not execute_orders or order_ok) else "warning"
+        summary_suffix = f" ({decision_status})" if decision_status else ""
+        if not execute_orders and action_name != "HOLD":
+            summary_suffix = f"{summary_suffix} (no-order-mode)" if summary_suffix else " (no-order-mode)"
+        self._add_log(
+            summary_type,
+            f"Bar evaluation completed: {action_name}{summary_suffix}",
+            phase="bar",
+            event="bar_complete",
+            meta={
+                "mode": mode,
+                "raw_action": raw_action_name,
+                "final_action": action_name,
+                "status": decision_status,
+                "execute_orders": bool(execute_orders),
+                "order_ok": bool(order_ok),
+            },
+        )
         self._push_state_to_server(action_name=action_name)
 
     def run(self):
+        print("\n 🚀 [BOOT] run_live starting...")
+        self._add_log("info", "run_live starting", phase="boot", event="start")
         self.connect()
         self._load_model()
         self._load_runtime_state()
         self._sync_bridge_from_mt5()
         if self.bridge is not None:
             print(
-                " Runtime synced from MT5: "
-                f"balance={self.bridge.balance:.2f} "
-                f"equity={self.bridge.equity:.2f} "
-                f"lot={self.bridge.lot_size:.2f}"
+                " [READY] "
+                f"balance={self.bridge.balance:.2f} equity={self.bridge.equity:.2f} "
+                f"lot={self.bridge.lot_size:.2f} last_bar_time={self.last_bar_time}"
+            )
+            self._add_log(
+                "success",
+                "Live runtime ready",
+                phase="boot",
+                event="ready",
+                meta={
+                    "balance": float(self.bridge.balance),
+                    "equity": float(self.bridge.equity),
+                    "lot": float(self.bridge.lot_size),
+                    "last_bar_time": int(self.last_bar_time),
+                },
             )
         self._start_ws_listener()
         startup_eval_pending = bool(EVAL_ON_START)
 
-        print(f" Waiting for new {TIMEFRAME_NAME} candles...")
+        print(f" 🕐 [CLOCK] Waiting for new {TIMEFRAME_NAME} candles...")
+        self._add_log(
+            "info",
+            f"Waiting for new {TIMEFRAME_NAME} candles",
+            phase="clock",
+            event="waiting_new_candle",
+            meta={"timeframe": TIMEFRAME_NAME},
+        )
 
         try:
             while True:
@@ -1331,20 +1842,66 @@ class LiveTradingBot:
                 if startup_eval_pending:
                     startup_eval_pending = False
                     if self.last_bar_time == 0:
+                        print("\n 🚀 [STARTUP] no last_bar_time in state -> process latest closed bar with live orders")
+                        self._add_log(
+                            "info",
+                            "Startup: no last_bar_time -> execute latest closed bar",
+                            phase="startup",
+                            event="no_state_bar",
+                            meta={"execute_orders": True},
+                        )
                         self.last_bar_time = current_bar_time
                         self._process_closed_bar(current_bar_time, mode="Startup", execute_orders=True)
                         self._sync_bridge_from_mt5()
                         self._push_state_to_server()
-                        self._print_status_line()
+                        self._print_status_line(current_bar_time=current_bar_time)
                         time.sleep(POLL_SECONDS)
                         continue
 
                     if self.last_bar_time == current_bar_time:
-                        print("\n Startup eval: current bar already processed; running no-order refresh")
-                        self._process_closed_bar(current_bar_time, mode="Startup", execute_orders=False)
+                        has_exposure, pos_count, order_count = self._broker_exposure_summary()
+                        if has_exposure:
+                            print(
+                                "\n 🚀 [STARTUP] current bar already processed; "
+                                f"broker exposure detected (positions={pos_count}, orders={order_count}) "
+                                "-> snapshot no-order"
+                            )
+                            self._add_log(
+                                "info",
+                                "Startup snapshot: broker exposure detected",
+                                phase="startup",
+                                event="snapshot_no_order",
+                                meta={"positions": int(pos_count), "orders": int(order_count)},
+                            )
+                            self._process_closed_bar(
+                                current_bar_time,
+                                mode="Startup Snapshot",
+                                execute_orders=False,
+                                persist_state=False,
+                            )
+                            # Restore persisted runtime state so startup snapshot does not drift counters/state.
+                            self._load_runtime_state()
+                        else:
+                            print(
+                                "\n 🚀 [STARTUP] current bar already processed; "
+                                "no open exposure -> execute startup action now"
+                            )
+                            self._add_log(
+                                "info",
+                                "Startup immediate: no exposure -> execute action",
+                                phase="startup",
+                                event="startup_immediate",
+                                meta={"execute_orders": True},
+                            )
+                            self._process_closed_bar(
+                                current_bar_time,
+                                mode="Startup Immediate",
+                                execute_orders=True,
+                                persist_state=True,
+                            )
                         self._sync_bridge_from_mt5()
                         self._push_state_to_server()
-                        self._print_status_line()
+                        self._print_status_line(current_bar_time=current_bar_time)
                         time.sleep(POLL_SECONDS)
                         continue
 
@@ -1354,11 +1911,20 @@ class LiveTradingBot:
                     self.last_bar_time = current_bar_time
                     self._sync_bridge_from_mt5()
                     self._push_state_to_server()
-                    self._print_status_line()
+                    self._print_status_line(current_bar_time=current_bar_time)
                     time.sleep(POLL_SECONDS)
                     continue
 
                 if current_bar_time != self.last_bar_time:
+                    closed_utc = datetime.fromtimestamp(current_bar_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+                    print(f"\n 🕐 [CLOCK] New closed candle detected at {closed_utc}")
+                    self._add_log(
+                        "info",
+                        "New closed candle detected",
+                        phase="clock",
+                        event="new_closed_candle",
+                        meta={"closed_utc": closed_utc},
+                    )
                     self._replay_missed_bars_if_any(current_bar_time)
                     if self.last_bar_time != current_bar_time:
                         self.last_bar_time = current_bar_time
@@ -1366,7 +1932,7 @@ class LiveTradingBot:
 
                 self._sync_bridge_from_mt5()
                 self._push_state_to_server()
-                self._print_status_line()
+                self._print_status_line(current_bar_time=current_bar_time)
                 time.sleep(POLL_SECONDS)
 
         except KeyboardInterrupt:
