@@ -91,9 +91,12 @@ class LiveTradingBot:
         self.llm_semantic_cache = {}
         self._ws_cache = {}       # ts_key -> {llm_text, cls_vec} from WebSocket
         self._ws_connected = False
+        self._ws_send_lock = threading.Lock()
+        self._sem_retry_not_before = {}  # ts_key -> epoch seconds
         self.last_action = "HOLD"
         self.vision_llm_api_url = str(VISION_LLM_API_URL or "").strip()
-        self.vision_llm_timeout_sec = max(3.0, float(VISION_LLM_TIMEOUT_SEC or 3.0))
+        # Live real-only semantic can take long on model warmup; avoid false timeout loops.
+        self.vision_llm_timeout_sec = max(180.0, float(VISION_LLM_TIMEOUT_SEC or 180.0))
         self.risk_profile_map = dict(RISK_PROFILE_MAP or {"low": 0.5, "medium": 1.0, "high": 1.5})
         self.risk_level = str(RISK_LEVEL or "medium").lower()
         self.risk_percent = float(RISK_PERCENT)
@@ -275,9 +278,17 @@ class LiveTradingBot:
 
         self._load_llm_semantic_cache()
         llm_cache_rows = 0
+        # Strict real-only semantic for live:
+        # do not keep any non-LLM preloaded map in runtime.
+        self.semantic_runtime.global_time_to_vec = {}
+        self.semantic_runtime.cache = {}
+        self.semantic_runtime.quality_cache = {}
         if self.llm_semantic_cache:
-            self.semantic_runtime.global_time_to_vec.update(self.llm_semantic_cache)
-            llm_cache_rows = int(len(self.llm_semantic_cache))
+            self.semantic_runtime.global_time_to_vec = {
+                key: np.asarray(vec, dtype=np.float32)
+                for key, vec in self.llm_semantic_cache.items()
+            }
+            llm_cache_rows = int(len(self.semantic_runtime.global_time_to_vec))
 
         print(
             " [MODEL] "
@@ -315,15 +326,17 @@ class LiveTradingBot:
                     print(f"\n [WS] connecting to {BOT_WS_URL}")
                     with ws_sync.connect(BOT_WS_URL) as ws:
                         self._ws = ws
-                        self._ws_connected = True
+                        self._ws_connected = False
                         self._add_log("info", "WS connected", phase="ws", event="connected", meta={"url": BOT_WS_URL})
                         # Register
-                        ws.send(json.dumps({
-                            "type": "register",
-                            "bot_config_id": BOT_CONFIG_ID,
-                            "symbol": SYMBOL.upper(),
-                            "timeframe": TIMEFRAME_NAME.upper(),
-                        }))
+                        with self._ws_send_lock:
+                            ws.send(json.dumps({
+                                "type": "register",
+                                "bot_config_id": BOT_CONFIG_ID,
+                                "symbol": SYMBOL.upper(),
+                                "timeframe": TIMEFRAME_NAME.upper(),
+                            }))
+                        self._ws_connected = True
                         print(f"\n [WS] registered: {BOT_CONFIG_ID} {SYMBOL}/{TIMEFRAME_NAME}")
                         self._add_log(
                             "success",
@@ -536,6 +549,20 @@ class LiveTradingBot:
                     "server": str(account.server),
                     "login": int(account.login),
                 }
+            elif self.bridge is not None:
+                # Keep dashboard alive even when account_info() is temporarily unavailable.
+                account_data = {
+                    "balance": float(self.bridge.balance),
+                    "equity": float(self.bridge.equity),
+                    "margin": 0.0,
+                    "free_margin": 0.0,
+                    "margin_level": 0.0,
+                    "leverage": 0,
+                    "profit": float(self.bridge.unrealized_pnl),
+                    "currency": "",
+                    "server": "",
+                    "login": 0,
+                }
 
             # ── MT5 Active positions ──
             all_positions = mt5.positions_get()
@@ -593,9 +620,19 @@ class LiveTradingBot:
                 "recent_logs": getattr(self, "recent_logs", []),
                 "ws_connected": True,
             }
-            self._ws.send(json.dumps(state, ensure_ascii=False))
+            payload = json.dumps(state, ensure_ascii=False)
+            with self._ws_send_lock:
+                self._ws.send(payload)
         except Exception as exc:
             print(f" WS state push failed: {exc}")
+            self._ws_connected = False
+            ws_ref = getattr(self, "_ws", None)
+            self._ws = None
+            if ws_ref is not None:
+                try:
+                    ws_ref.close()
+                except Exception:
+                    pass
 
     def _sanitize_log_meta(self, meta):
         if not isinstance(meta, dict):
@@ -667,6 +704,7 @@ class LiveTradingBot:
 
         self.llm_semantic_cache[ts_key] = vec
         self.semantic_runtime.global_time_to_vec[ts_key] = vec
+        self._sem_retry_not_before.pop(ts_key, None)
         self.last_llm_text = str(llm_text or "")
         if self.last_llm_text:
             self._append_llm_text_log(ts_key, self.last_llm_text)
@@ -749,12 +787,45 @@ class LiveTradingBot:
 
         beat_sec = max(0.5, min(float(POLL_SECONDS), 2.0))
         while not done.wait(timeout=beat_sec):
+            ws_data = self._ws_cache.pop(ts_key, None)
+            if ws_data is not None:
+                try:
+                    cls_vec = np.asarray(ws_data.get("cls_vec"), dtype=np.float32).reshape(-1)
+                    llm_text = str(ws_data.get("llm_text", "") or "")
+                    print(f"\n [SEM] ready (ws_wait) ts={ts_key} dim={cls_vec.size}")
+                    self._add_log(
+                        "analysis",
+                        f"Semantic received via WS while waiting ({ts_key})",
+                        phase="sem",
+                        event="ws_hit_while_waiting",
+                        meta={"ts": ts_key},
+                    )
+                    return llm_text, cls_vec
+                except Exception:
+                    pass
+
             self.last_action = "HOLD"
             self._sync_bridge_from_mt5()
             self._push_state_to_server(action_name="HOLD")
             self._print_status_line(current_bar_time=self.last_bar_time)
 
         if "exc" in error:
+            ws_data = self._ws_cache.pop(ts_key, None)
+            if ws_data is not None:
+                try:
+                    cls_vec = np.asarray(ws_data.get("cls_vec"), dtype=np.float32).reshape(-1)
+                    llm_text = str(ws_data.get("llm_text", "") or "")
+                    print(f"\n [SEM] ready (ws_timeout_fallback) ts={ts_key} dim={cls_vec.size}")
+                    self._add_log(
+                        "analysis",
+                        f"Semantic received via WS after HTTP timeout ({ts_key})",
+                        phase="sem",
+                        event="ws_hit_after_timeout",
+                        meta={"ts": ts_key},
+                    )
+                    return llm_text, cls_vec
+                except Exception:
+                    pass
             raise error["exc"]
         return result["llm_text"], result["cls_vec"]
 
@@ -762,6 +833,11 @@ class LiveTradingBot:
         if self.semantic_runtime is None:
             return
         if ts_key in self.semantic_runtime.global_time_to_vec:
+            return
+
+        now_epoch = time.time()
+        retry_not_before = float(self._sem_retry_not_before.get(ts_key, 0.0) or 0.0)
+        if now_epoch < retry_not_before:
             return
 
         # 1. Check local disk cache
@@ -808,6 +884,8 @@ class LiveTradingBot:
             llm_text, cls_vec = self._request_llm_semantic_from_server_with_heartbeat(ts_key)
             self._save_llm_semantic_entry(ts_key, cls_vec, llm_text, source="server_post")
         except Exception as exc:
+            # Avoid hammering the endpoint immediately after a timeout/failure.
+            self._sem_retry_not_before[ts_key] = time.time() + max(2.0, min(float(POLL_SECONDS) * 4.0, 12.0))
             print(f"\n [SEM] request failed ts={ts_key}: {exc} | fallback=blocked_real_only")
             self._add_log(
                 "warning",
@@ -852,6 +930,7 @@ class LiveTradingBot:
 
     def _wait_until_real_semantic_ready(self, window_df: pd.DataFrame):
         attempt = 0
+        total_needed = int(len(window_df))
         while True:
             attempt += 1
             ready = self._ensure_window_real_semantic(window_df)
@@ -865,6 +944,14 @@ class LiveTradingBot:
                         event="window_ready_after_retry",
                         meta={"attempt": int(attempt)},
                     )
+                print(f"\n [SEM] window ready: {total_needed}/{total_needed} real embeddings")
+                self._add_log(
+                    "success",
+                    f"Semantic window ready ({total_needed}/{total_needed})",
+                    phase="sem",
+                    event="window_ready",
+                    meta={"count": int(total_needed), "attempt": int(attempt)},
+                )
                 return True
 
             wait_sec = max(0.5, min(float(POLL_SECONDS), 5.0))
@@ -1153,20 +1240,99 @@ class LiveTradingBot:
     def _calc_delta_between(self, start_dt: datetime, end_dt: datetime):
         if end_dt <= start_dt:
             return 0, 0.0, "range_empty"
-        ticks = mt5.copy_ticks_range(SYMBOL, start_dt, end_dt, mt5.COPY_TICKS_ALL)
+        tick_retries = max(1, int(ORDER_TICK_RETRIES))
+        tick_wait = max(0.0, float(ORDER_TICK_RETRY_SEC))
+        ticks = None
+        tick_source = "ticks"
+
+        for attempt in range(1, tick_retries + 1):
+            try:
+                mt5.symbol_select(SYMBOL, True)
+            except Exception:
+                pass
+            try:
+                ticks = mt5.copy_ticks_range(SYMBOL, start_dt, end_dt, mt5.COPY_TICKS_ALL)
+            except Exception:
+                ticks = None
+
+            if ticks is not None and len(ticks) > 1:
+                break
+
+            # Some bridges can miss the range-end boundary tick; expand by 1 second before giving up.
+            try:
+                ticks_padded = mt5.copy_ticks_range(
+                    SYMBOL,
+                    start_dt,
+                    end_dt + timedelta(seconds=1),
+                    mt5.COPY_TICKS_ALL,
+                )
+            except Exception:
+                ticks_padded = None
+
+            if ticks_padded is not None and len(ticks_padded) > 1:
+                ticks = ticks_padded
+                tick_source = "ticks_edge_padded"
+                break
+
+            if attempt < tick_retries and tick_wait > 0.0:
+                time.sleep(tick_wait)
+
+        def _calc_from_ohlc(open_px: float, close_px: float, note: str):
+            open_px = float(open_px)
+            close_px = float(close_px)
+            if open_px <= 0.0 or close_px <= 0.0:
+                return None
+            move = float(close_px - open_px)
+            if abs(move) <= max(self.point * 0.1, 1e-10):
+                delta_tick_tf = 0
+            else:
+                delta_tick_tf = int(round(move / max(self.point, 1e-10)))
+            delta_price_tf = float(move * 2.0)
+            return delta_tick_tf, delta_price_tf, note
 
         def _fallback_from_m1():
             tf_m1 = getattr(mt5, "TIMEFRAME_M1", None)
             if tf_m1 is None:
                 return None
+
             try:
-                rates_m1 = mt5.copy_rates_range(SYMBOL, tf_m1, start_dt, end_dt)
+                mt5.symbol_select(SYMBOL, True)
+            except Exception:
+                pass
+
+            try:
+                rates_m1 = mt5.copy_rates_range(
+                    SYMBOL,
+                    tf_m1,
+                    start_dt,
+                    end_dt + timedelta(minutes=1),
+                )
             except Exception:
                 rates_m1 = None
+
+            if rates_m1 is None or len(rates_m1) < 2:
+                # Fallback path for bridges where copy_rates_range is intermittently empty.
+                try:
+                    m1_count = max(3, int((end_dt - start_dt).total_seconds() // 60) + 3)
+                    anchor_dt = end_dt - timedelta(seconds=1)
+                    rates_m1 = mt5.copy_rates_from(SYMBOL, tf_m1, anchor_dt, m1_count)
+                except Exception:
+                    rates_m1 = None
+
             if rates_m1 is None:
                 return None
             mdf = pd.DataFrame(rates_m1)
-            if len(mdf) < 2 or "close" not in mdf.columns:
+            if len(mdf) < 2 or "close" not in mdf.columns or "time" not in mdf.columns:
+                return None
+            try:
+                mdf["time"] = pd.to_datetime(mdf["time"], unit="s", utc=True)
+            except Exception:
+                return None
+            start_ts = int(start_dt.timestamp())
+            end_ts = int(end_dt.timestamp())
+            row_ts = (mdf["time"].astype("int64") // 10**9).astype(int)
+            mdf = mdf[(row_ts >= start_ts) & (row_ts < end_ts)].copy()
+            if len(mdf) < 2:
                 return None
             close_diff = mdf["close"].astype(float).diff().fillna(0.0)
             buy = int((close_diff > 0).sum())
@@ -1178,9 +1344,27 @@ class LiveTradingBot:
 
         def _fallback_from_tf_bar():
             try:
-                rates_tf = mt5.copy_rates_range(SYMBOL, self.timeframe, start_dt, end_dt)
+                mt5.symbol_select(SYMBOL, True)
+            except Exception:
+                pass
+
+            try:
+                rates_tf = mt5.copy_rates_range(
+                    SYMBOL,
+                    self.timeframe,
+                    start_dt,
+                    end_dt + timedelta(seconds=1),
+                )
             except Exception:
                 rates_tf = None
+
+            if rates_tf is None or len(rates_tf) == 0:
+                try:
+                    anchor_dt = end_dt - timedelta(seconds=1)
+                    rates_tf = mt5.copy_rates_from(SYMBOL, self.timeframe, anchor_dt, 4)
+                except Exception:
+                    rates_tf = None
+
             if rates_tf is None or len(rates_tf) == 0:
                 return None
             tdf = pd.DataFrame(rates_tf)
@@ -1197,20 +1381,16 @@ class LiveTradingBot:
             row_ts = (tdf["time"].astype("int64") // 10**9).astype(int)
             selected = tdf[row_ts == start_ts]
             if len(selected) == 0:
-                selected = tdf.iloc[[0]]
+                selected = tdf[row_ts < int(end_dt.timestamp())]
+                if len(selected) == 0:
+                    selected = tdf.iloc[[0]]
+                else:
+                    selected = selected.iloc[[-1]]
 
             row = selected.iloc[-1]
             open_px = float(row.get("open", 0.0))
             close_px = float(row.get("close", 0.0))
-            if open_px <= 0.0 or close_px <= 0.0:
-                return None
-            move = float(close_px - open_px)
-            if abs(move) <= max(self.point * 0.1, 1e-10):
-                delta_tick_tf = 0
-            else:
-                delta_tick_tf = int(round(move / max(self.point, 1e-10)))
-            delta_price_tf = float(move * 2.0)
-            return delta_tick_tf, delta_price_tf, f"tf_fallback({TIMEFRAME_NAME},n={len(tdf)})"
+            return _calc_from_ohlc(open_px, close_px, f"tf_fallback({TIMEFRAME_NAME},n={len(tdf)})")
 
         if ticks is None:
             fallback = _fallback_from_m1()
@@ -1219,6 +1399,13 @@ class LiveTradingBot:
             fallback = _fallback_from_tf_bar()
             if fallback is not None:
                 return fallback
+            err = None
+            try:
+                err = mt5.last_error()
+            except Exception:
+                err = None
+            if isinstance(err, tuple) and len(err) >= 2:
+                return 0, 0.0, f"ticks_unavailable(err={err[0]}:{err[1]})"
             return 0, 0.0, "ticks_unavailable"
 
         tick_count = len(ticks)
@@ -1229,6 +1416,13 @@ class LiveTradingBot:
             fallback = _fallback_from_tf_bar()
             if fallback is not None:
                 return fallback
+            err = None
+            try:
+                err = mt5.last_error()
+            except Exception:
+                err = None
+            if isinstance(err, tuple) and len(err) >= 2:
+                return 0, 0.0, f"ticks_insufficient(n={tick_count},err={err[0]}:{err[1]})"
             return 0, 0.0, f"ticks_insufficient(n={tick_count})"
 
         tdf = pd.DataFrame(ticks)
@@ -1244,12 +1438,37 @@ class LiveTradingBot:
 
         delta_tick = int(buy.sum() - sell.sum())
         delta_price = float((tdf["bid"].iloc[-1] - tdf["bid"].iloc[0]) + (tdf["ask"].iloc[-1] - tdf["ask"].iloc[0]))
-        return delta_tick, delta_price, f"ticks(n={tick_count})"
+        return delta_tick, delta_price, f"{tick_source}(n={tick_count})"
 
-    def _calc_delta_for_closed_bar(self, current_bar_ts: int):
+    def _calc_delta_for_closed_bar(self, current_bar_ts: int, window_df: pd.DataFrame | None = None):
         end_dt = datetime.fromtimestamp(current_bar_ts, tz=timezone.utc)
         start_dt = end_dt - timedelta(seconds=self.timeframe_seconds)
-        return self._calc_delta_between(start_dt, end_dt)
+        delta_tick, delta_price, delta_note = self._calc_delta_between(start_dt, end_dt)
+
+        # Last-resort fallback: derive delta from the actual closed bar OHLC in the model window.
+        if (
+            (delta_note.startswith("ticks_unavailable") or delta_note.startswith("ticks_insufficient"))
+            and window_df is not None
+            and len(window_df) > 0
+            and "open" in window_df.columns
+            and "close" in window_df.columns
+        ):
+            try:
+                row = window_df.iloc[-1]
+                open_px = float(row.get("open", 0.0))
+                close_px = float(row.get("close", 0.0))
+                if open_px > 0.0 and close_px > 0.0:
+                    move = float(close_px - open_px)
+                    if abs(move) <= max(self.point * 0.1, 1e-10):
+                        delta_tick = 0
+                    else:
+                        delta_tick = int(round(move / max(self.point, 1e-10)))
+                    delta_price = float(move * 2.0)
+                    delta_note = "window_ohlc_fallback"
+            except Exception:
+                pass
+
+        return delta_tick, delta_price, delta_note
 
     def _calc_realtime_delta_for_open_bar(self, tick_time_ts: int, current_bar_ts: int | None = None):
         bar_open_ts = int(current_bar_ts or 0)
@@ -1635,6 +1854,8 @@ class LiveTradingBot:
         mode: str = "New Candle",
         execute_orders: bool = True,
         persist_state: bool = True,
+        allow_entry_orders: bool = True,
+        preserve_timers_on_hold: bool = False,
     ):
         bar_end_utc = datetime.fromtimestamp(bar_end_ts, tz=timezone.utc)
         bar_open_utc = bar_end_utc - timedelta(seconds=self.timeframe_seconds)
@@ -1670,13 +1891,26 @@ class LiveTradingBot:
 
         self._wait_until_real_semantic_ready(window_df)
 
-        delta_tick, delta_price, delta_note = self._calc_delta_for_closed_bar(bar_end_ts)
+        delta_tick, delta_price, delta_note = self._calc_delta_for_closed_bar(bar_end_ts, window_df=window_df)
         self.bridge.gate_stats = self.gate_provider.update(window_df)
 
         self._sync_bridge_from_mt5()
+        pre_trade_cooldown = int(self.bridge.trade_cooldown) if self.bridge is not None else 0
+        pre_defensive_mode = int(self.bridge.defensive_mode_bars) if self.bridge is not None else 0
         action, model_price = self.bridge.process_bar(window_df, delta_tick, delta_price)
         action = int(action)
         decision = dict(getattr(self.bridge, "last_decision", {}) or {})
+
+        # Startup replay on an already-processed bar should not decay cooldown/defensive timers
+        # when the model ends up HOLD (prevents state drift from stop/start loops).
+        if preserve_timers_on_hold and action == 0 and self.bridge is not None:
+            self.bridge.trade_cooldown = int(pre_trade_cooldown)
+            self.bridge.defensive_mode_bars = int(pre_defensive_mode)
+            if isinstance(decision, dict):
+                decision["cooldown_before"] = int(pre_trade_cooldown)
+                decision["cooldown_after"] = int(pre_trade_cooldown)
+                decision["defensive_mode_before"] = int(pre_defensive_mode)
+                decision["defensive_mode_after"] = int(pre_defensive_mode)
 
         action_name = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}.get(action, "?")
         raw_action = int(decision.get("raw_action", action))
@@ -1734,6 +1968,7 @@ class LiveTradingBot:
             )
 
         schedule_blocked = False
+        startup_entry_blocked = False
         if execute_orders and not self._is_trading_day_enabled(bar_end_ts):
             if action in (1, 2):
                 self._add_log(
@@ -1746,6 +1981,17 @@ class LiveTradingBot:
                 action = 0
                 action_name = "HOLD"
                 schedule_blocked = True
+        if execute_orders and not allow_entry_orders and action in (1, 2):
+            self._add_log(
+                "info",
+                f"{mode}: startup exposure mode blocked new entry ({action_name})",
+                phase="startup",
+                event="startup_entry_blocked",
+                meta={"mode": mode, "action": action_name},
+            )
+            action = 0
+            action_name = "HOLD"
+            startup_entry_blocked = True
         self.last_action = action_name
 
         decision_status = "pass"
@@ -1754,6 +2000,8 @@ class LiveTradingBot:
         elif raw_action != 0 and action == 0:
             if schedule_blocked:
                 decision_status = "schedule_blocked"
+            elif startup_entry_blocked:
+                decision_status = "startup_entry_blocked"
             elif gate_reasons:
                 decision_status = "gate_blocked"
             else:
@@ -1766,6 +2014,8 @@ class LiveTradingBot:
             reason_parts.append("gate:" + ", ".join(gate_reasons))
         if schedule_blocked:
             reason_parts.append("schedule")
+        if startup_entry_blocked:
+            reason_parts.append("startup_entry_blocked")
         if not reason_parts:
             reason_parts.append("-")
         sem_q = float(decision.get("semantic_quality", 0.0))
@@ -1906,23 +2156,23 @@ class LiveTradingBot:
                             print(
                                 "\n 🚀 [STARTUP] current bar already processed; "
                                 f"broker exposure detected (positions={pos_count}, orders={order_count}) "
-                                "-> snapshot no-order"
+                                "-> exposure sync (allow CLOSE, block new entry)"
                             )
                             self._add_log(
                                 "info",
-                                "Startup snapshot: broker exposure detected",
+                                "Startup exposure sync: allow CLOSE, block new BUY/SELL",
                                 phase="startup",
-                                event="snapshot_no_order",
+                                event="startup_exposure_sync",
                                 meta={"positions": int(pos_count), "orders": int(order_count)},
                             )
                             self._process_closed_bar(
                                 current_bar_time,
-                                mode="Startup Snapshot",
-                                execute_orders=False,
-                                persist_state=False,
+                                mode="Startup Exposure Sync",
+                                execute_orders=True,
+                                persist_state=True,
+                                allow_entry_orders=False,
+                                preserve_timers_on_hold=True,
                             )
-                            # Restore persisted runtime state so startup snapshot does not drift counters/state.
-                            self._load_runtime_state()
                         else:
                             print(
                                 "\n 🚀 [STARTUP] current bar already processed; "
@@ -1940,6 +2190,8 @@ class LiveTradingBot:
                                 mode="Startup Immediate",
                                 execute_orders=True,
                                 persist_state=True,
+                                allow_entry_orders=True,
+                                preserve_timers_on_hold=True,
                             )
                         self._sync_bridge_from_mt5()
                         self._push_state_to_server()

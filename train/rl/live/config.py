@@ -168,7 +168,7 @@ def _derive_vision_llm_api_url(bot_ws_url: str) -> str:
 
 
 VISION_LLM_API_URL = _derive_vision_llm_api_url(BOT_WS_URL)
-VISION_LLM_TIMEOUT_SEC = _env_float(75.0, "VISION_LLM_TIMEOUT_SEC")
+VISION_LLM_TIMEOUT_SEC = _env_float(300.00, "VISION_LLM_TIMEOUT_SEC")
 
 
 # ---- Live feature / gate / bridge parameters (owned by live config)

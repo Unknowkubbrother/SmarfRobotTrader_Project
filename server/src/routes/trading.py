@@ -4,7 +4,7 @@ from cryptography.fernet import Fernet
 import base64
 import hashlib
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from ..models.trading_model import Create_Trading_Account
 from ..database.client import db
 from ..utils.trading_schedule import normalize_trading_schedule
@@ -200,6 +200,90 @@ async def get_trading_calendar(request: Request, year: int, month: int):
             "profitableDays": profitable_days,
             "averageWinRate": average_win_rate,
         }
+    }
+
+
+@trading_router.get("/history_by_day", tags=["trading"])
+async def get_trading_history_by_day(request: Request, year: int, month: int, day: int):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    try:
+        target_date = date(year, month, day)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date")
+
+    start_dt = datetime.combine(target_date, datetime.min.time())
+    end_dt = start_dt + timedelta(days=1)
+
+    accounts = await db.tradingaccount.find_many(
+        where={"userId": request.state.user_id},
+    )
+    account_ids = [str(a.id) for a in accounts]
+    if not account_ids:
+        return {
+            "status_code": 200,
+            "data": [],
+            "summary": {
+                "date": target_date.isoformat(),
+                "totalTrades": 0,
+                "netProfit": 0.0,
+                "wins": 0,
+                "losses": 0,
+            },
+        }
+
+    orders = await db.orderhistory.find_many(
+        where={
+            "accountId": {"in": account_ids},
+            "closeTime": {"gte": start_dt, "lt": end_dt},
+        },
+        order={"closeTime": "desc"},
+    )
+
+    rows = []
+    total_profit = 0.0
+    wins = 0
+    losses = 0
+
+    for order in orders:
+        profit = _to_float(getattr(order, "profit", 0.0), 0.0)
+        total_profit += profit
+        if profit > 0:
+            wins += 1
+        elif profit < 0:
+            losses += 1
+
+        open_time = getattr(order, "openTime", None)
+        close_time = getattr(order, "closeTime", None)
+        rows.append(
+            {
+                "ticketId": int(getattr(order, "ticketId", 0) or 0),
+                "accountId": str(getattr(order, "accountId", "") or ""),
+                "symbol": str(getattr(order, "symbol", "") or ""),
+                "type": str(getattr(order, "type", "") or "").upper(),
+                "status": str(getattr(order, "status", "") or ""),
+                "volume": _to_float(getattr(order, "volume", 0.0), 0.0),
+                "openPrice": _to_float(getattr(order, "openPrice", 0.0), 0.0),
+                "closePrice": _to_float(getattr(order, "closePrice", 0.0), 0.0),
+                "commission": _to_float(getattr(order, "commission", 0.0), 0.0),
+                "swap": _to_float(getattr(order, "swap", 0.0), 0.0),
+                "profit": round(float(profit), 2),
+                "openTime": open_time.isoformat() if open_time else None,
+                "closeTime": close_time.isoformat() if close_time else None,
+            }
+        )
+
+    return {
+        "status_code": 200,
+        "data": rows,
+        "summary": {
+            "date": target_date.isoformat(),
+            "totalTrades": int(len(rows)),
+            "netProfit": round(float(total_profit), 2),
+            "wins": int(wins),
+            "losses": int(losses),
+        },
     }
 
 @trading_router.get("/accounts_with_bots", tags=["trading"])

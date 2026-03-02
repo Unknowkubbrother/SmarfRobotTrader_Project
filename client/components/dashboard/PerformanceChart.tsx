@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { useState, useEffect, useMemo, useRef } from "react";
 import {
   AreaChart,
@@ -9,8 +10,10 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
+import { ArrowUpRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { BotLiveState } from "@/hooks/useBotLiveState";
+import { api } from "@/lib/api";
 
 interface ChartDataPoint {
   balance: number;
@@ -20,6 +23,12 @@ interface ChartDataPoint {
 
 interface ChartRenderPoint extends ChartDataPoint {
   label: string;
+}
+
+interface CalendarDayPoint {
+  date: number;
+  profit: number;
+  trades: number;
 }
 
 const timeframes = ["1D", "1W", "1M", "3M", "1Y", "ALL"] as const;
@@ -53,24 +62,103 @@ const filterByTimeframe = (rows: ChartDataPoint[], timeframe: ChartTimeframe): C
 
 interface PerformanceChartProps {
   liveState?: BotLiveState;
+  botId?: string;
 }
 
-export function PerformanceChart({ liveState }: PerformanceChartProps) {
+export function PerformanceChart({ liveState, botId }: PerformanceChartProps) {
   const [selectedTimeframe, setSelectedTimeframe] = useState<ChartTimeframe>("1M");
   const [historyData, setHistoryData] = useState<ChartDataPoint[]>([]);
   const lastBotIdRef = useRef<string>("");
+  const [historyLoaded, setHistoryLoaded] = useState(false);
 
   const isLive = !!liveState?.connected;
-  const activeBotId = String(liveState?.bot_config_id || "").trim();
+  const activeBotId = String(botId || liveState?.bot_config_id || "").trim();
 
   useEffect(() => {
     if (!activeBotId) return;
     if (lastBotIdRef.current && lastBotIdRef.current !== activeBotId) {
       // Avoid mixing equity histories when user switches selected bot.
       setHistoryData([]);
+      setHistoryLoaded(false);
     }
     lastBotIdRef.current = activeBotId;
   }, [activeBotId]);
+
+  useEffect(() => {
+    if (!activeBotId || historyLoaded) return;
+    let cancelled = false;
+
+    const loadCalendarHistory = async () => {
+      try {
+        const now = new Date();
+        const monthRefs = Array.from({ length: 12 }, (_, idx) => {
+          const dt = new Date(now.getFullYear(), now.getMonth() - (11 - idx), 1);
+          return { year: dt.getFullYear(), month: dt.getMonth() + 1 };
+        });
+
+        const responses = await Promise.all(
+          monthRefs.map(({ year, month }) =>
+            api
+              .get("/trading/calendar", { params: { year, month } })
+              .then((res) => ({ ok: true, data: res.data, year, month }))
+              .catch(() => ({ ok: false, data: null, year, month }))
+          )
+        );
+
+        const seeded: ChartDataPoint[] = [];
+        let cumulative = 0.0;
+        for (const item of responses) {
+          if (!item.ok) continue;
+          const rows: CalendarDayPoint[] = Array.isArray(item.data?.data) ? item.data.data : [];
+          const monthRows = rows
+            .map((r) => ({
+              date: Number(r?.date || 0),
+              profit: Number(r?.profit || 0),
+              trades: Number(r?.trades || 0),
+            }))
+            .filter((r) => Number.isFinite(r.date) && r.date > 0 && r.trades > 0)
+            .sort((a, b) => a.date - b.date);
+
+          for (const row of monthRows) {
+            cumulative += row.profit;
+            const ts = Date.UTC(item.year, item.month - 1, row.date, 12, 0, 0);
+            seeded.push({
+              balance: cumulative,
+              equity: cumulative,
+              timestamp: ts,
+            });
+          }
+        }
+
+        if (cancelled || seeded.length === 0) return;
+
+        const liveBalance = Number(liveState?.balance);
+        if (Number.isFinite(liveBalance) && liveBalance > 0) {
+          const offset = liveBalance - seeded[seeded.length - 1].balance;
+          for (const point of seeded) {
+            point.balance += offset;
+            point.equity += offset;
+          }
+        }
+
+        setHistoryData((prev) => {
+          if (prev.length === 0) return seeded;
+          const oldestLiveTs = prev[0].timestamp;
+          const base = seeded.filter((p) => p.timestamp < oldestLiveTs);
+          return [...base, ...prev];
+        });
+      } catch {
+        // Fallback silently: chart will continue to work from live stream.
+      } finally {
+        if (!cancelled) setHistoryLoaded(true);
+      }
+    };
+
+    loadCalendarHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeBotId, historyLoaded, liveState?.balance]);
 
   useEffect(() => {
     if (!isLive || !liveState) return;
@@ -149,7 +237,13 @@ export function PerformanceChart({ liveState }: PerformanceChartProps) {
       <div className="h-[280px]">
         {chartData.length === 0 ? (
           <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
-            {isLive ? "Waiting for live balance/equity data..." : "Connect bot to show performance chart"}
+            <div className="text-center space-y-2">
+              <div>{isLive ? "Waiting for live balance/equity data..." : "Connect bot to show performance chart"}</div>
+              <Link href="/calendar" className="inline-flex items-center gap-1 text-primary hover:underline">
+                View history in Profit Calendar
+                <ArrowUpRight className="w-3.5 h-3.5" />
+              </Link>
+            </div>
           </div>
         ) : (
           <ResponsiveContainer width="100%" height="100%">

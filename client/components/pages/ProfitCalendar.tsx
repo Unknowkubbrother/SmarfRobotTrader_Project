@@ -3,6 +3,8 @@ import { ChevronLeft, ChevronRight, TrendingUp, TrendingDown, BarChart3, Loader2
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
 interface DayData {
   date: number;
@@ -19,6 +21,29 @@ interface CalendarSummary {
   averageWinRate: number;
 }
 
+interface TradeHistoryRow {
+  ticketId: number;
+  symbol: string;
+  type: string;
+  status: string;
+  volume: number;
+  openPrice: number;
+  closePrice: number;
+  commission: number;
+  swap: number;
+  profit: number;
+  openTime: string | null;
+  closeTime: string | null;
+}
+
+interface TradeHistorySummary {
+  date: string;
+  totalTrades: number;
+  netProfit: number;
+  wins: number;
+  losses: number;
+}
+
 const weekDays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 export default function ProfitCalendar() {
@@ -33,6 +58,11 @@ export default function ProfitCalendar() {
     averageWinRate: 0,
   });
   const [loading, setLoading] = useState(true);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [tradeHistory, setTradeHistory] = useState<TradeHistoryRow[]>([]);
+  const [historyLoadedForDate, setHistoryLoadedForDate] = useState<string>("");
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historySummary, setHistorySummary] = useState<TradeHistorySummary | null>(null);
 
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth();
@@ -110,6 +140,68 @@ export default function ProfitCalendar() {
   const navigateMonth = (direction: number) => {
     setCurrentDate(new Date(year, month + direction, 1));
     setSelectedDay(null);
+    setTradeHistory([]);
+    setHistoryLoadedForDate("");
+  };
+
+  const selectedDateKey = selectedDay
+    ? new Date(year, month, selectedDay.date).toISOString().split("T")[0]
+    : "";
+
+  useEffect(() => {
+    setTradeHistory([]);
+    setHistoryLoadedForDate("");
+    setHistorySummary(null);
+    setHistoryOpen(false);
+  }, [selectedDateKey]);
+
+  const loadTradeHistory = async () => {
+    if (!selectedDay) return;
+    setHistoryLoading(true);
+    try {
+      const res = await api.get("/trading/history_by_day", {
+        params: { year, month: month + 1, day: selectedDay.date },
+      });
+      const rows = Array.isArray(res.data?.data) ? res.data.data : [];
+      const summary = res.data?.summary && typeof res.data.summary === "object" ? res.data.summary : null;
+      setTradeHistory(rows as TradeHistoryRow[]);
+      if (summary) {
+        setHistorySummary({
+          date: String(summary.date || selectedDateKey),
+          totalTrades: Number(summary.totalTrades || rows.length || 0),
+          netProfit: Number(summary.netProfit || 0),
+          wins: Number(summary.wins || 0),
+          losses: Number(summary.losses || 0),
+        });
+      } else {
+        const wins = (rows as TradeHistoryRow[]).filter((r) => Number(r.profit || 0) > 0).length;
+        const losses = (rows as TradeHistoryRow[]).filter((r) => Number(r.profit || 0) < 0).length;
+        const netProfit = (rows as TradeHistoryRow[]).reduce((sum, r) => sum + Number(r.profit || 0), 0);
+        setHistorySummary({
+          date: selectedDateKey,
+          totalTrades: rows.length,
+          netProfit,
+          wins,
+          losses,
+        });
+      }
+      setHistoryLoadedForDate(selectedDateKey);
+      setHistoryOpen(true);
+    } catch (error) {
+      console.error("Failed to fetch trade history", error);
+      setTradeHistory([]);
+      setHistorySummary({
+        date: selectedDateKey,
+        totalTrades: 0,
+        netProfit: 0,
+        wins: 0,
+        losses: 0,
+      });
+      setHistoryLoadedForDate(selectedDateKey);
+      setHistoryOpen(true);
+    } finally {
+      setHistoryLoading(false);
+    }
   };
 
   const getIntensity = (profit: number | null): string => {
@@ -294,9 +386,22 @@ export default function ProfitCalendar() {
                     </div>
                   </div>
 
-                  <Button variant="outline" className="w-full">
-                    View Trade History
+                  <Button
+                    variant="outline"
+                    className="w-full"
+                    onClick={loadTradeHistory}
+                    disabled={historyLoading}
+                  >
+                    {historyLoading ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Loading...
+                      </span>
+                    ) : (
+                      "View Trade History"
+                    )}
                   </Button>
+
                 </div>
               ) : (
                 <div className="text-center py-12 text-muted-foreground">
@@ -306,6 +411,91 @@ export default function ProfitCalendar() {
               )}
             </div>
           </div>
+
+          <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
+            <DialogContent className="max-w-5xl max-h-[85vh] overflow-y-auto">
+              <DialogHeader>
+                <DialogTitle>Trade History - {selectedDateKey || "-"}</DialogTitle>
+                <DialogDescription>
+                  Detailed closed orders for the selected day from your MT5-synced history.
+                </DialogDescription>
+              </DialogHeader>
+
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div className="rounded-lg border border-border p-3">
+                  <p className="text-xs text-muted-foreground">Net PnL</p>
+                  <p className={cn("text-lg font-bold font-mono", (historySummary?.netProfit || 0) >= 0 ? "text-success" : "text-destructive")}>
+                    {(historySummary?.netProfit || 0) >= 0 ? "+" : ""}${Math.abs(historySummary?.netProfit || 0).toFixed(2)}
+                  </p>
+                </div>
+                <div className="rounded-lg border border-border p-3">
+                  <p className="text-xs text-muted-foreground">Total Trades</p>
+                  <p className="text-lg font-bold font-mono">{historySummary?.totalTrades || 0}</p>
+                </div>
+                <div className="rounded-lg border border-border p-3">
+                  <p className="text-xs text-muted-foreground">Wins</p>
+                  <p className="text-lg font-bold font-mono text-success">{historySummary?.wins || 0}</p>
+                </div>
+                <div className="rounded-lg border border-border p-3">
+                  <p className="text-xs text-muted-foreground">Losses</p>
+                  <p className="text-lg font-bold font-mono text-destructive">{historySummary?.losses || 0}</p>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Ticket</TableHead>
+                      <TableHead>Symbol</TableHead>
+                      <TableHead>Type</TableHead>
+                      <TableHead>Lot</TableHead>
+                      <TableHead>Open</TableHead>
+                      <TableHead>Close</TableHead>
+                      <TableHead>Fees</TableHead>
+                      <TableHead className="text-right">Profit</TableHead>
+                      <TableHead>Closed Time</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {historyLoadedForDate === selectedDateKey && tradeHistory.length === 0 && (
+                      <TableRow>
+                        <TableCell colSpan={9} className="text-center text-muted-foreground py-8">
+                          No trade history found for this day
+                        </TableCell>
+                      </TableRow>
+                    )}
+                    {tradeHistory.map((row) => {
+                      const fee = Number(row.commission || 0) + Number(row.swap || 0);
+                      return (
+                        <TableRow key={`${row.ticketId}-${row.closeTime || ""}`}>
+                          <TableCell className="font-mono text-xs">#{row.ticketId}</TableCell>
+                          <TableCell>{row.symbol || "-"}</TableCell>
+                          <TableCell>
+                            <span className={cn("text-xs font-semibold", row.type === "BUY" ? "text-success" : row.type === "SELL" ? "text-destructive" : "text-foreground")}>
+                              {row.type || "-"}
+                            </span>
+                          </TableCell>
+                          <TableCell className="font-mono">{Number(row.volume || 0).toFixed(2)}</TableCell>
+                          <TableCell className="font-mono">{Number(row.openPrice || 0).toFixed(5)}</TableCell>
+                          <TableCell className="font-mono">{Number(row.closePrice || 0).toFixed(5)}</TableCell>
+                          <TableCell className="font-mono">{fee >= 0 ? "+" : ""}${Math.abs(fee).toFixed(2)}</TableCell>
+                          <TableCell className={cn("font-mono text-right", Number(row.profit || 0) >= 0 ? "text-success" : "text-destructive")}>
+                            {Number(row.profit || 0) >= 0 ? "+" : ""}${Math.abs(Number(row.profit || 0)).toFixed(2)}
+                          </TableCell>
+                          <TableCell className="font-mono text-xs">
+                            {row.closeTime
+                              ? new Date(row.closeTime).toLocaleString("en-US", { hour12: false })
+                              : "-"}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
+            </DialogContent>
+          </Dialog>
         </>
       )}
     </div>

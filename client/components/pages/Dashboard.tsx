@@ -304,7 +304,7 @@ export default function Dashboard() {
           <div className="grid lg:grid-cols-3 gap-6">
             {/* Portfolio Performance (2/3) */}
             <div className="lg:col-span-2">
-              <PerformanceChart liveState={liveState} />
+              <PerformanceChart liveState={liveState} botId={selectedBotId || undefined} />
             </div>
             {/* Activity Log (1/3) */}
             <div className="lg:col-span-1">

@@ -217,3 +217,8 @@ app.include_router(bot_ws.bot_ws_router, prefix="/bot")
 # cloudflared tunnel --url http://localhost:8000
 # prisma db push --schema=src/database/schema.prisma
 # prisma generate --schema=src/database/schema.prisma
+
+# python -m prisma validate --schema=src/database/schema.prisma
+# echo CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; | python -m prisma db execute --stdin --schema=src/database/schema.prisma
+# python -m prisma db push --schema=src/database/schema.prisma --skip-generate
+# python -m prisma generate --schema=src/database/schema.prisma
