@@ -4,8 +4,10 @@ import {
   Clock,
   CreditCard,
   Download,
+  Lock,
   Receipt,
   Shield,
+  Sparkles,
   Star,
   Trash2,
 } from "lucide-react";
@@ -122,9 +124,10 @@ function StripeAddCardForm({
   onCancel,
   onSubmit,
 }: StripeAddCardFormProps & { publishableKey: string }) {
-  const cardElementContainerRef = useRef<HTMLDivElement | null>(null);
+  const paymentElementContainerRef = useRef<HTMLDivElement | null>(null);
   const stripeRef = useRef<any>(null);
-  const cardElementRef = useRef<any>(null);
+  const elementsRef = useRef<any>(null);
+  const paymentElementRef = useRef<any>(null);
   const [ready, setReady] = useState(false);
   const [confirming, setConfirming] = useState(false);
 
@@ -134,28 +137,39 @@ function StripeAddCardForm({
     const init = async () => {
       try {
         await ensureStripeJsLoaded();
-        if (!isActive || !window.Stripe || !cardElementContainerRef.current) return;
+        if (!isActive || !window.Stripe || !paymentElementContainerRef.current) return;
 
         const stripe = window.Stripe(publishableKey);
-        const elements = stripe.elements();
-        const card = elements.create("card", {
-          hidePostalCode: true,
-          style: {
-            base: {
-              color: "#0f172a",
-              fontSize: "14px",
-              "::placeholder": { color: "#64748b" },
-            },
-            invalid: {
-              color: "#dc2626",
-            },
+        const appearance = {
+          theme: "stripe",
+          variables: {
+            colorPrimary: "#2563eb",
+            colorText: "#0f172a",
+            colorDanger: "#dc2626",
+            borderRadius: "10px",
+          },
+          inputs: "spaced",
+          labels: "above",
+        } as const;
+
+        const elements = stripe.elements({
+          clientSecret,
+          appearance,
+          loader: "auto",
+        });
+
+        const paymentElement = elements.create("payment", {
+          layout: {
+            type: "tabs",
+            defaultCollapsed: false,
           },
         });
 
-        card.mount(cardElementContainerRef.current);
+        paymentElement.mount(paymentElementContainerRef.current);
 
         stripeRef.current = stripe;
-        cardElementRef.current = card;
+        elementsRef.current = elements;
+        paymentElementRef.current = paymentElement;
         setReady(true);
       } catch (error: any) {
         toast.error(error?.message || "Failed to initialize Stripe");
@@ -166,28 +180,39 @@ function StripeAddCardForm({
 
     return () => {
       isActive = false;
-      if (cardElementRef.current) {
-        cardElementRef.current.destroy();
-        cardElementRef.current = null;
+      if (paymentElementRef.current) {
+        paymentElementRef.current.destroy();
+        paymentElementRef.current = null;
       }
       stripeRef.current = null;
+      elementsRef.current = null;
       setReady(false);
     };
-  }, [publishableKey]);
+  }, [publishableKey, clientSecret]);
 
   const disabled = submitting || confirming || !ready;
+  const actionLabel = confirming ? "Verifying..." : submitting ? "Saving..." : "Add Card";
 
   const handleSubmit = async () => {
-    if (!stripeRef.current || !cardElementRef.current) {
+    if (!stripeRef.current || !elementsRef.current) {
       toast.error("Stripe is not ready yet");
       return;
     }
 
     setConfirming(true);
-    const result = await stripeRef.current.confirmCardSetup(clientSecret, {
-      payment_method: {
-        card: cardElementRef.current,
+    const submitResult = await elementsRef.current.submit?.();
+    if (submitResult?.error) {
+      setConfirming(false);
+      toast.error(submitResult.error.message || "Please check your payment details");
+      return;
+    }
+
+    const result = await stripeRef.current.confirmSetup({
+      elements: elementsRef.current,
+      confirmParams: {
+        return_url: window.location.href,
       },
+      redirect: "if_required",
     });
     setConfirming(false);
 
@@ -197,33 +222,64 @@ function StripeAddCardForm({
     }
 
     const paymentMethod = result.setupIntent?.payment_method;
-    if (typeof paymentMethod !== "string") {
+    const paymentMethodId =
+      typeof paymentMethod === "string" ? paymentMethod : paymentMethod?.id;
+    if (typeof paymentMethodId !== "string" || !paymentMethodId) {
       toast.error("Stripe did not return a payment method");
       return;
     }
 
-    await onSubmit(paymentMethod, setAsDefault);
+    await onSubmit(paymentMethodId, setAsDefault);
   };
 
   return (
-    <div className="space-y-4">
-      <div ref={cardElementContainerRef} className="rounded-lg border border-border bg-secondary/30 p-3" />
+    <div className="space-y-5">
+      <div className="rounded-xl border border-primary/20 bg-gradient-to-br from-primary/10 via-primary/5 to-background p-4">
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold text-foreground">Card details</p>
+            <p className="text-xs text-muted-foreground">Enter your card once for weekly automatic billing.</p>
+          </div>
+          <span className="inline-flex items-center gap-1 rounded-full border border-border bg-background/80 px-2 py-1 text-[11px] font-medium text-muted-foreground">
+            <Lock className="h-3 w-3" />
+            PCI DSS
+          </span>
+        </div>
+        <div className="rounded-lg border border-border bg-background/80 p-3 shadow-inner">
+          <div ref={paymentElementContainerRef} className="min-h-[112px]" />
+        </div>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {["VISA", "MASTERCARD", "AMEX"].map((brand) => (
+            <span
+              key={brand}
+              className="rounded-full border border-border/70 bg-background/80 px-2 py-0.5 text-[11px] font-medium text-muted-foreground"
+            >
+              {brand}
+            </span>
+          ))}
+        </div>
+      </div>
 
-      <div className="flex items-center gap-2">
+      <div className="flex items-start gap-3 rounded-lg border border-border bg-secondary/30 p-3">
         <Checkbox
           id="setAsDefault"
           checked={setAsDefault}
           onCheckedChange={(checked) => onSetAsDefaultChange(checked === true)}
         />
-        <Label htmlFor="setAsDefault">Set as default payment method</Label>
+        <div className="space-y-0.5">
+          <Label htmlFor="setAsDefault" className="text-sm font-medium">
+            Set as default payment method
+          </Label>
+          <p className="text-xs text-muted-foreground">Recommended for uninterrupted weekly billing.</p>
+        </div>
       </div>
 
-      <div className="flex justify-end gap-2 pt-2">
+      <div className="flex flex-col-reverse gap-2 pt-1 sm:flex-row sm:justify-end">
         <Button variant="outline" onClick={onCancel} disabled={disabled}>
           Cancel
         </Button>
         <Button onClick={handleSubmit} disabled={disabled}>
-          {disabled ? "Saving..." : "Add Card"}
+          {actionLabel}
         </Button>
       </div>
     </div>
@@ -630,13 +686,30 @@ export default function Subscription() {
       )}
 
       <Dialog open={addCardOpen} onOpenChange={setAddCardOpen}>
-        <DialogContent className="max-w-md">
+        <DialogContent className="max-w-lg">
           <DialogHeader>
-            <DialogTitle>Add Payment Method</DialogTitle>
+            <DialogTitle className="flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-primary" />
+              Add Payment Method
+            </DialogTitle>
             <DialogDescription>
               Your card details are collected securely by Stripe.
             </DialogDescription>
           </DialogHeader>
+
+          <div className="rounded-xl border border-primary/20 bg-gradient-to-r from-primary/10 via-primary/5 to-transparent p-4">
+            <div className="flex items-start gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/15">
+                <CreditCard className="h-4 w-4 text-primary" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-foreground">Secure card setup</p>
+                <p className="text-xs text-muted-foreground">
+                  Tokenized by Stripe. We never store your full card number or CVC.
+                </p>
+              </div>
+            </div>
+          </div>
 
           {!STRIPE_READY && (
             <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
@@ -645,8 +718,12 @@ export default function Subscription() {
           )}
 
           {STRIPE_READY && setupIntentLoading && (
-            <div className="flex items-center justify-center py-6">
-              <div className="animate-spin w-6 h-6 border-2 border-primary border-t-transparent rounded-full" />
+            <div className="space-y-3 py-2">
+              <div className="h-24 animate-pulse rounded-xl border border-border bg-secondary/40" />
+              <div className="h-12 animate-pulse rounded-lg border border-border bg-secondary/30" />
+              <div className="flex items-center justify-center pt-1 text-xs text-muted-foreground">
+                Preparing secure payment form...
+              </div>
             </div>
           )}
 
