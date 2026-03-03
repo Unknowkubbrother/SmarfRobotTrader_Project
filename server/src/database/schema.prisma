@@ -107,6 +107,7 @@ model User {
   // Relations
   paymentMethods     UserPaymentMethod[]
   activityLogs       ActivityLog[]
+  botOperationLogs   BotOperationLog[]
   notificationConfig NotificationConfig?
   notifications      Notification[]
   supportTickets     SupportTicket[]
@@ -332,11 +333,34 @@ model BotConfiguration {
   updatedAt              DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
   // Relations
-  account    TradingAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  botVersion BotVersion     @relation(fields: [modelId], references: [modelId])
+  account       TradingAccount    @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  botVersion    BotVersion        @relation(fields: [modelId], references: [modelId])
+  operationLogs BotOperationLog[]
 
   @@unique([accountId, botInstanceId])
   @@map("bot_configurations")
+}
+
+model BotOperationLog {
+  id          String   @id @default(dbgenerated("uuid_generate_v4()")) @map("event_id") @db.Uuid
+  botConfigId String   @map("bot_config_id") @db.Uuid
+  userId      String?  @map("user_id") @db.Uuid
+  source      String?  @db.VarChar(30)
+  action      String   @db.VarChar(50)
+  phase       String   @db.VarChar(30)
+  level       String?  @db.VarChar(20)
+  message     String?  @db.Text
+  status      String?  @db.VarChar(30)
+  meta        Json?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  botConfiguration BotConfiguration @relation(fields: [botConfigId], references: [id], onDelete: Cascade)
+  user             User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([botConfigId, createdAt])
+  @@index([userId, createdAt])
+  @@map("bot_operation_logs")
 }
 
 // ==========================================

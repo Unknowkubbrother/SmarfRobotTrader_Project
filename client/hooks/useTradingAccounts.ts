@@ -107,6 +107,20 @@ export interface BotRuntimeHealth {
   probe_stderr?: string;
 }
 
+export interface BotOperationLogEntry {
+  id: string;
+  bot_config_id: string;
+  user_id: string | null;
+  source: string | null;
+  action: string | null;
+  phase: string | null;
+  level: string;
+  message: string | null;
+  status: string | null;
+  meta?: Record<string, unknown> | null;
+  created_at: string | null;
+}
+
 const isLikelyTransientRequestError = (error: unknown): boolean => {
   const e = error as ApiClientError | undefined;
   if (e?.isCanceled) return true;
@@ -356,6 +370,25 @@ export function useTradingAccounts() {
     }
   };
 
+  const getBotOperationLogs = async (
+    botConfigId: string,
+    limit: number = 50
+  ): Promise<BotOperationLogEntry[]> => {
+    try {
+      const response = await api.get("/bot/operation_logs", {
+        params: { botConfigId, limit },
+      });
+      const payload = response?.data?.data;
+      if (!Array.isArray(payload)) {
+        return [];
+      }
+      return payload as BotOperationLogEntry[];
+    } catch (error) {
+      console.error("Error fetching bot operation logs:", error);
+      return [];
+    }
+  };
+
   // Create a new bot configuration for an account
   const createBot = async (
     accountId: string,
@@ -487,6 +520,7 @@ export function useTradingAccounts() {
     emergencyStopBot,
     applyBotUpdate,
     getBotRuntimeHealth,
+    getBotOperationLogs,
     createBot,
     deleteBot,
     getBotVersions,

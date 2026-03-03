@@ -35,13 +35,15 @@ export function BotCard({
 }: BotCardProps) {
   const [showStopConfirm, setShowStopConfirm] = useState(false);
   const status = bot.status || "stopped";
+  const isStarting = status === "starting";
+  const isActionLocked = isBusy || isStarting;
   const symbol = bot.bot_version?.symbol || "N/A";
   const label = bot.bot_version?.label || "No Model";
   const riskLevel = bot.risk_level || "medium";
 
   const handleToggleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (isBusy) return;
+    if (isActionLocked) return;
     if (status === "running") {
       setShowStopConfirm(true);
     } else {
@@ -61,6 +63,13 @@ export function BotCard({
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-success/10 text-success">
             <span className="w-1.5 h-1.5 rounded-full bg-success animate-pulse" />
             Running
+          </span>
+        );
+      case "starting":
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-warning/10 text-warning">
+            <RefreshCw className="w-3 h-3 animate-spin" />
+            Starting
           </span>
         );
       case "paused":
@@ -100,11 +109,11 @@ export function BotCard({
           <div className="flex items-center gap-3 flex-1 min-w-0">
             <div className={cn(
               "w-10 h-10 rounded-xl flex items-center justify-center shrink-0",
-              status === "running" ? "bg-success/10" : "bg-secondary"
+              status === "running" ? "bg-success/10" : status === "starting" ? "bg-warning/10" : "bg-secondary"
             )}>
               <Activity className={cn(
                 "w-5 h-5",
-                status === "running" ? "text-success" : "text-muted-foreground"
+                status === "running" ? "text-success" : status === "starting" ? "text-warning" : "text-muted-foreground"
               )} />
             </div>
             <div className="min-w-0 flex-1">
@@ -153,10 +162,12 @@ export function BotCard({
               size="sm"
               className="h-8 w-8 p-0"
               onClick={handleToggleClick}
-              disabled={isBusy}
+              disabled={isActionLocked}
             >
               {status === "running" ? (
                 <Power className="w-4 h-4 text-destructive" />
+              ) : status === "starting" ? (
+                <RefreshCw className="w-4 h-4 text-warning animate-spin" />
               ) : (
                 <Play className="w-4 h-4 text-success" />
               )}
@@ -169,10 +180,10 @@ export function BotCard({
                 className="h-8 w-8 p-0 hover:bg-destructive/10"
                 onClick={(e) => {
                   e.stopPropagation();
-                  if (isBusy) return;
+                  if (isActionLocked) return;
                   onDelete(bot.id);
                 }}
-                disabled={isBusy}
+                disabled={isActionLocked}
               >
                 <Trash2 className="w-4 h-4 text-muted-foreground hover:text-destructive" />
               </Button>
@@ -199,7 +210,7 @@ export function BotCard({
                 handleConfirmStop();
               }}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={isBusy}
+              disabled={isActionLocked}
             >
               Stop Bot
             </AlertDialogAction>

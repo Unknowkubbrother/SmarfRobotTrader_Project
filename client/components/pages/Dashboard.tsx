@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { TrendingUp, TrendingDown, Activity, Wallet, Target, BarChart3, Plus, BellRing, DownloadCloud } from "lucide-react";
 import { PerformanceChart } from "@/components/dashboard/PerformanceChart";
 import { StatusPanel } from "@/components/dashboard/StatusPanel";
@@ -31,6 +31,9 @@ export default function Dashboard() {
   const [addAccountOpen, setAddAccountOpen] = useState(false);
   const [botActionState, setBotActionState] = useState<PersistedBotAction | null>(null);
   const [storeReady, setStoreReady] = useState(false);
+  const processedLifecycleIdsRef = useRef<Set<string>>(new Set());
+  const lastLifecycleRefetchAtRef = useRef<number>(0);
+  const { getBotState, lifecycleEvents } = useBotLiveState();
 
   // Auto-select first account when accounts load
   useEffect(() => {
@@ -77,6 +80,51 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
+    if (lifecycleEvents.length === 0) return;
+
+    const ownedBotIds = new Set(
+      accounts.flatMap((account) => (account.bot_configurations || []).map((bot) => bot.id))
+    );
+    let shouldRefetch = false;
+    const orderedEvents = [...lifecycleEvents].reverse();
+
+    for (const event of orderedEvents) {
+      if (processedLifecycleIdsRef.current.has(event.id)) {
+        continue;
+      }
+      processedLifecycleIdsRef.current.add(event.id);
+
+      if (!ownedBotIds.has(event.bot_config_id)) {
+        continue;
+      }
+
+      shouldRefetch = true;
+
+      if (event.phase === "succeeded" || event.phase === "failed") {
+        setBotActionState((prev) => {
+          if (!prev || prev.botId !== event.bot_config_id) return prev;
+          return null;
+        });
+      }
+    }
+
+    if (processedLifecycleIdsRef.current.size > 1200) {
+      processedLifecycleIdsRef.current.clear();
+      for (const item of lifecycleEvents.slice(0, 400)) {
+        processedLifecycleIdsRef.current.add(item.id);
+      }
+    }
+
+    if (shouldRefetch) {
+      const now = Date.now();
+      if (now - lastLifecycleRefetchAtRef.current > 1200) {
+        lastLifecycleRefetchAtRef.current = now;
+        void refetch();
+      }
+    }
+  }, [accounts, lifecycleEvents, refetch]);
+
+  useEffect(() => {
     if (!botActionState?.botId || !botActionState.expectedStatus) return;
     const allBots = accounts.flatMap((account) => account.bot_configurations || []);
     const targetBot = allBots.find((bot) => bot.id === botActionState.botId);
@@ -105,6 +153,19 @@ export default function Dashboard() {
     const timer = window.setTimeout(() => setBotActionState(null), ttlMs - ageMs);
     return () => window.clearTimeout(timer);
   }, [botActionState]);
+
+  useEffect(() => {
+    const hasStartingBot = accounts.some((account) =>
+      (account.bot_configurations || []).some(
+        (bot) => String(bot.status || bot.container_status || "").toLowerCase() === "starting"
+      )
+    );
+    if (!hasStartingBot) return;
+    const timer = window.setInterval(() => {
+      void refetch();
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [accounts, refetch]);
 
   const handleToggleBotStatus = async (botId: string, newStatus: "running" | "stopped") => {
     if (botActionState) return;
@@ -151,7 +212,6 @@ export default function Dashboard() {
     setBotActionState(null);
   };
 
-  const { getBotState } = useBotLiveState();
   const liveState = selectedBotId ? getBotState(selectedBotId) : undefined;
   const isLive = !!liveState?.connected;
 

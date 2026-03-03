@@ -50,7 +50,9 @@ export function AccountSelector({
   const [deleteLoading, setDeleteLoading] = useState(false);
 
   const getRunningBotsCount = (account: AccountWithBots) => {
-    return account.bot_configurations.filter((b) => b.container_status === "running").length;
+    return account.bot_configurations.filter(
+      (b) => b.container_status === "running" || b.container_status === "starting"
+    ).length;
   };
 
   const getStatusColor = (account: AccountWithBots) => {

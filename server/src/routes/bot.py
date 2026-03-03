@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from fastapi import APIRouter, HTTPException, Request
 from prisma import Json
@@ -23,9 +24,11 @@ from ..utils.mt5_bot_runner import (
     pull_docker_image,
     run_bot_instance_action,
 )
+from ..utils.bot_operation_events import emit_and_store_bot_operation_event
 from ..utils.ws_manager import bot_hub
 
 bot_router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _enum_value(value):
@@ -103,6 +106,37 @@ def _runner_error_message(prefix: str, exc: BotRunnerError) -> str:
     if stdout:
         return f"{prefix}: {exc}. stdout={stdout}"
     return f"{prefix}: {exc}"
+
+
+async def _emit_lifecycle_event(
+    bot_config_id: str,
+    action: str,
+    phase: str,
+    detail: str,
+    status: str | None = None,
+    source: str = "user",
+    metadata: dict | None = None,
+    owner_user_id: str | None = None,
+) -> None:
+    try:
+        await emit_and_store_bot_operation_event(
+            bot_config_id=bot_config_id,
+            action=action,
+            phase=phase,
+            detail=detail,
+            status=status,
+            source=source,
+            metadata=metadata,
+            owner_user_id=owner_user_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "failed to broadcast bot lifecycle event bot=%s action=%s phase=%s: %s",
+            bot_config_id,
+            action,
+            phase,
+            exc,
+        )
 
 
 # === Helper: verify bot config ownership ===
@@ -242,6 +276,20 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
         runtime = _extract_runtime_context(config)
         current_status = _enum_value(getattr(config, "containerStatus", None))
         action = "restart" if current_status == "running" or bool(config.isActive) else "start"
+        await db.botconfiguration.update(
+            where={"id": data.botConfigId},
+            data={
+                "containerStatus": "starting",
+            },
+        )
+        await _emit_lifecycle_event(
+            bot_config_id=str(data.botConfigId),
+            action=action,
+            phase="requested",
+            detail="Bot runtime start requested",
+            status="running",
+            owner_user_id=request.state.user_id,
+        )
 
         try:
             runner_result = await asyncio.to_thread(
@@ -258,6 +306,14 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
                     "containerStatus": "error",
                     "isActive": False,
                 }
+            )
+            await _emit_lifecycle_event(
+                bot_config_id=str(data.botConfigId),
+                action=action,
+                phase="failed",
+                detail=str(exc),
+                status="error",
+                owner_user_id=request.state.user_id,
             )
             raise HTTPException(
                 status_code=500,
@@ -278,7 +334,27 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
             where={"id": data.botConfigId},
             data=update_payload,
         )
+        await _emit_lifecycle_event(
+            bot_config_id=str(data.botConfigId),
+            action=action,
+            phase="succeeded",
+            detail="Bot runtime is running",
+            status="running",
+            metadata={
+                "docker_project_name": getattr(runner_result, "project_name", None),
+                "docker_container_id": getattr(runner_result, "container_id", None),
+            },
+            owner_user_id=request.state.user_id,
+        )
     else:
+        await _emit_lifecycle_event(
+            bot_config_id=str(data.botConfigId),
+            action="stop",
+            phase="requested",
+            detail="Bot runtime stop requested",
+            status="stopped",
+            owner_user_id=request.state.user_id,
+        )
         try:
             runner_result = await asyncio.to_thread(
                 run_bot_instance_action,
@@ -287,6 +363,14 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
                 timeout_sec=300,
             )
         except BotRunnerError as exc:
+            await _emit_lifecycle_event(
+                bot_config_id=str(data.botConfigId),
+                action="stop",
+                phase="failed",
+                detail=str(exc),
+                status="error",
+                owner_user_id=request.state.user_id,
+            )
             raise HTTPException(
                 status_code=500,
                 detail=_runner_error_message("Failed to stop bot docker instance", exc),
@@ -299,6 +383,18 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
                 "isActive": False,
                 "dockerContainerId": None,
             },
+        )
+        await _emit_lifecycle_event(
+            bot_config_id=str(data.botConfigId),
+            action="stop",
+            phase="succeeded",
+            detail="Bot runtime stopped",
+            status="stopped",
+            metadata={
+                "docker_project_name": getattr(runner_result, "project_name", None),
+                "docker_container_id": getattr(runner_result, "container_id", None),
+            },
+            owner_user_id=request.state.user_id,
         )
 
     # Log Activity
@@ -382,6 +478,41 @@ async def get_bot_runtime_health(request: Request, botConfigId: str):
     }
 
 
+@bot_router.get('/operation_logs', tags=["bot"])
+async def get_bot_operation_logs(request: Request, botConfigId: str, limit: int = 50):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    config = await verify_bot_ownership(botConfigId, request.state.user_id)
+    take = max(1, min(int(limit), 200))
+
+    logs = await db.botoperationlog.find_many(
+        where={"botConfigId": str(config.id)},
+        order={"createdAt": "desc"},
+        take=take,
+    )
+
+    return {
+        "status_code": 200,
+        "data": [
+            {
+                "id": str(log.id),
+                "bot_config_id": str(log.botConfigId),
+                "user_id": str(log.userId) if getattr(log, "userId", None) else None,
+                "source": str(getattr(log, "source", "") or "").strip() or None,
+                "action": str(getattr(log, "action", "") or "").strip() or None,
+                "phase": str(getattr(log, "phase", "") or "").strip() or None,
+                "level": str(getattr(log, "level", "") or "").strip() or "info",
+                "message": str(getattr(log, "message", "") or "").strip() or None,
+                "status": str(getattr(log, "status", "") or "").strip() or None,
+                "meta": getattr(log, "meta", None),
+                "created_at": log.createdAt.isoformat() if getattr(log, "createdAt", None) else None,
+            }
+            for log in logs
+        ],
+    }
+
+
 @bot_router.patch('/update_risk', tags=["bot"])
 async def update_bot_risk(request: Request, data: Update_Bot_Risk):
     if not request.state.user_id:
@@ -462,6 +593,14 @@ async def emergency_stop_bot(request: Request, data: Emergency_Bot_Stop):
     config = await verify_bot_ownership(data.botConfigId, request.state.user_id)
     current_status = _enum_value(getattr(config, "containerStatus", None))
     is_running = current_status == "running" or bool(getattr(config, "isActive", False))
+    await _emit_lifecycle_event(
+        bot_config_id=str(data.botConfigId),
+        action="emergency_stop",
+        phase="requested",
+        detail="Emergency stop requested (close positions + stop runtime)",
+        status="stopped",
+        owner_user_id=request.state.user_id,
+    )
 
     close_result = "skipped_bot_offline"
     command_id = None
@@ -506,6 +645,15 @@ async def emergency_stop_bot(request: Request, data: Emergency_Bot_Stop):
                     "isActive": False,
                 },
             )
+            await _emit_lifecycle_event(
+                bot_config_id=str(data.botConfigId),
+                action="emergency_stop",
+                phase="failed",
+                detail=str(exc),
+                status="error",
+                metadata={"close_result": close_result},
+                owner_user_id=request.state.user_id,
+            )
             raise HTTPException(
                 status_code=500,
                 detail=_runner_error_message("Emergency stop failed while stopping docker instance", exc),
@@ -518,6 +666,19 @@ async def emergency_stop_bot(request: Request, data: Emergency_Bot_Stop):
             "isActive": False,
             "dockerContainerId": None,
         },
+    )
+    await _emit_lifecycle_event(
+        bot_config_id=str(data.botConfigId),
+        action="emergency_stop",
+        phase="succeeded",
+        detail="Emergency stop completed",
+        status="stopped",
+        metadata={
+            "close_result": close_result,
+            "docker_project_name": getattr(runner_result, "project_name", None),
+            "docker_container_id": getattr(runner_result, "container_id", None),
+        },
+        owner_user_id=request.state.user_id,
     )
 
     # Log Activity
@@ -576,6 +737,15 @@ async def change_bot_model(request: Request, data: Change_Bot_Model):
     current_status = _enum_value(getattr(config, "containerStatus", None))
     was_running = current_status == "running" or bool(getattr(config, "isActive", False))
     runner_result = None
+    await _emit_lifecycle_event(
+        bot_config_id=str(data.botConfigId),
+        action="change_model",
+        phase="requested",
+        detail=f"Model change requested to {data.newModelId}",
+        status="running" if was_running else "stopped",
+        metadata={"new_model_id": str(data.newModelId)},
+        owner_user_id=request.state.user_id,
+    )
 
     if was_running:
         runtime = _extract_runtime_context(
@@ -599,6 +769,15 @@ async def change_bot_model(request: Request, data: Change_Bot_Model):
                     "isActive": False,
                 },
             )
+            await _emit_lifecycle_event(
+                bot_config_id=str(data.botConfigId),
+                action="change_model",
+                phase="failed",
+                detail=str(exc),
+                status="error",
+                metadata={"new_model_id": str(data.newModelId)},
+                owner_user_id=request.state.user_id,
+            )
             raise HTTPException(
                 status_code=500,
                 detail=_runner_error_message("Failed to restart bot with new model", exc),
@@ -617,6 +796,20 @@ async def change_bot_model(request: Request, data: Change_Bot_Model):
     await db.botconfiguration.update(
         where={"id": data.botConfigId},
         data=update_payload,
+    )
+    await _emit_lifecycle_event(
+        bot_config_id=str(data.botConfigId),
+        action="change_model",
+        phase="succeeded",
+        detail="Model changed successfully",
+        status="running" if was_running else "stopped",
+        metadata={
+            "new_model_id": str(data.newModelId),
+            "restarted": was_running,
+            "docker_project_name": getattr(runner_result, "project_name", None),
+            "docker_container_id": getattr(runner_result, "container_id", None),
+        },
+        owner_user_id=request.state.user_id,
     )
 
     # Log Activity
@@ -690,6 +883,18 @@ async def apply_bot_update(request: Request, data: Apply_Bot_Update):
 
     current_status = _enum_value(config.containerStatus)
     was_running = current_status == "running" or bool(config.isActive)
+    await _emit_lifecycle_event(
+        bot_config_id=str(data.botConfigId),
+        action="apply_update",
+        phase="requested",
+        detail=f"Apply update requested ({installed_version_tag} -> {latest_version_tag})",
+        status="running" if was_running else "stopped",
+        metadata={
+            "installed_version_tag": installed_version_tag,
+            "latest_version_tag": latest_version_tag,
+        },
+        owner_user_id=request.state.user_id,
+    )
 
     runner_result = None
     operation = "metadata_only"
@@ -712,6 +917,14 @@ async def apply_bot_update(request: Request, data: Apply_Bot_Update):
                     "isActive": False,
                 },
             )
+            await _emit_lifecycle_event(
+                bot_config_id=str(data.botConfigId),
+                action="apply_update",
+                phase="failed",
+                detail=str(exc),
+                status="error",
+                owner_user_id=request.state.user_id,
+            )
             raise HTTPException(
                 status_code=500,
                 detail=_runner_error_message("Failed to restart bot to apply version update", exc),
@@ -728,6 +941,14 @@ async def apply_bot_update(request: Request, data: Apply_Bot_Update):
                     latest_image_id,
                 )
             except BotRunnerError as exc:
+                await _emit_lifecycle_event(
+                    bot_config_id=str(data.botConfigId),
+                    action="apply_update",
+                    phase="failed",
+                    detail=str(exc),
+                    status="error",
+                    owner_user_id=request.state.user_id,
+                )
                 raise HTTPException(
                     status_code=500,
                     detail=_runner_error_message(f"Failed to pull docker image '{latest_image_id}'", exc),
@@ -748,6 +969,21 @@ async def apply_bot_update(request: Request, data: Apply_Bot_Update):
     await db.botconfiguration.update(
         where={"id": data.botConfigId},
         data=update_payload,
+    )
+    await _emit_lifecycle_event(
+        bot_config_id=str(data.botConfigId),
+        action="apply_update",
+        phase="succeeded",
+        detail=f"Bot update applied ({latest_version_tag})",
+        status=final_status,
+        metadata={
+            "operation": operation,
+            "previous_version_tag": installed_version_tag,
+            "latest_version_tag": latest_version_tag,
+            "docker_project_name": getattr(runner_result, "project_name", None),
+            "docker_container_id": getattr(runner_result, "container_id", None),
+        },
+        owner_user_id=request.state.user_id,
     )
 
     bot_label = bot_version.label or "Trading Bot"
@@ -798,6 +1034,14 @@ async def delete_bot(request: Request, data: Delete_Bot):
 
     current_status = _enum_value(getattr(config, "containerStatus", None))
     is_running = current_status == "running" or bool(getattr(config, "isActive", False))
+    await _emit_lifecycle_event(
+        bot_config_id=str(data.botConfigId),
+        action="delete",
+        phase="requested",
+        detail="Delete bot requested",
+        status="deleted",
+        owner_user_id=request.state.user_id,
+    )
     try:
         await asyncio.to_thread(
             run_bot_instance_action,
@@ -807,6 +1051,14 @@ async def delete_bot(request: Request, data: Delete_Bot):
         )
     except BotRunnerError as exc:
         if is_running:
+            await _emit_lifecycle_event(
+                bot_config_id=str(data.botConfigId),
+                action="delete",
+                phase="failed",
+                detail=str(exc),
+                status="error",
+                owner_user_id=request.state.user_id,
+            )
             raise HTTPException(
                 status_code=500,
                 detail=_runner_error_message("Failed to stop bot docker instance before delete", exc),
@@ -814,6 +1066,14 @@ async def delete_bot(request: Request, data: Delete_Bot):
 
     await db.botconfiguration.delete(
         where={"id": data.botConfigId}
+    )
+    await _emit_lifecycle_event(
+        bot_config_id=str(data.botConfigId),
+        action="delete",
+        phase="succeeded",
+        detail="Bot configuration deleted",
+        status="deleted",
+        owner_user_id=request.state.user_id,
     )
 
     return {"status_code": 200, "message": "Bot configuration deleted"}

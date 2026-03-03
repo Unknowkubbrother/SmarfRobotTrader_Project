@@ -24,7 +24,7 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
   const [dialogOpen, setDialogOpen] = useState(false);
 
   const selectedBot = bots.find(b => b.id === selectedBotId);
-  const runningCount = bots.filter(b => b.status === "running").length;
+  const runningCount = bots.filter((b) => b.status === "running" || b.status === "starting").length;
 
   return (
     <div className="flex items-center gap-3">
@@ -41,7 +41,11 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
                     <p className="text-sm font-medium">{selectedBot.bot_version?.label || "Unknown Bot"}</p>
                     <span className={cn(
                       "w-2 h-2 rounded-full",
-                      selectedBot.status === "running" ? "bg-success" : "bg-muted-foreground"
+                      selectedBot.status === "running"
+                        ? "bg-success"
+                        : selectedBot.status === "starting"
+                          ? "bg-warning"
+                          : "bg-muted-foreground"
                     )} />
                   </div>
                   <p className="text-xs text-muted-foreground">
@@ -88,6 +92,8 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
                   <div className="w-8 h-8 rounded-lg bg-secondary flex items-center justify-center relative">
                     {bot.status === "running" ? (
                       <Play className="w-4 h-4 text-success" />
+                    ) : bot.status === "starting" ? (
+                      <Play className="w-4 h-4 text-warning" />
                     ) : (
                       <Square className="w-4 h-4 text-muted-foreground" />
                     )}

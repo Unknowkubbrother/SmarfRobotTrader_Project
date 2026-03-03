@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, Set
 from uuid import uuid4
 
@@ -37,6 +38,7 @@ class BotHub:
         self._dashboards: Set[WebSocket] = set()
         self._command_waiters: Dict[tuple[str, str], asyncio.Future] = {}
         self._command_acks: Dict[tuple[str, str], dict] = {}
+        self._recent_lifecycle_events: list[dict] = []
 
     # ── Bot connections ──────────────────────────────────────────────
 
@@ -84,6 +86,10 @@ class BotHub:
             })
         return states
 
+    def get_recent_lifecycle_events(self, limit: int = 150) -> list[dict]:
+        size = max(1, min(int(limit), 500))
+        return list(self._recent_lifecycle_events[-size:])
+
     # ── Dashboard connections ────────────────────────────────────────
 
     async def connect_dashboard(self, websocket: WebSocket) -> None:
@@ -113,6 +119,46 @@ class BotHub:
             "bot_config_id": bot_id,
             **state,
         }
+        await self._broadcast_dashboards(payload)
+
+    async def broadcast_lifecycle_event(
+        self,
+        bot_config_id: str,
+        action: str,
+        phase: str,
+        detail: str | None = None,
+        status: str | None = None,
+        source: str | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        """Broadcast bot lifecycle events (requested/succeeded/failed) to dashboards."""
+        bot_id = str(bot_config_id).strip()
+        action_name = str(action or "").strip().lower()
+        phase_name = str(phase or "").strip().lower()
+        if not bot_id or not action_name or not phase_name:
+            return
+
+        payload = {
+            "type": "bot_lifecycle",
+            "event_id": str(uuid4()),
+            "bot_config_id": bot_id,
+            "action": action_name,
+            "phase": phase_name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if detail:
+            payload["detail"] = str(detail)
+        if status:
+            payload["status"] = str(status).strip().lower()
+        if source:
+            payload["source"] = str(source).strip().lower()
+        if metadata and isinstance(metadata, dict):
+            payload["meta"] = dict(metadata)
+
+        self._recent_lifecycle_events.append(payload)
+        if len(self._recent_lifecycle_events) > 500:
+            self._recent_lifecycle_events = self._recent_lifecycle_events[-500:]
+
         await self._broadcast_dashboards(payload)
 
     # ── Vision LLM broadcast ────────────────────────────────────────

@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, List, Optional
@@ -25,10 +27,18 @@ from ..models.admin_model import (
     UpdateAdminUserRoleRequest,
     UpdateAdminUserStatusRequest,
 )
-from ..utils.mt5_bot_runner import build_profile_name
+from ..utils.mt5_bot_runner import (
+    BotRunnerError,
+    build_bot_runtime_env,
+    build_profile_name,
+    decrypt_mt5_password,
+    run_bot_instance_action,
+)
+from ..utils.bot_operation_events import emit_and_store_bot_operation_event
 from .authentication import get_current_active_user
 
 admin_router = APIRouter(tags=["Admin"])
+logger = logging.getLogger(__name__)
 
 ALLOWED_USER_STATUSES = {"active", "banned", "pending"}
 ALLOWED_USER_ROLES = {"user", "admin"}
@@ -180,6 +190,109 @@ def _is_notification_allowed(notification_config) -> bool:
     if value is None:
         return True
     return bool(value)
+
+
+def _runner_error_message(prefix: str, exc: BotRunnerError) -> str:
+    stderr = str(getattr(exc, "stderr", "") or "").strip()
+    stdout = str(getattr(exc, "stdout", "") or "").strip()
+    if stderr:
+        return f"{prefix}: {exc}. stderr={stderr}"
+    if stdout:
+        return f"{prefix}: {exc}. stdout={stdout}"
+    return f"{prefix}: {exc}"
+
+
+def _extract_admin_runtime_context(
+    bot_configuration,
+    image_override: str | None = None,
+    bot_version_override=None,
+) -> dict[str, str | None]:
+    account = getattr(bot_configuration, "account", None)
+    if not account:
+        raise HTTPException(status_code=400, detail="Trading account is missing for this bot.")
+
+    mt5_login = str(getattr(account, "mt5LoginId", "") or "").strip()
+    mt5_server = str(getattr(account, "serverName", "") or "").strip()
+    encrypted_password = str(getattr(account, "mt5Password", "") or "").strip()
+    if not mt5_login or not mt5_server or not encrypted_password:
+        raise HTTPException(
+            status_code=400,
+            detail="Trading account credentials are incomplete. Please update account login/password/server first.",
+        )
+
+    bot_version = bot_version_override or getattr(bot_configuration, "botVersion", None)
+    if not bot_version:
+        raise HTTPException(status_code=400, detail="Bot version is missing for this bot.")
+
+    live_symbol = str(getattr(bot_version, "symbol", "") or "").strip().upper()
+    live_timeframe = str(getattr(bot_version, "timeframe", "") or "").strip().upper()
+    if not live_symbol or not live_timeframe:
+        raise HTTPException(
+            status_code=400,
+            detail="Bot version must include symbol and timeframe to run docker profile.",
+        )
+
+    try:
+        mt5_password = decrypt_mt5_password(encrypted_password)
+    except BotRunnerError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    image_ref = (
+        str(image_override).strip()
+        if image_override and str(image_override).strip()
+        else str(getattr(bot_version, "dockerImageId", "") or "").strip() or None
+    )
+
+    try:
+        profile_name = build_profile_name(live_symbol, live_timeframe)
+    except BotRunnerError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    runtime_env = build_bot_runtime_env(
+        bot_config_id=str(bot_configuration.id),
+        mt5_login=mt5_login,
+        mt5_password=mt5_password,
+        mt5_server=mt5_server,
+        live_symbol=live_symbol,
+        live_timeframe=live_timeframe,
+        docker_image_id=image_ref,
+    )
+
+    return {
+        "profile_name": profile_name,
+        "docker_image_id": image_ref,
+        "runtime_env": runtime_env,
+    }
+
+
+async def _emit_admin_lifecycle_event(
+    bot_config_id: str,
+    action: str,
+    phase: str,
+    detail: str,
+    status: str | None = None,
+    metadata: dict | None = None,
+    owner_user_id: str | None = None,
+) -> None:
+    try:
+        await emit_and_store_bot_operation_event(
+            bot_config_id=bot_config_id,
+            action=action,
+            phase=phase,
+            detail=detail,
+            status=status,
+            source="admin",
+            metadata=metadata,
+            owner_user_id=owner_user_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "failed to broadcast admin bot lifecycle event bot=%s action=%s phase=%s: %s",
+            bot_config_id,
+            action,
+            phase,
+            exc,
+        )
 
 
 def _build_bot_update_email_html(
@@ -463,7 +576,7 @@ async def get_admin_user_detail(
             container_status = _enum_value(config.containerStatus)
             is_active = bool(config.isActive)
 
-            if container_status == "running":
+            if container_status in {"running", "starting"}:
                 running_bots += 1
             if is_active:
                 active_bots += 1
@@ -758,23 +871,157 @@ async def update_admin_user_bot_configuration_status(
 
     bot_configuration = await db.botconfiguration.find_unique(
         where={"id": bot_configuration_id},
-        include={"account": True},
+        include={"account": True, "botVersion": True},
     )
     if not bot_configuration or str(bot_configuration.account.userId) != user_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Bot configuration not found for this user",
         )
+    if status_value == "running" and bot_configuration.botVersion and not bool(getattr(bot_configuration.botVersion, "isActive", True)):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot run bot. Its version is inactive.",
+        )
 
-    await db.botconfiguration.update(
-        where={"id": bot_configuration_id},
-        data={
-            "containerStatus": status_value,
-            "isActive": status_value == "running",
-        },
-    )
+    runner_result = None
+    if status_value == "running":
+        runtime = _extract_admin_runtime_context(bot_configuration)
+        current_status = _enum_value(getattr(bot_configuration, "containerStatus", None))
+        action = "restart" if current_status == "running" or bool(bot_configuration.isActive) else "start"
+        await db.botconfiguration.update(
+            where={"id": bot_configuration_id},
+            data={
+                "containerStatus": "starting",
+            },
+        )
+        await _emit_admin_lifecycle_event(
+            bot_config_id=str(bot_configuration_id),
+            action=action,
+            phase="requested",
+            detail="Bot runtime start requested by admin",
+            status="running",
+            metadata={"admin_user_id": str(getattr(current_user, "id", "") or "").strip() or None},
+            owner_user_id=str(user_id),
+        )
 
-    return {"message": f"Bot status updated to {status_value}"}
+        try:
+            runner_result = await asyncio.to_thread(
+                run_bot_instance_action,
+                action=action,
+                instance_name=str(bot_configuration_id),
+                profile_name=str(runtime["profile_name"]),
+                env_overrides=dict(runtime["runtime_env"] or {}),
+            )
+        except BotRunnerError as exc:
+            await db.botconfiguration.update(
+                where={"id": bot_configuration_id},
+                data={
+                    "containerStatus": "error",
+                    "isActive": False,
+                },
+            )
+            await _emit_admin_lifecycle_event(
+                bot_config_id=str(bot_configuration_id),
+                action=action,
+                phase="failed",
+                detail=str(exc),
+                status="error",
+                metadata={"admin_user_id": str(getattr(current_user, "id", "") or "").strip() or None},
+                owner_user_id=str(user_id),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=_runner_error_message("Failed to start bot docker instance (admin action)", exc),
+            ) from exc
+
+        update_payload = {
+            "containerStatus": "running",
+            "isActive": True,
+            "dockerContainerId": runner_result.container_id,
+        }
+        current_version_tag = str(getattr(bot_configuration.botVersion, "versionTag", "") or "").strip()
+        if current_version_tag:
+            update_payload["installedVersionTag"] = current_version_tag
+        if runtime.get("docker_image_id"):
+            update_payload["installedDockerImageId"] = runtime["docker_image_id"]
+
+        await db.botconfiguration.update(
+            where={"id": bot_configuration_id},
+            data=update_payload,
+        )
+        await _emit_admin_lifecycle_event(
+            bot_config_id=str(bot_configuration_id),
+            action=action,
+            phase="succeeded",
+            detail="Bot runtime is running",
+            status="running",
+            metadata={
+                "admin_user_id": str(getattr(current_user, "id", "") or "").strip() or None,
+                "docker_project_name": getattr(runner_result, "project_name", None),
+                "docker_container_id": getattr(runner_result, "container_id", None),
+            },
+            owner_user_id=str(user_id),
+        )
+    else:
+        await _emit_admin_lifecycle_event(
+            bot_config_id=str(bot_configuration_id),
+            action="stop",
+            phase="requested",
+            detail="Bot runtime stop requested by admin",
+            status="stopped",
+            metadata={"admin_user_id": str(getattr(current_user, "id", "") or "").strip() or None},
+            owner_user_id=str(user_id),
+        )
+        try:
+            runner_result = await asyncio.to_thread(
+                run_bot_instance_action,
+                action="stop",
+                instance_name=str(bot_configuration_id),
+                timeout_sec=300,
+            )
+        except BotRunnerError as exc:
+            await _emit_admin_lifecycle_event(
+                bot_config_id=str(bot_configuration_id),
+                action="stop",
+                phase="failed",
+                detail=str(exc),
+                status="error",
+                metadata={"admin_user_id": str(getattr(current_user, "id", "") or "").strip() or None},
+                owner_user_id=str(user_id),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=_runner_error_message("Failed to stop bot docker instance (admin action)", exc),
+            ) from exc
+
+        await db.botconfiguration.update(
+            where={"id": bot_configuration_id},
+            data={
+                "containerStatus": "stopped",
+                "isActive": False,
+                "dockerContainerId": None,
+            },
+        )
+        await _emit_admin_lifecycle_event(
+            bot_config_id=str(bot_configuration_id),
+            action="stop",
+            phase="succeeded",
+            detail="Bot runtime stopped",
+            status="stopped",
+            metadata={
+                "admin_user_id": str(getattr(current_user, "id", "") or "").strip() or None,
+                "docker_project_name": getattr(runner_result, "project_name", None),
+                "docker_container_id": getattr(runner_result, "container_id", None),
+            },
+            owner_user_id=str(user_id),
+        )
+
+    return {
+        "message": f"Bot status updated to {status_value}",
+        "docker_project_name": getattr(runner_result, "project_name", None),
+        "docker_container_id": getattr(runner_result, "container_id", None),
+    }
 
 
 @admin_router.get("/bot-versions", response_model=List[AdminBotVersionItemResponse])

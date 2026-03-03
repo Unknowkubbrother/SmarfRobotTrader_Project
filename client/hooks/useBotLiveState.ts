@@ -66,10 +66,53 @@ export interface BotLiveState {
     recent_logs?: BotLiveLogEntry[];
 }
 
+export interface BotLifecycleEvent {
+    id: string;
+    bot_config_id: string;
+    action: string;
+    phase: "requested" | "succeeded" | "failed" | string;
+    status?: string;
+    detail?: string;
+    source?: string;
+    timestamp: string;
+    meta?: Record<string, unknown>;
+}
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const WS_URL = API_BASE_URL.replace(/^http/i, "ws") + "/bot/ws/dashboard";
 
 const normalizeBotConfigId = (value: unknown): string => String(value ?? "").trim();
+const toText = (value: unknown): string => String(value ?? "").trim();
+const buildLifecycleEventId = (payload: Record<string, unknown>, botId: string): string => {
+    const direct = toText(payload.event_id);
+    if (direct) return direct;
+    const timestamp = toText(payload.timestamp);
+    const action = toText(payload.action).toLowerCase();
+    const phase = toText(payload.phase).toLowerCase();
+    const detail = toText(payload.detail);
+    return `${botId}:${timestamp}:${action}:${phase}:${detail}`;
+};
+const toLifecycleEvent = (raw: unknown): BotLifecycleEvent | null => {
+    const payload = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
+    if (!payload) return null;
+
+    const botId = normalizeBotConfigId(payload.bot_config_id);
+    if (!botId) return null;
+
+    return {
+        id: buildLifecycleEventId(payload, botId),
+        bot_config_id: botId,
+        action: toText(payload.action).toLowerCase(),
+        phase: toText(payload.phase).toLowerCase() || "requested",
+        status: toText(payload.status).toLowerCase() || undefined,
+        detail: toText(payload.detail) || undefined,
+        source: toText(payload.source).toLowerCase() || undefined,
+        timestamp: toText(payload.timestamp) || new Date().toISOString(),
+        meta: payload.meta && typeof payload.meta === "object"
+            ? (payload.meta as Record<string, unknown>)
+            : undefined,
+    };
+};
 
 /**
  * React hook: connects to the BotHub dashboard WebSocket and
@@ -77,6 +120,7 @@ const normalizeBotConfigId = (value: unknown): string => String(value ?? "").tri
  */
 export function useBotLiveState() {
     const [botStates, setBotStates] = useState<Map<string, BotLiveState>>(new Map());
+    const [lifecycleEvents, setLifecycleEvents] = useState<BotLifecycleEvent[]>([]);
     const [isConnected, setIsConnected] = useState(false);
     const wsRef = useRef<WebSocket | null>(null);
     const reconnectTimer = useRef<NodeJS.Timeout | null>(null);
@@ -109,6 +153,12 @@ export function useBotLiveState() {
                             });
                         }
                         setBotStates(map);
+                        const nextEvents: BotLifecycleEvent[] = [];
+                        for (const item of msg.lifecycle_events || []) {
+                            const parsed = toLifecycleEvent(item);
+                            if (parsed) nextEvents.push(parsed);
+                        }
+                        setLifecycleEvents(nextEvents.slice(-300).reverse());
                     } else if (msg.type === "bot_state") {
                         const botId = normalizeBotConfigId(msg.bot_config_id);
                         if (!botId) return;
@@ -122,6 +172,15 @@ export function useBotLiveState() {
                                 connected: true,
                             });
                             return next;
+                        });
+                    } else if (msg.type === "bot_lifecycle") {
+                        const event = toLifecycleEvent(msg);
+                        if (!event) return;
+                        setLifecycleEvents((prev) => {
+                            if (prev.some((item) => item.id === event.id)) {
+                                return prev;
+                            }
+                            return [event, ...prev].slice(0, 300);
                         });
                     }
                 } catch {
@@ -170,10 +229,21 @@ export function useBotLiveState() {
         [botStates]
     );
 
+    const getLifecycleEventsForBot = useCallback(
+        (botConfigId: string | number): BotLifecycleEvent[] => {
+            const botId = normalizeBotConfigId(botConfigId);
+            if (!botId) return [];
+            return lifecycleEvents.filter((event) => event.bot_config_id === botId);
+        },
+        [lifecycleEvents]
+    );
+
     return {
         botStates,
+        lifecycleEvents,
         isConnected,
         getBotState,
+        getLifecycleEventsForBot,
         allBotStates: Array.from(botStates.values()),
     };
 }

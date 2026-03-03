@@ -9,10 +9,11 @@ import { AddBotDialog } from "@/components/dialogs/AddBotDialog";
 import {
   useTradingAccounts,
   BotConfigWithVersion,
+  BotOperationLogEntry,
   BotRuntimeHealth,
   BotVersion,
 } from "@/hooks/useTradingAccounts";
-import { useBotLiveState } from "@/hooks/useBotLiveState";
+import { useBotLiveState, type BotLifecycleEvent } from "@/hooks/useBotLiveState";
 import {
   Dialog,
   DialogContent,
@@ -109,6 +110,26 @@ const normalizeTradingSchedule = (value: unknown): Record<string, boolean> => {
   return normalized;
 };
 
+const mapLifecycleActionTitle = (action: string): string => {
+  switch (String(action || "").toLowerCase()) {
+    case "start":
+    case "restart":
+      return "Starting Bot";
+    case "stop":
+      return "Stopping Bot";
+    case "emergency_stop":
+      return "Emergency Stop";
+    case "change_model":
+      return "Changing Model";
+    case "apply_update":
+      return "Applying Update";
+    case "delete":
+      return "Deleting Bot";
+    default:
+      return "Bot Operation";
+  }
+};
+
 export default function BotControl() {
   const {
     accounts,
@@ -121,6 +142,7 @@ export default function BotControl() {
     applyBotUpdate,
     deleteBot,
     getBotRuntimeHealth,
+    getBotOperationLogs,
     updateAccount,
     deleteAccount,
     refetch,
@@ -150,15 +172,22 @@ export default function BotControl() {
   const [runtimeHealth, setRuntimeHealth] = useState<BotRuntimeHealth | null>(null);
   const [storeReady, setStoreReady] = useState(false);
   const healthLogKeysRef = useRef<Set<string>>(new Set());
+  const processedLifecycleIdsRef = useRef<Set<string>>(new Set());
+  const lastLifecycleRefetchAtRef = useRef<number>(0);
+  const lastLogsRefreshAtRef = useRef<number>(0);
 
   const [availableModels, setAvailableModels] = useState<BotVersion[]>([]);
   const activeActionForSelectedBot =
     activeAction && selectedBot && activeAction.botId === selectedBot.id
       ? activeAction
       : null;
-  const isBusy = Boolean(activeActionForSelectedBot);
+  const selectedBotStatusNormalized = String(
+    selectedBot?.status || selectedBot?.container_status || ""
+  ).toLowerCase();
+  const isStatusStarting = selectedBotStatusNormalized === "starting";
+  const isBusy = Boolean(activeActionForSelectedBot) || isStatusStarting;
 
-  const { getBotState } = useBotLiveState();
+  const { getBotState, lifecycleEvents } = useBotLiveState();
   const liveState = selectedBot ? getBotState(selectedBot.id) : undefined;
 
   // Safe live state properties with fallbacks
@@ -248,6 +277,15 @@ export default function BotControl() {
     setRuntimeHealth(null);
   }, [selectedBot?.id]);
 
+  useEffect(() => {
+    const botId = selectedBot?.id;
+    if (!botId) {
+      setActionLogs([]);
+      return;
+    }
+    void refreshSelectedBotLogs(botId, true);
+  }, [selectedBot?.id]);
+
   const appendActionLog = (
     level: PersistedBotLog["level"],
     message: string,
@@ -257,6 +295,36 @@ export default function BotControl() {
     const at = now.toLocaleTimeString([], { hour12: false });
     const id = `${now.getTime()}-${Math.random().toString(36).slice(2, 8)}`;
     setActionLogs((prev) => [{ id, level, message, at, botId }, ...prev].slice(0, 20));
+  };
+
+  const mapServerLogToUi = (entry: BotOperationLogEntry): PersistedBotLog => {
+    const normalizedLevel = String(entry.level || "").toLowerCase();
+    const level: PersistedBotLog["level"] =
+      normalizedLevel === "success" ? "success" : normalizedLevel === "error" ? "error" : "info";
+    const createdDate = entry.created_at ? new Date(entry.created_at) : new Date();
+    const at = createdDate.toLocaleTimeString([], { hour12: false });
+    const sourceLabel =
+      entry.source === "admin" ? "Admin" : entry.source === "user" ? "User" : "System";
+    const fallbackMessage = `${entry.action || "operation"} ${entry.phase || "updated"}`.trim();
+    return {
+      id: `srv-${entry.id}`,
+      level,
+      message: `${sourceLabel}: ${entry.message || fallbackMessage}`,
+      at,
+      botId: entry.bot_config_id,
+    };
+  };
+
+  const refreshSelectedBotLogs = async (botId: string, force = false) => {
+    if (!botId) return;
+    const now = Date.now();
+    if (!force && now - lastLogsRefreshAtRef.current < 1000) {
+      return;
+    }
+    lastLogsRefreshAtRef.current = now;
+    const logs = await getBotOperationLogs(botId, 60);
+    if (logs.length === 0) return;
+    setActionLogs(logs.map(mapServerLogToUi));
   };
 
   const startUiAction = (
@@ -284,7 +352,6 @@ export default function BotControl() {
   useEffect(() => {
     const latest = readBotUiState();
     setActiveAction(latest.activeAction);
-    setActionLogs(latest.logs);
     setStoreReady(true);
   }, []);
 
@@ -292,20 +359,97 @@ export default function BotControl() {
     if (!storeReady) return;
     saveBotUiState({
       activeAction,
-      logs: actionLogs,
+      logs: [],
     });
-  }, [activeAction, actionLogs, storeReady]);
+  }, [activeAction, storeReady]);
 
   useEffect(() => {
     const onStorage = (event: StorageEvent) => {
       if (event.key !== BOT_UI_STORAGE_KEY) return;
       const latest = readBotUiState();
       setActiveAction(latest.activeAction);
-      setActionLogs(latest.logs);
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
   }, []);
+
+  useEffect(() => {
+    if (lifecycleEvents.length === 0) return;
+
+    const ownedBotIds = new Set(
+      accounts.flatMap((account) => (account.bot_configurations || []).map((bot) => bot.id))
+    );
+    const selectedBotId = selectedBot?.id || null;
+    const pendingSelectedEvents: BotLifecycleEvent[] = [];
+    let shouldRefetch = false;
+    let shouldRefreshSelectedLogs = false;
+
+    const orderedEvents = [...lifecycleEvents].reverse();
+    for (const event of orderedEvents) {
+      if (processedLifecycleIdsRef.current.has(event.id)) {
+        continue;
+      }
+      processedLifecycleIdsRef.current.add(event.id);
+
+      if (!ownedBotIds.has(event.bot_config_id)) {
+        continue;
+      }
+
+      shouldRefetch = true;
+      if (selectedBotId && event.bot_config_id === selectedBotId) {
+        pendingSelectedEvents.push(event);
+        shouldRefreshSelectedLogs = true;
+      }
+    }
+
+    for (const event of pendingSelectedEvents) {
+      const sourceLabel =
+        event.source === "admin" ? "Admin" : event.source === "user" ? "User" : "System";
+      const actionTitle = mapLifecycleActionTitle(event.action);
+      const detailMessage =
+        String(event.detail || "").trim() ||
+        (event.phase === "requested"
+          ? `${actionTitle} requested`
+          : event.phase === "failed"
+            ? `${actionTitle} failed`
+            : `${actionTitle} completed`);
+      const prefixedLog = `${sourceLabel}: ${detailMessage}`;
+
+      if (event.phase === "requested") {
+        appendActionLog("info", prefixedLog, event.bot_config_id);
+      } else if (event.phase === "succeeded") {
+        appendActionLog("success", prefixedLog, event.bot_config_id);
+        if (activeAction?.botId === event.bot_config_id) {
+          finishUiAction();
+        }
+      } else if (event.phase === "failed") {
+        appendActionLog("error", prefixedLog, event.bot_config_id);
+        if (activeAction?.botId === event.bot_config_id) {
+          finishUiAction();
+        }
+      } else {
+        appendActionLog("info", prefixedLog, event.bot_config_id);
+      }
+    }
+
+    if (processedLifecycleIdsRef.current.size > 1200) {
+      processedLifecycleIdsRef.current.clear();
+      for (const item of lifecycleEvents.slice(0, 400)) {
+        processedLifecycleIdsRef.current.add(item.id);
+      }
+    }
+
+    if (shouldRefetch) {
+      const now = Date.now();
+      if (now - lastLifecycleRefetchAtRef.current > 1200) {
+        lastLifecycleRefetchAtRef.current = now;
+        void refetch();
+      }
+    }
+    if (selectedBotId && shouldRefreshSelectedLogs) {
+      void refreshSelectedBotLogs(selectedBotId);
+    }
+  }, [accounts, lifecycleEvents, selectedBot?.id, activeAction, refetch]);
 
   useEffect(() => {
     if (!activeAction?.botId || !activeAction?.expectedStatus) return;
@@ -371,6 +515,17 @@ export default function BotControl() {
     }, 4000);
     return () => window.clearInterval(timer);
   }, [activeAction, refetch]);
+
+  useEffect(() => {
+    if (!selectedBot) return;
+    const normalizedStatus = String(selectedBot.status || selectedBot.container_status || "").toLowerCase();
+    if (normalizedStatus !== "starting") return;
+    const timer = window.setInterval(() => {
+      void refetch();
+      void refreshSelectedBotLogs(selectedBot.id);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [selectedBot?.id, selectedBot?.status, selectedBot?.container_status, refetch]);
 
   useEffect(() => {
     if (!selectedBot) return;
@@ -639,8 +794,10 @@ export default function BotControl() {
   const botStatus = selectedBot?.status || "stopped";
   const normalizedBotStatus = String(botStatus || "").toLowerCase();
   const isRunningStatus = normalizedBotStatus === "running";
+  const isStartingStatus = normalizedBotStatus === "starting";
   const hasLiveStream = Boolean(liveState?.connected);
-  const isLiveConnecting = !hasLiveStream && (isRunningStatus || activeActionForSelectedBot?.kind === "starting");
+  const isLiveConnecting =
+    !hasLiveStream && (isRunningStatus || isStartingStatus || activeActionForSelectedBot?.kind === "starting");
   const botSymbol = selectedBot?.bot_version?.symbol || "N/A";
   const botLabel = selectedBot?.bot_version?.label || "No Bot Selected";
   const bots = selectedAccount?.bot_configurations || [];
@@ -652,6 +809,8 @@ export default function BotControl() {
     switch (status) {
       case "running":
         return <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-success/10 text-success"><span className="w-1.5 h-1.5 rounded-full bg-success" />Running</span>;
+      case "starting":
+        return <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-warning/10 text-warning"><RefreshCw className="w-3 h-3 animate-spin" />Starting</span>;
       case "paused":
         return <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-warning/10 text-warning">Paused</span>;
       default:
@@ -796,7 +955,22 @@ export default function BotControl() {
                       Change Model
                     </Button>
                     <Button variant="outline" className="gap-2" onClick={handleToggleBotClick} disabled={isBusy}>
-                      {botStatus === "running" ? <><Power className="w-4 h-4" />Stop</> : <><Play className="w-4 h-4" />Start</>}
+                      {botStatus === "running" ? (
+                        <>
+                          <Power className="w-4 h-4" />
+                          Stop
+                        </>
+                      ) : botStatus === "starting" ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                          Starting...
+                        </>
+                      ) : (
+                        <>
+                          <Play className="w-4 h-4" />
+                          Start
+                        </>
+                      )}
                     </Button>
                     <Button variant="destructive" onClick={handlePanicClick} className="gap-2" disabled={isBusy}>
                       <AlertOctagon className="w-4 h-4" />

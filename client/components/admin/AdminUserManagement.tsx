@@ -54,7 +54,7 @@ interface AdminUserBot {
   label: string | null;
   symbol: string | null;
   timeframe: string | null;
-  container_status: "running" | "stopped" | null;
+  container_status: "running" | "starting" | "stopped" | "error" | null;
   is_active: boolean;
   updated_at: string | null;
 }
@@ -139,6 +139,11 @@ const formatDate = (value: string | null) => {
 };
 
 const shortId = (value: string) => `#${value.slice(0, 8)}`;
+const normalizeBotStatus = (status: AdminUserBot["container_status"], isActive: boolean): string => {
+  const raw = String(status || "").trim().toLowerCase();
+  if (raw) return raw;
+  return isActive ? "active" : "stopped";
+};
 
 export function AdminUserManagement() {
   const [users, setUsers] = useState<AdminUser[]>([]);
@@ -159,6 +164,20 @@ export function AdminUserManagement() {
   useEffect(() => {
     fetchUsers();
   }, []);
+
+  useEffect(() => {
+    if (!showUserDialog || !selectedUser?.id || !userDetail) return;
+    const hasStartingBot = userDetail.trading_accounts.some((account) =>
+      account.bots.some((bot) => normalizeBotStatus(bot.container_status, bot.is_active) === "starting")
+    );
+    if (!hasStartingBot) return;
+
+    const timer = window.setInterval(() => {
+      void fetchUserDetail(selectedUser.id);
+    }, 3000);
+
+    return () => window.clearInterval(timer);
+  }, [showUserDialog, selectedUser?.id, userDetail]);
 
   const fetchUsers = async () => {
     try {
@@ -625,15 +644,34 @@ export function AdminUserManagement() {
                       </div>
                     ) : (
                       <div className="grid gap-3 md:grid-cols-2">
-                        {userDetail.trading_accounts.map((account) => (
+                        {userDetail.trading_accounts.map((account) => {
+                          const accountHasStarting = account.bots.some(
+                            (bot) => normalizeBotStatus(bot.container_status, bot.is_active) === "starting"
+                          );
+                          const accountRunningOrStarting = account.bots.filter((bot) => {
+                            const status = normalizeBotStatus(bot.container_status, bot.is_active);
+                            return status === "running" || status === "starting";
+                          }).length;
+                          const accountBadgeClass = accountHasStarting
+                            ? "bg-amber-100 text-amber-700"
+                            : accountRunningOrStarting > 0
+                              ? "bg-emerald-100 text-emerald-700"
+                              : "bg-zinc-100 text-zinc-700";
+                          const accountBadgeLabel = accountHasStarting
+                            ? "Starting"
+                            : accountRunningOrStarting > 0
+                              ? "Running"
+                              : "Stopped";
+
+                          return (
                           <div key={account.id} className="rounded-lg border border-border bg-secondary/20 p-4">
                             <div className="flex items-center justify-between">
                               <div>
                                 <p className="font-semibold">#{account.mt5_login_id || shortId(account.id)}</p>
                                 <p className="text-xs text-muted-foreground">{account.broker_name || "Unknown Broker"} {account.server_name ? `· ${account.server_name}` : ""}</p>
                               </div>
-                              <Badge className={account.running_bots > 0 ? "bg-emerald-100 text-emerald-700" : "bg-zinc-100 text-zinc-700"}>
-                                {account.running_bots > 0 ? "Running" : "Stopped"}
+                              <Badge className={accountBadgeClass}>
+                                {accountBadgeLabel}
                               </Badge>
                             </div>
 
@@ -644,40 +682,54 @@ export function AdminUserManagement() {
                               </div>
                               <div className="rounded-md bg-background p-2">
                                 <p className="text-xs text-muted-foreground">Bot Status</p>
-                                <p className="font-semibold">{account.active_bots} active / {account.running_bots} running</p>
+                                <p className="font-semibold">{account.active_bots} active / {accountRunningOrStarting} running</p>
                               </div>
                             </div>
 
                             {account.bots.length > 0 ? (
                               <div className="mt-3 space-y-2">
-                                {account.bots.map((bot) => (
+                                {account.bots.map((bot) => {
+                                  const botStatus = normalizeBotStatus(bot.container_status, bot.is_active);
+                                  const isBotStarting = botStatus === "starting";
+                                  const isBotRunning = botStatus === "running";
+                                  const badgeClass = isBotStarting
+                                    ? "border-amber-200 text-amber-700"
+                                    : botStatus === "error"
+                                      ? "border-rose-200 text-rose-700"
+                                      : undefined;
+
+                                  return (
                                   <div key={bot.id} className="flex items-center justify-between rounded-md border border-border bg-background p-2">
                                     <div className="min-w-0">
                                       <p className="truncate text-sm font-medium">{bot.label || `Bot #${bot.bot_instance_id}`}</p>
                                       <p className="text-xs text-muted-foreground">#{bot.bot_instance_id} · {bot.symbol || "-"} {bot.timeframe || ""}</p>
                                     </div>
                                     <div className="flex items-center gap-2">
-                                      <Badge variant="outline" className="capitalize">
-                                        {bot.container_status || (bot.is_active ? "active" : "stopped")}
+                                      <Badge variant="outline" className={`capitalize ${badgeClass || ""}`}>
+                                        {botStatus}
                                       </Badge>
                                       <Button
                                         size="sm"
                                         variant="outline"
-                                        disabled={updatingBotId === bot.id}
-                                        onClick={() => updateBotStatus(bot.id, bot.container_status === "running" ? "stopped" : "running")}
+                                        disabled={updatingBotId === bot.id || isBotStarting}
+                                        onClick={() => updateBotStatus(bot.id, isBotRunning ? "stopped" : "running")}
                                       >
-                                        <Activity className="mr-1 w-3 h-3" />
-                                        {bot.container_status === "running" ? "Stop" : "Run"}
+                                        {isBotStarting ? (
+                                          <RefreshCw className="mr-1 w-3 h-3 animate-spin" />
+                                        ) : (
+                                          <Activity className="mr-1 w-3 h-3" />
+                                        )}
+                                        {isBotRunning ? "Stop" : isBotStarting ? "Starting..." : "Run"}
                                       </Button>
                                     </div>
                                   </div>
-                                ))}
+                                )})}
                               </div>
                             ) : (
                               <p className="mt-3 text-xs text-muted-foreground">No bots configured for this account.</p>
                             )}
                           </div>
-                        ))}
+                        )})}
                       </div>
                     )}
                   </TabsContent>

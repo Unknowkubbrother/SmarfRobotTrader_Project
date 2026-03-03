@@ -422,9 +422,11 @@ async def dashboard_websocket(websocket: WebSocket):
     try:
         # Send initial snapshot
         snapshot = bot_hub.get_all_bot_states()
+        lifecycle_events = bot_hub.get_recent_lifecycle_events()
         await websocket.send_text(json.dumps({
             "type": "snapshot",
             "bots": snapshot,
+            "lifecycle_events": lifecycle_events,
         }))
 
         # Keep alive
