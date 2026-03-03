@@ -1,0 +1,13 @@
+stable-baselines3==2.3.2
+gymnasium>=0.28.1,<0.30
+numpy>=2.0.0,<3.0.0
+pandas>=2.1.0,<3.0.0
+joblib
+torch
+chromadb
+FlagEmbedding
+
+# ==================================================
+# MT5 / Live / Strategy Tester
+# ==================================================
+git+https://github.com/lucas-campagna/mt5linux.git@master

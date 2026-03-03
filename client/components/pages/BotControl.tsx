@@ -175,6 +175,7 @@ export default function BotControl() {
   const processedLifecycleIdsRef = useRef<Set<string>>(new Set());
   const lastLifecycleRefetchAtRef = useRef<number>(0);
   const lastLogsRefreshAtRef = useRef<number>(0);
+  const applyUpdateInFlightRef = useRef(false);
 
   const [availableModels, setAvailableModels] = useState<BotVersion[]>([]);
   const activeActionForSelectedBot =
@@ -186,6 +187,7 @@ export default function BotControl() {
   ).toLowerCase();
   const isStatusStarting = selectedBotStatusNormalized === "starting";
   const isBusy = Boolean(activeActionForSelectedBot) || isStatusStarting;
+  const isApplyingUpdateAction = activeActionForSelectedBot?.kind === "apply_update";
 
   const { getBotState, lifecycleEvents } = useBotLiveState();
   const liveState = selectedBot ? getBotState(selectedBot.id) : undefined;
@@ -453,6 +455,12 @@ export default function BotControl() {
 
   useEffect(() => {
     if (!activeAction?.botId || !activeAction?.expectedStatus) return;
+    const shouldSyncByStatus =
+      activeAction.kind === "starting" ||
+      activeAction.kind === "stopping" ||
+      activeAction.kind === "deleting" ||
+      activeAction.kind === "emergency";
+    if (!shouldSyncByStatus) return;
 
     const allBots = accounts.flatMap((account) => account.bot_configurations || []);
     const targetBot = allBots.find((bot) => bot.id === activeAction.botId);
@@ -748,24 +756,35 @@ export default function BotControl() {
   const handleApplyUpdate = async () => {
     if (isBusy) return;
     if (!selectedBot) return;
+    if (applyUpdateInFlightRef.current) return;
+    applyUpdateInFlightRef.current = true;
     startUiAction(
       "Applying Update",
       "Applying latest version and restarting bot if required...",
       `Applying latest version for ${selectedBot.bot_version?.label || "bot"}`,
       {
         botId: selectedBot.id,
-        expectedStatus: (selectedBot.status === "running" ? "running" : "stopped"),
         kind: "apply_update",
       }
     );
-    const success = await applyBotUpdate(selectedBot.id);
-    if (success) {
-      appendActionLog("success", "Bot update applied", selectedBot.id);
-      setUpdateConfirmOpen(false);
-    } else {
+    setUpdateConfirmOpen(false);
+    try {
+      const result = await applyBotUpdate(selectedBot.id);
+      if (result.success) {
+        appendActionLog("success", "Bot update applied", selectedBot.id);
+        finishUiAction();
+        return;
+      }
+      if (result.pending) {
+        appendActionLog("info", "Apply update request accepted. Waiting for backend sync...", selectedBot.id);
+        toast.info("Update is still in progress. Tracking status from backend...");
+        return;
+      }
       appendActionLog("error", "Bot update failed", selectedBot.id);
+      finishUiAction();
+    } finally {
+      applyUpdateInFlightRef.current = false;
     }
-    finishUiAction();
   };
 
   const handleDeleteBot = async () => {
@@ -930,8 +949,12 @@ export default function BotControl() {
                         onClick={() => setUpdateConfirmOpen(true)}
                         disabled={isBusy}
                       >
-                        <DownloadCloud className="w-4 h-4" />
-                        Update Bot
+                        {isApplyingUpdateAction ? (
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <DownloadCloud className="w-4 h-4" />
+                        )}
+                        {isApplyingUpdateAction ? "Updating..." : "Update Bot"}
                       </Button>
                     )}
                     <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-secondary">
@@ -1128,8 +1151,12 @@ export default function BotControl() {
                       )}
                     </div>
                     <Button className="gap-2" onClick={() => setUpdateConfirmOpen(true)} disabled={isBusy}>
-                      <DownloadCloud className="w-4 h-4" />
-                      Apply Update
+                      {isApplyingUpdateAction ? (
+                        <RefreshCw className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <DownloadCloud className="w-4 h-4" />
+                      )}
+                      {isApplyingUpdateAction ? "Updating..." : "Apply Update"}
                     </Button>
                   </div>
                 </div>
@@ -1439,7 +1466,7 @@ export default function BotControl() {
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={handleApplyUpdate} disabled={isBusy}>
-              Update Bot
+              {isApplyingUpdateAction ? "Updating..." : "Update Bot"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

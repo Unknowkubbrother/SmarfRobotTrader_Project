@@ -9,4 +9,4 @@ __pycache__/
 logs/
 snapshots/
 .instances/
-bots/
+bots/eurusd_h1/models/

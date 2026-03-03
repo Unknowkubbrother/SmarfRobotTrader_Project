@@ -341,16 +341,29 @@ export function useTradingAccounts() {
   };
 
   // Apply pending bot image update
-  const applyBotUpdate = async (botConfigId: string) => {
+  const applyBotUpdate = async (botConfigId: string): Promise<BotStatusUpdateResult> => {
     try {
       await api.patch("/bot/apply_update", { botConfigId });
       await fetchAccounts();
       toast.success("Bot update applied successfully");
-      return true;
+      return { success: true };
     } catch (error) {
       console.error("Error applying bot update:", error);
-      toast.error("Failed to apply bot update");
-      return false;
+      const message = (error as Error)?.message || "Failed to apply bot update";
+      if (isLikelyTransientRequestError(error)) {
+        await fetchAccounts();
+        return {
+          success: false,
+          pending: true,
+          error: message,
+        };
+      }
+      toast.error(message);
+      return {
+        success: false,
+        pending: false,
+        error: message,
+      };
     }
   };
 

@@ -486,7 +486,17 @@ async def get_bot_operation_logs(request: Request, botConfigId: str, limit: int 
     config = await verify_bot_ownership(botConfigId, request.state.user_id)
     take = max(1, min(int(limit), 200))
 
-    logs = await db.botoperationlog.find_many(
+    bot_operation_model = getattr(db, "botoperationlog", None)
+    if bot_operation_model is None:
+        logger.error(
+            "Prisma client is missing model botoperationlog; run `prisma generate --schema=src/database/schema.prisma`."
+        )
+        return {
+            "status_code": 200,
+            "data": [],
+        }
+
+    logs = await bot_operation_model.find_many(
         where={"botConfigId": str(config.id)},
         order={"createdAt": "desc"},
         take=take,

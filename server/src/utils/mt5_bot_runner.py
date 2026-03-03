@@ -245,12 +245,38 @@ try:
 except Exception:
     timeout_ms = 180000
 
+login_text = str(os.getenv("MT5_LOGIN", "") or "").strip()
+password = str(os.getenv("MT5_PASSWORD", "") or "").strip()
+server = str(os.getenv("MT5_SERVER", "") or "").strip()
+login_id = None
+if login_text:
+    try:
+        login_id = int(login_text)
+    except Exception:
+        login_id = None
+
 try:
     mt5 = MetaTrader5(host="localhost", port=8001)
-    if not mt5.initialize(timeout=timeout_ms):
+    init_kwargs = {"timeout": timeout_ms}
+    if login_id is not None and password:
+        init_kwargs["login"] = login_id
+        init_kwargs["password"] = password
+        if server:
+            init_kwargs["server"] = server
+
+    if not mt5.initialize(**init_kwargs):
         payload["detail"] = "initialize_failed"
         print(json.dumps(payload))
         sys.exit(2)
+
+    if login_id is not None and password:
+        login_kwargs = {"login": login_id, "password": password}
+        if server:
+            login_kwargs["server"] = server
+        if not mt5.login(**login_kwargs):
+            payload["detail"] = "login_failed"
+            print(json.dumps(payload))
+            sys.exit(5)
 
     info = mt5.terminal_info()
     if info is None:

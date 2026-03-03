@@ -1,0 +1,9 @@
+# Live runtime dependencies only.
+# Keep this list lean to avoid training-only transitive packages that are unstable under qemu emulation.
+stable-baselines3==2.3.2
+gymnasium>=0.28.1,<0.30
+numpy>=2.0.0,<3.0.0
+pandas>=2.1.0,<3.0.0
+joblib
+torch
+mt5linux

@@ -6,6 +6,7 @@ from ..database.client import db
 from .ws_manager import bot_hub
 
 logger = logging.getLogger(__name__)
+_BOT_LOG_MODEL_MISSING_WARNED = False
 
 
 def _to_text(value) -> str:
@@ -65,16 +66,25 @@ async def emit_and_store_bot_operation_event(
     if meta_payload:
         create_data["meta"] = Json(meta_payload)
 
-    try:
-        await db.botoperationlog.create(data=create_data)
-    except Exception as exc:
-        logger.warning(
-            "failed to persist bot operation event bot=%s action=%s phase=%s: %s",
-            bot_id,
-            action_name,
-            phase_name,
-            exc,
-        )
+    bot_operation_model = getattr(db, "botoperationlog", None)
+    if bot_operation_model is None:
+        global _BOT_LOG_MODEL_MISSING_WARNED
+        if not _BOT_LOG_MODEL_MISSING_WARNED:
+            _BOT_LOG_MODEL_MISSING_WARNED = True
+            logger.warning(
+                "Prisma client missing botoperationlog model. Run `prisma generate --schema=src/database/schema.prisma`."
+            )
+    else:
+        try:
+            await bot_operation_model.create(data=create_data)
+        except Exception as exc:
+            logger.warning(
+                "failed to persist bot operation event bot=%s action=%s phase=%s: %s",
+                bot_id,
+                action_name,
+                phase_name,
+                exc,
+            )
 
     try:
         await bot_hub.broadcast_lifecycle_event(
