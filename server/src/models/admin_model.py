@@ -51,7 +51,6 @@ class UpdateAdminBotVersionRequest(BaseModel):
     version_tag: Optional[str] = None
     symbol: Optional[str] = None
     timeframe: Optional[str] = None
-    docker_image_id: Optional[str] = None
     release_notes: Optional[List[str]] = None
     is_active: Optional[bool] = None
 
@@ -131,7 +130,7 @@ class AdminBotVersionItemResponse(BaseModel):
     version_tag: Optional[str] = None
     symbol: Optional[str] = None
     timeframe: Optional[str] = None
-    docker_image_id: Optional[str] = None
+    runner_profile: Optional[str] = None
     is_active: bool = True
     release_notes: List[str] = Field(default_factory=list)
     release_date: Optional[str] = None
@@ -143,13 +142,11 @@ class CreateAdminBotVersionRequest(BaseModel):
     version_tag: str
     symbol: Optional[str] = None
     timeframe: Optional[str] = None
-    docker_image_id: Optional[str] = None
     is_active: bool = True
     release_notes: List[str] = Field(default_factory=list)
 
 
 class PublishAdminBotUpdateRequest(BaseModel):
-    docker_image_id: str
     version_tag: Optional[str] = None
-    release_notes: List[str] = Field(default_factory=list)
+    release_notes: Optional[List[str]] = None
     notify_users: bool = True

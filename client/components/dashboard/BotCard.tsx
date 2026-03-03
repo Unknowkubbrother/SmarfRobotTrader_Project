@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Power, Play, Activity, TrendingUp, Trash2, AlertTriangle, DownloadCloud } from "lucide-react";
+import { Power, Play, Activity, TrendingUp, Trash2, AlertTriangle, DownloadCloud, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { BotConfigWithVersion } from "@/hooks/useTradingAccounts";
@@ -21,6 +21,7 @@ interface BotCardProps {
   onSelect?: (botId: string) => void;
   isSelected?: boolean;
   showDelete?: boolean;
+  isBusy?: boolean;
 }
 
 export function BotCard({
@@ -29,7 +30,8 @@ export function BotCard({
   onDelete,
   onSelect,
   isSelected = false,
-  showDelete = true
+  showDelete = true,
+  isBusy = false
 }: BotCardProps) {
   const [showStopConfirm, setShowStopConfirm] = useState(false);
   const status = bot.status || "stopped";
@@ -39,6 +41,7 @@ export function BotCard({
 
   const handleToggleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (isBusy) return;
     if (status === "running") {
       setShowStopConfirm(true);
     } else {
@@ -108,6 +111,12 @@ export function BotCard({
               <div className="flex items-center gap-2 flex-wrap">
                 <h4 className="font-medium text-sm truncate">{label}</h4>
                 {getStatusBadge(status)}
+                {isBusy && (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-warning/10 text-warning">
+                    <RefreshCw className="w-3 h-3 animate-spin" />
+                    Processing
+                  </span>
+                )}
                 {bot.has_pending_update && (
                   <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-primary/10 text-primary">
                     <DownloadCloud className="w-3 h-3" />
@@ -144,6 +153,7 @@ export function BotCard({
               size="sm"
               className="h-8 w-8 p-0"
               onClick={handleToggleClick}
+              disabled={isBusy}
             >
               {status === "running" ? (
                 <Power className="w-4 h-4 text-destructive" />
@@ -159,8 +169,10 @@ export function BotCard({
                 className="h-8 w-8 p-0 hover:bg-destructive/10"
                 onClick={(e) => {
                   e.stopPropagation();
+                  if (isBusy) return;
                   onDelete(bot.id);
                 }}
+                disabled={isBusy}
               >
                 <Trash2 className="w-4 h-4 text-muted-foreground hover:text-destructive" />
               </Button>
@@ -187,6 +199,7 @@ export function BotCard({
                 handleConfirmStop();
               }}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={isBusy}
             >
               Stop Bot
             </AlertDialogAction>

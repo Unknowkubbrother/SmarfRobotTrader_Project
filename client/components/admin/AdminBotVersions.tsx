@@ -24,7 +24,7 @@ interface BotVersion {
   version_tag: string | null;
   symbol: string | null;
   timeframe: string | null;
-  docker_image_id: string | null;
+  runner_profile: string | null;
   is_active: boolean;
   release_notes: string[];
   release_date: string | null;
@@ -36,12 +36,10 @@ interface VersionForm {
   version_tag: string;
   symbol: string;
   timeframe: string;
-  docker_image_id: string;
   release_notes: string;
 }
 
 interface PublishUpdateForm {
-  docker_image_id: string;
   version_tag: string;
   release_notes: string;
   notify_users: boolean;
@@ -52,15 +50,19 @@ const EMPTY_FORM: VersionForm = {
   version_tag: "",
   symbol: "XAUUSD",
   timeframe: "H1",
-  docker_image_id: "",
   release_notes: "",
 };
 
 const EMPTY_PUBLISH_FORM: PublishUpdateForm = {
-  docker_image_id: "",
   version_tag: "",
   release_notes: "",
   notify_users: true,
+};
+
+const toRunnerProfile = (symbol: string, timeframe: string): string => {
+  const s = symbol.trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const t = timeframe.trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return s && t ? `${s}_${t}` : "-";
 };
 
 export function AdminBotVersions() {
@@ -119,7 +121,6 @@ export function AdminBotVersions() {
         version_tag: addForm.version_tag.trim(),
         symbol: addForm.symbol.trim() || null,
         timeframe: addForm.timeframe.trim() || null,
-        docker_image_id: addForm.docker_image_id.trim() || null,
         is_active: true,
         release_notes: toReleaseNotes(addForm.release_notes),
       });
@@ -143,7 +144,6 @@ export function AdminBotVersions() {
       version_tag: version.version_tag || "",
       symbol: version.symbol || "",
       timeframe: version.timeframe || "",
-      docker_image_id: version.docker_image_id || "",
       release_notes: (version.release_notes || []).join("\n"),
     });
     setShowEditDialog(true);
@@ -163,7 +163,6 @@ export function AdminBotVersions() {
         version_tag: editForm.version_tag.trim(),
         symbol: editForm.symbol.trim() || null,
         timeframe: editForm.timeframe.trim() || null,
-        docker_image_id: editForm.docker_image_id.trim() || null,
         release_notes: toReleaseNotes(editForm.release_notes),
       });
 
@@ -182,7 +181,6 @@ export function AdminBotVersions() {
   const openPublishDialog = (version: BotVersion) => {
     setPublishingVersion(version);
     setPublishForm({
-      docker_image_id: version.docker_image_id || "",
       version_tag: version.version_tag || "",
       release_notes: (version.release_notes || []).join("\n"),
       notify_users: true,
@@ -192,15 +190,10 @@ export function AdminBotVersions() {
 
   const handlePublishUpdate = async () => {
     if (!publishingVersion) return;
-    if (!publishForm.docker_image_id.trim()) {
-      toast.error("Please provide docker image id");
-      return;
-    }
 
     setPublishSubmitting(true);
     try {
       const { data } = await api.post(`/admin/bot-versions/${publishingVersion.id}/publish-update`, {
-        docker_image_id: publishForm.docker_image_id.trim(),
         version_tag: publishForm.version_tag.trim() || null,
         release_notes: toReleaseNotes(publishForm.release_notes),
         notify_users: publishForm.notify_users,
@@ -356,14 +349,16 @@ export function AdminBotVersions() {
                   />
                 </div>
               </div>
+              <p className="text-xs text-muted-foreground">
+                Runner profile folder: <span className="font-mono">{toRunnerProfile(addForm.symbol, addForm.timeframe)}</span>
+              </p>
 
               <div>
-                <Label htmlFor="add-image">Docker Image ID</Label>
+                <Label htmlFor="add-profile">Runner Profile</Label>
                 <Input
-                  id="add-image"
-                  placeholder="registry/repo:tag"
-                  value={addForm.docker_image_id}
-                  onChange={(event) => setAddForm({ ...addForm, docker_image_id: event.target.value })}
+                  id="add-profile"
+                  value={toRunnerProfile(addForm.symbol, addForm.timeframe)}
+                  disabled
                 />
               </div>
 
@@ -442,13 +437,16 @@ export function AdminBotVersions() {
                 />
               </div>
             </div>
+            <p className="text-xs text-muted-foreground">
+              Runner profile folder: <span className="font-mono">{toRunnerProfile(editForm.symbol, editForm.timeframe)}</span>
+            </p>
 
             <div>
-              <Label htmlFor="edit-image">Docker Image ID</Label>
+              <Label htmlFor="edit-profile">Runner Profile</Label>
               <Input
-                id="edit-image"
-                value={editForm.docker_image_id}
-                onChange={(event) => setEditForm({ ...editForm, docker_image_id: event.target.value })}
+                id="edit-profile"
+                value={toRunnerProfile(editForm.symbol, editForm.timeframe)}
+                disabled
               />
             </div>
 
@@ -486,23 +484,13 @@ export function AdminBotVersions() {
           <DialogHeader>
             <DialogTitle>Publish Bot Update</DialogTitle>
             <DialogDescription>
-              Push a new docker image + release notes and notify users to update from Bot Control.
+              Publish latest version tag and release notes so users can apply update from Bot Control.
             </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-4">
             <div>
-              <Label htmlFor="publish-image">Docker Image ID *</Label>
-              <Input
-                id="publish-image"
-                value={publishForm.docker_image_id}
-                onChange={(event) => setPublishForm({ ...publishForm, docker_image_id: event.target.value })}
-                placeholder="registry/repo:tag"
-              />
-            </div>
-
-            <div>
-              <Label htmlFor="publish-version">Version Tag (optional)</Label>
+              <Label htmlFor="publish-version">Version Tag (required when changed)</Label>
               <Input
                 id="publish-version"
                 value={publishForm.version_tag}
@@ -582,15 +570,12 @@ export function AdminBotVersions() {
                   <div className="flex items-center gap-4 text-sm text-muted-foreground flex-wrap">
                     <span className="font-mono">{version.symbol || "-"}</span>
                     <span>{version.timeframe || "-"}</span>
+                    <span className="font-mono">profile: {version.runner_profile || "-"}</span>
                     <span className="flex items-center gap-1">
                       <Clock className="w-3 h-3" />
                       {version.release_date ? new Date(version.release_date).toLocaleDateString() : "N/A"}
                     </span>
                   </div>
-
-                  {version.docker_image_id && (
-                    <p className="text-xs text-muted-foreground mt-2 font-mono">{version.docker_image_id}</p>
-                  )}
 
                   {version.release_notes.length > 0 && (
                     <ul className="text-sm text-muted-foreground mt-2 list-disc list-inside">

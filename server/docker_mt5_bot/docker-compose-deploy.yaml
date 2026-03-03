@@ -1,0 +1,30 @@
+services:
+  metatrader5-macos:
+    platform: linux/amd64
+    image: ${METATRADER_IMAGE:-unknowkubbrother/metatrader5_macos}
+    volumes:
+      - config:/config
+      - ./bots:/bots
+      - ${MT5_SNAPSHOT_HOST_DIR:-./snapshots}:/snapshots
+      - pydeps:/shared-pydeps
+    ports:
+      - ${MT5_WEB_PORT:-3000}:3000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - CUSTOM_USER=${CUSTOM_USER:-admin}
+      - PASSWORD=${PASSWORD:-12345}
+      - MT5_LOGIN=${MT5_LOGIN:-}
+      - MT5_PASSWORD=${MT5_PASSWORD:-}
+      - MT5_SERVER=${MT5_SERVER:-}
+      - MT5_SNAPSHOT_PATH=${MT5_SNAPSHOT_PATH:-/snapshots/mt5-config-snapshot.tgz}
+      - BOT_WS_URL=${BOT_WS_URL:-}
+      - BOT_CONFIG_ID=${BOT_CONFIG_ID:-}
+      - VISION_LLM_API_URL=${VISION_LLM_API_URL:-}
+
+volumes:
+  config:
+  pydeps:
+    name: mt5_pydeps_shared

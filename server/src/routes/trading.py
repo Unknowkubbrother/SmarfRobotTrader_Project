@@ -1,4 +1,6 @@
-from fastapi import APIRouter, HTTPException, Depends, status, Response, Request, Form
+import asyncio
+
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from cryptography.fernet import Fernet
 from prisma import Json
@@ -13,6 +15,7 @@ from ..models.trading_model import (
     UpsertTradingJournalRequest,
 )
 from ..database.client import db
+from ..utils.mt5_bot_runner import BotRunnerError, build_profile_name, run_bot_instance_action
 from ..utils.trading_schedule import normalize_trading_schedule
 
 trading_router = APIRouter()
@@ -54,6 +57,29 @@ def _encrypt_mt5_password(raw_password: str) -> str:
     )
     fernet = Fernet(key)
     return fernet.encrypt(raw_password.encode()).decode()
+
+
+async def _stop_account_bot_instances(account_id: str) -> int:
+    bot_configs = await db.botconfiguration.find_many(
+        where={"accountId": account_id},
+    )
+    if not bot_configs:
+        return 0
+
+    stopped_count = 0
+    for config in bot_configs:
+        try:
+            await asyncio.to_thread(
+                run_bot_instance_action,
+                action="stop",
+                instance_name=str(config.id),
+                timeout_sec=300,
+            )
+            stopped_count += 1
+        except BotRunnerError as exc:
+            print(f"[WARN] failed to stop bot instance {config.id}: {exc}")
+
+    return stopped_count
 
 
 async def _get_user_account_ids(user_id: str) -> list[str]:
@@ -576,6 +602,12 @@ async def get_accounts_with_bots(request: Request):
                     latest_release_notes = bv.releaseNotes or []
                     latest_release_date = str(bv.releaseDate) if bv.releaseDate else None
                     latest_version_tag = bv.versionTag
+                    runner_profile = None
+                    try:
+                        if bv.symbol and bv.timeframe:
+                            runner_profile = build_profile_name(bv.symbol, bv.timeframe)
+                    except Exception:
+                        runner_profile = None
                     bot_version = {
                         "model_id": str(bv.modelId),
                         "label": bv.label,
@@ -583,15 +615,18 @@ async def get_accounts_with_bots(request: Request):
                         "version_tag": bv.versionTag,
                         "symbol": bv.symbol,
                         "timeframe": bv.timeframe,
+                        "runner_profile": runner_profile,
                         "release_notes": bv.releaseNotes,
                     }
 
                 installed_image_id = getattr(config, "installedDockerImageId", None)
+                installed_version_tag = getattr(config, "installedVersionTag", None)
                 effective_installed_image_id = installed_image_id or latest_image_id
+                effective_installed_version_tag = installed_version_tag or latest_version_tag
                 has_pending_update = bool(
-                    latest_image_id
-                    and effective_installed_image_id
-                    and latest_image_id != effective_installed_image_id
+                    latest_version_tag
+                    and effective_installed_version_tag
+                    and latest_version_tag != effective_installed_version_tag
                 )
 
                 bot_configs.append({
@@ -604,6 +639,7 @@ async def get_accounts_with_bots(request: Request):
                     "is_active": config.isActive,
                     "docker_container_id": config.dockerContainerId,
                     "installed_docker_image_id": effective_installed_image_id,
+                    "installed_version_tag": effective_installed_version_tag,
                     "container_status": config.containerStatus if config.containerStatus else None,
                     "has_pending_update": has_pending_update,
                     "latest_docker_image_id": latest_image_id,
@@ -726,6 +762,9 @@ async def update_account(request: Request, data: Update_Trading_Account):
     linked_bots = await db.botconfiguration.count(
         where={"accountId": data.accountId},
     )
+    stopped_instances = 0
+    if linked_bots > 0:
+        stopped_instances = await _stop_account_bot_instances(data.accountId)
 
     await db.tradingaccount.update(
         where={"id": data.accountId},
@@ -745,6 +784,7 @@ async def update_account(request: Request, data: Update_Trading_Account):
         "status_code": 200,
         "message": "Trading account updated successfully",
         "affected_bots": int(linked_bots),
+        "stopped_instances": int(stopped_instances),
     }
 
 
@@ -765,6 +805,9 @@ async def delete_account(request: Request, data: Delete_Trading_Account):
     linked_bots = await db.botconfiguration.count(
         where={"accountId": data.accountId},
     )
+    stopped_instances = 0
+    if linked_bots > 0:
+        stopped_instances = await _stop_account_bot_instances(data.accountId)
 
     if linked_bots > 0:
         await db.botconfiguration.update_many(
@@ -783,6 +826,7 @@ async def delete_account(request: Request, data: Delete_Trading_Account):
         "status_code": 200,
         "message": "Trading account deleted successfully",
         "deleted_bots": int(linked_bots),
+        "stopped_instances": int(stopped_instances),
     }
 
 

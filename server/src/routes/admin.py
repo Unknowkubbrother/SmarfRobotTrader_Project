@@ -25,6 +25,7 @@ from ..models.admin_model import (
     UpdateAdminUserRoleRequest,
     UpdateAdminUserStatusRequest,
 )
+from ..utils.mt5_bot_runner import build_profile_name
 from .authentication import get_current_active_user
 
 admin_router = APIRouter(tags=["Admin"])
@@ -142,18 +143,34 @@ def _clean_release_notes(release_notes: Optional[List[str]]) -> List[str]:
 
 
 def _map_bot_version(version, usage_count: int) -> AdminBotVersionItemResponse:
+    runner_profile = None
+    try:
+        if version.symbol and version.timeframe:
+            runner_profile = build_profile_name(version.symbol, version.timeframe)
+    except Exception:
+        runner_profile = None
+
     return AdminBotVersionItemResponse(
         id=str(version.modelId),
         label=version.label,
         version_tag=version.versionTag,
         symbol=version.symbol,
         timeframe=version.timeframe,
-        docker_image_id=version.dockerImageId,
+        runner_profile=runner_profile,
         is_active=bool(getattr(version, "isActive", True)),
         release_notes=version.releaseNotes or [],
         release_date=_to_datetime_string(version.releaseDate),
         usage_count=usage_count,
     )
+
+
+def _safe_runner_profile(symbol: Optional[str], timeframe: Optional[str]) -> str:
+    if not symbol or not timeframe:
+        return "-"
+    try:
+        return build_profile_name(symbol, timeframe)
+    except Exception:
+        return "-"
 
 
 def _is_notification_allowed(notification_config) -> bool:
@@ -168,7 +185,7 @@ def _is_notification_allowed(notification_config) -> bool:
 def _build_bot_update_email_html(
     bot_label: str,
     version_tag: str,
-    docker_image_id: str,
+    runner_profile: str,
     release_notes: List[str],
 ) -> str:
     notes_html = "".join(f"<li>{note}</li>" for note in release_notes) if release_notes else "<li>General improvements</li>"
@@ -185,13 +202,13 @@ def _build_bot_update_email_html(
     <p style="margin:0 0 14px 0; color:#334155;">
       {bot_label} has a new release <strong>{version_tag}</strong>.
     </p>
-    <p style="margin:0 0 10px 0; color:#334155;">Docker image: <code>{docker_image_id}</code></p>
+    <p style="margin:0 0 10px 0; color:#334155;">Runner profile: <code>{runner_profile}</code></p>
     <p style="margin:0 0 8px 0; color:#0f172a;"><strong>Release notes</strong></p>
     <ul style="margin:0 0 18px 16px; color:#334155;">
       {notes_html}
     </ul>
     <p style="margin:0; color:#334155;">
-      Go to Bot Control to apply the update. The system will stop, pull, and restart your bot automatically.
+      Go to Bot Control to apply the update. The system will restart your bot to use the latest version.
     </p>
   </div>
 </body>
@@ -221,14 +238,14 @@ async def _notify_users_for_bot_update(
     if old_model_ids:
         notify_filters.append({"modelId": {"in": old_model_ids}})
 
-    latest_image_id = getattr(version, "dockerImageId", None)
-    if latest_image_id:
+    latest_version_tag = getattr(version, "versionTag", None)
+    if latest_version_tag:
         notify_filters.append(
             {
                 "modelId": model_id,
                 "OR": [
-                    {"installedDockerImageId": None},
-                    {"installedDockerImageId": {"not": latest_image_id}},
+                    {"installedVersionTag": None},
+                    {"installedVersionTag": {"not": latest_version_tag}},
                 ],
             }
         )
@@ -297,7 +314,7 @@ async def _notify_users_for_bot_update(
                     html_content=_build_bot_update_email_html(
                         bot_label=bot_label,
                         version_tag=version_tag,
-                        docker_image_id=version.dockerImageId or "-",
+                        runner_profile=_safe_runner_profile(version.symbol, version.timeframe),
                         release_notes=release_notes,
                     ),
                 )
@@ -798,7 +815,6 @@ async def create_admin_bot_version(
             "versionTag": data.version_tag.strip(),
             "symbol": data.symbol.strip() if data.symbol else None,
             "timeframe": data.timeframe.strip() if data.timeframe else None,
-            "dockerImageId": data.docker_image_id.strip() if data.docker_image_id else None,
             "isActive": bool(data.is_active),
             "releaseNotes": _clean_release_notes(data.release_notes),
         }
@@ -831,6 +847,14 @@ async def update_admin_bot_version(
         version_tag = data.version_tag.strip()
         if not version_tag:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="version_tag cannot be empty")
+        if existing.versionTag and version_tag != existing.versionTag:
+            await db.botconfiguration.update_many(
+                where={
+                    "modelId": model_id,
+                    "installedVersionTag": None,
+                },
+                data={"installedVersionTag": existing.versionTag},
+            )
         update_payload["versionTag"] = version_tag
 
     if data.symbol is not None:
@@ -838,22 +862,6 @@ async def update_admin_bot_version(
 
     if data.timeframe is not None:
         update_payload["timeframe"] = data.timeframe.strip() if data.timeframe else None
-
-    if data.docker_image_id is not None:
-        next_docker_image_id = data.docker_image_id.strip() if data.docker_image_id else None
-        if (
-            existing.dockerImageId
-            and next_docker_image_id
-            and next_docker_image_id != existing.dockerImageId
-        ):
-            await db.botconfiguration.update_many(
-                where={
-                    "modelId": model_id,
-                    "installedDockerImageId": None,
-                },
-                data={"installedDockerImageId": existing.dockerImageId},
-            )
-        update_payload["dockerImageId"] = next_docker_image_id
 
     if data.release_notes is not None:
         update_payload["releaseNotes"] = _clean_release_notes(data.release_notes)
@@ -888,40 +896,45 @@ async def publish_admin_bot_update(
     if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot version not found")
 
-    docker_image_id = data.docker_image_id.strip() if data.docker_image_id else ""
-    if not docker_image_id:
+    release_notes = _clean_release_notes(data.release_notes) if data.release_notes is not None else None
+    next_version_tag = data.version_tag.strip() if data.version_tag is not None else None
+    if next_version_tag is not None and not next_version_tag:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="docker_image_id is required",
+            detail="version_tag cannot be empty",
         )
 
-    release_notes = _clean_release_notes(data.release_notes)
+    has_version_tag_change = bool(
+        next_version_tag is not None and next_version_tag != (existing.versionTag or "")
+    )
+    has_release_notes_change = (
+        release_notes is not None and release_notes != (existing.releaseNotes or [])
+    )
 
-    if existing.dockerImageId:
+    if not has_version_tag_change and not has_release_notes_change:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No update fields changed. Provide version_tag or release_notes.",
+        )
+
+    if has_version_tag_change and existing.versionTag:
         await db.botconfiguration.update_many(
             where={
                 "modelId": model_id,
-                "installedDockerImageId": None,
+                "installedVersionTag": None,
             },
-            data={"installedDockerImageId": existing.dockerImageId},
+            data={"installedVersionTag": existing.versionTag},
         )
 
     update_payload = {
-        "dockerImageId": docker_image_id,
         "releaseDate": datetime.utcnow(),
     }
 
-    if data.version_tag is not None:
-        version_tag = data.version_tag.strip()
-        if not version_tag:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="version_tag cannot be empty",
-            )
-        update_payload["versionTag"] = version_tag
+    if next_version_tag is not None:
+        update_payload["versionTag"] = next_version_tag
 
     if data.release_notes is not None:
-        update_payload["releaseNotes"] = release_notes
+        update_payload["releaseNotes"] = release_notes or []
 
     updated_version = await db.botversion.update(
         where={"modelId": model_id},
@@ -941,7 +954,6 @@ async def publish_admin_bot_update(
     return {
         "message": "Bot update published",
         "model_id": model_id,
-        "docker_image_id": updated_version.dockerImageId,
         "version_tag": updated_version.versionTag,
         "affected_bots": affected_bots,
         "users_notified": users_notified,
@@ -1028,6 +1040,7 @@ async def rollout_admin_bot_version(
             data={
                 "modelId": model_id,
                 "installedDockerImageId": target_version.dockerImageId,
+                "installedVersionTag": target_version.versionTag,
             },
         )
 

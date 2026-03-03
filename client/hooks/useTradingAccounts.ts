@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
-import { api } from "@/lib/api";
+import { api, type ApiClientError } from "@/lib/api";
 
 export interface Create_Trading_Account {
   brokerName: string;
@@ -24,14 +24,16 @@ export interface BotVersion {
   version_tag: string | null;
   symbol: string | null;
   timeframe: string | null;
+  runner_profile?: string | null;
   release_notes: string[];
 }
 
 export interface PendingBotUpdate {
   has_pending_update: boolean;
+  installed_version_tag: string | null;
+  latest_version_tag: string | null;
   installed_docker_image_id: string | null;
   latest_docker_image_id: string | null;
-  latest_version_tag: string | null;
   latest_release_notes: string[];
   latest_release_date: string | null;
 }
@@ -48,9 +50,10 @@ export interface BotConfigWithVersion {
   container_status: string | null;
   status: string | null;
   has_pending_update: boolean;
+  installed_version_tag: string | null;
+  latest_version_tag: string | null;
   installed_docker_image_id: string | null;
   latest_docker_image_id: string | null;
-  latest_version_tag: string | null;
   latest_release_notes: string[];
   latest_release_date: string | null;
   bot_version: BotVersion | null;
@@ -83,6 +86,42 @@ export interface AccountWithBot {
   bot_configuration: (BotConfigWithVersion & { bot_version: BotVersion | null }) | null;
   today_pnl: number;
 }
+
+export interface BotStatusUpdateResult {
+  success: boolean;
+  pending?: boolean;
+  error?: string;
+}
+
+const isLikelyTransientRequestError = (error: unknown): boolean => {
+  const e = error as ApiClientError | undefined;
+  if (e?.isCanceled) return true;
+
+  const code = String(e?.code || "").toUpperCase();
+  if (code === "ERR_CANCELED" || code === "ECONNABORTED" || code === "ERR_NETWORK") {
+    return true;
+  }
+
+  // Browser refresh/navigation can abort the in-flight request before response.
+  // In this case backend may still be processing start/stop.
+  const hasHttpStatus = typeof e?.statusCode === "number";
+  if (!hasHttpStatus && e?.isNetworkError) {
+    return true;
+  }
+
+  if (!hasHttpStatus && typeof document !== "undefined" && document.visibilityState === "hidden") {
+    return true;
+  }
+
+  const message = String(e?.message || "").toLowerCase();
+  return (
+    message.includes("network error") ||
+    message.includes("failed to fetch") ||
+    message.includes("timeout") ||
+    message.includes("canceled") ||
+    message.includes("cancelled")
+  );
+};
 
 const DAY_ALIAS_TO_KEY: Record<string, string> = {
   mon: "mon",
@@ -165,9 +204,10 @@ export function useTradingAccounts() {
           trading_schedule: normalizeTradingSchedule(config.trading_schedule),
           status: config.container_status || "stopped",
           has_pending_update: Boolean(config.has_pending_update),
+          installed_version_tag: config.installed_version_tag || null,
+          latest_version_tag: config.latest_version_tag || null,
           installed_docker_image_id: config.installed_docker_image_id || null,
           latest_docker_image_id: config.latest_docker_image_id || null,
-          latest_version_tag: config.latest_version_tag || null,
           latest_release_notes: Array.isArray(config.latest_release_notes) ? config.latest_release_notes : [],
           latest_release_date: config.latest_release_date || null,
           today_pnl: 0,
@@ -188,15 +228,29 @@ export function useTradingAccounts() {
   }, [fetchAccounts]);
 
   // Update bot status (start/stop)
-  const updateBotStatus = async (botConfigId: string, status: string) => {
+  const updateBotStatus = async (botConfigId: string, status: string): Promise<BotStatusUpdateResult> => {
     try {
       await api.patch("/bot/update_status", { botConfigId, status });
       await fetchAccounts();
-      return true;
+      return { success: true };
     } catch (error) {
       console.error("Error updating bot status:", error);
-      toast.error("Failed to update bot status");
-      return false;
+      const message = (error as Error)?.message || "Failed to update bot status";
+      if (isLikelyTransientRequestError(error)) {
+        // Request can be interrupted by page refresh/navigation while backend keeps running.
+        await fetchAccounts();
+        return {
+          success: false,
+          pending: true,
+          error: message,
+        };
+      }
+      toast.error(message);
+      return {
+        success: false,
+        pending: false,
+        error: message,
+      };
     }
   };
 
@@ -231,14 +285,30 @@ export function useTradingAccounts() {
   // Change bot model
   const changeModel = async (botConfigId: string, newModelId: string) => {
     try {
-      await api.patch("/bot/change_model", { botConfigId, newModelId });
+      const response = await api.patch("/bot/change_model", { botConfigId, newModelId });
       await fetchAccounts();
-      toast.success("Bot model changed successfully");
+      toast.success(response.data?.message || "Bot model changed successfully");
       return true;
     } catch (error) {
       console.error("Error changing model:", error);
       toast.error("Failed to change bot model");
       return false;
+    }
+  };
+
+  // Emergency stop bot (close all positions, then stop container)
+  const emergencyStopBot = async (botConfigId: string) => {
+    try {
+      const response = await api.patch("/bot/emergency_stop", { botConfigId });
+      await fetchAccounts();
+      return { success: true, data: response.data };
+    } catch (error: any) {
+      console.error("Error emergency stopping bot:", error);
+      const detail =
+        error?.response?.data?.detail ||
+        error?.message ||
+        "Failed to emergency stop bot";
+      return { success: false, error: detail };
     }
   };
 
@@ -384,6 +454,7 @@ export function useTradingAccounts() {
     updateBotRisk,
     updateBotSchedule,
     changeModel,
+    emergencyStopBot,
     applyBotUpdate,
     createBot,
     deleteBot,

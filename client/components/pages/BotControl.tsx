@@ -24,6 +24,14 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import {
+  BOT_UI_STORAGE_KEY,
+  readBotUiState,
+  saveActiveBotAction,
+  saveBotUiState,
+  type PersistedBotAction,
+  type PersistedBotLog,
+} from "@/lib/botOperationStore";
 
 const riskLevels = [
   { id: "low", label: "Low", description: "Conservative trading with minimal risk", color: "text-success" },
@@ -104,6 +112,7 @@ export default function BotControl() {
     updateBotRisk,
     updateBotSchedule,
     changeModel,
+    emergencyStopBot,
     applyBotUpdate,
     deleteBot,
     updateAccount,
@@ -130,8 +139,16 @@ export default function BotControl() {
   const [scheduleConfirmOpen, setScheduleConfirmOpen] = useState(false);
   const [pendingDay, setPendingDay] = useState<string | null>(null);
   const [updateConfirmOpen, setUpdateConfirmOpen] = useState(false);
+  const [activeAction, setActiveAction] = useState<PersistedBotAction | null>(null);
+  const [actionLogs, setActionLogs] = useState<PersistedBotLog[]>([]);
+  const [storeReady, setStoreReady] = useState(false);
 
   const [availableModels, setAvailableModels] = useState<BotVersion[]>([]);
+  const activeActionForSelectedBot =
+    activeAction && selectedBot && activeAction.botId === selectedBot.id
+      ? activeAction
+      : null;
+  const isBusy = Boolean(activeActionForSelectedBot);
 
   const { getBotState } = useBotLiveState();
   const liveState = selectedBot ? getBotState(selectedBot.id) : undefined;
@@ -219,7 +236,102 @@ export default function BotControl() {
     }
   }, [selectedBot]);
 
+  const appendActionLog = (
+    level: PersistedBotLog["level"],
+    message: string,
+    botId?: string
+  ) => {
+    const now = new Date();
+    const at = now.toLocaleTimeString([], { hour12: false });
+    const id = `${now.getTime()}-${Math.random().toString(36).slice(2, 8)}`;
+    setActionLogs((prev) => [{ id, level, message, at, botId }, ...prev].slice(0, 20));
+  };
+
+  const startUiAction = (
+    title: string,
+    detail: string,
+    startLog: string,
+    meta: Partial<PersistedBotAction> = {}
+  ) => {
+    const nextAction: PersistedBotAction = {
+      title,
+      detail,
+      startedAt: Date.now(),
+      ...meta,
+    };
+    setActiveAction(nextAction);
+    saveActiveBotAction(nextAction);
+    appendActionLog("info", startLog, meta.botId);
+  };
+
+  const finishUiAction = () => {
+    setActiveAction(null);
+    saveActiveBotAction(null);
+  };
+
+  useEffect(() => {
+    const latest = readBotUiState();
+    setActiveAction(latest.activeAction);
+    setActionLogs(latest.logs);
+    setStoreReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!storeReady) return;
+    saveBotUiState({
+      activeAction,
+      logs: actionLogs,
+    });
+  }, [activeAction, actionLogs, storeReady]);
+
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== BOT_UI_STORAGE_KEY) return;
+      const latest = readBotUiState();
+      setActiveAction(latest.activeAction);
+      setActionLogs(latest.logs);
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  useEffect(() => {
+    if (!activeAction?.botId || !activeAction?.expectedStatus) return;
+
+    const allBots = accounts.flatMap((account) => account.bot_configurations || []);
+    const targetBot = allBots.find((bot) => bot.id === activeAction.botId);
+    const currentStatus = String(targetBot?.status || targetBot?.container_status || "").toLowerCase();
+    let isDone = false;
+    if (activeAction.expectedStatus === "deleted") {
+      isDone = !targetBot;
+    } else if (targetBot) {
+      isDone = currentStatus === activeAction.expectedStatus;
+    }
+
+    if (isDone) {
+      appendActionLog("success", `${activeAction.title} synchronized`, activeAction.botId);
+      setActiveAction(null);
+    }
+  }, [accounts, activeAction]);
+
+  useEffect(() => {
+    if (!activeAction?.startedAt) return;
+    const ttlMs = 15 * 60 * 1000;
+    const ageMs = Date.now() - Number(activeAction.startedAt || 0);
+    if (ageMs >= ttlMs) {
+      appendActionLog("error", `${activeAction.title} timeout. Please check latest bot status.`, activeAction.botId);
+      setActiveAction(null);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      appendActionLog("error", `${activeAction.title} timeout. Please check latest bot status.`, activeAction.botId);
+      setActiveAction(null);
+    }, ttlMs - ageMs);
+    return () => window.clearTimeout(timer);
+  }, [activeAction]);
+
   const handleToggleBotClick = () => {
+    if (isBusy) return;
     if (!selectedBot) return;
     const currentStatus = selectedBot.status || "stopped";
     if (currentStatus === "running") {
@@ -230,96 +342,224 @@ export default function BotControl() {
   };
 
   const performBotToggle = async (newStatus: "running" | "stopped") => {
+    if (isBusy) return;
     if (!selectedBot) return;
-    const success = await updateBotStatus(selectedBot.id, newStatus);
-    if (success) {
+    const actionTitle = newStatus === "running" ? "Starting Bot" : "Stopping Bot";
+    startUiAction(
+      actionTitle,
+      "Waiting for Docker and MT5 runtime to finish operation...",
+      `${actionTitle} for ${selectedBot.bot_version?.label || "bot"}`,
+      {
+        botId: selectedBot.id,
+        expectedStatus: newStatus,
+        kind: newStatus === "running" ? "starting" : "stopping",
+      }
+    );
+    const result = await updateBotStatus(selectedBot.id, newStatus);
+    if (result.success) {
+      appendActionLog("success", `${actionTitle} completed`, selectedBot.id);
       toast.success(newStatus === "running" ? "Bot started successfully" : "Bot stopped successfully");
+      finishUiAction();
+    } else if (result.pending) {
+      appendActionLog("info", `${actionTitle} request accepted. Waiting for backend sync...`, selectedBot.id);
+      toast.info("Operation still in progress. Tracking status from backend...");
+    } else {
+      appendActionLog("error", `${actionTitle} failed`, selectedBot.id);
+      finishUiAction();
     }
     setStopConfirmOpen(false);
   };
 
   const handlePanicClick = () => {
+    if (isBusy) return;
     setPanicConfirmOpen(true);
   };
 
   const performPanicStop = async () => {
+    if (isBusy) return;
     if (!selectedBot) return;
-    await updateBotStatus(selectedBot.id, "stopped");
-    toast.error("Emergency: Bot stopped and closing all positions...");
+    startUiAction(
+      "Emergency Stop",
+      "Sending close-all command to bot, then stopping Docker container...",
+      `Emergency stop requested for ${selectedBot.bot_version?.label || "bot"}`,
+      {
+        botId: selectedBot.id,
+        expectedStatus: "stopped",
+        kind: "emergency",
+      }
+    );
+    const result = await emergencyStopBot(selectedBot.id);
+    if (result.success) {
+      const warning = result.data?.warning;
+      if (warning) {
+        appendActionLog("error", `Emergency stop completed with warning: ${warning}`, selectedBot.id);
+        toast.warning(`Emergency stop completed. ${warning}`);
+      } else {
+        appendActionLog("success", "Emergency stop completed successfully", selectedBot.id);
+        toast.success("Emergency stop completed. Bot stopped and close-position command finished.");
+      }
+    } else {
+      appendActionLog("error", `Emergency stop failed: ${result.error || "unknown error"}`, selectedBot.id);
+      toast.error(result.error || "Emergency stop failed");
+    }
     setPanicConfirmOpen(false);
+    finishUiAction();
   };
 
   const handleDayClick = (day: string) => {
+    if (isBusy) return;
     if (!selectedBot) return;
     setPendingDay(day);
     setScheduleConfirmOpen(true);
   };
 
   const performScheduleToggle = async () => {
+    if (isBusy) return;
     if (!selectedBot || !pendingDay) return;
 
+    startUiAction(
+      "Updating Schedule",
+      "Sending schedule update to live bot runtime...",
+      `Updating trading schedule (${pendingDay})`,
+      {
+        botId: selectedBot.id,
+        kind: "update_schedule",
+      }
+    );
     const newSchedule = schedule.map(s => s.day === pendingDay ? { ...s, enabled: !s.enabled } : s);
     setSchedule(newSchedule);
 
     const scheduleObj = Object.fromEntries(
       newSchedule.map((s) => [DAY_ALIAS_TO_KEY[s.day.toLowerCase()] || s.day.toLowerCase(), s.enabled]),
     );
-    await updateBotSchedule(selectedBot.id, scheduleObj);
+    const success = await updateBotSchedule(selectedBot.id, scheduleObj);
+    if (success) {
+      appendActionLog("success", "Trading schedule updated", selectedBot.id);
+    } else {
+      appendActionLog("error", "Trading schedule update failed", selectedBot.id);
+    }
 
     setScheduleConfirmOpen(false);
     setPendingDay(null);
+    finishUiAction();
   };
 
   const handleRiskClick = (riskId: string) => {
+    if (isBusy) return;
     if (riskId === selectedRisk) return;
     setPendingRiskId(riskId);
     setRiskConfirmOpen(true);
   };
 
   const performRiskChange = async () => {
+    if (isBusy) return;
     if (!selectedBot || !pendingRiskId) return;
+    startUiAction(
+      "Updating Risk",
+      "Applying risk profile to running bot...",
+      `Updating risk to ${pendingRiskId.toUpperCase()}`,
+      {
+        botId: selectedBot.id,
+        kind: "update_risk",
+      }
+    );
     setSelectedRisk(pendingRiskId);
-    await updateBotRisk(selectedBot.id, pendingRiskId);
+    const success = await updateBotRisk(selectedBot.id, pendingRiskId);
+    if (success) {
+      appendActionLog("success", "Risk level updated", selectedBot.id);
+    } else {
+      appendActionLog("error", "Risk level update failed", selectedBot.id);
+    }
     setRiskConfirmOpen(false);
     setPendingRiskId(null);
+    finishUiAction();
   };
 
   const handleModelSelect = (modelId: string) => {
+    if (isBusy) return;
     if (modelId === selectedBot?.model_id) return;
     setPendingModelId(modelId);
     setModelConfirmOpen(true);
   };
 
   const performModelChange = async () => {
+    if (isBusy) return;
     if (!selectedBot || !pendingModelId) return;
+    startUiAction(
+      "Changing Model",
+      "Updating model metadata and restarting bot if currently running...",
+      `Changing model to ${availableModels.find((m) => m.model_id === pendingModelId)?.label || pendingModelId}`,
+      {
+        botId: selectedBot.id,
+        expectedStatus: (selectedBot.status === "running" ? "running" : "stopped"),
+        kind: "change_model",
+      }
+    );
     const success = await changeModel(selectedBot.id, pendingModelId);
     if (success) {
+      appendActionLog("success", "Model changed successfully", selectedBot.id);
       setShowModelDialog(false);
+    } else {
+      appendActionLog("error", "Model change failed", selectedBot.id);
     }
     setModelConfirmOpen(false);
     setPendingModelId(null);
+    finishUiAction();
   };
 
   const handleApplyUpdate = async () => {
+    if (isBusy) return;
     if (!selectedBot) return;
+    startUiAction(
+      "Applying Update",
+      "Applying latest version and restarting bot if required...",
+      `Applying latest version for ${selectedBot.bot_version?.label || "bot"}`,
+      {
+        botId: selectedBot.id,
+        expectedStatus: (selectedBot.status === "running" ? "running" : "stopped"),
+        kind: "apply_update",
+      }
+    );
     const success = await applyBotUpdate(selectedBot.id);
     if (success) {
+      appendActionLog("success", "Bot update applied", selectedBot.id);
       setUpdateConfirmOpen(false);
+    } else {
+      appendActionLog("error", "Bot update failed", selectedBot.id);
     }
+    finishUiAction();
   };
 
   const handleDeleteBot = async () => {
+    if (isBusy) return;
     if (!selectedBot) return;
+    startUiAction(
+      "Deleting Bot",
+      "Stopping container and removing bot configuration...",
+      `Deleting ${selectedBot.bot_version?.label || "bot"}`,
+      {
+        botId: selectedBot.id,
+        expectedStatus: "deleted",
+        kind: "deleting",
+      }
+    );
     const success = await deleteBot(selectedBot.id);
     if (success) {
+      appendActionLog("success", "Bot deleted", selectedBot.id);
       setDeleteConfirmOpen(false);
+    } else {
+      appendActionLog("error", "Delete bot failed", selectedBot.id);
     }
+    finishUiAction();
   };
 
   const botStatus = selectedBot?.status || "stopped";
   const botSymbol = selectedBot?.bot_version?.symbol || "N/A";
   const botLabel = selectedBot?.bot_version?.label || "No Bot Selected";
   const bots = selectedAccount?.bot_configurations || [];
+  const visibleActionLogs = selectedBot
+    ? actionLogs.filter((log) => log.botId === selectedBot.id)
+    : [];
 
   const getStatusBadge = (status: string | null) => {
     switch (status) {
@@ -375,6 +615,47 @@ export default function BotControl() {
         </div>
       </div>
 
+      {activeActionForSelectedBot && (
+        <div className="rounded-xl border border-warning/30 bg-warning/5 p-4">
+          <div className="flex items-start gap-3">
+            <RefreshCw className="mt-0.5 h-4 w-4 animate-spin text-warning" />
+            <div>
+              <p className="text-sm font-semibold text-foreground">{activeActionForSelectedBot.title}</p>
+              <p className="text-xs text-muted-foreground">{activeActionForSelectedBot.detail}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {visibleActionLogs.length > 0 && (
+        <div className="glass-card p-4">
+          <div className="mb-2 flex items-center justify-between">
+            <p className="text-sm font-semibold">Operation Log</p>
+            <span className="text-xs text-muted-foreground">latest {visibleActionLogs.length} entries</span>
+          </div>
+          <div className="space-y-2">
+            {visibleActionLogs.map((log) => (
+              <div key={log.id} className="flex items-center gap-2 text-xs">
+                <span className="font-mono text-muted-foreground">{log.at}</span>
+                <span
+                  className={cn(
+                    "font-medium",
+                    log.level === "success"
+                      ? "text-success"
+                      : log.level === "error"
+                        ? "text-destructive"
+                        : "text-warning"
+                  )}
+                >
+                  {log.level.toUpperCase()}
+                </span>
+                <span className="text-muted-foreground">{log.message}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {selectedAccount && (
         <>
           {/* Bot Status Card */}
@@ -401,6 +682,7 @@ export default function BotControl() {
                       <Button
                         className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
                         onClick={() => setUpdateConfirmOpen(true)}
+                        disabled={isBusy}
                       >
                         <DownloadCloud className="w-4 h-4" />
                         Update Bot
@@ -421,14 +703,15 @@ export default function BotControl() {
                       variant="outline"
                       className="gap-2 bg-warning/10 text-warning border-warning/30 hover:bg-warning/20"
                       onClick={() => setShowModelDialog(true)}
+                      disabled={isBusy}
                     >
                       <RefreshCw className="w-4 h-4" />
                       Change Model
                     </Button>
-                    <Button variant="outline" className="gap-2" onClick={handleToggleBotClick}>
+                    <Button variant="outline" className="gap-2" onClick={handleToggleBotClick} disabled={isBusy}>
                       {botStatus === "running" ? <><Power className="w-4 h-4" />Stop</> : <><Play className="w-4 h-4" />Start</>}
                     </Button>
-                    <Button variant="destructive" onClick={handlePanicClick} className="gap-2">
+                    <Button variant="destructive" onClick={handlePanicClick} className="gap-2" disabled={isBusy}>
                       <AlertOctagon className="w-4 h-4" />
                       Emergency Stop
                     </Button>
@@ -436,6 +719,7 @@ export default function BotControl() {
                       variant="ghost"
                       className="gap-2 text-destructive hover:text-destructive hover:bg-destructive/10"
                       onClick={() => setDeleteConfirmOpen(true)}
+                      disabled={isBusy}
                     >
                       <Trash2 className="w-4 h-4" />
                       Delete Bot
@@ -536,8 +820,8 @@ export default function BotControl() {
                 </div>
               ) : (
                 <div className="text-center py-6 text-muted-foreground">
-                  <p className="text-sm">Bot is not connected to the live hub</p>
-                  <p className="text-xs mt-1">Set <code className="bg-secondary px-1 rounded">BOT_CONFIG_ID</code> and <code className="bg-secondary px-1 rounded">BOT_WS_URL</code> in the bot&apos;s environment</p>
+                  <p className="text-sm">Bot is currently offline</p>
+                  <p className="text-xs mt-1">Start the bot to begin live updates. This panel will connect automatically.</p>
                 </div>
               )}
             </div>
@@ -550,9 +834,9 @@ export default function BotControl() {
                 <div className="lg:col-span-2 rounded-xl border border-primary/30 bg-primary/5 p-4">
                   <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                     <div>
-                      <p className="text-sm font-semibold text-primary">New bot image available</p>
+                      <p className="text-sm font-semibold text-primary">New bot version available</p>
                       <p className="text-xs text-muted-foreground">
-                        Installed: {selectedBot.installed_docker_image_id || "-"} | Latest: {selectedBot.latest_docker_image_id || "-"}
+                        Installed: {selectedBot.installed_version_tag || "-"} | Latest: {selectedBot.latest_version_tag || "-"}
                       </p>
                       {selectedBot.latest_release_notes.length > 0 && (
                         <ul className="mt-2 space-y-1 text-xs text-muted-foreground">
@@ -565,7 +849,7 @@ export default function BotControl() {
                         </ul>
                       )}
                     </div>
-                    <Button className="gap-2" onClick={() => setUpdateConfirmOpen(true)}>
+                    <Button className="gap-2" onClick={() => setUpdateConfirmOpen(true)} disabled={isBusy}>
                       <DownloadCloud className="w-4 h-4" />
                       Apply Update
                     </Button>
@@ -583,6 +867,7 @@ export default function BotControl() {
                     <button
                       key={level.id}
                       onClick={() => handleRiskClick(level.id)}
+                      disabled={isBusy}
                       className={cn(
                         "w-full p-4 rounded-xl border text-left transition-all",
                         selectedRisk === level.id
@@ -613,6 +898,7 @@ export default function BotControl() {
                     <button
                       key={day.day}
                       onClick={() => handleDayClick(day.day)}
+                      disabled={isBusy}
                       className={cn(
                         "py-3 rounded-xl text-sm font-medium transition-all",
                         day.enabled
@@ -653,6 +939,7 @@ export default function BotControl() {
                 key={model.model_id}
                 className={cn(
                   "rounded-2xl border border-border overflow-hidden hover:border-primary transition-colors cursor-pointer",
+                  isBusy && "pointer-events-none opacity-60",
                   selectedBot?.model_id === model.model_id && "ring-2 ring-primary border-primary"
                 )}
                 onClick={() => handleModelSelect(model.model_id)}
@@ -702,7 +989,7 @@ export default function BotControl() {
                       handleModelSelect(model.model_id);
                     }}
                     variant={selectedBot?.model_id === model.model_id ? "secondary" : "default"}
-                    disabled={selectedBot?.model_id === model.model_id}
+                    disabled={selectedBot?.model_id === model.model_id || isBusy}
                   >
                     <Activity className="w-4 h-4" />
                     {selectedBot?.model_id === model.model_id ? "Current Model" : "Select Model"}
@@ -740,7 +1027,11 @@ export default function BotControl() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleDeleteBot} className="bg-destructive text-destructive-foreground hover:bg-destructive/90">
+            <AlertDialogAction
+              onClick={handleDeleteBot}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={isBusy}
+            >
               Delete
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -763,6 +1054,7 @@ export default function BotControl() {
             <AlertDialogAction
               onClick={() => performBotToggle("stopped")}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={isBusy}
             >
               Stop Bot
             </AlertDialogAction>
@@ -789,6 +1081,7 @@ export default function BotControl() {
             <AlertDialogAction
               onClick={performPanicStop}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={isBusy}
             >
               CONFIRM EMERGENCY STOP
             </AlertDialogAction>
@@ -809,7 +1102,7 @@ export default function BotControl() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel onClick={() => setPendingRiskId(null)}>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={performRiskChange}>
+            <AlertDialogAction onClick={performRiskChange} disabled={isBusy}>
               Confirm Change
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -829,7 +1122,7 @@ export default function BotControl() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel onClick={() => setPendingModelId(null)}>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={performModelChange}>
+            <AlertDialogAction onClick={performModelChange} disabled={isBusy}>
               Confirm Switch
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -847,7 +1140,7 @@ export default function BotControl() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel onClick={() => setPendingDay(null)}>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={performScheduleToggle}>
+            <AlertDialogAction onClick={performScheduleToggle} disabled={isBusy}>
               Confirm Update
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -860,14 +1153,14 @@ export default function BotControl() {
           <AlertDialogHeader>
             <AlertDialogTitle>Apply Bot Update</AlertDialogTitle>
             <AlertDialogDescription>
-              This will stop the bot, pull the latest docker image, and restart automatically.
+              This will apply the latest version tag to this bot and restart automatically if it is currently running.
               <br />
-              Latest image: <strong>{selectedBot?.latest_docker_image_id || "-"}</strong>
+              Latest version: <strong>{selectedBot?.latest_version_tag || "-"}</strong>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleApplyUpdate}>
+            <AlertDialogAction onClick={handleApplyUpdate} disabled={isBusy}>
               Update Bot
             </AlertDialogAction>
           </AlertDialogFooter>

@@ -16,6 +16,12 @@ import { useTradingAccounts } from "@/hooks/useTradingAccounts";
 import { useBotLiveState } from "@/hooks/useBotLiveState";
 import { BotSelector } from "@/components/dashboard/BotSelector";
 import Link from "next/link";
+import {
+  BOT_UI_STORAGE_KEY,
+  readBotUiState,
+  saveActiveBotAction,
+  type PersistedBotAction,
+} from "@/lib/botOperationStore";
 
 export default function Dashboard() {
   const { accounts, loading, updateBotStatus, deleteBot, updateAccount, deleteAccount, refetch, getPendingUpdatesCount } = useTradingAccounts();
@@ -23,6 +29,8 @@ export default function Dashboard() {
   const [selectedBotId, setSelectedBotId] = useState<string | null>(null);
   const [addBotOpen, setAddBotOpen] = useState(false);
   const [addAccountOpen, setAddAccountOpen] = useState(false);
+  const [botActionState, setBotActionState] = useState<PersistedBotAction | null>(null);
+  const [storeReady, setStoreReady] = useState(false);
 
   // Auto-select first account when accounts load
   useEffect(() => {
@@ -49,18 +57,98 @@ export default function Dashboard() {
     setSelectedBotId(null);
   }, [selectedAccount?.id]);
 
-  const handleToggleBotStatus = async (botId: string, newStatus: "running" | "stopped") => {
-    const success = await updateBotStatus(botId, newStatus);
-    if (success) {
-      toast.success(newStatus === "running" ? "Bot started" : "Bot stopped");
+  useEffect(() => {
+    setBotActionState(readBotUiState().activeAction);
+    setStoreReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!storeReady) return;
+    saveActiveBotAction(botActionState);
+  }, [botActionState, storeReady]);
+
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== BOT_UI_STORAGE_KEY) return;
+      setBotActionState(readBotUiState().activeAction);
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  useEffect(() => {
+    if (!botActionState?.botId || !botActionState.expectedStatus) return;
+    const allBots = accounts.flatMap((account) => account.bot_configurations || []);
+    const targetBot = allBots.find((bot) => bot.id === botActionState.botId);
+    const currentStatus = String(targetBot?.status || targetBot?.container_status || "").toLowerCase();
+
+    let isDone = false;
+    if (botActionState.expectedStatus === "deleted") {
+      isDone = !targetBot;
+    } else if (targetBot) {
+      isDone = currentStatus === botActionState.expectedStatus;
     }
+
+    if (isDone) {
+      setBotActionState(null);
+    }
+  }, [accounts, botActionState]);
+
+  useEffect(() => {
+    if (!botActionState?.startedAt) return;
+    const ttlMs = 15 * 60 * 1000;
+    const ageMs = Date.now() - Number(botActionState.startedAt || 0);
+    if (ageMs >= ttlMs) {
+      setBotActionState(null);
+      return;
+    }
+    const timer = window.setTimeout(() => setBotActionState(null), ttlMs - ageMs);
+    return () => window.clearTimeout(timer);
+  }, [botActionState]);
+
+  const handleToggleBotStatus = async (botId: string, newStatus: "running" | "stopped") => {
+    if (botActionState) return;
+    const nextAction: PersistedBotAction = {
+      title: newStatus === "running" ? "Starting Bot" : "Stopping Bot",
+      detail: "Waiting for Docker operation to complete...",
+      botId,
+      kind: newStatus === "running" ? "starting" : "stopping",
+      expectedStatus: newStatus,
+      startedAt: Date.now(),
+    };
+    setBotActionState(nextAction);
+    saveActiveBotAction(nextAction);
+
+    const result = await updateBotStatus(botId, newStatus);
+    if (result.success) {
+      toast.success(newStatus === "running" ? "Bot started" : "Bot stopped");
+      setBotActionState(null);
+      saveActiveBotAction(null);
+      return;
+    }
+    if (result.pending) {
+      toast.info("Operation still in progress. Tracking status from backend...");
+      return;
+    }
+    setBotActionState(null);
+    saveActiveBotAction(null);
   };
 
   const handleDeleteBot = async (botId: string) => {
+    if (botActionState) return;
+    setBotActionState({
+      title: "Deleting Bot",
+      detail: "Stopping container and removing bot configuration...",
+      botId,
+      kind: "deleting",
+      expectedStatus: "deleted",
+      startedAt: Date.now(),
+    });
     const success = await deleteBot(botId);
     if (success) {
       toast.success("Bot removed");
     }
+    setBotActionState(null);
   };
 
   const { getBotState } = useBotLiveState();
@@ -254,6 +342,7 @@ export default function Dashboard() {
                     onDelete={handleDeleteBot}
                     onSelect={setSelectedBotId}
                     showDelete={true}
+                    isBusy={botActionState?.botId === bot.id}
                   />
                 </div>
               ))}

@@ -1,0 +1,284 @@
+import base64
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+from cryptography.fernet import Fernet, InvalidToken
+
+
+@dataclass
+class RunnerCommandResult:
+    stdout: str
+    stderr: str
+    project_name: str | None = None
+    container_id: str | None = None
+
+
+class BotRunnerError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        returncode: int | None = None,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def decrypt_mt5_password(encrypted_password: str) -> str:
+    key = base64.urlsafe_b64encode(
+        hashlib.sha256(os.getenv("SECRET_KEY", "UknownmeInLove").encode()).digest()
+    )
+    fernet = Fernet(key)
+    try:
+        return fernet.decrypt(encrypted_password.encode()).decode()
+    except InvalidToken as exc:
+        raise BotRunnerError("Unable to decrypt MT5 password. Check SECRET_KEY.") from exc
+
+
+def build_profile_name(symbol: str, timeframe: str) -> str:
+    cleaned_symbol = _sanitize_profile_token(symbol)
+    cleaned_timeframe = _sanitize_profile_token(timeframe)
+    if not cleaned_symbol or not cleaned_timeframe:
+        raise BotRunnerError("LIVE_SYMBOL and LIVE_TIMEFRAME are required.")
+    return f"{cleaned_symbol}_{cleaned_timeframe}"
+
+
+def build_bot_runtime_env(
+    *,
+    bot_config_id: str,
+    mt5_login: str,
+    mt5_password: str,
+    mt5_server: str,
+    live_symbol: str,
+    live_timeframe: str,
+    docker_image_id: str | None = None,
+) -> dict[str, str]:
+    ws_url = (
+        os.getenv("BOT_RUNNER_WS_URL")
+        or os.getenv("BOT_WS_URL")
+        or "ws://host.docker.internal:8000/bot/ws"
+    )
+    vision_url = (
+        os.getenv("BOT_RUNNER_VISION_LLM_API_URL")
+        or os.getenv("VISION_LLM_API_URL")
+        or "http://host.docker.internal:8000/vision_llm/"
+    )
+
+    env = {
+        "MT5_LOGIN": str(mt5_login).strip(),
+        "MT5_PASSWORD": str(mt5_password).strip(),
+        "MT5_SERVER": str(mt5_server).strip(),
+        "LIVE_SYMBOL": str(live_symbol).strip().upper(),
+        "LIVE_TIMEFRAME": str(live_timeframe).strip().upper(),
+        "BOT_CONFIG_ID": str(bot_config_id).strip(),
+        "BOT_WS_URL": ws_url.strip(),
+        "VISION_LLM_API_URL": vision_url.strip(),
+        "AUTO_BUILD": os.getenv("BOT_RUNNER_AUTO_BUILD", "0").strip() or "0",
+        "PULL_LATEST_IMAGE": os.getenv("BOT_RUNNER_PULL_LATEST", "1").strip() or "1",
+        "FORCE_REBUILD": os.getenv("BOT_RUNNER_FORCE_REBUILD", "0").strip() or "0",
+    }
+
+    if docker_image_id and str(docker_image_id).strip():
+        env["METATRADER_IMAGE"] = str(docker_image_id).strip()
+
+    return env
+
+
+def run_bot_instance_action(
+    *,
+    action: str,
+    instance_name: str,
+    profile_name: str | None = None,
+    env_overrides: dict[str, str] | None = None,
+    timeout_sec: int = 7200,
+) -> RunnerCommandResult:
+    normalized_action = str(action or "").strip().lower()
+    if normalized_action not in {"start", "stop", "restart"}:
+        raise BotRunnerError("Invalid action. Use start, stop, or restart.")
+
+    if not str(instance_name or "").strip():
+        raise BotRunnerError("instance_name is required.")
+
+    if normalized_action in {"start", "restart"} and not str(profile_name or "").strip():
+        raise BotRunnerError("profile_name is required for start/restart.")
+
+    runner_dir = _resolve_runner_dir()
+    _ensure_runner_script(runner_dir)
+    _ensure_docker_access()
+
+    args = ["./run_instance.sh", normalized_action, str(instance_name).strip()]
+    if normalized_action in {"start", "restart"}:
+        args.append(str(profile_name).strip())
+
+    env = os.environ.copy()
+    if env_overrides:
+        env.update({k: str(v) for k, v in env_overrides.items() if v is not None})
+
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=str(runner_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BotRunnerError(
+            f"Runner command timed out after {timeout_sec}s.",
+            stdout=_shorten_output(exc.stdout),
+            stderr=_shorten_output(exc.stderr),
+        ) from exc
+
+    if proc.returncode != 0:
+        raise BotRunnerError(
+            f"Runner command failed with exit code {proc.returncode}.",
+            returncode=proc.returncode,
+            stdout=_shorten_output(proc.stdout),
+            stderr=_shorten_output(proc.stderr),
+        )
+
+    project_name = f"mt5_{_sanitize_instance_name(str(instance_name))}"
+    container_id = None
+    if normalized_action in {"start", "restart"}:
+        container_id = _resolve_container_id(project_name)
+
+    return RunnerCommandResult(
+        stdout=_shorten_output(proc.stdout),
+        stderr=_shorten_output(proc.stderr),
+        project_name=project_name,
+        container_id=container_id,
+    )
+
+
+def pull_docker_image(image_ref: str, timeout_sec: int = 1200) -> RunnerCommandResult:
+    image = str(image_ref or "").strip()
+    if not image:
+        raise BotRunnerError("docker image reference is required.")
+
+    _ensure_docker_access()
+    try:
+        proc = subprocess.run(
+            ["docker", "pull", image],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BotRunnerError(
+            f"docker pull timed out after {timeout_sec}s.",
+            stdout=_shorten_output(exc.stdout),
+            stderr=_shorten_output(exc.stderr),
+        ) from exc
+
+    if proc.returncode != 0:
+        raise BotRunnerError(
+            f"docker pull failed for image '{image}'.",
+            returncode=proc.returncode,
+            stdout=_shorten_output(proc.stdout),
+            stderr=_shorten_output(proc.stderr),
+        )
+
+    return RunnerCommandResult(
+        stdout=_shorten_output(proc.stdout),
+        stderr=_shorten_output(proc.stderr),
+    )
+
+
+def _resolve_runner_dir() -> Path:
+    candidates: list[Path] = []
+    configured = str(os.getenv("RUNNER_DIR", "") or "").strip()
+    if configured:
+        candidates.append(Path(configured))
+
+    candidates.append(Path("/opt/mt5-runner"))
+    candidates.append(Path(__file__).resolve().parents[2] / "docker_mt5_bot")
+
+    for path in candidates:
+        if path.is_dir() and (path / "run_instance.sh").is_file():
+            return path
+
+    raise BotRunnerError(
+        "Runner directory not found. Set RUNNER_DIR to a directory containing run_instance.sh."
+    )
+
+
+def _ensure_runner_script(runner_dir: Path) -> None:
+    script = runner_dir / "run_instance.sh"
+    if not script.is_file():
+        raise BotRunnerError(f"Runner script not found: {script}")
+
+
+def _ensure_docker_access() -> None:
+    if shutil.which("docker") is None:
+        raise BotRunnerError(
+            "docker CLI not found. Install Docker CLI in server runtime."
+        )
+
+    if os.path.exists("/.dockerenv") and not os.path.exists("/var/run/docker.sock"):
+        raise BotRunnerError(
+            "Server is running in Docker but /var/run/docker.sock is not mounted."
+        )
+
+    probe = subprocess.run(
+        ["docker", "version", "--format", "{{.Server.Version}}"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        raise BotRunnerError(
+            "Cannot access Docker daemon. Mount /var/run/docker.sock and verify permissions.",
+            returncode=probe.returncode,
+            stdout=_shorten_output(probe.stdout),
+            stderr=_shorten_output(probe.stderr),
+        )
+
+
+def _resolve_container_id(project_name: str) -> str | None:
+    service_name = str(os.getenv("MT5_SERVICE_NAME", "metatrader5-macos")).strip() or "metatrader5-macos"
+    proc = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "-aq",
+            "--filter",
+            f"label=com.docker.compose.project={project_name}",
+            "--filter",
+            f"label=com.docker.compose.service={service_name}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    return lines[0] if lines else None
+
+
+def _shorten_output(output: str | bytes | None, limit: int = 4000) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, bytes):
+        text = output.decode(errors="ignore")
+    else:
+        text = str(output)
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def _sanitize_instance_name(raw: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(raw or "").strip().lower()).strip("_")
+
+
+def _sanitize_profile_token(raw: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())

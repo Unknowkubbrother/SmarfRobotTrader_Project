@@ -1,0 +1,12 @@
+
+.devcontainer/
+.env
+config/
+.DS_Store
+__pycache__/
+*.pyc
+.venv-bot-api/
+logs/
+snapshots/
+.instances/
+bots/

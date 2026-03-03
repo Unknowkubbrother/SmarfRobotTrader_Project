@@ -4,10 +4,10 @@ from enum import Enum
 
 class Create_Bot_Version(BaseModel):
     label: str
-    dockerImageId: str
+    dockerImageId: str | None = None
     versionTag: str
-    symbol: str
-    timeframe: str
+    symbol: str | None = None
+    timeframe: str | None = None
     releaseNotes: List[str]
 
 
@@ -42,4 +42,8 @@ class Delete_Bot(BaseModel):
 
 
 class Apply_Bot_Update(BaseModel):
+    botConfigId: str
+
+
+class Emergency_Bot_Stop(BaseModel):
     botConfigId: str

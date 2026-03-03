@@ -389,6 +389,11 @@ async def bot_websocket(websocket: WebSocket):
                     await _persist_bot_state(bot_config_id, state)
                 except Exception as exc:
                     logger.warning("bot state db sync failed for %s: %s", bot_config_id, exc)
+            elif msg_type == "bot_command_ack" and bot_config_id:
+                try:
+                    await bot_hub.receive_bot_command_ack(bot_config_id, msg)
+                except Exception as exc:
+                    logger.warning("bot command ack handling failed for %s: %s", bot_config_id, exc)
 
             elif msg_type == "ping":
                 await websocket.send_text("pong")
