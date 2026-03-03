@@ -41,7 +41,12 @@ export interface UpsertTradingJournalPayload {
   attachmentUrls?: string[];
 }
 
-export function useTradingJournal() {
+interface UseTradingJournalOptions {
+  includeArchived?: boolean;
+}
+
+export function useTradingJournal(options: UseTradingJournalOptions = {}) {
+  const includeArchived = options.includeArchived ?? true;
   const { user, loading: authLoading } = useAuth();
   const [rows, setRows] = useState<TradingJournalRow[]>([]);
   const [summary, setSummary] = useState<TradingJournalSummary>({
@@ -69,6 +74,7 @@ export function useTradingJournal() {
           params: {
             q: q || undefined,
             limit: 400,
+            includeArchived: includeArchived ? 1 : 0,
           },
         });
         const data = Array.isArray(res.data?.data) ? res.data.data : [];
@@ -86,7 +92,7 @@ export function useTradingJournal() {
         setLoading(false);
       }
     },
-    [authLoading, query, user]
+    [authLoading, includeArchived, query, user]
   );
 
   useEffect(() => {

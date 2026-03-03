@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Request
 from prisma import Json
@@ -29,6 +30,7 @@ from ..utils.ws_manager import bot_hub
 
 bot_router = APIRouter()
 logger = logging.getLogger(__name__)
+ACTIVE_RECORD_STATUS = "active"
 
 
 def _enum_value(value):
@@ -141,14 +143,19 @@ async def _emit_lifecycle_event(
 
 # === Helper: verify bot config ownership ===
 async def verify_bot_ownership(bot_config_id: str, user_id: str):
-    config = await db.botconfiguration.find_unique(
-        where={"id": bot_config_id},
+    config = await db.botconfiguration.find_first(
+        where={
+            "id": bot_config_id,
+            "recordStatus": ACTIVE_RECORD_STATUS,
+            "account": {
+                "userId": user_id,
+                "recordStatus": ACTIVE_RECORD_STATUS,
+            },
+        },
         include={"account": True, "botVersion": True}
     )
     if not config:
         raise HTTPException(status_code=404, detail="Bot configuration not found")
-    if config.account.userId != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
     return config
 
 
@@ -198,17 +205,16 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
 
-    trading_account = await db.tradingaccount.find_unique(
+    trading_account = await db.tradingaccount.find_first(
         where={
-            "id": data.accountId
+            "id": data.accountId,
+            "userId": request.state.user_id,
+            "recordStatus": ACTIVE_RECORD_STATUS,
         }
     )
     
     if not trading_account:
         raise HTTPException(status_code=404, detail="Trading account not found")
-
-    if trading_account.userId != request.state.user_id:
-        raise HTTPException(status_code=403, detail="You are not authorized to create bot configuration for this trading account")
 
     bot_version = await db.botversion.find_unique(
         where={
@@ -240,6 +246,8 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
             "riskLevel": data.riskLevel.value,
             "tradingSchedule": Json(tradingSchedule),
             "isActive": False,
+            "recordStatus": ACTIVE_RECORD_STATUS,
+            "deletedAt": None,
             "containerStatus": "stopped",
             "installedDockerImageId": bot_version.dockerImageId,
             "installedVersionTag": bot_version.versionTag,
@@ -1074,16 +1082,23 @@ async def delete_bot(request: Request, data: Delete_Bot):
                 detail=_runner_error_message("Failed to stop bot docker instance before delete", exc),
             ) from exc
 
-    await db.botconfiguration.delete(
-        where={"id": data.botConfigId}
+    await db.botconfiguration.update(
+        where={"id": data.botConfigId},
+        data={
+            "containerStatus": "stopped",
+            "isActive": False,
+            "dockerContainerId": None,
+            "recordStatus": "deleted",
+            "deletedAt": datetime.utcnow(),
+        },
     )
     await _emit_lifecycle_event(
         bot_config_id=str(data.botConfigId),
         action="delete",
         phase="succeeded",
-        detail="Bot configuration deleted",
+        detail="Bot configuration archived",
         status="deleted",
         owner_user_id=request.state.user_id,
     )
 
-    return {"status_code": 200, "message": "Bot configuration deleted"}
+    return {"status_code": 200, "message": "Bot configuration archived"}

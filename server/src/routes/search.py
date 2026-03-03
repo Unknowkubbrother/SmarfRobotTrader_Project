@@ -22,6 +22,7 @@ async def search_all(request: Request, q: str = Query(..., min_length=2)):
     accounts = await db.tradingaccount.find_many(
         where={
             "userId": user_id,
+            "recordStatus": "active",
             "OR": [
                 {"mt5LoginId": {"contains": query}},
                 {"brokerName": {"contains": query, "mode": "insensitive"}}
@@ -42,8 +43,10 @@ async def search_all(request: Request, q: str = Query(..., min_length=2)):
     # 2. Search Bot Configurations (joined with Version)
     bots = await db.botconfiguration.find_many(
         where={
+            "recordStatus": "active",
             "account": {
-                "userId": user_id
+                "userId": user_id,
+                "recordStatus": "active",
             },
             "botVersion": {
                 "OR": [

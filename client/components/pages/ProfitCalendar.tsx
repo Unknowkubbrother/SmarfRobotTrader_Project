@@ -6,6 +6,8 @@ import { api } from "@/lib/api";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
 
 interface DayData {
   date: number;
@@ -55,6 +57,7 @@ interface TradingAccountSource {
 
 const weekDays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const ALL_ACCOUNTS_FILTER = "__all_accounts__";
+const INCLUDE_ARCHIVED_STORAGE_KEY = "profit-calendar-include-archived";
 
 export default function ProfitCalendar() {
   const [currentDate, setCurrentDate] = useState(new Date());
@@ -75,6 +78,13 @@ export default function ProfitCalendar() {
   const [historySummary, setHistorySummary] = useState<TradeHistorySummary | null>(null);
   const [tradingAccounts, setTradingAccounts] = useState<TradingAccountSource[]>([]);
   const [historyAccountFilter, setHistoryAccountFilter] = useState<string>(ALL_ACCOUNTS_FILTER);
+  const [includeArchived, setIncludeArchived] = useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    const raw = window.localStorage.getItem(INCLUDE_ARCHIVED_STORAGE_KEY);
+    if (raw === "0") return false;
+    if (raw === "1") return true;
+    return true;
+  });
 
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth();
@@ -84,10 +94,17 @@ export default function ProfitCalendar() {
   const monthName = currentDate.toLocaleString("default", { month: "long", year: "numeric" });
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(INCLUDE_ARCHIVED_STORAGE_KEY, includeArchived ? "1" : "0");
+  }, [includeArchived]);
+
+  useEffect(() => {
     let cancelled = false;
     const fetchTradingAccounts = async () => {
       try {
-        const res = await api.get("/trading/accounts_with_bots");
+        const res = await api.get("/trading/accounts_with_bots", {
+          params: { includeArchived: includeArchived ? 1 : 0 },
+        });
         const rows = Array.isArray(res.data?.data) ? res.data.data : [];
         if (cancelled) return;
         const mapped = rows.map((row: any) => ({
@@ -106,14 +123,14 @@ export default function ProfitCalendar() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [includeArchived]);
 
   useEffect(() => {
     const fetchCalendarData = async () => {
       setLoading(true);
       try {
         const res = await api.get("/trading/calendar", {
-          params: { year, month: month + 1 },
+          params: { year, month: month + 1, includeArchived: includeArchived ? 1 : 0 },
         });
         const result = res.data || {};
         const apiData: { date: number; profit: number; trades: number; winRate: number }[] = Array.isArray(result.data)
@@ -172,7 +189,7 @@ export default function ProfitCalendar() {
     };
 
     fetchCalendarData();
-  }, [year, month, daysInMonth]);
+  }, [year, month, daysInMonth, includeArchived]);
 
   const navigateMonth = (direction: number) => {
     setCurrentDate(new Date(year, month + direction, 1));
@@ -270,12 +287,26 @@ export default function ProfitCalendar() {
     setHistoryAccountFilter(ALL_ACCOUNTS_FILTER);
   }, [selectedDateKey]);
 
+  useEffect(() => {
+    setSelectedDay(null);
+    setTradeHistory([]);
+    setHistoryLoadedForDate("");
+    setHistorySummary(null);
+    setHistoryOpen(false);
+    setHistoryAccountFilter(ALL_ACCOUNTS_FILTER);
+  }, [includeArchived]);
+
   const loadTradeHistory = async () => {
     if (!selectedDay) return;
     setHistoryLoading(true);
     try {
       const res = await api.get("/trading/history_by_day", {
-        params: { year, month: month + 1, day: selectedDay.date },
+        params: {
+          year,
+          month: month + 1,
+          day: selectedDay.date,
+          includeArchived: includeArchived ? 1 : 0,
+        },
       });
       const rows = Array.isArray(res.data?.data) ? res.data.data : [];
       const summary = res.data?.summary && typeof res.data.summary === "object" ? res.data.summary : null;
@@ -335,9 +366,23 @@ export default function ProfitCalendar() {
   return (
     <div className="space-y-6">
       {/* Page Header */}
-      <div>
-        <h1 className="text-2xl font-bold text-foreground">Profit Calendar</h1>
-        <p className="text-sm text-muted-foreground">Visualize your daily trading performance</p>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-foreground">Profit Calendar</h1>
+          <p className="text-sm text-muted-foreground">Visualize your daily trading performance</p>
+        </div>
+        <div className="rounded-lg border border-border bg-card px-3 py-2">
+          <div className="flex items-center gap-2">
+            <Switch
+              id="calendar-include-archived"
+              checked={includeArchived}
+              onCheckedChange={setIncludeArchived}
+            />
+            <Label htmlFor="calendar-include-archived" className="cursor-pointer text-sm font-medium">
+              Include archived bots/accounts
+            </Label>
+          </div>
+        </div>
       </div>
 
       {loading ? (

@@ -1,6 +1,6 @@
 import asyncio
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from cryptography.fernet import Fernet
 from prisma import Json
@@ -19,6 +19,7 @@ from ..utils.mt5_bot_runner import BotRunnerError, build_profile_name, run_bot_i
 from ..utils.trading_schedule import normalize_trading_schedule
 
 trading_router = APIRouter()
+ACTIVE_RECORD_STATUS = "active"
 
 
 def _as_date(value) -> date:
@@ -61,7 +62,7 @@ def _encrypt_mt5_password(raw_password: str) -> str:
 
 async def _stop_account_bot_instances(account_id: str) -> int:
     bot_configs = await db.botconfiguration.find_many(
-        where={"accountId": account_id},
+        where={"accountId": account_id, "recordStatus": ACTIVE_RECORD_STATUS},
     )
     if not bot_configs:
         return 0
@@ -82,24 +83,73 @@ async def _stop_account_bot_instances(account_id: str) -> int:
     return stopped_count
 
 
-async def _get_user_account_ids(user_id: str) -> list[str]:
-    accounts = await db.tradingaccount.find_many(
-        where={"userId": user_id},
-    )
+async def _get_user_account_ids(user_id: str, *, include_archived: bool = False) -> list[str]:
+    where: dict = {"userId": user_id}
+    if not include_archived:
+        where["recordStatus"] = ACTIVE_RECORD_STATUS
+    accounts = await db.tradingaccount.find_many(where=where)
     return [str(a.id) for a in accounts]
+
+
+async def _build_user_order_scope(user_id: str, *, include_archived: bool) -> tuple[list[str], dict]:
+    account_ids = await _get_user_account_ids(user_id, include_archived=include_archived)
+    if not account_ids:
+        return [], {}
+
+    if include_archived:
+        return account_ids, {"accountId": {"in": account_ids}}
+
+    active_configs = await db.botconfiguration.find_many(
+        where={
+            "recordStatus": ACTIVE_RECORD_STATUS,
+            "account": {
+                "userId": user_id,
+                "recordStatus": ACTIVE_RECORD_STATUS,
+            },
+        },
+    )
+
+    pair_set: set[tuple[str, int]] = set()
+    pair_filters: list[dict] = []
+    for cfg in active_configs:
+        account_id = str(getattr(cfg, "accountId", "") or "").strip()
+        bot_instance_id = int(getattr(cfg, "botInstanceId", 0) or 0)
+        if not account_id or bot_instance_id <= 0:
+            continue
+        pair_key = (account_id, bot_instance_id)
+        if pair_key in pair_set:
+            continue
+        pair_set.add(pair_key)
+        pair_filters.append(
+            {
+                "accountId": account_id,
+                "botInstanceId": bot_instance_id,
+            }
+        )
+
+    manual_filter = {
+        "accountId": {"in": account_ids},
+        "botInstanceId": None,
+    }
+    if not pair_filters:
+        return account_ids, manual_filter
+
+    return account_ids, {"OR": [manual_filter, *pair_filters]}
 
 
 async def _sync_daily_aggregates_from_orders(
     user_id: str,
     start_date: date,
     end_date: date,
+    include_archived_accounts: bool = True,
 ):
     start_dt = datetime.combine(start_date, datetime.min.time())
     end_dt = datetime.combine(end_date, datetime.min.time())
 
-    accounts = await db.tradingaccount.find_many(
-        where={"userId": user_id},
-    )
+    account_where: dict = {"userId": user_id}
+    if not include_archived_accounts:
+        account_where["recordStatus"] = ACTIVE_RECORD_STATUS
+    accounts = await db.tradingaccount.find_many(where=account_where)
     account_ids = [str(a.id) for a in accounts]
     if not account_ids:
         return {}
@@ -177,7 +227,12 @@ async def _sync_daily_aggregates_from_orders(
     return day_rollup
 
 @trading_router.get("/calendar", tags=["trading"])
-async def get_trading_calendar(request: Request, year: int, month: int):
+async def get_trading_calendar(
+    request: Request,
+    year: int,
+    month: int,
+    include_archived: bool = Query(True, alias="includeArchived"),
+):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
     
@@ -197,43 +252,81 @@ async def get_trading_calendar(request: Request, year: int, month: int):
             user_id=request.state.user_id,
             start_date=start_date,
             end_date=end_date,
+            include_archived_accounts=True,
         )
     except Exception as e:
         print(f"[WARN] trading calendar sync failed: {e}")
         day_rollup = {}
 
-    # Fetch aggregates for all user's accounts within the date range
-    aggregates = await db.dailyaggregate.find_many(
-        where={
-            "account": {
-                "userId": request.state.user_id
-            },
-            "date": {
-                "gte": datetime.combine(start_date, datetime.min.time()),
-                "lt": datetime.combine(end_date, datetime.min.time())
-            }
-        }
-    )
-    
-    # Group by date and sum profits
     calendar_data = {}
-    for agg in aggregates:
-        # agg.date might be datetime or date, normalize to day number
-        day = agg.date.day
-        if day not in calendar_data:
-            calendar_data[day] = {
-                "date": day,
-                "profit": 0.0,
-                "trades": 0,
-                "winRate": 0.0 # Placeholder, would need detailed trade data for real winrate
+    if include_archived:
+        account_filter: dict = {"userId": request.state.user_id}
+        aggregates = await db.dailyaggregate.find_many(
+            where={
+                "account": account_filter,
+                "date": {
+                    "gte": datetime.combine(start_date, datetime.min.time()),
+                    "lt": datetime.combine(end_date, datetime.min.time())
+                }
             }
-        
-        # safely add values
-        profit = _to_float(agg.dailyNetProfit, 0.0)
-        trades = agg.totalTrades if agg.totalTrades else 0
-        
-        calendar_data[day]["profit"] += profit
-        calendar_data[day]["trades"] += trades
+        )
+
+        for agg in aggregates:
+            day = agg.date.day
+            if day not in calendar_data:
+                calendar_data[day] = {
+                    "date": day,
+                    "profit": 0.0,
+                    "trades": 0,
+                    "winRate": 0.0,
+                }
+
+            profit = _to_float(agg.dailyNetProfit, 0.0)
+            trades = agg.totalTrades if agg.totalTrades else 0
+            calendar_data[day]["profit"] += profit
+            calendar_data[day]["trades"] += trades
+    else:
+        day_rollup = {}
+        _, order_scope = await _build_user_order_scope(
+            request.state.user_id,
+            include_archived=False,
+        )
+        if order_scope:
+            orders = await db.orderhistory.find_many(
+                where={
+                    **order_scope,
+                    "closeTime": {
+                        "gte": datetime.combine(start_date, datetime.min.time()),
+                        "lt": datetime.combine(end_date, datetime.min.time()),
+                    },
+                },
+            )
+
+            for order in orders:
+                close_time = getattr(order, "closeTime", None)
+                if close_time is None:
+                    continue
+                trade_day = _as_date(close_time)
+                if trade_day < start_date or trade_day >= end_date:
+                    continue
+
+                day = int(trade_day.day)
+                if day not in calendar_data:
+                    calendar_data[day] = {
+                        "date": day,
+                        "profit": 0.0,
+                        "trades": 0,
+                        "winRate": 0.0,
+                    }
+
+                profit = _to_float(getattr(order, "profit", 0.0), 0.0)
+                calendar_data[day]["profit"] += profit
+                calendar_data[day]["trades"] += 1
+
+                day_item = day_rollup.setdefault(day, {"wins": 0, "trades": 0})
+                day_item["trades"] += 1
+                if profit > 0:
+                    day_item["wins"] += 1
 
     for day, payload in calendar_data.items():
         payload["profit"] = round(float(payload["profit"]), 2)
@@ -268,7 +361,13 @@ async def get_trading_calendar(request: Request, year: int, month: int):
 
 
 @trading_router.get("/history_by_day", tags=["trading"])
-async def get_trading_history_by_day(request: Request, year: int, month: int, day: int):
+async def get_trading_history_by_day(
+    request: Request,
+    year: int,
+    month: int,
+    day: int,
+    include_archived: bool = Query(True, alias="includeArchived"),
+):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
 
@@ -280,10 +379,10 @@ async def get_trading_history_by_day(request: Request, year: int, month: int, da
     start_dt = datetime.combine(target_date, datetime.min.time())
     end_dt = start_dt + timedelta(days=1)
 
-    accounts = await db.tradingaccount.find_many(
-        where={"userId": request.state.user_id},
+    account_ids, order_scope = await _build_user_order_scope(
+        request.state.user_id,
+        include_archived=include_archived,
     )
-    account_ids = [str(a.id) for a in accounts]
     if not account_ids:
         return {
             "status_code": 200,
@@ -297,11 +396,12 @@ async def get_trading_history_by_day(request: Request, year: int, month: int, da
             },
         }
 
+    where_scope = {
+        **order_scope,
+        "closeTime": {"gte": start_dt, "lt": end_dt},
+    }
     orders = await db.orderhistory.find_many(
-        where={
-            "accountId": {"in": account_ids},
-            "closeTime": {"gte": start_dt, "lt": end_dt},
-        },
+        where=where_scope,
         order={"closeTime": "desc"},
     )
 
@@ -356,12 +456,16 @@ async def get_trading_journal_feed(
     request: Request,
     q: str = "",
     limit: int = 200,
+    include_archived: bool = Query(True, alias="includeArchived"),
 ):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
 
     safe_limit = max(1, min(int(limit), 1000))
-    account_ids = await _get_user_account_ids(request.state.user_id)
+    account_ids, order_scope = await _build_user_order_scope(
+        request.state.user_id,
+        include_archived=include_archived,
+    )
     if not account_ids:
         return {
             "status_code": 200,
@@ -374,11 +478,12 @@ async def get_trading_journal_feed(
         }
 
     fetch_size = max(safe_limit * 3, 400)
+    where_scope = {
+        **order_scope,
+        "closeTime": {"not": None},
+    }
     orders = await db.orderhistory.find_many(
-        where={
-            "accountId": {"in": account_ids},
-            "closeTime": {"not": None},
-        },
+        where=where_scope,
         order={"closeTime": "desc"},
         take=fetch_size,
     )
@@ -477,7 +582,10 @@ async def upsert_trading_journal(request: Request, data: UpsertTradingJournalReq
     if ticket_id <= 0:
         raise HTTPException(status_code=400, detail="ticketId is required")
 
-    account_ids = await _get_user_account_ids(request.state.user_id)
+    account_ids = await _get_user_account_ids(
+        request.state.user_id,
+        include_archived=True,
+    )
     if not account_ids:
         raise HTTPException(status_code=404, detail="Trading account not found")
 
@@ -545,7 +653,10 @@ async def delete_trading_journal(request: Request, journal_id: str):
     if ticket_id <= 0:
         raise HTTPException(status_code=403, detail="Journal entry cannot be verified")
 
-    account_ids = await _get_user_account_ids(request.state.user_id)
+    account_ids = await _get_user_account_ids(
+        request.state.user_id,
+        include_archived=True,
+    )
     if not account_ids:
         raise HTTPException(status_code=404, detail="Trading account not found")
 
@@ -567,21 +678,26 @@ async def delete_trading_journal(request: Request, journal_id: str):
     }
 
 @trading_router.get("/accounts_with_bots", tags=["trading"])
-async def get_accounts_with_bots(request: Request):
+async def get_accounts_with_bots(
+    request: Request,
+    include_archived: bool = Query(False, alias="includeArchived"),
+):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
     
     try:
+        account_where: dict = {"userId": request.state.user_id}
+        if not include_archived:
+            account_where["recordStatus"] = ACTIVE_RECORD_STATUS
+
+        bot_include: dict = {"include": {"botVersion": True}}
+        if not include_archived:
+            bot_include["where"] = {"recordStatus": ACTIVE_RECORD_STATUS}
+
         trading_accounts = await db.tradingaccount.find_many(
-            where={
-                "userId": request.state.user_id
-            },
+            where=account_where,
             include={
-                "botConfigurations": {
-                    "include": {
-                        "botVersion": True
-                    }
-                },
+                "botConfigurations": bot_include,
                 "dailyAggregates": True
             }
         )
@@ -694,7 +810,9 @@ async def create_account(request: Request, data: Create_Trading_Account):
             "brokerName": data.brokerName,
             "serverName": data.serverName,
             "mt5LoginId": data.mt5LoginId,
-            "mt5Password": encrypted_password
+            "mt5Password": encrypted_password,
+            "recordStatus": ACTIVE_RECORD_STATUS,
+            "deletedAt": None,
         }
     )
 
@@ -725,6 +843,7 @@ async def update_account(request: Request, data: Update_Trading_Account):
         where={
             "id": data.accountId,
             "userId": request.state.user_id,
+            "recordStatus": ACTIVE_RECORD_STATUS,
         }
     )
     if not account:
@@ -760,7 +879,7 @@ async def update_account(request: Request, data: Update_Trading_Account):
         raise HTTPException(status_code=400, detail="No update fields provided")
 
     linked_bots = await db.botconfiguration.count(
-        where={"accountId": data.accountId},
+        where={"accountId": data.accountId, "recordStatus": ACTIVE_RECORD_STATUS},
     )
     stopped_instances = 0
     if linked_bots > 0:
@@ -773,7 +892,7 @@ async def update_account(request: Request, data: Update_Trading_Account):
 
     if linked_bots > 0:
         await db.botconfiguration.update_many(
-            where={"accountId": data.accountId},
+            where={"accountId": data.accountId, "recordStatus": ACTIVE_RECORD_STATUS},
             data={
                 "containerStatus": "stopped",
                 "isActive": False,
@@ -797,13 +916,14 @@ async def delete_account(request: Request, data: Delete_Trading_Account):
         where={
             "id": data.accountId,
             "userId": request.state.user_id,
+            "recordStatus": ACTIVE_RECORD_STATUS,
         }
     )
     if not account:
         raise HTTPException(status_code=404, detail="Trading account not found")
 
     linked_bots = await db.botconfiguration.count(
-        where={"accountId": data.accountId},
+        where={"accountId": data.accountId, "recordStatus": ACTIVE_RECORD_STATUS},
     )
     stopped_instances = 0
     if linked_bots > 0:
@@ -811,20 +931,27 @@ async def delete_account(request: Request, data: Delete_Trading_Account):
 
     if linked_bots > 0:
         await db.botconfiguration.update_many(
-            where={"accountId": data.accountId},
+            where={"accountId": data.accountId, "recordStatus": ACTIVE_RECORD_STATUS},
             data={
                 "containerStatus": "stopped",
                 "isActive": False,
+                "dockerContainerId": None,
+                "recordStatus": "deleted",
+                "deletedAt": datetime.utcnow(),
             },
         )
 
-    await db.tradingaccount.delete(
+    await db.tradingaccount.update(
         where={"id": data.accountId},
+        data={
+            "recordStatus": "deleted",
+            "deletedAt": datetime.utcnow(),
+        },
     )
 
     return {
         "status_code": 200,
-        "message": "Trading account deleted successfully",
+        "message": "Trading account archived successfully",
         "deleted_bots": int(linked_bots),
         "stopped_instances": int(stopped_instances),
     }
@@ -838,7 +965,8 @@ async def trading_by_user(request: Request, accountId: str):
     trading_account = await db.tradingaccount.find_first(
         where={
             "id": accountId,
-            "userId": request.state.user_id
+            "userId": request.state.user_id,
+            "recordStatus": ACTIVE_RECORD_STATUS,
         }
     )
     
@@ -857,7 +985,8 @@ async def trading_by_user(request: Request):
     
     trading_account = await db.tradingaccount.find_many(
         where={
-            "userId": request.state.user_id
+            "userId": request.state.user_id,
+            "recordStatus": ACTIVE_RECORD_STATUS,
         }
     )
     
@@ -887,7 +1016,8 @@ async def trading_by_user_admin(request: Request, userId: str):
     
     trading_accounts = await db.tradingaccount.find_many(
         where={
-            "userId": userId
+            "userId": userId,
+            "recordStatus": ACTIVE_RECORD_STATUS,
         }
     )
     

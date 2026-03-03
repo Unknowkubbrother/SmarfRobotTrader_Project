@@ -478,7 +478,7 @@ export function useTradingAccounts() {
     }
   };
 
-  // Delete trading account (cascade delete linked bots)
+  // Archive trading account (soft-delete linked bots)
   const deleteAccount = async (accountId: string) => {
     try {
       const response = await api.delete("/trading/delete_account", {
@@ -488,13 +488,13 @@ export function useTradingAccounts() {
       const deletedBots = Number(response.data?.deleted_bots || 0);
       toast.success(
         deletedBots > 0
-          ? `Trading account removed. ${deletedBots} linked bot(s) were deleted.`
-          : "Trading account removed successfully"
+          ? `Trading account archived. ${deletedBots} linked bot(s) were archived.`
+          : "Trading account archived successfully"
       );
       return { success: true, data: response.data };
     } catch (error: any) {
       console.error("Error deleting account:", error);
-      toast.error(error.message || "Failed to delete account");
+      toast.error(error.message || "Failed to archive account");
       return { success: false, error: error.message };
     }
   };

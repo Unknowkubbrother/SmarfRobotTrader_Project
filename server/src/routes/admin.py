@@ -369,7 +369,11 @@ async def _notify_users_for_bot_update(
         return 0, 0
 
     bot_configurations = await db.botconfiguration.find_many(
-        where={"OR": notify_filters},
+        where={
+            "recordStatus": "active",
+            "account": {"recordStatus": "active"},
+            "OR": notify_filters,
+        },
         include={
             "account": {
                 "include": {
@@ -442,6 +446,8 @@ async def _stop_active_bots_using_version(model_id: str) -> int:
     active_bots_count = await db.botconfiguration.count(
         where={
             "modelId": model_id,
+            "recordStatus": "active",
+            "account": {"recordStatus": "active"},
             "OR": [
                 {"containerStatus": "running"},
                 {"isActive": True},
@@ -453,6 +459,8 @@ async def _stop_active_bots_using_version(model_id: str) -> int:
         await db.botconfiguration.update_many(
             where={
                 "modelId": model_id,
+                "recordStatus": "active",
+                "account": {"recordStatus": "active"},
                 "OR": [
                     {"containerStatus": "running"},
                     {"isActive": True},
@@ -474,12 +482,14 @@ async def get_admin_stats(
     _require_admin(current_user)
 
     total_users = await db.user.count()
-    total_mt5_accounts = await db.tradingaccount.count()
+    total_mt5_accounts = await db.tradingaccount.count(where={"recordStatus": "active"})
     total_bot_versions = await db.botversion.count()
     active_subscriptions = await db.subscription.count(where={"status": "active"})
     pending_tickets = await db.supportticket.count(where={"status": "open"})
     running_bots = await db.botconfiguration.count(
         where={
+            "recordStatus": "active",
+            "account": {"recordStatus": "active"},
             "OR": [
                 {"containerStatus": "running"},
                 {"isActive": True},
@@ -550,10 +560,11 @@ async def get_admin_user_detail(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
     trading_accounts = await db.tradingaccount.find_many(
-        where={"userId": user_id},
+        where={"userId": user_id, "recordStatus": "active"},
         order={"createdAt": "desc"},
         include={
             "botConfigurations": {
+                "where": {"recordStatus": "active"},
                 "include": {
                     "botVersion": True,
                 }
@@ -869,11 +880,18 @@ async def update_admin_user_bot_configuration_status(
             detail="status must be running or stopped",
         )
 
-    bot_configuration = await db.botconfiguration.find_unique(
-        where={"id": bot_configuration_id},
+    bot_configuration = await db.botconfiguration.find_first(
+        where={
+            "id": bot_configuration_id,
+            "recordStatus": "active",
+            "account": {
+                "userId": user_id,
+                "recordStatus": "active",
+            },
+        },
         include={"account": True, "botVersion": True},
     )
-    if not bot_configuration or str(bot_configuration.account.userId) != user_id:
+    if not bot_configuration:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Bot configuration not found for this user",
@@ -1034,7 +1052,13 @@ async def get_admin_bot_versions(
     results: List[AdminBotVersionItemResponse] = []
 
     for version in versions:
-        usage_count = await db.botconfiguration.count(where={"modelId": str(version.modelId)})
+        usage_count = await db.botconfiguration.count(
+            where={
+                "modelId": str(version.modelId),
+                "recordStatus": "active",
+                "account": {"recordStatus": "active"},
+            }
+        )
         results.append(_map_bot_version(version, usage_count=usage_count))
 
     return results
@@ -1098,6 +1122,8 @@ async def update_admin_bot_version(
             await db.botconfiguration.update_many(
                 where={
                     "modelId": model_id,
+                    "recordStatus": "active",
+                    "account": {"recordStatus": "active"},
                     "installedVersionTag": None,
                 },
                 data={"installedVersionTag": existing.versionTag},
@@ -1127,7 +1153,13 @@ async def update_admin_bot_version(
     else:
         updated = existing
 
-    usage_count = await db.botconfiguration.count(where={"modelId": model_id})
+    usage_count = await db.botconfiguration.count(
+        where={
+            "modelId": model_id,
+            "recordStatus": "active",
+            "account": {"recordStatus": "active"},
+        }
+    )
     return _map_bot_version(updated, usage_count=usage_count)
 
 
@@ -1168,6 +1200,8 @@ async def publish_admin_bot_update(
         await db.botconfiguration.update_many(
             where={
                 "modelId": model_id,
+                "recordStatus": "active",
+                "account": {"recordStatus": "active"},
                 "installedVersionTag": None,
             },
             data={"installedVersionTag": existing.versionTag},
@@ -1188,7 +1222,13 @@ async def publish_admin_bot_update(
         data=update_payload,
     )
 
-    affected_bots = await db.botconfiguration.count(where={"modelId": model_id})
+    affected_bots = await db.botconfiguration.count(
+        where={
+            "modelId": model_id,
+            "recordStatus": "active",
+            "account": {"recordStatus": "active"},
+        }
+    )
     users_notified = 0
     emails_sent = 0
     if bool(data.notify_users):
@@ -1278,12 +1318,20 @@ async def rollout_admin_bot_version(
         }
 
     affected_bots = await db.botconfiguration.count(
-        where={"modelId": {"in": source_model_ids}}
+        where={
+            "modelId": {"in": source_model_ids},
+            "recordStatus": "active",
+            "account": {"recordStatus": "active"},
+        }
     )
 
     if affected_bots > 0:
         await db.botconfiguration.update_many(
-            where={"modelId": {"in": source_model_ids}},
+            where={
+                "modelId": {"in": source_model_ids},
+                "recordStatus": "active",
+                "account": {"recordStatus": "active"},
+            },
             data={
                 "modelId": model_id,
                 "installedDockerImageId": target_version.dockerImageId,
@@ -1310,7 +1358,13 @@ async def delete_admin_bot_version(
     if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot version not found")
 
-    usage_count = await db.botconfiguration.count(where={"modelId": model_id})
+    usage_count = await db.botconfiguration.count(
+        where={
+            "modelId": model_id,
+            "recordStatus": "active",
+            "account": {"recordStatus": "active"},
+        }
+    )
     if usage_count > 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

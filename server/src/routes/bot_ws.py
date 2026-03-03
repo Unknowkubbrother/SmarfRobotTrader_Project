@@ -92,8 +92,12 @@ async def _get_bot_context(bot_config_id: str) -> dict | None:
     if cached:
         return cached
 
-    config = await db.botconfiguration.find_unique(
-        where={"id": bot_config_id},
+    config = await db.botconfiguration.find_first(
+        where={
+            "id": bot_config_id,
+            "recordStatus": "active",
+            "account": {"recordStatus": "active"},
+        },
         include={"account": True},
     )
     if not config:
@@ -274,8 +278,8 @@ async def _persist_account_snapshot(bot_config_id: str, account_id: str, state: 
     if not _should_sync_account_snapshot(bot_config_id, payload):
         return
 
-    await db.tradingaccount.update(
-        where={"id": account_id},
+    await db.tradingaccount.update_many(
+        where={"id": account_id, "recordStatus": "active"},
         data=payload,
     )
     _BOT_ACCOUNT_SYNC_CACHE[bot_config_id] = {
@@ -355,30 +359,41 @@ async def bot_websocket(websocket: WebSocket):
                 symbol = msg.get("symbol", "")
                 timeframe = msg.get("timeframe", "H1")
                 if bot_config_id and symbol:
+                    config = await db.botconfiguration.find_first(
+                        where={
+                            "id": bot_config_id,
+                            "recordStatus": "active",
+                            "account": {"recordStatus": "active"},
+                        },
+                        include={"account": True},
+                    )
+                    if not config:
+                        await websocket.send_text(json.dumps({
+                            "type": "register_rejected",
+                            "reason": "bot_config_not_active",
+                        }))
+                        bot_config_id = None
+                        continue
+
                     bot_hub.register_bot(websocket, bot_config_id, symbol, timeframe)
                     await websocket.send_text(json.dumps({
                         "type": "registered",
                         "bot_config_id": bot_config_id,
                     }))
                     try:
-                        config = await db.botconfiguration.find_unique(
-                            where={"id": bot_config_id},
-                            include={"account": True},
+                        _BOT_CONTEXT[bot_config_id] = {
+                            "account_id": str(config.accountId),
+                            "bot_instance_id": _safe_int(getattr(config, "botInstanceId", 0), 0),
+                        }
+                        raw_schedule = getattr(config, "tradingSchedule", None)
+                        schedule = normalize_trading_schedule(raw_schedule)
+                        await bot_hub.send_bot_config(
+                            bot_config_id,
+                            {
+                                "risk_level": _enum_value(getattr(config, "riskLevel", None)),
+                                "trading_schedule": schedule,
+                            },
                         )
-                        if config:
-                            _BOT_CONTEXT[bot_config_id] = {
-                                "account_id": str(config.accountId),
-                                "bot_instance_id": _safe_int(getattr(config, "botInstanceId", 0), 0),
-                            }
-                            raw_schedule = getattr(config, "tradingSchedule", None)
-                            schedule = normalize_trading_schedule(raw_schedule)
-                            await bot_hub.send_bot_config(
-                                bot_config_id,
-                                {
-                                    "risk_level": _enum_value(getattr(config, "riskLevel", None)),
-                                    "trading_schedule": schedule,
-                                },
-                            )
                     except Exception as exc:
                         logger.warning("bot register config sync failed for %s: %s", bot_config_id, exc)
 

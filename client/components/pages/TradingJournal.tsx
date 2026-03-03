@@ -17,6 +17,8 @@ import { useTradingJournal, type TradingJournalRow } from "@/hooks/useTradingJou
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
 import {
   Dialog,
   DialogContent,
@@ -38,6 +40,7 @@ const DEFAULT_TAGS = [
   "Mistake",
   "WinnerTrade",
 ];
+const INCLUDE_ARCHIVED_STORAGE_KEY = "trading-journal-include-archived";
 
 function fmtDate(value: string | null): string {
   if (!value) return "-";
@@ -71,6 +74,13 @@ function displayTag(value: string): string {
 }
 
 export default function TradingJournal() {
+  const [includeArchived, setIncludeArchived] = useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    const raw = window.localStorage.getItem(INCLUDE_ARCHIVED_STORAGE_KEY);
+    if (raw === "0") return false;
+    if (raw === "1") return true;
+    return true;
+  });
   const {
     rows,
     loading,
@@ -78,7 +88,7 @@ export default function TradingJournal() {
     setQuery,
     upsertJournal,
     deleteJournal,
-  } = useTradingJournal();
+  } = useTradingJournal({ includeArchived });
 
   const [searchText, setSearchText] = useState(query);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
@@ -97,6 +107,11 @@ export default function TradingJournal() {
   const [editTagKeys, setEditTagKeys] = useState<string[]>([]);
   const [attachments, setAttachments] = useState("");
   const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(INCLUDE_ARCHIVED_STORAGE_KEY, includeArchived ? "1" : "0");
+  }, [includeArchived]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -258,7 +273,7 @@ export default function TradingJournal() {
       </div>
 
       <div className="rounded-xl border border-border bg-card p-4">
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <div className="relative flex-1">
             <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
@@ -267,6 +282,16 @@ export default function TradingJournal() {
               placeholder="Search entries..."
               className="pl-9"
             />
+          </div>
+          <div className="flex items-center gap-2 rounded-md border border-border px-2 py-1.5">
+            <Switch
+              id="journal-include-archived"
+              checked={includeArchived}
+              onCheckedChange={setIncludeArchived}
+            />
+            <Label htmlFor="journal-include-archived" className="cursor-pointer text-xs sm:text-sm">
+              Include archived bots/accounts
+            </Label>
           </div>
           <Button
             variant="outline"

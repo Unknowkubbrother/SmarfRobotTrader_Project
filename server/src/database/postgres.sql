@@ -108,6 +108,8 @@ CREATE TABLE "trading_accounts" (
   "server_name" VARCHAR(100),
   "mt5_login_id" VARCHAR(50),
   "mt5_password" VARCHAR(255), -- Should be encrypted
+  "record_status" VARCHAR(20) NOT NULL DEFAULT 'active',
+  "deleted_at" TIMESTAMPTZ,
   
   -- Real-time Status
   "balance" NUMERIC(15, 2) DEFAULT 0,
@@ -191,6 +193,8 @@ CREATE TABLE "bot_configurations" (
   "risk_level" risk_enum,
   "trading_schedule" JSONB,
   "is_active" BOOLEAN DEFAULT FALSE,
+  "record_status" VARCHAR(20) NOT NULL DEFAULT 'active',
+  "deleted_at" TIMESTAMPTZ,
   
   -- Container Control
   "docker_container_id" VARCHAR(100),
@@ -203,6 +207,17 @@ CREATE TABLE "bot_configurations" (
   -- Prevent duplicate magic numbers in same account
   UNIQUE ("account_id", "bot_instance_id")
 );
+
+ALTER TABLE "trading_accounts"
+  ADD COLUMN IF NOT EXISTS "record_status" VARCHAR(20) NOT NULL DEFAULT 'active',
+  ADD COLUMN IF NOT EXISTS "deleted_at" TIMESTAMPTZ;
+
+ALTER TABLE "bot_configurations"
+  ADD COLUMN IF NOT EXISTS "record_status" VARCHAR(20) NOT NULL DEFAULT 'active',
+  ADD COLUMN IF NOT EXISTS "deleted_at" TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS "idx_trading_accounts_record_status" ON "trading_accounts" ("record_status");
+CREATE INDEX IF NOT EXISTS "idx_bot_configurations_record_status" ON "bot_configurations" ("record_status");
 
 -- ==============================================================
 -- 6. Billing & Subscriptions
