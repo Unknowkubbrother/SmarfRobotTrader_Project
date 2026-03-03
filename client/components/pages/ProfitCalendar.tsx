@@ -1,10 +1,11 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { ChevronLeft, ChevronRight, TrendingUp, TrendingDown, BarChart3, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 interface DayData {
   date: number;
@@ -23,6 +24,7 @@ interface CalendarSummary {
 
 interface TradeHistoryRow {
   ticketId: number;
+  accountId: string;
   symbol: string;
   type: string;
   status: string;
@@ -44,7 +46,15 @@ interface TradeHistorySummary {
   losses: number;
 }
 
+interface TradingAccountSource {
+  id: string;
+  broker_name: string | null;
+  server_name: string | null;
+  mt5_login_id: string | null;
+}
+
 const weekDays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const ALL_ACCOUNTS_FILTER = "__all_accounts__";
 
 export default function ProfitCalendar() {
   const [currentDate, setCurrentDate] = useState(new Date());
@@ -63,6 +73,8 @@ export default function ProfitCalendar() {
   const [historyLoadedForDate, setHistoryLoadedForDate] = useState<string>("");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historySummary, setHistorySummary] = useState<TradeHistorySummary | null>(null);
+  const [tradingAccounts, setTradingAccounts] = useState<TradingAccountSource[]>([]);
+  const [historyAccountFilter, setHistoryAccountFilter] = useState<string>(ALL_ACCOUNTS_FILTER);
 
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth();
@@ -70,6 +82,31 @@ export default function ProfitCalendar() {
   const firstDayOfMonth = new Date(year, month, 1).getDay();
   const daysInMonth = new Date(year, month + 1, 0).getDate();
   const monthName = currentDate.toLocaleString("default", { month: "long", year: "numeric" });
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchTradingAccounts = async () => {
+      try {
+        const res = await api.get("/trading/accounts_with_bots");
+        const rows = Array.isArray(res.data?.data) ? res.data.data : [];
+        if (cancelled) return;
+        const mapped = rows.map((row: any) => ({
+          id: String(row?.id || ""),
+          broker_name: row?.broker_name ? String(row.broker_name) : null,
+          server_name: row?.server_name ? String(row.server_name) : null,
+          mt5_login_id: row?.mt5_login_id ? String(row.mt5_login_id) : null,
+        })).filter((row: TradingAccountSource) => row.id);
+        setTradingAccounts(mapped);
+      } catch (error) {
+        console.error("Failed to fetch trading accounts for calendar source", error);
+      }
+    };
+
+    fetchTradingAccounts();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const fetchCalendarData = async () => {
@@ -148,11 +185,89 @@ export default function ProfitCalendar() {
     ? new Date(year, month, selectedDay.date).toISOString().split("T")[0]
     : "";
 
+  const accountById = useMemo(() => {
+    const map = new Map<string, TradingAccountSource>();
+    for (const account of tradingAccounts) {
+      if (!account.id) continue;
+      map.set(account.id, account);
+    }
+    return map;
+  }, [tradingAccounts]);
+
+  const formatAccountLabel = (accountId: string): string => {
+    const safeId = String(accountId || "").trim();
+    if (!safeId) return "Unknown account";
+    const account = accountById.get(safeId);
+    if (!account) return `Account ${safeId.slice(0, 8)}`;
+
+    const broker = String(account.broker_name || "").trim();
+    const server = String(account.server_name || "").trim();
+    const login = String(account.mt5_login_id || "").trim();
+
+    const left = [broker, server].filter(Boolean).join(" / ");
+    if (left && login) return `${left} (${login})`;
+    if (left) return left;
+    if (login) return `MT5 ${login}`;
+    return `Account ${safeId.slice(0, 8)}`;
+  };
+
+  const historyAccountLabels = useMemo(() => {
+    const ids = Array.from(
+      new Set(
+        tradeHistory
+          .map((row) => String(row.accountId || "").trim())
+          .filter((id) => id.length > 0)
+      )
+    );
+    return ids.map((id) => formatAccountLabel(id));
+  }, [tradeHistory, accountById]);
+
+  const historyAccountOptions = useMemo(() => {
+    const ids = Array.from(
+      new Set(
+        tradeHistory
+          .map((row) => String(row.accountId || "").trim())
+          .filter((id) => id.length > 0)
+      )
+    );
+    return ids
+      .map((id) => ({ id, label: formatAccountLabel(id) }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [tradeHistory, accountById]);
+
+  const filteredTradeHistory = useMemo(() => {
+    if (historyAccountFilter === ALL_ACCOUNTS_FILTER) return tradeHistory;
+    return tradeHistory.filter((row) => String(row.accountId || "").trim() === historyAccountFilter);
+  }, [tradeHistory, historyAccountFilter]);
+
+  const effectiveHistorySummary = useMemo<TradeHistorySummary>(() => {
+    if (historyAccountFilter === ALL_ACCOUNTS_FILTER && historySummary) {
+      return {
+        date: String(historySummary.date || selectedDateKey),
+        totalTrades: Number(historySummary.totalTrades || filteredTradeHistory.length || 0),
+        netProfit: Number(historySummary.netProfit || 0),
+        wins: Number(historySummary.wins || 0),
+        losses: Number(historySummary.losses || 0),
+      };
+    }
+    const wins = filteredTradeHistory.filter((r) => Number(r.profit || 0) > 0).length;
+    const losses = filteredTradeHistory.filter((r) => Number(r.profit || 0) < 0).length;
+    const netProfit = filteredTradeHistory.reduce((sum, r) => sum + Number(r.profit || 0), 0);
+    return {
+      date: selectedDateKey,
+      totalTrades: filteredTradeHistory.length,
+      netProfit,
+      wins,
+      losses,
+    };
+  }, [historyAccountFilter, historySummary, filteredTradeHistory, selectedDateKey]);
+
   useEffect(() => {
     setTradeHistory([]);
     setHistoryLoadedForDate("");
     setHistorySummary(null);
     setHistoryOpen(false);
+    setHistoryAccountFilter(ALL_ACCOUNTS_FILTER);
   }, [selectedDateKey]);
 
   const loadTradeHistory = async () => {
@@ -416,29 +531,57 @@ export default function ProfitCalendar() {
             <DialogContent className="max-w-5xl max-h-[85vh] overflow-y-auto">
               <DialogHeader>
                 <DialogTitle>Trade History - {selectedDateKey || "-"}</DialogTitle>
-                <DialogDescription>
-                  Detailed closed orders for the selected day from your MT5-synced history.
+                <DialogDescription className="space-y-1">
+                  <span className="block">Detailed closed orders for the selected day from your MT5-synced history.</span>
+                  <span className="block text-xs">
+                    Source trading account{historyAccountLabels.length > 1 ? "s" : ""}:{" "}
+                    {historyAccountLabels.length > 0 ? historyAccountLabels.join(", ") : "No trade rows on this day"}
+                  </span>
                 </DialogDescription>
               </DialogHeader>
+
+              <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+                <div className="text-xs text-muted-foreground">
+                  {historyAccountFilter === ALL_ACCOUNTS_FILTER
+                    ? "Showing all accounts"
+                    : `Showing account: ${formatAccountLabel(historyAccountFilter)}`}
+                </div>
+                <div className="w-full md:w-[320px] space-y-1">
+                  <p className="text-xs text-muted-foreground">Filter by Profit Account</p>
+                  <Select value={historyAccountFilter} onValueChange={setHistoryAccountFilter}>
+                    <SelectTrigger className="h-9">
+                      <SelectValue placeholder="Select account" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={ALL_ACCOUNTS_FILTER}>All accounts</SelectItem>
+                      {historyAccountOptions.map((option) => (
+                        <SelectItem key={option.id} value={option.id}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
 
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                 <div className="rounded-lg border border-border p-3">
                   <p className="text-xs text-muted-foreground">Net PnL</p>
-                  <p className={cn("text-lg font-bold font-mono", (historySummary?.netProfit || 0) >= 0 ? "text-success" : "text-destructive")}>
-                    {(historySummary?.netProfit || 0) >= 0 ? "+" : ""}${Math.abs(historySummary?.netProfit || 0).toFixed(2)}
+                  <p className={cn("text-lg font-bold font-mono", (effectiveHistorySummary.netProfit || 0) >= 0 ? "text-success" : "text-destructive")}>
+                    {(effectiveHistorySummary.netProfit || 0) >= 0 ? "+" : ""}${Math.abs(effectiveHistorySummary.netProfit || 0).toFixed(2)}
                   </p>
                 </div>
                 <div className="rounded-lg border border-border p-3">
                   <p className="text-xs text-muted-foreground">Total Trades</p>
-                  <p className="text-lg font-bold font-mono">{historySummary?.totalTrades || 0}</p>
+                  <p className="text-lg font-bold font-mono">{effectiveHistorySummary.totalTrades || 0}</p>
                 </div>
                 <div className="rounded-lg border border-border p-3">
                   <p className="text-xs text-muted-foreground">Wins</p>
-                  <p className="text-lg font-bold font-mono text-success">{historySummary?.wins || 0}</p>
+                  <p className="text-lg font-bold font-mono text-success">{effectiveHistorySummary.wins || 0}</p>
                 </div>
                 <div className="rounded-lg border border-border p-3">
                   <p className="text-xs text-muted-foreground">Losses</p>
-                  <p className="text-lg font-bold font-mono text-destructive">{historySummary?.losses || 0}</p>
+                  <p className="text-lg font-bold font-mono text-destructive">{effectiveHistorySummary.losses || 0}</p>
                 </div>
               </div>
 
@@ -447,6 +590,7 @@ export default function ProfitCalendar() {
                   <TableHeader>
                     <TableRow>
                       <TableHead>Ticket</TableHead>
+                      <TableHead>Account</TableHead>
                       <TableHead>Symbol</TableHead>
                       <TableHead>Type</TableHead>
                       <TableHead>Lot</TableHead>
@@ -458,18 +602,21 @@ export default function ProfitCalendar() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {historyLoadedForDate === selectedDateKey && tradeHistory.length === 0 && (
+                    {historyLoadedForDate === selectedDateKey && filteredTradeHistory.length === 0 && (
                       <TableRow>
-                        <TableCell colSpan={9} className="text-center text-muted-foreground py-8">
+                        <TableCell colSpan={10} className="text-center text-muted-foreground py-8">
                           No trade history found for this day
                         </TableCell>
                       </TableRow>
                     )}
-                    {tradeHistory.map((row) => {
+                    {filteredTradeHistory.map((row) => {
                       const fee = Number(row.commission || 0) + Number(row.swap || 0);
                       return (
                         <TableRow key={`${row.ticketId}-${row.closeTime || ""}`}>
                           <TableCell className="font-mono text-xs">#{row.ticketId}</TableCell>
+                          <TableCell className="text-xs text-muted-foreground max-w-[180px] break-words">
+                            {formatAccountLabel(row.accountId)}
+                          </TableCell>
                           <TableCell>{row.symbol || "-"}</TableCell>
                           <TableCell>
                             <span className={cn("text-xs font-semibold", row.type === "BUY" ? "text-success" : row.type === "SELL" ? "text-destructive" : "text-foreground")}>
