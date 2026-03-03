@@ -1318,18 +1318,86 @@ class LiveTradingBot:
     def _broker_exposure_summary(self):
         pos_count = 0
         order_count = 0
+        pos_tickets = []
+        order_tickets = []
+        foreign_order_count = 0
+
         try:
-            pos_count = int(len(self._get_symbol_positions_safe()))
+            positions = list(self._get_symbol_positions_safe() or [])
         except Exception:
-            pos_count = 0
+            positions = []
+        active_positions = []
+        for p in positions:
+            vol = float(getattr(p, "volume", 0.0) or 0.0)
+            if vol <= 0.0:
+                continue
+            active_positions.append(p)
+            ticket = int(getattr(p, "ticket", 0) or 0)
+            if ticket > 0:
+                pos_tickets.append(ticket)
+        pos_count = int(len(active_positions))
+
+        pending_types = set()
+        for name in (
+            "ORDER_TYPE_BUY_LIMIT",
+            "ORDER_TYPE_SELL_LIMIT",
+            "ORDER_TYPE_BUY_STOP",
+            "ORDER_TYPE_SELL_STOP",
+            "ORDER_TYPE_BUY_STOP_LIMIT",
+            "ORDER_TYPE_SELL_STOP_LIMIT",
+        ):
+            val = getattr(mt5, name, None)
+            if val is not None:
+                pending_types.add(int(val))
+
+        inactive_states = set()
+        for name in (
+            "ORDER_STATE_CANCELED",
+            "ORDER_STATE_REJECTED",
+            "ORDER_STATE_EXPIRED",
+            "ORDER_STATE_FILLED",
+        ):
+            val = getattr(mt5, name, None)
+            if val is not None:
+                inactive_states.add(int(val))
+
         try:
             orders = mt5.orders_get(symbol=SYMBOL)
-            if orders is not None:
-                order_count = int(len(orders))
         except Exception:
-            order_count = 0
+            orders = None
+
+        if orders:
+            for o in orders:
+                try:
+                    o_type = int(getattr(o, "type", -1) or -1)
+                except Exception:
+                    o_type = -1
+                if pending_types and o_type not in pending_types:
+                    continue
+
+                try:
+                    o_state = int(getattr(o, "state", -1) or -1)
+                except Exception:
+                    o_state = -1
+                if inactive_states and o_state in inactive_states:
+                    continue
+
+                ticket = int(getattr(o, "ticket", 0) or 0)
+                magic = int(getattr(o, "magic", 0) or 0)
+                # Startup block should react only to this bot (or manual=0) orders.
+                if magic not in (0, int(MAGIC_NUMBER)):
+                    foreign_order_count += 1
+                    continue
+                if ticket > 0:
+                    order_tickets.append(ticket)
+
+        order_count = int(len(order_tickets))
         has_exposure = pos_count > 0 or order_count > 0
-        return has_exposure, pos_count, order_count
+        return has_exposure, pos_count, order_count, {
+            "pos_tickets": pos_tickets[:8],
+            "order_tickets": order_tickets[:8],
+            "foreign_order_count": int(foreign_order_count),
+        }
 
     def _sync_bridge_from_mt5(self):
         if self.bridge is None:
@@ -2520,8 +2588,11 @@ class LiveTradingBot:
                         continue
 
                     if self.last_bar_time == current_bar_time:
-                        has_exposure, pos_count, order_count = self._broker_exposure_summary()
+                        has_exposure, pos_count, order_count, exposure_meta = self._broker_exposure_summary()
                         if has_exposure:
+                            pos_tickets = list(exposure_meta.get("pos_tickets", []) or [])
+                            order_tickets = list(exposure_meta.get("order_tickets", []) or [])
+                            foreign_order_count = int(exposure_meta.get("foreign_order_count", 0) or 0)
                             print(
                                 "\n 🚀 [STARTUP] current bar already processed; "
                                 f"broker exposure detected (positions={pos_count}, orders={order_count}) "
@@ -2532,7 +2603,13 @@ class LiveTradingBot:
                                 "Startup exposure sync: allow CLOSE, block new BUY/SELL",
                                 phase="startup",
                                 event="startup_exposure_sync",
-                                meta={"positions": int(pos_count), "orders": int(order_count)},
+                                meta={
+                                    "positions": int(pos_count),
+                                    "orders": int(order_count),
+                                    "pos_tickets": ",".join(str(x) for x in pos_tickets) if pos_tickets else "",
+                                    "order_tickets": ",".join(str(x) for x in order_tickets) if order_tickets else "",
+                                    "ignored_foreign_orders": int(foreign_order_count),
+                                },
                             )
                             self._process_closed_bar(
                                 current_bar_time,
