@@ -73,6 +73,7 @@ def build_bot_runtime_env(
     live_symbol: str,
     live_timeframe: str,
     docker_image_id: str | None = None,
+    magic_number: int | None = None,
 ) -> dict[str, str]:
     ws_url = (
         os.getenv("BOT_RUNNER_WS_URL")
@@ -94,10 +95,14 @@ def build_bot_runtime_env(
         "BOT_CONFIG_ID": str(bot_config_id).strip(),
         "BOT_WS_URL": ws_url.strip(),
         "VISION_LLM_API_URL": vision_url.strip(),
+        "LIVE_MANAGE_MANUAL_POSITIONS": os.getenv("BOT_RUNNER_MANAGE_MANUAL_POSITIONS", "0").strip() or "0",
         "AUTO_BUILD": os.getenv("BOT_RUNNER_AUTO_BUILD", "0").strip() or "0",
         "PULL_LATEST_IMAGE": os.getenv("BOT_RUNNER_PULL_LATEST", "1").strip() or "1",
         "FORCE_REBUILD": os.getenv("BOT_RUNNER_FORCE_REBUILD", "0").strip() or "0",
     }
+
+    if magic_number is not None:
+        env["LIVE_MAGIC_NUMBER"] = str(int(magic_number))
 
     if docker_image_id and str(docker_image_id).strip():
         env["METATRADER_IMAGE"] = str(docker_image_id).strip()

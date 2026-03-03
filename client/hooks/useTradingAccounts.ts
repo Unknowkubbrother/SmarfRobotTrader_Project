@@ -43,6 +43,7 @@ export interface BotConfigWithVersion {
   account_id: string;
   model_id: string;
   bot_instance_id: number;
+  magic_number?: number | null;
   risk_level: string | null;
   trading_schedule: any;
   is_active: boolean;
@@ -95,6 +96,7 @@ export interface BotStatusUpdateResult {
 
 export interface BotRuntimeHealth {
   bot_config_id: string;
+  magic_number?: number | null;
   container_status: string | null;
   is_active: boolean;
   docker_project_name: string | null;

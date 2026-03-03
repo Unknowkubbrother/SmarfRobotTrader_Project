@@ -34,6 +34,7 @@ from ..utils.mt5_bot_runner import (
     decrypt_mt5_password,
     run_bot_instance_action,
 )
+from ..utils.bot_magic import derive_magic_number, normalize_magic_number
 from ..utils.bot_operation_events import emit_and_store_bot_operation_event
 from .authentication import get_current_active_user
 
@@ -45,6 +46,7 @@ ALLOWED_USER_ROLES = {"user", "admin"}
 ALLOWED_BOT_STATUSES = {"running", "stopped"}
 ALLOWED_SUB_STATUSES = {"active", "past_due", "canceled"}
 ALLOWED_FEE_TYPES = {"percentage", "fixed"}
+MAGIC_RESEED_LIMIT = 128
 
 
 def _to_float(value: Optional[Decimal]) -> float:
@@ -202,11 +204,60 @@ def _runner_error_message(prefix: str, exc: BotRunnerError) -> str:
     return f"{prefix}: {exc}"
 
 
-def _extract_admin_runtime_context(
+async def _allocate_magic_number_for_account(
+    *,
+    account_id: str,
+    bot_instance_id: int,
+    exclude_config_id: str | None = None,
+) -> int:
+    account_text = str(account_id or "").strip()
+    instance_int = int(bot_instance_id or 0)
+    if not account_text or instance_int <= 0:
+        raise HTTPException(status_code=400, detail="Cannot resolve bot magic number")
+
+    for salt in range(MAGIC_RESEED_LIMIT):
+        candidate = derive_magic_number(account_text, instance_int, salt=salt)
+        where: dict = {
+            "accountId": account_text,
+            "magicNumber": int(candidate),
+        }
+        if exclude_config_id:
+            where["id"] = {"not": str(exclude_config_id)}
+        existing = await db.botconfiguration.find_first(where=where)
+        if not existing:
+            return int(candidate)
+
+    raise HTTPException(status_code=500, detail="Unable to allocate unique bot magic number")
+
+
+async def _ensure_bot_config_magic_number(bot_configuration) -> int:
+    current = normalize_magic_number(getattr(bot_configuration, "magicNumber", None))
+    if current is not None:
+        return int(current)
+
+    account_id = str(getattr(bot_configuration, "accountId", "") or "").strip()
+    bot_instance_id = int(getattr(bot_configuration, "botInstanceId", 0) or 0)
+    resolved = await _allocate_magic_number_for_account(
+        account_id=account_id,
+        bot_instance_id=bot_instance_id,
+        exclude_config_id=str(getattr(bot_configuration, "id", "") or "").strip() or None,
+    )
+    await db.botconfiguration.update(
+        where={"id": str(bot_configuration.id)},
+        data={"magicNumber": int(resolved)},
+    )
+    try:
+        setattr(bot_configuration, "magicNumber", int(resolved))
+    except Exception:
+        pass
+    return int(resolved)
+
+
+async def _extract_admin_runtime_context(
     bot_configuration,
     image_override: str | None = None,
     bot_version_override=None,
-) -> dict[str, str | None]:
+) -> dict[str, object | None]:
     account = getattr(bot_configuration, "account", None)
     if not account:
         raise HTTPException(status_code=400, detail="Trading account is missing for this bot.")
@@ -248,6 +299,8 @@ def _extract_admin_runtime_context(
     except BotRunnerError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    magic_number = await _ensure_bot_config_magic_number(bot_configuration)
+
     runtime_env = build_bot_runtime_env(
         bot_config_id=str(bot_configuration.id),
         mt5_login=mt5_login,
@@ -256,11 +309,13 @@ def _extract_admin_runtime_context(
         live_symbol=live_symbol,
         live_timeframe=live_timeframe,
         docker_image_id=image_ref,
+        magic_number=magic_number,
     )
 
     return {
         "profile_name": profile_name,
         "docker_image_id": image_ref,
+        "magic_number": magic_number,
         "runtime_env": runtime_env,
     }
 
@@ -596,6 +651,7 @@ async def get_admin_user_detail(
                 AdminUserBotConfigurationItemResponse(
                     id=str(config.id),
                     bot_instance_id=int(config.botInstanceId),
+                    magic_number=normalize_magic_number(getattr(config, "magicNumber", None)),
                     model_id=str(config.modelId),
                     label=config.botVersion.label if config.botVersion else None,
                     symbol=config.botVersion.symbol if config.botVersion else None,
@@ -904,7 +960,7 @@ async def update_admin_user_bot_configuration_status(
 
     runner_result = None
     if status_value == "running":
-        runtime = _extract_admin_runtime_context(bot_configuration)
+        runtime = await _extract_admin_runtime_context(bot_configuration)
         current_status = _enum_value(getattr(bot_configuration, "containerStatus", None))
         action = "restart" if current_status == "running" or bool(bot_configuration.isActive) else "start"
         await db.botconfiguration.update(

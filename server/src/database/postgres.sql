@@ -189,6 +189,7 @@ CREATE TABLE "bot_configurations" (
   
   -- Multi-Bot Identifiers
   "bot_instance_id" INT NOT NULL, -- Mapped to MT5 Magic Number
+  "magic_number" INT NOT NULL,
   
   "risk_level" risk_enum,
   "trading_schedule" JSONB,
@@ -204,8 +205,9 @@ CREATE TABLE "bot_configurations" (
   
   "updated_at" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
   
-  -- Prevent duplicate magic numbers in same account
-  UNIQUE ("account_id", "bot_instance_id")
+  -- Prevent duplicate bot slot and magic number in same account
+  UNIQUE ("account_id", "bot_instance_id"),
+  UNIQUE ("account_id", "magic_number")
 );
 
 ALTER TABLE "trading_accounts"
@@ -214,10 +216,15 @@ ALTER TABLE "trading_accounts"
 
 ALTER TABLE "bot_configurations"
   ADD COLUMN IF NOT EXISTS "record_status" VARCHAR(20) NOT NULL DEFAULT 'active',
-  ADD COLUMN IF NOT EXISTS "deleted_at" TIMESTAMPTZ;
+  ADD COLUMN IF NOT EXISTS "deleted_at" TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS "magic_number" INT;
+ALTER TABLE "bot_configurations"
+  ALTER COLUMN "magic_number" SET NOT NULL;
 
 CREATE INDEX IF NOT EXISTS "idx_trading_accounts_record_status" ON "trading_accounts" ("record_status");
 CREATE INDEX IF NOT EXISTS "idx_bot_configurations_record_status" ON "bot_configurations" ("record_status");
+DROP INDEX IF EXISTS "idx_bot_configurations_account_magic";
+CREATE UNIQUE INDEX IF NOT EXISTS "idx_bot_configurations_account_magic" ON "bot_configurations" ("account_id", "magic_number");
 
 -- ==============================================================
 -- 6. Billing & Subscriptions

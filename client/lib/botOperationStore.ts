@@ -21,6 +21,9 @@ export type PersistedBotLog = {
   message: string;
   at: string;
   botId?: string;
+  action?: string;
+  phase?: string;
+  ts?: number;
 };
 
 export type PersistedBotUiState = {

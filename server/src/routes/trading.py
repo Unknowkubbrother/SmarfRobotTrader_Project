@@ -750,6 +750,7 @@ async def get_accounts_with_bots(
                     "account_id": str(config.accountId),
                     "model_id": str(config.modelId),
                     "bot_instance_id": config.botInstanceId,
+                    "magic_number": int(getattr(config, "magicNumber", 0) or 0) or None,
                     "risk_level": config.riskLevel if config.riskLevel else None,
                     "trading_schedule": normalize_trading_schedule(config.tradingSchedule),
                     "is_active": config.isActive,

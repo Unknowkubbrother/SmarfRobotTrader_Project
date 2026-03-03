@@ -24,6 +24,7 @@ from .config import (
     EVAL_ON_START,
     EXECUTE_STALE_REPLAY_ORDERS,
     LIVE_DYNAMIC_LOT,
+    LIVE_MANAGE_MANUAL_POSITIONS,
     LIVE_SYNC_ACCOUNT_STATE,
     LLM_SEMANTIC_CACHE_FILE,
     LLM_SEMANTIC_CACHE_SCHEMA,
@@ -806,7 +807,7 @@ class LiveTradingBot:
             started_at = time.time()
             self._add_log(
                 "warning",
-                "Emergency command received: close all positions",
+                "Emergency command received: close managed positions",
                 phase="order",
                 event="emergency_close_requested",
             )
@@ -814,7 +815,7 @@ class LiveTradingBot:
             detail = ""
             try:
                 ok = bool(self.close_all())
-                detail = "All open positions were closed" if ok else "Some positions could not be closed"
+                detail = "All managed positions were closed" if ok else "Some managed positions could not be closed"
             except Exception as exc:
                 detail = f"Emergency close failed: {exc}"
                 ok = False
@@ -920,13 +921,9 @@ class LiveTradingBot:
 
         # ── MT5 Active positions ──
         positions_data = []
-        all_positions = None
-        try:
-            all_positions = mt5.positions_get()
-        except Exception:
-            all_positions = None
-        if all_positions:
-            for p in all_positions:
+        managed_positions = self._get_symbol_positions_safe()
+        if managed_positions:
+            for p in managed_positions:
                 opened_at_utc = datetime.fromtimestamp(p.time, tz=timezone.utc)
                 positions_data.append({
                     "ticket": int(p.ticket),
@@ -945,6 +942,7 @@ class LiveTradingBot:
                         p.time, tz=timezone.utc
                     ).strftime("%H:%M:%S"),
                     "comment": str(p.comment) if p.comment else "",
+                    "magic": int(getattr(p, "magic", 0) or 0),
                 })
 
         last_err = self._safe_last_error()
@@ -960,6 +958,8 @@ class LiveTradingBot:
             "bot_config_id": BOT_CONFIG_ID,
             "symbol": SYMBOL,
             "timeframe": TIMEFRAME_NAME,
+            "magic_number": int(MAGIC_NUMBER),
+            "manage_manual_positions": bool(LIVE_MANAGE_MANUAL_POSITIONS),
             # Bot model state
             "position": int(current_pos),
             "entry_price": float(self.bridge.entry_price) if self.bridge else 0.0,
@@ -1447,6 +1447,30 @@ class LiveTradingBot:
             return mt5.ORDER_FILLING_IOC
         return mt5.ORDER_FILLING_RETURNAL
 
+    def _is_managed_magic(self, raw_magic) -> bool:
+        try:
+            magic = int(raw_magic or 0)
+        except Exception:
+            magic = 0
+        if magic == int(MAGIC_NUMBER):
+            return True
+        if bool(LIVE_MANAGE_MANUAL_POSITIONS) and magic == 0:
+            return True
+        return False
+
+    def _filter_managed_symbol_positions(self, positions):
+        if not positions:
+            return []
+        out = []
+        symbol_upper = str(SYMBOL or "").upper()
+        for p in positions:
+            if str(getattr(p, "symbol", "")).upper() != symbol_upper:
+                continue
+            if not self._is_managed_magic(getattr(p, "magic", 0)):
+                continue
+            out.append(p)
+        return out
+
     def _get_symbol_positions_safe(self):
         retries = 2
         for attempt in range(retries + 1):
@@ -1455,28 +1479,26 @@ class LiveTradingBot:
                 if attempt < retries:
                     time.sleep(0.05)
                 continue
-            if len(positions) == 0 and self.last_known_ticket != 0 and attempt < retries:
+
+            managed = self._filter_managed_symbol_positions(list(positions))
+            if len(managed) == 0 and self.last_known_ticket != 0 and attempt < retries:
                 time.sleep(0.05)
                 continue
-            return list(positions)
+            return managed
+
         last_err = self._safe_last_error()
         if self._is_mt5_ipc_error(last_err):
             self._try_reconnect_mt5(reason="positions_get")
             try:
                 positions = mt5.positions_get(symbol=SYMBOL)
                 if positions is not None:
-                    return list(positions)
+                    return self._filter_managed_symbol_positions(list(positions))
             except Exception:
                 pass
         try:
             all_positions = mt5.positions_get()
             if all_positions:
-                filtered = [
-                    p
-                    for p in all_positions
-                    if str(getattr(p, "symbol", "")).upper() == SYMBOL.upper()
-                ]
-                return list(filtered)
+                return self._filter_managed_symbol_positions(list(all_positions))
         except Exception:
             pass
         return []
@@ -1561,8 +1583,7 @@ class LiveTradingBot:
 
                 ticket = int(getattr(o, "ticket", 0) or 0)
                 magic = int(getattr(o, "magic", 0) or 0)
-                # Startup block should react only to this bot (or manual=0) orders.
-                if magic not in (0, int(MAGIC_NUMBER)):
+                if not self._is_managed_magic(magic):
                     foreign_order_count += 1
                     continue
                 if ticket > 0:
@@ -2050,13 +2071,13 @@ class LiveTradingBot:
             )
 
     def close_all(self):
-        positions = mt5.positions_get(symbol=SYMBOL)
-        if positions is None:
+        raw_positions = mt5.positions_get(symbol=SYMBOL)
+        if raw_positions is None:
             last_err = self._safe_last_error()
             if self._is_mt5_ipc_error(last_err):
                 self._try_reconnect_mt5(reason="close_all:positions_get")
-                positions = mt5.positions_get(symbol=SYMBOL)
-        if positions is None:
+                raw_positions = mt5.positions_get(symbol=SYMBOL)
+        if raw_positions is None:
             self._add_log(
                 "warning",
                 "Close skipped: positions_get returned None",
@@ -2064,6 +2085,8 @@ class LiveTradingBot:
                 event="close_skipped",
             )
             return False
+
+        positions = self._filter_managed_symbol_positions(list(raw_positions))
         if len(positions) == 0:
             self._add_log(
                 "info",

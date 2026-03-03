@@ -58,6 +58,7 @@ class UpdateAdminBotVersionRequest(BaseModel):
 class AdminUserBotConfigurationItemResponse(BaseModel):
     id: str
     bot_instance_id: int
+    magic_number: Optional[int] = None
     model_id: str
     label: Optional[str] = None
     symbol: Optional[str] = None

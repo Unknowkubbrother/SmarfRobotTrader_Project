@@ -26,22 +26,73 @@ from ..utils.mt5_bot_runner import (
     run_bot_instance_action,
 )
 from ..utils.bot_operation_events import emit_and_store_bot_operation_event
+from ..utils.bot_magic import derive_magic_number, normalize_magic_number
 from ..utils.ws_manager import bot_hub
 
 bot_router = APIRouter()
 logger = logging.getLogger(__name__)
 ACTIVE_RECORD_STATUS = "active"
+MAGIC_RESEED_LIMIT = 128
 
 
 def _enum_value(value):
     return value.value if hasattr(value, "value") else value
 
 
-def _extract_runtime_context(
+async def _allocate_magic_number_for_account(
+    *,
+    account_id: str,
+    bot_instance_id: int,
+    exclude_config_id: str | None = None,
+) -> int:
+    account_text = str(account_id or "").strip()
+    instance_int = int(bot_instance_id or 0)
+    if not account_text or instance_int <= 0:
+        raise HTTPException(status_code=400, detail="Cannot resolve bot magic number")
+
+    for salt in range(MAGIC_RESEED_LIMIT):
+        candidate = derive_magic_number(account_text, instance_int, salt=salt)
+        where: dict = {
+            "accountId": account_text,
+            "magicNumber": int(candidate),
+        }
+        if exclude_config_id:
+            where["id"] = {"not": str(exclude_config_id)}
+        existing = await db.botconfiguration.find_first(where=where)
+        if not existing:
+            return int(candidate)
+
+    raise HTTPException(status_code=500, detail="Unable to allocate unique bot magic number")
+
+
+async def _ensure_bot_magic_number(config) -> int:
+    current = normalize_magic_number(getattr(config, "magicNumber", None))
+    if current is not None:
+        return int(current)
+
+    account_id = str(getattr(config, "accountId", "") or "").strip()
+    bot_instance_id = int(getattr(config, "botInstanceId", 0) or 0)
+    resolved = await _allocate_magic_number_for_account(
+        account_id=account_id,
+        bot_instance_id=bot_instance_id,
+        exclude_config_id=str(getattr(config, "id", "") or "").strip() or None,
+    )
+    await db.botconfiguration.update(
+        where={"id": str(config.id)},
+        data={"magicNumber": int(resolved)},
+    )
+    try:
+        setattr(config, "magicNumber", int(resolved))
+    except Exception:
+        pass
+    return int(resolved)
+
+
+async def _extract_runtime_context(
     config,
     image_override: str | None = None,
     bot_version_override=None,
-) -> dict[str, str | None]:
+) -> dict[str, object | None]:
     account = getattr(config, "account", None)
     if not account:
         raise HTTPException(status_code=400, detail="Trading account is missing for this bot.")
@@ -83,6 +134,8 @@ def _extract_runtime_context(
     except BotRunnerError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    magic_number = await _ensure_bot_magic_number(config)
+
     runtime_env = build_bot_runtime_env(
         bot_config_id=str(config.id),
         mt5_login=mt5_login,
@@ -91,11 +144,13 @@ def _extract_runtime_context(
         live_symbol=live_symbol,
         live_timeframe=live_timeframe,
         docker_image_id=image_ref,
+        magic_number=magic_number,
     )
 
     return {
         "profile_name": profile_name,
         "docker_image_id": image_ref,
+        "magic_number": magic_number,
         "runtime_env": runtime_env,
     }
 
@@ -236,6 +291,10 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
     bot_configuration_count = bot_configuration_count + 1
 
     botInstanceId = 1000 + bot_configuration_count
+    magic_number = await _allocate_magic_number_for_account(
+        account_id=str(data.accountId),
+        bot_instance_id=int(botInstanceId),
+    )
     
     tradingSchedule = normalize_trading_schedule({})
 
@@ -251,7 +310,8 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
             "containerStatus": "stopped",
             "installedDockerImageId": bot_version.dockerImageId,
             "installedVersionTag": bot_version.versionTag,
-            "botInstanceId": botInstanceId
+            "botInstanceId": botInstanceId,
+            "magicNumber": int(magic_number),
         }
     )
     
@@ -260,7 +320,8 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
     
     return {
         "status_code": 200,
-        "message": "Bot configuration created successfully"
+        "message": "Bot configuration created successfully",
+        "magic_number": int(magic_number),
     }
 
 
@@ -281,7 +342,7 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
 
     runner_result = None
     if requested_status == "running":
-        runtime = _extract_runtime_context(config)
+        runtime = await _extract_runtime_context(config)
         current_status = _enum_value(getattr(config, "containerStatus", None))
         action = "restart" if current_status == "running" or bool(config.isActive) else "start"
         await db.botconfiguration.update(
@@ -472,6 +533,7 @@ async def get_bot_runtime_health(request: Request, botConfigId: str):
         "status_code": 200,
         "data": {
             "bot_config_id": bot_config_id,
+            "magic_number": normalize_magic_number(getattr(config, "magicNumber", None)),
             "container_status": container_status,
             "is_active": is_active,
             "docker_project_name": docker_project_name,
@@ -615,7 +677,7 @@ async def emergency_stop_bot(request: Request, data: Emergency_Bot_Stop):
         bot_config_id=str(data.botConfigId),
         action="emergency_stop",
         phase="requested",
-        detail="Emergency stop requested (close positions + stop runtime)",
+        detail="Emergency stop requested (close bot-managed positions + stop runtime)",
         status="stopped",
         owner_user_id=request.state.user_id,
     )
@@ -717,11 +779,11 @@ async def emergency_stop_bot(request: Request, data: Emergency_Bot_Stop):
 
     warning_message = None
     if close_result == "skipped_bot_offline":
-        warning_message = "Bot was offline, so close-position command was skipped before container stop."
+        warning_message = "Bot was offline, so close-managed-position command was skipped before container stop."
     elif close_result == "timeout_waiting_ack":
-        warning_message = "Close-position command was sent but no acknowledgment was received before timeout."
+        warning_message = "Close-managed-position command was sent but no acknowledgment was received before timeout."
     elif close_result in {"close_all_partial_or_failed", "command_send_failed"}:
-        warning_message = "Close-position command did not finish cleanly. Please verify open positions on MT5."
+        warning_message = "Close-managed-position command did not finish cleanly. Please verify open positions on MT5."
 
     return {
         "status_code": 200,
@@ -766,7 +828,7 @@ async def change_bot_model(request: Request, data: Change_Bot_Model):
     )
 
     if was_running:
-        runtime = _extract_runtime_context(
+        runtime = await _extract_runtime_context(
             config,
             image_override=str(getattr(new_version, "dockerImageId", "") or "").strip() or None,
             bot_version_override=new_version,
@@ -901,12 +963,20 @@ async def apply_bot_update(request: Request, data: Apply_Bot_Update):
 
     current_status = _enum_value(config.containerStatus)
     was_running = current_status == "running" or bool(config.isActive)
+    if was_running:
+        await db.botconfiguration.update(
+            where={"id": data.botConfigId},
+            data={
+                "containerStatus": "starting",
+                "isActive": True,
+            },
+        )
     await _emit_lifecycle_event(
         bot_config_id=str(data.botConfigId),
         action="apply_update",
         phase="requested",
         detail=f"Apply update requested ({installed_version_tag} -> {latest_version_tag})",
-        status="running" if was_running else "stopped",
+        status="starting" if was_running else "stopped",
         metadata={
             "installed_version_tag": installed_version_tag,
             "latest_version_tag": latest_version_tag,
@@ -917,7 +987,7 @@ async def apply_bot_update(request: Request, data: Apply_Bot_Update):
     runner_result = None
     operation = "metadata_only"
     if was_running:
-        runtime = _extract_runtime_context(config, image_override=latest_image_id)
+        runtime = await _extract_runtime_context(config, image_override=latest_image_id)
         operation = "restart"
         try:
             runner_result = await asyncio.to_thread(

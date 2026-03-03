@@ -322,6 +322,7 @@ model BotConfiguration {
 
   // Multi-Bot Identifiers
   botInstanceId Int @map("bot_instance_id")
+  magicNumber   Int @map("magic_number")
 
   riskLevel       RiskLevel? @map("risk_level")
   tradingSchedule Json?      @map("trading_schedule")
@@ -342,6 +343,7 @@ model BotConfiguration {
   operationLogs BotOperationLog[]
 
   @@unique([accountId, botInstanceId])
+  @@unique([accountId, magicNumber])
   @@map("bot_configurations")
 }
 

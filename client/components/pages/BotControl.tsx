@@ -314,6 +314,9 @@ export default function BotControl() {
       message: `${sourceLabel}: ${entry.message || fallbackMessage}`,
       at,
       botId: entry.bot_config_id,
+      action: String(entry.action || "").trim().toLowerCase() || undefined,
+      phase: String(entry.phase || "").trim().toLowerCase() || undefined,
+      ts: createdDate.getTime(),
     };
   };
 
@@ -755,6 +758,7 @@ export default function BotControl() {
 
   const handleApplyUpdate = async () => {
     if (isBusy) return;
+    if (isApplyUpdatePendingFromLogs) return;
     if (!selectedBot) return;
     if (applyUpdateInFlightRef.current) return;
     applyUpdateInFlightRef.current = true;
@@ -823,6 +827,13 @@ export default function BotControl() {
   const visibleActionLogs = selectedBot
     ? actionLogs.filter((log) => log.botId === selectedBot.id)
     : [];
+  const latestApplyUpdateLog = visibleActionLogs.find((log) => log.action === "apply_update");
+  const isApplyUpdatePendingFromLogs = Boolean(
+    latestApplyUpdateLog?.phase === "requested" &&
+    typeof latestApplyUpdateLog?.ts === "number" &&
+    Date.now() - latestApplyUpdateLog.ts <= 15 * 60 * 1000
+  );
+  const isApplyingUpdateVisual = Boolean(isApplyingUpdateAction || isApplyUpdatePendingFromLogs);
 
   const getStatusBadge = (status: string | null) => {
     switch (status) {
@@ -947,14 +958,14 @@ export default function BotControl() {
                       <Button
                         className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
                         onClick={() => setUpdateConfirmOpen(true)}
-                        disabled={isBusy}
+                        disabled={isBusy || isApplyUpdatePendingFromLogs}
                       >
-                        {isApplyingUpdateAction ? (
+                        {isApplyingUpdateVisual ? (
                           <RefreshCw className="w-4 h-4 animate-spin" />
                         ) : (
                           <DownloadCloud className="w-4 h-4" />
                         )}
-                        {isApplyingUpdateAction ? "Updating..." : "Update Bot"}
+                        {isApplyingUpdateVisual ? "Updating..." : "Update Bot"}
                       </Button>
                     )}
                     <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-secondary">
@@ -1150,13 +1161,13 @@ export default function BotControl() {
                         </ul>
                       )}
                     </div>
-                    <Button className="gap-2" onClick={() => setUpdateConfirmOpen(true)} disabled={isBusy}>
-                      {isApplyingUpdateAction ? (
+                    <Button className="gap-2" onClick={() => setUpdateConfirmOpen(true)} disabled={isBusy || isApplyUpdatePendingFromLogs}>
+                      {isApplyingUpdateVisual ? (
                         <RefreshCw className="w-4 h-4 animate-spin" />
                       ) : (
                         <DownloadCloud className="w-4 h-4" />
                       )}
-                      {isApplyingUpdateAction ? "Updating..." : "Apply Update"}
+                      {isApplyingUpdateVisual ? "Updating..." : "Apply Update"}
                     </Button>
                   </div>
                 </div>
@@ -1465,8 +1476,8 @@ export default function BotControl() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleApplyUpdate} disabled={isBusy}>
-              {isApplyingUpdateAction ? "Updating..." : "Update Bot"}
+            <AlertDialogAction onClick={handleApplyUpdate} disabled={isBusy || isApplyUpdatePendingFromLogs}>
+              {isApplyingUpdateVisual ? "Updating..." : "Update Bot"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
