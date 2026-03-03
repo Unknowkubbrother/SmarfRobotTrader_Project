@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -16,6 +17,17 @@ class RunnerCommandResult:
     stderr: str
     project_name: str | None = None
     container_id: str | None = None
+
+
+@dataclass
+class BotRuntimeHealthResult:
+    project_name: str
+    container_id: str | None
+    trade_allowed: bool | None
+    tradeapi_disabled: bool | None
+    detail: str
+    stdout: str = ""
+    stderr: str = ""
 
 
 class BotRunnerError(RuntimeError):
@@ -194,6 +206,109 @@ def pull_docker_image(image_ref: str, timeout_sec: int = 1200) -> RunnerCommandR
     )
 
 
+def check_bot_runtime_health(
+    *,
+    instance_name: str,
+    timeout_sec: int = 90,
+    rpc_timeout_ms: int | str = 180000,
+) -> BotRuntimeHealthResult:
+    normalized_instance = str(instance_name or "").strip()
+    if not normalized_instance:
+        raise BotRunnerError("instance_name is required.")
+
+    _ensure_docker_access()
+    project_name = f"mt5_{_sanitize_instance_name(normalized_instance)}"
+    container_id = _resolve_container_id(project_name)
+    if not container_id:
+        return BotRuntimeHealthResult(
+            project_name=project_name,
+            container_id=None,
+            trade_allowed=None,
+            tradeapi_disabled=None,
+            detail="container_not_found",
+        )
+
+    probe_script = """
+import json
+import os
+import sys
+from mt5linux import MetaTrader5
+
+payload = {
+    "trade_allowed": None,
+    "tradeapi_disabled": None,
+    "detail": "",
+}
+
+try:
+    timeout_ms = int(os.getenv("MT5_RPC_TIMEOUT_MS", "180000"))
+except Exception:
+    timeout_ms = 180000
+
+try:
+    mt5 = MetaTrader5(host="localhost", port=8001)
+    if not mt5.initialize(timeout=timeout_ms):
+        payload["detail"] = "initialize_failed"
+        print(json.dumps(payload))
+        sys.exit(2)
+
+    info = mt5.terminal_info()
+    if info is None:
+        payload["detail"] = "terminal_info_none"
+        print(json.dumps(payload))
+        sys.exit(3)
+
+    payload["trade_allowed"] = bool(getattr(info, "trade_allowed", False))
+    payload["tradeapi_disabled"] = bool(getattr(info, "tradeapi_disabled", False))
+    payload["detail"] = "ok"
+    print(json.dumps(payload))
+    sys.exit(0 if payload["trade_allowed"] else 1)
+except Exception as exc:
+    payload["detail"] = f"exception:{exc}"
+    print(json.dumps(payload))
+    sys.exit(4)
+""".strip()
+
+    env = os.environ.copy()
+    env["MT5_RPC_TIMEOUT_MS"] = str(rpc_timeout_ms)
+    try:
+        proc = subprocess.run(
+            ["docker", "exec", "-e", f"MT5_RPC_TIMEOUT_MS={rpc_timeout_ms}", container_id, "python3", "-c", probe_script],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BotRunnerError(
+            f"Runtime health check timed out after {timeout_sec}s.",
+            stdout=_shorten_output(exc.stdout),
+            stderr=_shorten_output(exc.stderr),
+        ) from exc
+
+    stdout = _shorten_output(proc.stdout)
+    stderr = _shorten_output(proc.stderr)
+    payload = _extract_json_payload(stdout)
+    detail = str(payload.get("detail", "") or "").strip() or (
+        "trade_allowed_on" if proc.returncode == 0 else "trade_allowed_off" if proc.returncode == 1 else f"exit_{proc.returncode}"
+    )
+
+    trade_allowed_raw = payload.get("trade_allowed", None)
+    tradeapi_disabled_raw = payload.get("tradeapi_disabled", None)
+    trade_allowed = bool(trade_allowed_raw) if isinstance(trade_allowed_raw, bool) else None
+    tradeapi_disabled = bool(tradeapi_disabled_raw) if isinstance(tradeapi_disabled_raw, bool) else None
+
+    return BotRuntimeHealthResult(
+        project_name=project_name,
+        container_id=container_id,
+        trade_allowed=trade_allowed,
+        tradeapi_disabled=tradeapi_disabled,
+        detail=detail,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
 def _resolve_runner_dir() -> Path:
     candidates: list[Path] = []
     configured = str(os.getenv("RUNNER_DIR", "") or "").strip()
@@ -274,6 +389,23 @@ def _shorten_output(output: str | bytes | None, limit: int = 4000) -> str:
     if len(text) <= limit:
         return text
     return text[-limit:]
+
+
+def _extract_json_payload(raw_text: str | None) -> dict:
+    text = str(raw_text or "").strip()
+    if not text:
+        return {}
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
 
 
 def _sanitize_instance_name(raw: str) -> str:

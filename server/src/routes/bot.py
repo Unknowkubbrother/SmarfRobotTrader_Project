@@ -18,6 +18,7 @@ from ..utils.mt5_bot_runner import (
     BotRunnerError,
     build_bot_runtime_env,
     build_profile_name,
+    check_bot_runtime_health,
     decrypt_mt5_password,
     pull_docker_image,
     run_bot_instance_action,
@@ -321,6 +322,63 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
         "message": f"Bot status updated to {requested_status}",
         "docker_project_name": getattr(runner_result, "project_name", None),
         "docker_container_id": getattr(runner_result, "container_id", None),
+    }
+
+
+@bot_router.get('/runtime_health', tags=["bot"])
+async def get_bot_runtime_health(request: Request, botConfigId: str):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    config = await verify_bot_ownership(botConfigId, request.state.user_id)
+    bot_config_id = str(config.id)
+    container_status = _enum_value(getattr(config, "containerStatus", None))
+    is_active = bool(getattr(config, "isActive", False))
+    db_container_id = str(getattr(config, "dockerContainerId", "") or "").strip() or None
+    live_hub_connected = bot_hub.get_bot(bot_config_id) is not None
+
+    trade_allowed = None
+    tradeapi_disabled = None
+    health_detail = "container_not_running"
+    docker_project_name = None
+    docker_container_id = db_container_id
+    probe_stdout = ""
+    probe_stderr = ""
+
+    should_probe_runtime = container_status == "running" or is_active or bool(db_container_id)
+    if should_probe_runtime:
+        try:
+            probe = await asyncio.to_thread(
+                check_bot_runtime_health,
+                instance_name=bot_config_id,
+            )
+            docker_project_name = probe.project_name
+            docker_container_id = probe.container_id or docker_container_id
+            trade_allowed = probe.trade_allowed
+            tradeapi_disabled = probe.tradeapi_disabled
+            health_detail = probe.detail
+            probe_stdout = probe.stdout
+            probe_stderr = probe.stderr
+        except BotRunnerError as exc:
+            health_detail = _runner_error_message("Runtime health check failed", exc)
+            probe_stdout = str(getattr(exc, "stdout", "") or "")
+            probe_stderr = str(getattr(exc, "stderr", "") or "")
+
+    return {
+        "status_code": 200,
+        "data": {
+            "bot_config_id": bot_config_id,
+            "container_status": container_status,
+            "is_active": is_active,
+            "docker_project_name": docker_project_name,
+            "docker_container_id": docker_container_id,
+            "live_hub_connected": live_hub_connected,
+            "trade_allowed": trade_allowed,
+            "tradeapi_disabled": tradeapi_disabled,
+            "health_detail": health_detail,
+            "probe_stdout": probe_stdout,
+            "probe_stderr": probe_stderr,
+        },
     }
 
 

@@ -93,6 +93,20 @@ export interface BotStatusUpdateResult {
   error?: string;
 }
 
+export interface BotRuntimeHealth {
+  bot_config_id: string;
+  container_status: string | null;
+  is_active: boolean;
+  docker_project_name: string | null;
+  docker_container_id: string | null;
+  live_hub_connected: boolean;
+  trade_allowed: boolean | null;
+  tradeapi_disabled: boolean | null;
+  health_detail: string;
+  probe_stdout?: string;
+  probe_stderr?: string;
+}
+
 const isLikelyTransientRequestError = (error: unknown): boolean => {
   const e = error as ApiClientError | undefined;
   if (e?.isCanceled) return true;
@@ -326,6 +340,22 @@ export function useTradingAccounts() {
     }
   };
 
+  const getBotRuntimeHealth = async (botConfigId: string): Promise<BotRuntimeHealth | null> => {
+    try {
+      const response = await api.get("/bot/runtime_health", {
+        params: { botConfigId },
+      });
+      const payload = response?.data?.data ?? null;
+      if (!payload || typeof payload !== "object") {
+        return null;
+      }
+      return payload as BotRuntimeHealth;
+    } catch (error) {
+      console.error("Error checking bot runtime health:", error);
+      return null;
+    }
+  };
+
   // Create a new bot configuration for an account
   const createBot = async (
     accountId: string,
@@ -456,6 +486,7 @@ export function useTradingAccounts() {
     changeModel,
     emergencyStopBot,
     applyBotUpdate,
+    getBotRuntimeHealth,
     createBot,
     deleteBot,
     getBotVersions,

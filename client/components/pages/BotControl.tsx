@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Power, AlertOctagon, Clock, Shield, Play, Activity, TrendingUp, RefreshCw, Sparkles, Plus, Trash2, AlertTriangle, DownloadCloud } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -6,7 +6,12 @@ import { toast } from "sonner";
 import { AccountSelector, AccountWithBots } from "@/components/dashboard/AccountSelector";
 import { BotSelector } from "@/components/dashboard/BotSelector";
 import { AddBotDialog } from "@/components/dialogs/AddBotDialog";
-import { useTradingAccounts, BotConfigWithVersion, BotVersion } from "@/hooks/useTradingAccounts";
+import {
+  useTradingAccounts,
+  BotConfigWithVersion,
+  BotRuntimeHealth,
+  BotVersion,
+} from "@/hooks/useTradingAccounts";
 import { useBotLiveState } from "@/hooks/useBotLiveState";
 import {
   Dialog,
@@ -115,6 +120,7 @@ export default function BotControl() {
     emergencyStopBot,
     applyBotUpdate,
     deleteBot,
+    getBotRuntimeHealth,
     updateAccount,
     deleteAccount,
     refetch,
@@ -141,7 +147,9 @@ export default function BotControl() {
   const [updateConfirmOpen, setUpdateConfirmOpen] = useState(false);
   const [activeAction, setActiveAction] = useState<PersistedBotAction | null>(null);
   const [actionLogs, setActionLogs] = useState<PersistedBotLog[]>([]);
+  const [runtimeHealth, setRuntimeHealth] = useState<BotRuntimeHealth | null>(null);
   const [storeReady, setStoreReady] = useState(false);
+  const healthLogKeysRef = useRef<Set<string>>(new Set());
 
   const [availableModels, setAvailableModels] = useState<BotVersion[]>([]);
   const activeActionForSelectedBot =
@@ -236,6 +244,10 @@ export default function BotControl() {
     }
   }, [selectedBot]);
 
+  useEffect(() => {
+    setRuntimeHealth(null);
+  }, [selectedBot?.id]);
+
   const appendActionLog = (
     level: PersistedBotLog["level"],
     message: string,
@@ -309,10 +321,81 @@ export default function BotControl() {
     }
 
     if (isDone) {
-      appendActionLog("success", `${activeAction.title} synchronized`, activeAction.botId);
-      setActiveAction(null);
+      const completedAction = activeAction;
+      appendActionLog("success", `${completedAction.title} synchronized`, completedAction.botId);
+      finishUiAction();
+
+      if (completedAction.kind === "starting" && completedAction.botId) {
+        const actionKey = `${completedAction.botId}:${completedAction.startedAt}:post_start_health`;
+        if (!healthLogKeysRef.current.has(actionKey)) {
+          healthLogKeysRef.current.add(actionKey);
+          void (async () => {
+            let health: BotRuntimeHealth | null = null;
+            for (let attempt = 1; attempt <= 6; attempt += 1) {
+              health = await getBotRuntimeHealth(completedAction.botId as string);
+              if (health && health.trade_allowed !== null) {
+                break;
+              }
+              if (attempt < 6) {
+                await new Promise((resolve) => window.setTimeout(resolve, 2000));
+              }
+            }
+            if (!health) {
+              appendActionLog("info", "Bot started. Runtime health check is pending...", completedAction.botId);
+              return;
+            }
+            if (selectedBot?.id === health.bot_config_id) {
+              setRuntimeHealth(health);
+            }
+            if (health.trade_allowed === true) {
+              appendActionLog("success", "MT5 algorithmic trading is enabled", completedAction.botId);
+            } else if (health.trade_allowed === false) {
+              appendActionLog("error", "MT5 algorithmic trading is disabled", completedAction.botId);
+            } else {
+              appendActionLog(
+                "info",
+                `MT5 runtime health: ${health.health_detail || "waiting for data"}`,
+                completedAction.botId,
+              );
+            }
+          })();
+        }
+      }
     }
-  }, [accounts, activeAction]);
+  }, [accounts, activeAction, selectedBot?.id]);
+
+  useEffect(() => {
+    if (!activeAction) return;
+    const timer = window.setInterval(() => {
+      void refetch();
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [activeAction, refetch]);
+
+  useEffect(() => {
+    if (!selectedBot) return;
+    const selectedBotId = selectedBot.id;
+    const normalizedStatus = String(selectedBot.status || selectedBot.container_status || "").toLowerCase();
+    const shouldPoll = normalizedStatus === "running" || activeAction?.botId === selectedBotId;
+    if (!shouldPoll) return;
+
+    let cancelled = false;
+    const pollRuntimeHealth = async () => {
+      const health = await getBotRuntimeHealth(selectedBotId);
+      if (!cancelled && health) {
+        setRuntimeHealth(health);
+      }
+    };
+
+    void pollRuntimeHealth();
+    const timer = window.setInterval(() => {
+      void pollRuntimeHealth();
+    }, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [selectedBot, activeAction?.botId]);
 
   useEffect(() => {
     if (!activeAction?.startedAt) return;
@@ -554,6 +637,10 @@ export default function BotControl() {
   };
 
   const botStatus = selectedBot?.status || "stopped";
+  const normalizedBotStatus = String(botStatus || "").toLowerCase();
+  const isRunningStatus = normalizedBotStatus === "running";
+  const hasLiveStream = Boolean(liveState?.connected);
+  const isLiveConnecting = !hasLiveStream && (isRunningStatus || activeActionForSelectedBot?.kind === "starting");
   const botSymbol = selectedBot?.bot_version?.symbol || "N/A";
   const botLabel = selectedBot?.bot_version?.label || "No Bot Selected";
   const bots = selectedAccount?.bot_configurations || [];
@@ -633,7 +720,7 @@ export default function BotControl() {
             <p className="text-sm font-semibold">Operation Log</p>
             <span className="text-xs text-muted-foreground">latest {visibleActionLogs.length} entries</span>
           </div>
-          <div className="space-y-2">
+          <div className="max-h-52 space-y-2 overflow-y-auto pr-1">
             {visibleActionLogs.map((log) => (
               <div key={log.id} className="flex items-center gap-2 text-xs">
                 <span className="font-mono text-muted-foreground">{log.at}</span>
@@ -747,6 +834,11 @@ export default function BotControl() {
                     <span className="w-1.5 h-1.5 rounded-full bg-success animate-pulse" />
                     Live
                   </span>
+                ) : isLiveConnecting ? (
+                  <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-warning/10 text-warning">
+                    <RefreshCw className="h-3 w-3 animate-spin" />
+                    Connecting
+                  </span>
                 ) : (
                   <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-muted text-muted-foreground">
                     Offline
@@ -820,8 +912,20 @@ export default function BotControl() {
                 </div>
               ) : (
                 <div className="text-center py-6 text-muted-foreground">
-                  <p className="text-sm">Bot is currently offline</p>
-                  <p className="text-xs mt-1">Start the bot to begin live updates. This panel will connect automatically.</p>
+                  {isLiveConnecting ? (
+                    <>
+                      <p className="text-sm">Bot is starting up</p>
+                      <p className="text-xs mt-1">
+                        Container is running. Waiting for live data stream...
+                        {runtimeHealth?.health_detail ? ` (${runtimeHealth.health_detail})` : ""}
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-sm">Bot is currently offline</p>
+                      <p className="text-xs mt-1">Start the bot to begin live updates. This panel will connect automatically.</p>
+                    </>
+                  )}
                 </div>
               )}
             </div>
