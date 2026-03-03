@@ -38,6 +38,7 @@ import {
   type PersistedBotAction,
   type PersistedBotLog,
 } from "@/lib/botOperationStore";
+import { useSearchParams } from "next/navigation";
 
 const riskLevels = [
   { id: "low", label: "Low", description: "Conservative trading with minimal risk", color: "text-success" },
@@ -131,6 +132,9 @@ const mapLifecycleActionTitle = (action: string): string => {
 };
 
 export default function BotControl() {
+  const searchParams = useSearchParams();
+  const queryBotId = searchParams.get("botId");
+
   const {
     accounts,
     loading,
@@ -176,6 +180,7 @@ export default function BotControl() {
   const lastLifecycleRefetchAtRef = useRef<number>(0);
   const lastLogsRefreshAtRef = useRef<number>(0);
   const applyUpdateInFlightRef = useRef(false);
+  const appliedQueryBotIdRef = useRef<string | null>(null);
 
   const [availableModels, setAvailableModels] = useState<BotVersion[]>([]);
   const activeActionForSelectedBot =
@@ -221,6 +226,28 @@ export default function BotControl() {
   useEffect(() => {
     getBotVersions().then(setAvailableModels);
   }, []);
+
+  // When opened from global search, honor ?botId=... and focus that exact bot/account.
+  useEffect(() => {
+    if (!queryBotId) {
+      appliedQueryBotIdRef.current = null;
+      return;
+    }
+
+    if (appliedQueryBotIdRef.current === queryBotId) {
+      return;
+    }
+
+    for (const account of accounts) {
+      const matchedBot = account.bot_configurations.find((bot) => bot.id === queryBotId);
+      if (matchedBot) {
+        setSelectedAccount(account);
+        setSelectedBot(matchedBot);
+        appliedQueryBotIdRef.current = queryBotId;
+        return;
+      }
+    }
+  }, [accounts, queryBotId]);
 
   // Auto-select first account when accounts load
   useEffect(() => {

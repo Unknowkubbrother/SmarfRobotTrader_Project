@@ -29,11 +29,31 @@ function TickerTagWidget() {
         }
     }, []);
 
+    useEffect(() => {
+        const suppressKnownTradingViewError = (event: ErrorEvent) => {
+            const message = String(event.message || "");
+            const source = String(event.filename || "");
+
+            if (
+                message.includes("Element is not connected") &&
+                source.includes("tradingview-widget.com")
+            ) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            }
+        };
+
+        window.addEventListener("error", suppressKnownTradingViewError, true);
+        return () => {
+            window.removeEventListener("error", suppressKnownTradingViewError, true);
+        };
+    }, []);
+
     // Duplicate list for seamless scrolling
     const items = [...SYMBOLS, ...SYMBOLS];
 
     return (
-        <div className="w-full h-full overflow-hidden flex items-center relative group mask-gradient">
+        <div className="w-full h-full overflow-hidden flex items-center relative mask-gradient pointer-events-none">
             <style>{`
          @keyframes scroll {
            0% { transform: translateX(0); }
@@ -44,9 +64,6 @@ function TickerTagWidget() {
            animation: scroll 60s linear infinite; /* Slow smooth scroll */
            width: max-content;
          }
-         .group:hover .animate-scroll {
-           animation-play-state: paused;
-         }
          .mask-gradient {
             mask-image: linear-gradient(to right, transparent, black 5%, black 95%, transparent);
             -webkit-mask-image: linear-gradient(to right, transparent, black 5%, black 95%, transparent);
@@ -54,7 +71,7 @@ function TickerTagWidget() {
        `}</style>
             <div className="animate-scroll">
                 {items.map((symbol, i) => (
-                    <div key={`${symbol}-${i}`} className="mx-4 transform transition-transform hover:scale-105">
+                    <div key={`${symbol}-${i}`} className="mx-4 pointer-events-none">
                         <tv-ticker-tag symbol={symbol} theme="light" large></tv-ticker-tag>
                     </div>
                 ))}
