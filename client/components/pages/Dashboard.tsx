@@ -219,10 +219,11 @@ export default function Dashboard() {
   const accountBalance = selectedAccount?.balance ?? 0;
   const accountEquity = selectedAccount?.equity ?? accountBalance;
   const accountTodayPnl = selectedAccount?.total_today_pnl ?? 0;
+  const accountTotalPnl = selectedAccount?.total_net_pnl ?? accountTodayPnl;
   const liveBalance = liveState?.balance ?? accountBalance;
   const liveEquity = liveState?.equity ?? accountEquity;
-  const liveTotalPnl = liveState?.total_pnl ?? accountTodayPnl;
-  const liveUnrealized = liveState?.unrealized_pnl ?? accountTodayPnl;
+  const liveTotalPnl = liveState?.total_pnl ?? accountTotalPnl;
+  const liveUnrealized = liveState?.unrealized_pnl ?? 0;
   const liveWins = liveState?.wins ?? 0;
   const liveTrades = liveState?.trades ?? 0;
   const livePosition = liveState?.position ?? 0;

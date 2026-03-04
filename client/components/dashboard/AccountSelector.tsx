@@ -70,6 +70,9 @@ export function AccountSelector({
     return `${total} Bots`;
   };
 
+  const getAccountPnl = (account: AccountWithBots) =>
+    Number(account.total_net_pnl ?? account.total_today_pnl ?? 0);
+
   const handleDeleteSelectedAccount = async () => {
     if (!selectedAccount) return;
     setDeleteLoading(true);
@@ -150,10 +153,8 @@ export function AccountSelector({
                     <span>•</span>
                     <span>{getBotsInfo(account)}</span>
                     <span>•</span>
-                    <span className={cn(
-                      account.total_today_pnl >= 0 ? "text-success" : "text-destructive"
-                    )}>
-                      {account.total_today_pnl >= 0 ? "+" : ""}${account.total_today_pnl.toFixed(2)}
+                    <span className={cn(getAccountPnl(account) >= 0 ? "text-success" : "text-destructive")}>
+                      {getAccountPnl(account) >= 0 ? "+" : ""}${getAccountPnl(account).toFixed(2)}
                     </span>
                   </div>
                 </div>

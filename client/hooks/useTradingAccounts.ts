@@ -76,6 +76,7 @@ export interface AccountWithBots {
   created_at: string | null;
   bot_configurations: BotConfigWithVersion[];
   total_today_pnl: number;
+  total_net_pnl: number;
 }
 
 // Legacy interface for backward compatibility
@@ -229,6 +230,8 @@ export function useTradingAccounts() {
 
       const accountsData: AccountWithBots[] = (result.data?.data || []).map((account: any) => ({
         ...account,
+        total_today_pnl: Number(account?.total_today_pnl ?? 0),
+        total_net_pnl: Number(account?.total_net_pnl ?? account?.total_today_pnl ?? 0),
         bot_configurations: (account.bot_configurations || []).map((config: any) => ({
           ...config,
           trading_schedule: normalizeTradingSchedule(config.trading_schedule),

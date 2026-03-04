@@ -795,7 +795,32 @@ async def get_accounts_with_bots(
             }
         )
 
-        today_str = date.today().isoformat()
+        account_ids = [str(a.id) for a in trading_accounts]
+        today_local = date.today()
+        today_str = today_local.isoformat()
+        total_net_by_account: dict[str, float] = {aid: 0.0 for aid in account_ids}
+        today_net_by_account: dict[str, float] = {aid: 0.0 for aid in account_ids}
+        if account_ids:
+            metric_orders = await db.orderhistory.find_many(
+                where={
+                    "accountId": {"in": account_ids},
+                    "closeTime": {"not": None},
+                },
+            )
+            for order in metric_orders:
+                account_id = str(getattr(order, "accountId", "") or "").strip()
+                if not account_id:
+                    continue
+                net_profit = _order_net_profit(order)
+                total_net_by_account[account_id] = float(total_net_by_account.get(account_id, 0.0)) + net_profit
+
+                close_time = getattr(order, "closeTime", None)
+                if close_time is None:
+                    continue
+                trade_day = _as_date(close_time)
+                if trade_day == today_local:
+                    today_net_by_account[account_id] = float(today_net_by_account.get(account_id, 0.0)) + net_profit
+
         result = []
         for account in trading_accounts:
             bot_configs = []
@@ -863,7 +888,11 @@ async def get_accounts_with_bots(
                 (a for a in account.dailyAggregates if str(a.date.date() if hasattr(a.date, 'date') else a.date) == today_str),
                 None
             )
-            total_today_pnl = float(today_agg.dailyNetProfit) if today_agg and today_agg.dailyNetProfit else 0
+            account_id = str(account.id)
+            total_today_pnl = float(today_net_by_account.get(account_id, 0.0))
+            if abs(total_today_pnl) <= 1e-9 and today_agg and today_agg.dailyNetProfit is not None:
+                total_today_pnl = float(today_agg.dailyNetProfit)
+            total_net_pnl = float(total_net_by_account.get(account_id, 0.0))
 
             result.append({
                 "id": str(account.id),
@@ -880,6 +909,7 @@ async def get_accounts_with_bots(
                 "created_at": str(account.createdAt) if account.createdAt else None,
                 "bot_configurations": bot_configs,
                 "total_today_pnl": total_today_pnl,
+                "total_net_pnl": total_net_pnl,
             })
 
         return {
