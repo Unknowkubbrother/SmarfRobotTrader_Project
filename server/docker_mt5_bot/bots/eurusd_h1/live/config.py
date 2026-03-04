@@ -169,7 +169,13 @@ MT5_PORT = _env_int(8001, "MT5_PORT")
 MT5_LOGIN = _env_first("MT5_LOGIN")
 MT5_PASSWORD = _env_first("MT5_PASSWORD")
 MT5_SERVER = _env_first("MT5_SERVER")
-MT5_RPC_TIMEOUT_MS = max(30000, _env_int(180000, "MT5_RPC_TIMEOUT_MS"))
+MT5_SERVER_FALLBACKS = [
+    chunk.strip()
+    for chunk in _env_first("MT5_SERVER_FALLBACKS").replace(";", ",").split(",")
+    if chunk.strip()
+]
+MT5_STRICT_SERVER_MATCH = _env_bool(False, "MT5_STRICT_SERVER_MATCH")
+MT5_RPC_TIMEOUT_MS = max(30000, _env_int(60000, "MT5_RPC_TIMEOUT_MS"))
 MT5_LOGIN_RETRIES = max(1, _env_int(20, "MT5_LOGIN_RETRIES"))
 MT5_RETRY_SECONDS = max(1.0, _env_float(5.0, "MT5_RETRY_SECONDS"))
 SYMBOL = _env_first("LIVE_SYMBOL") or "EURUSD"
@@ -216,6 +222,10 @@ LIVE_PERFORMANCE_SYNC_INTERVAL_SEC = max(
 LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS = max(
     30,
     _env_int(3650, "LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS"),
+)
+LIVE_MT5_HISTORY_END_AHEAD_HOURS = min(
+    24.0,
+    max(0.0, _env_float(2.0, "LIVE_MT5_HISTORY_END_AHEAD_HOURS")),
 )
 LIVE_PERFORMANCE_SCOPE = (_env_first("LIVE_PERFORMANCE_SCOPE") or "symbol").strip().lower()
 if LIVE_PERFORMANCE_SCOPE not in {"managed", "symbol", "account"}:

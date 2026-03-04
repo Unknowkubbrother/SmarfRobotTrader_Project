@@ -30,38 +30,38 @@ export interface BotLiveLogEntry {
 
 export interface BotLiveState {
     bot_config_id: string;
-    symbol: string;
-    timeframe: string;
+    symbol?: string;
+    timeframe?: string;
     // Bot model state
-    position: number;
-    entry_price: number;
-    total_pnl: number;
-    trades: number;
-    wins: number;
-    loss_streak: number;
-    last_action: string;
-    last_bar_time: string;
-    lot_size: number;
-    unrealized_pnl: number;
+    position?: number;
+    entry_price?: number;
+    total_pnl?: number;
+    trades?: number;
+    wins?: number;
+    loss_streak?: number;
+    last_action?: string;
+    last_bar_time?: string;
+    lot_size?: number;
+    unrealized_pnl?: number;
     risk_level?: string;
     risk_percent?: number;
     risk_profile_map?: Record<string, number>;
     trading_schedule?: Record<string, boolean>;
-    connected: boolean;
+    connected?: boolean;
     ws_connected?: boolean;
     // MT5 Account
-    balance: number;
-    equity: number;
-    margin: number;
-    free_margin: number;
-    margin_level: number;
-    leverage: number;
-    profit: number;
-    currency: string;
-    server: string;
-    login: number;
+    balance?: number;
+    equity?: number;
+    margin?: number;
+    free_margin?: number;
+    margin_level?: number;
+    leverage?: number;
+    profit?: number;
+    currency?: string;
+    server?: string;
+    login?: number;
     // MT5 Positions
-    positions: MT5Position[];
+    positions?: MT5Position[];
     // Logs
     llm_text?: string;
     recent_logs?: BotLiveLogEntry[];
@@ -161,14 +161,23 @@ export function useBotLiveState() {
                         }
                         setLifecycleEvents(nextEvents.slice(-300).reverse());
                     } else if (msg.type === "bot_state") {
-                        const botId = normalizeBotConfigId(msg.bot_config_id);
+                        const payload =
+                            msg.state && typeof msg.state === "object"
+                                ? ({
+                                    ...msg.state,
+                                    bot_config_id: normalizeBotConfigId(
+                                        (msg.state as Record<string, unknown>).bot_config_id ?? msg.bot_config_id
+                                    ),
+                                } as Record<string, unknown>)
+                                : (msg as Record<string, unknown>);
+                        const botId = normalizeBotConfigId(payload.bot_config_id);
                         if (!botId) return;
                         // Incremental update for one bot
                         setBotStates((prev) => {
                             const next = new Map(prev);
                             next.set(botId, {
                                 ...prev.get(botId),
-                                ...msg,
+                                ...(payload as Partial<BotLiveState>),
                                 bot_config_id: botId,
                                 connected: true,
                             });

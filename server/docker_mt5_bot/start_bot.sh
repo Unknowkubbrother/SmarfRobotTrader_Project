@@ -17,6 +17,10 @@ PULL_LATEST_IMAGE="${PULL_LATEST_IMAGE:-1}"
 METATRADER_IMAGE="${METATRADER_IMAGE:-metatrader5_macos}"
 USE_SHARED_PYDEPS="${USE_SHARED_PYDEPS:-1}"
 SHARED_PYDEPS_DIR="${SHARED_PYDEPS_DIR:-/shared-pydeps}"
+MT5_LOGIN_CHECK_TIMEOUT_SECONDS="${MT5_LOGIN_CHECK_TIMEOUT_SECONDS:-180}"
+MT5_TRADE_CHECK_TIMEOUT_SECONDS="${MT5_TRADE_CHECK_TIMEOUT_SECONDS:-45}"
+MT5_DIALOG_SEARCH_WAIT_SECONDS="${MT5_DIALOG_SEARCH_WAIT_SECONDS:-6}"
+MT5_SKIP_PRECHECKS="${MT5_SKIP_PRECHECKS:-1}"
 
 read_dotenv_value() {
   local key="$1"
@@ -45,6 +49,7 @@ MT5_INIT_TIMEOUT_VAL="${MT5_INIT_TIMEOUT:-$(read_dotenv_value MT5_INIT_TIMEOUT)}
 MT5_LOGIN_RETRIES_VAL="${MT5_LOGIN_RETRIES:-$(read_dotenv_value MT5_LOGIN_RETRIES)}"
 MT5_RETRY_SECONDS_VAL="${MT5_RETRY_SECONDS:-$(read_dotenv_value MT5_RETRY_SECONDS)}"
 MT5_RPC_TIMEOUT_MS_VAL="${MT5_RPC_TIMEOUT_MS:-$(read_dotenv_value MT5_RPC_TIMEOUT_MS)}"
+MT5_STRICT_SERVER_MATCH_VAL="${MT5_STRICT_SERVER_MATCH:-$(read_dotenv_value MT5_STRICT_SERVER_MATCH)}"
 CUSTOM_USER_VAL="${CUSTOM_USER:-$(read_dotenv_value CUSTOM_USER)}"
 VNC_PASSWORD_VAL="${PASSWORD:-$(read_dotenv_value PASSWORD)}"
 
@@ -54,6 +59,9 @@ if [[ -z "$CUSTOM_USER_VAL" && -n "$MT5_LOGIN_VAL" ]]; then
 fi
 if [[ -z "$VNC_PASSWORD_VAL" && -n "$MT5_PASSWORD_VAL" ]]; then
   VNC_PASSWORD_VAL="$MT5_PASSWORD_VAL"
+fi
+if [[ -z "$MT5_STRICT_SERVER_MATCH_VAL" ]]; then
+  MT5_STRICT_SERVER_MATCH_VAL="0"
 fi
 
 # Final fallback for first-time setup without MT5 credentials.
@@ -80,6 +88,39 @@ compose() {
 
   echo "Error: ไม่พบ docker compose หรือ docker-compose"
   exit 1
+}
+
+run_with_timeout() {
+  local timeout_seconds="${1:-0}"
+  shift
+
+  if (( timeout_seconds <= 0 )); then
+    "$@"
+    return $?
+  fi
+
+  "$@" &
+  local cmd_pid=$!
+  local elapsed=0
+
+  while kill -0 "$cmd_pid" >/dev/null 2>&1; do
+    if (( elapsed >= timeout_seconds )); then
+      kill "$cmd_pid" >/dev/null 2>&1 || true
+      sleep 1
+      kill -9 "$cmd_pid" >/dev/null 2>&1 || true
+      wait "$cmd_pid" >/dev/null 2>&1 || true
+      return 124
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  wait "$cmd_pid"
+}
+
+cleanup_stale_mt5_exec_processes() {
+  compose exec -T "$SERVICE_NAME" sh -lc \
+    "pkill -f '/usr/bin/python3 python3 -' >/dev/null 2>&1 || true"
 }
 
 ensure_image_ready() {
@@ -158,12 +199,17 @@ ensure_image_ready() {
 }
 
 check_trade_allowed() {
-  compose exec -T \
-    -e MT5_LOGIN="$MT5_LOGIN_VAL" \
-    -e MT5_PASSWORD="$MT5_PASSWORD_VAL" \
-    -e MT5_SERVER="$MT5_SERVER_VAL" \
-    -e MT5_RPC_TIMEOUT_MS="${MT5_RPC_TIMEOUT_MS_VAL:-180000}" \
-    "$SERVICE_NAME" python3 - <<'PY'
+  local output
+  local rc=0
+
+  output="$(
+    run_with_timeout "$MT5_TRADE_CHECK_TIMEOUT_SECONDS" \
+      compose exec -T \
+        -e MT5_LOGIN="$MT5_LOGIN_VAL" \
+        -e MT5_PASSWORD="$MT5_PASSWORD_VAL" \
+        -e MT5_SERVER="$MT5_SERVER_VAL" \
+        -e MT5_RPC_TIMEOUT_MS="${MT5_RPC_TIMEOUT_MS_VAL:-180000}" \
+        "$SERVICE_NAME" python3 - <<'PY'
 from mt5linux import MetaTrader5
 import os
 import sys
@@ -186,15 +232,6 @@ try:
         print("trade_allowed=0 tradeapi_disabled=unknown (initialize failed)")
         sys.exit(2)
 
-    if login_text and password:
-        login_kwargs = {"login": int(login_text), "password": password}
-        if server:
-            login_kwargs["server"] = server
-        try:
-            mt5.login(**login_kwargs)
-        except Exception:
-            pass
-
     info = mt5.terminal_info()
     if info is None:
         print("trade_allowed=0 tradeapi_disabled=unknown (terminal_info is None)")
@@ -207,6 +244,19 @@ except Exception as exc:
     print(f"trade_allowed=0 check_exception={exc}")
     sys.exit(3)
 PY
+  )" || rc=$?
+
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output"
+  fi
+
+  if [[ "$rc" -eq 124 ]]; then
+    echo "trade_allowed=0 check_exception=timeout"
+    cleanup_stale_mt5_exec_processes || true
+    return 3
+  fi
+
+  return "$rc"
 }
 
 ensure_mt5_login_if_configured() {
@@ -216,15 +266,28 @@ ensure_mt5_login_if_configured() {
   fi
 
   echo "[2.4/6] Ensuring MT5 account login via API..."
-  compose exec -T \
-    -e MT5_LOGIN="$MT5_LOGIN_VAL" \
-    -e MT5_PASSWORD="$MT5_PASSWORD_VAL" \
-    -e MT5_SERVER="$MT5_SERVER_VAL" \
-    -e MT5_LOGIN_RETRIES="${MT5_LOGIN_RETRIES_VAL:-20}" \
-    -e MT5_RETRY_SECONDS="${MT5_RETRY_SECONDS_VAL:-5}" \
-    -e MT5_RPC_TIMEOUT_MS="${MT5_RPC_TIMEOUT_MS_VAL:-180000}" \
-    "$SERVICE_NAME" python3 - <<'PY'
+  dismiss_mt5_dialogs || true
+  search_company_dialog_by_server "$MT5_SERVER_VAL" || true
+  dismiss_mt5_dialogs || true
+  cleanup_stale_mt5_exec_processes || true
+
+  local login_output=""
+  local rc=0
+  login_output="$(
+    run_with_timeout "$MT5_LOGIN_CHECK_TIMEOUT_SECONDS" \
+      compose exec -T \
+        -e MT5_LOGIN="$MT5_LOGIN_VAL" \
+        -e MT5_PASSWORD="$MT5_PASSWORD_VAL" \
+        -e MT5_SERVER="$MT5_SERVER_VAL" \
+        -e MT5_LOGIN_RETRIES="${MT5_LOGIN_RETRIES_VAL:-20}" \
+        -e MT5_RETRY_SECONDS="${MT5_RETRY_SECONDS_VAL:-5}" \
+        -e MT5_RPC_TIMEOUT_MS="${MT5_RPC_TIMEOUT_MS_VAL:-180000}" \
+        -e MT5_LOGIN_ATTEMPT_TIMEOUT_SEC="${MT5_LOGIN_ATTEMPT_TIMEOUT_SEC:-25}" \
+        -e MT5_SERVER_FALLBACKS="${MT5_SERVER_FALLBACKS:-}" \
+        -e MT5_STRICT_SERVER_MATCH="${MT5_STRICT_SERVER_MATCH_VAL}" \
+        "$SERVICE_NAME" python3 - <<'PY'
 from mt5linux import MetaTrader5
+import multiprocessing as mp
 import os
 import sys
 import time
@@ -235,6 +298,9 @@ server = os.getenv("MT5_SERVER", "").strip()
 retries = int(os.getenv("MT5_LOGIN_RETRIES", "20"))
 retry_seconds = int(os.getenv("MT5_RETRY_SECONDS", "5"))
 timeout_ms = int(os.getenv("MT5_RPC_TIMEOUT_MS", "180000"))
+attempt_timeout_sec = int(os.getenv("MT5_LOGIN_ATTEMPT_TIMEOUT_SEC", "25"))
+fallbacks_raw = str(os.getenv("MT5_SERVER_FALLBACKS", "") or "").strip()
+strict_server = str(os.getenv("MT5_STRICT_SERVER_MATCH", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 if not login_text or not password:
     print("skip_login=1")
@@ -246,33 +312,163 @@ except ValueError:
     print(f"invalid_login={login_text}")
     sys.exit(1)
 
-mt5 = MetaTrader5(host="localhost", port=8001)
+def normalize_server_name(name: str) -> str:
+    return " ".join(str(name or "").split()).strip()
+
+
+def add_candidate(candidates: list[str], value: str) -> None:
+    normalized = normalize_server_name(value)
+    if normalized and normalized not in candidates:
+        candidates.append(normalized)
+
+
+def build_server_candidates(primary: str, fallbacks: str) -> list[str]:
+    candidates: list[str] = []
+    primary_name = normalize_server_name(primary)
+    add_candidate(candidates, primary_name)
+
+    if fallbacks:
+        for token in fallbacks.split(","):
+            add_candidate(candidates, token)
+
+    if strict_server:
+        return candidates
+
+    if primary_name:
+        if primary_name.lower().startswith("mt5 "):
+            add_candidate(candidates, primary_name[4:])
+        else:
+            add_candidate(candidates, f"MT5 {primary_name}")
+
+    return candidates
+
+
+def probe_login(server_name: str, login_id: int, pwd: str, rpc_timeout: int, result_queue) -> None:
+    payload = {
+        "server": server_name,
+        "ok": False,
+        "login": 0,
+        "account_server": "",
+        "error": "",
+    }
+    mt5 = None
+    try:
+        mt5 = MetaTrader5(host="localhost", port=8001)
+        init_kwargs = {"timeout": rpc_timeout, "login": login_id, "password": pwd}
+        if server_name:
+            init_kwargs["server"] = server_name
+        init_ok = bool(mt5.initialize(**init_kwargs))
+        payload["ok"] = init_ok
+        try:
+            payload["error"] = str(mt5.last_error())
+        except Exception:
+            payload["error"] = ""
+
+        account = mt5.account_info()
+        if account is not None:
+            payload["login"] = int(getattr(account, "login", 0) or 0)
+            payload["account_server"] = str(getattr(account, "server", "") or "")
+
+        if not (init_ok and payload["login"] == int(login_id)):
+            payload["ok"] = False
+    except Exception as exc:
+        payload["error"] = f"exception:{exc}"
+        payload["ok"] = False
+    finally:
+        try:
+            if mt5 is not None:
+                mt5.shutdown()
+        except Exception:
+            pass
+        try:
+            result_queue.put(payload)
+        except Exception:
+            pass
+
+
+server_candidates = build_server_candidates(server, fallbacks_raw)
+if not server_candidates:
+    print("login_failed=1")
+    sys.exit(1)
 
 for attempt in range(1, retries + 1):
-    try:
-        init_kwargs = {"timeout": timeout_ms, "login": login_id, "password": password}
-        if server:
-            init_kwargs["server"] = server
-        init_ok = mt5.initialize(**init_kwargs)
+    for server_name in server_candidates:
+        queue = mp.Queue()
+        proc = mp.Process(
+            target=probe_login,
+            args=(server_name, login_id, password, timeout_ms, queue),
+            daemon=True,
+        )
+        proc.start()
+        proc.join(attempt_timeout_sec)
 
-        login_kwargs = {"login": login_id, "password": password}
-        if server:
-            login_kwargs["server"] = server
-        login_ok = mt5.login(**login_kwargs)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(3)
+            print(f"login_attempt_{attempt}_server={server_name} result=timeout")
+            continue
 
-        acc = mt5.account_info()
-        if init_ok and login_ok and acc is not None and acc.login == login_id:
-            print(f"login_ok={acc.login}")
+        result = None
+        try:
+            result = queue.get_nowait()
+        except Exception:
+            result = {
+                "server": server_name,
+                "ok": False,
+                "login": 0,
+                "account_server": "",
+                "error": "no_result",
+            }
+
+        print(
+            f"login_attempt_{attempt}_server={result.get('server','')}"
+            f" ok={int(bool(result.get('ok')))}"
+            f" login={int(result.get('login') or 0)}"
+            f" account_server={result.get('account_server','')}"
+            f" error={result.get('error','')}"
+        )
+
+        if bool(result.get("ok")):
+            resolved_server = normalize_server_name(result.get("account_server") or server_name)
+            if resolved_server:
+                print(f"resolved_server={resolved_server}")
+            print(f"login_ok={int(result.get('login') or login_id)}")
             sys.exit(0)
-    except Exception as exc:
-        print(f"login_attempt_{attempt}_exception={exc}")
 
-    print(f"waiting_login_retry={attempt}/{retries}")
+    if attempt < retries:
+        print(f"waiting_login_retry={attempt}/{retries}")
     time.sleep(retry_seconds)
 
 print("login_failed=1")
 sys.exit(1)
 PY
+  )" || rc=$?
+
+  if [[ -n "$login_output" ]]; then
+    printf '%s\n' "$login_output"
+  fi
+
+  if [[ "$rc" -eq 124 ]]; then
+    echo "  warning: MT5 login probe timed out (${MT5_LOGIN_CHECK_TIMEOUT_SECONDS}s)."
+    cleanup_stale_mt5_exec_processes || true
+    return 1
+  fi
+
+  local resolved_server
+  resolved_server="$(printf '%s\n' "$login_output" | sed -n 's/^resolved_server=//p' | tail -n 1 | tr -d '\r')"
+  if [[ -n "$resolved_server" && "$resolved_server" != "$MT5_SERVER_VAL" ]]; then
+    echo "  resolved MT5 server alias: '$MT5_SERVER_VAL' -> '$resolved_server'"
+    MT5_SERVER_VAL="$resolved_server"
+    export MT5_SERVER="$MT5_SERVER_VAL"
+  fi
+
+  if [[ "$rc" -ne 0 ]]; then
+    search_company_dialog_by_server "$MT5_SERVER_VAL" || true
+    dismiss_mt5_dialogs || true
+  fi
+
+  cleanup_stale_mt5_exec_processes || true
+  return "$rc"
 }
 
 ensure_xdotool() {
@@ -303,6 +499,110 @@ for pattern in "Select a company" "Open an account" "Find your company"; do
     DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Alt+F4 >/dev/null 2>&1 || true
   done
 done
+'
+}
+
+search_company_dialog_by_server() {
+  local server_name="${1:-}"
+  server_name="$(printf '%s' "$server_name" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+  if [[ -z "$server_name" ]]; then
+    return 0
+  fi
+
+  if ! ensure_xdotool; then
+    return 1
+  fi
+
+  compose exec -T -u abc -e MT5_SERVER="$server_name" -e MT5_DIALOG_SEARCH_WAIT_SECONDS="$MT5_DIALOG_SEARCH_WAIT_SECONDS" "$SERVICE_NAME" sh -lc '
+display=":1"
+server="${MT5_SERVER:-}"
+wait_seconds="${MT5_DIALOG_SEARCH_WAIT_SECONDS:-6}"
+
+wid="$(DISPLAY="$display" xdotool search --onlyvisible --name "Select a company" 2>/dev/null | head -n1 || true)"
+if [ -z "$wid" ]; then
+  exit 0
+fi
+
+DISPLAY="$display" xdotool windowactivate --sync "$wid" >/dev/null 2>&1 || true
+sleep 0.2
+
+# Focus company search input.
+DISPLAY="$display" xdotool mousemove --window "$wid" 280 132 click 1 >/dev/null 2>&1 || true
+sleep 0.2
+DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers ctrl+a BackSpace >/dev/null 2>&1 || true
+sleep 0.1
+DISPLAY="$display" xdotool type --window "$wid" --delay 1 "$server" >/dev/null 2>&1 || true
+sleep 0.2
+
+# Click "Find your company".
+DISPLAY="$display" xdotool mousemove --window "$wid" 820 132 click 1 >/dev/null 2>&1 || true
+sleep "$wait_seconds"
+
+# Close dialog if it is still blocking.
+DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Escape >/dev/null 2>&1 || true
+'
+}
+
+login_mt5_account_via_ui() {
+  local login_text="${1:-}"
+  local password_text="${2:-}"
+  local server_name="${3:-}"
+
+  if [[ -z "$login_text" || -z "$password_text" ]]; then
+    return 0
+  fi
+  if ! ensure_xdotool; then
+    return 1
+  fi
+
+  compose exec -T -u abc \
+    -e MT5_LOGIN="$login_text" \
+    -e MT5_PASSWORD="$password_text" \
+    -e MT5_SERVER="$server_name" \
+    "$SERVICE_NAME" sh -lc '
+display=":1"
+login="${MT5_LOGIN:-}"
+password="${MT5_PASSWORD:-}"
+server="${MT5_SERVER:-}"
+
+main_wid="$(DISPLAY="$display" xdotool search --onlyvisible --name "MetaTrader|Netting" 2>/dev/null | head -n1 || true)"
+if [ -z "$main_wid" ]; then
+  exit 1
+fi
+
+DISPLAY="$display" xdotool windowactivate --sync "$main_wid" >/dev/null 2>&1 || true
+DISPLAY="$display" xdotool key --window "$main_wid" --clearmodifiers alt+f >/dev/null 2>&1 || true
+sleep 0.25
+DISPLAY="$display" xdotool key --window "$main_wid" --clearmodifiers l >/dev/null 2>&1 || true
+sleep 1
+
+login_wid="$(DISPLAY="$display" xdotool search --onlyvisible --name "Login|Authorization|Trade Account" 2>/dev/null | head -n1 || true)"
+if [ -z "$login_wid" ]; then
+  exit 1
+fi
+
+DISPLAY="$display" xdotool windowactivate --sync "$login_wid" >/dev/null 2>&1 || true
+sleep 0.2
+DISPLAY="$display" xdotool key --window "$login_wid" --clearmodifiers ctrl+a BackSpace >/dev/null 2>&1 || true
+DISPLAY="$display" xdotool type --window "$login_wid" --delay 1 "$login" >/dev/null 2>&1 || true
+DISPLAY="$display" xdotool key --window "$login_wid" --clearmodifiers Tab >/dev/null 2>&1 || true
+sleep 0.1
+DISPLAY="$display" xdotool key --window "$login_wid" --clearmodifiers ctrl+a BackSpace >/dev/null 2>&1 || true
+DISPLAY="$display" xdotool type --window "$login_wid" --delay 1 "$password" >/dev/null 2>&1 || true
+DISPLAY="$display" xdotool key --window "$login_wid" --clearmodifiers Tab >/dev/null 2>&1 || true
+sleep 0.1
+DISPLAY="$display" xdotool key --window "$login_wid" --clearmodifiers ctrl+a BackSpace >/dev/null 2>&1 || true
+if [ -n "$server" ]; then
+  DISPLAY="$display" xdotool type --window "$login_wid" --delay 1 "$server" >/dev/null 2>&1 || true
+fi
+
+# Save password checkbox + Login button.
+DISPLAY="$display" xdotool key --window "$login_wid" --clearmodifiers Tab >/dev/null 2>&1 || true
+sleep 0.1
+DISPLAY="$display" xdotool key --window "$login_wid" --clearmodifiers space >/dev/null 2>&1 || true
+DISPLAY="$display" xdotool key --window "$login_wid" --clearmodifiers Tab >/dev/null 2>&1 || true
+sleep 0.1
+DISPLAY="$display" xdotool key --window "$login_wid" --clearmodifiers Return >/dev/null 2>&1 || true
 '
 }
 
@@ -545,9 +845,21 @@ until compose exec -T "$SERVICE_NAME" python3 -c "import socket,sys;s=socket.soc
   echo "  waiting... ${elapsed}s/${WAIT_TIMEOUT_SECONDS}s"
 done
 echo "  mt5linux server is ready."
-ensure_mt5_login_if_configured || true
+dismiss_mt5_dialogs || true
+search_company_dialog_by_server "$MT5_SERVER_VAL" || true
+dismiss_mt5_dialogs || true
+login_mt5_account_via_ui "$MT5_LOGIN_VAL" "$MT5_PASSWORD_VAL" "$MT5_SERVER_VAL" || true
+if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
+  ensure_mt5_login_if_configured || true
+else
+  echo "[2.4/6] Skipping MT5 API prechecks (MT5_SKIP_PRECHECKS=$MT5_SKIP_PRECHECKS)."
+fi
 ensure_experts_common_ini || true
-enable_algo_trading_if_needed || true
+if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
+  enable_algo_trading_if_needed || true
+else
+  echo "[2.5/6] Skipping trade_allowed probe/toggle precheck."
+fi
 
 echo "[3/6] Installing bot dependencies (only when requirements changed)..."
 compose exec -T \
@@ -674,7 +986,11 @@ fi
 
 echo "[4.5/6] Re-checking MT5 Algo Trading before bot launch..."
 ensure_experts_common_ini || true
-enable_algo_trading_if_needed || true
+if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
+  enable_algo_trading_if_needed || true
+else
+  echo "[4.5/6] Skipping second MT5 API precheck."
+fi
 
 echo "[5/6] Starting bot..."
 bot_python_cmd="python3"
@@ -704,6 +1020,7 @@ compose exec -T \
   -e LIVE_PREWARM_REQUEST_TIMEOUT_SEC="${LIVE_PREWARM_REQUEST_TIMEOUT_SEC:-}" \
   -e LIVE_PERFORMANCE_SYNC_INTERVAL_SEC="${LIVE_PERFORMANCE_SYNC_INTERVAL_SEC:-}" \
   -e LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS="${LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS:-}" \
+  -e LIVE_MT5_HISTORY_END_AHEAD_HOURS="${LIVE_MT5_HISTORY_END_AHEAD_HOURS:-}" \
   -e LIVE_PERFORMANCE_SCOPE="${LIVE_PERFORMANCE_SCOPE:-}" \
   -e LIVE_MANAGED_MAGIC_SET="${LIVE_MANAGED_MAGIC_SET:-}" \
   -e LIVE_PERFORMANCE_MAGIC_SET="${LIVE_PERFORMANCE_MAGIC_SET:-}" \

@@ -60,6 +60,29 @@ export default function Dashboard() {
     setSelectedBotId(null);
   }, [selectedAccount?.id]);
 
+  // Auto-select a bot for live dashboard cards.
+  // Prefer currently running/starting bot, then fallback to first bot.
+  useEffect(() => {
+    if (!selectedAccount) {
+      setSelectedBotId(null);
+      return;
+    }
+    const bots = selectedAccount.bot_configurations || [];
+    if (bots.length === 0) {
+      setSelectedBotId(null);
+      return;
+    }
+    if (selectedBotId && bots.some((bot) => bot.id === selectedBotId)) {
+      return;
+    }
+    const preferred =
+      bots.find((bot) => {
+        const status = String(bot.status || bot.container_status || "").toLowerCase();
+        return status === "running" || status === "starting";
+      }) || bots[0];
+    setSelectedBotId(preferred.id);
+  }, [selectedAccount, selectedBotId]);
+
   useEffect(() => {
     setBotActionState(readBotUiState().activeAction);
     setStoreReady(true);

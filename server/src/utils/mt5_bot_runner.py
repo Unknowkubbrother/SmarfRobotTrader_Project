@@ -111,10 +111,13 @@ def build_bot_runtime_env(
         "BOT_RUNNER_PERFORMANCE_SCOPE": "LIVE_PERFORMANCE_SCOPE",
         "BOT_RUNNER_PERFORMANCE_SYNC_INTERVAL_SEC": "LIVE_PERFORMANCE_SYNC_INTERVAL_SEC",
         "BOT_RUNNER_PERFORMANCE_BOOT_LOOKBACK_DAYS": "LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS",
+        "BOT_RUNNER_MT5_HISTORY_END_AHEAD_HOURS": "LIVE_MT5_HISTORY_END_AHEAD_HOURS",
         "BOT_RUNNER_PREWARM_SEMANTIC_ON_START": "LIVE_PREWARM_SEMANTIC_ON_START",
         "BOT_RUNNER_PREWARM_SEMANTIC_MAX_SECONDS": "LIVE_PREWARM_SEMANTIC_MAX_SECONDS",
         "BOT_RUNNER_PREWARM_SEMANTIC_MAX_MISSING": "LIVE_PREWARM_SEMANTIC_MAX_MISSING",
         "BOT_RUNNER_PREWARM_REQUEST_TIMEOUT_SEC": "LIVE_PREWARM_REQUEST_TIMEOUT_SEC",
+        "BOT_RUNNER_STRICT_SERVER_MATCH": "MT5_STRICT_SERVER_MATCH",
+        "BOT_RUNNER_SERVER_FALLBACKS": "MT5_SERVER_FALLBACKS",
     }
     for source_name, target_name in optional_passthrough.items():
         raw_value = os.getenv(source_name)
@@ -200,6 +203,103 @@ def run_bot_instance_action(
     )
 
 
+def purge_bot_instance_state(
+    *,
+    instance_name: str,
+    timeout_sec: int = 300,
+) -> RunnerCommandResult:
+    normalized_instance = _sanitize_instance_name(str(instance_name or ""))
+    if not normalized_instance:
+        raise BotRunnerError("instance_name is required.")
+
+    runner_dir = _resolve_runner_dir()
+    _ensure_runner_script(runner_dir)
+    _ensure_docker_access()
+
+    project_name = f"mt5_{normalized_instance}"
+    env = os.environ.copy()
+    env["COMPOSE_PROJECT_NAME"] = project_name
+
+    down_cmd = ["docker", "compose", "down", "--remove-orphans"]
+    try:
+        down_proc = subprocess.run(
+            down_cmd,
+            cwd=str(runner_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BotRunnerError(
+            f"Runner purge timed out after {timeout_sec}s (compose down).",
+            stdout=_shorten_output(exc.stdout),
+            stderr=_shorten_output(exc.stderr),
+        ) from exc
+
+    if down_proc.returncode != 0:
+        raise BotRunnerError(
+            "Runner purge failed while stopping compose stack.",
+            returncode=down_proc.returncode,
+            stdout=_shorten_output(down_proc.stdout),
+            stderr=_shorten_output(down_proc.stderr),
+        )
+
+    config_volume_name = f"{project_name}_config"
+    volume_proc = subprocess.run(
+        ["docker", "volume", "rm", "-f", config_volume_name],
+        capture_output=True,
+        text=True,
+    )
+    if volume_proc.returncode != 0:
+        stderr_text = str(volume_proc.stderr or "")
+        if "No such volume" not in stderr_text:
+            raise BotRunnerError(
+                f"Runner purge failed while removing volume '{config_volume_name}'.",
+                returncode=volume_proc.returncode,
+                stdout=_shorten_output(volume_proc.stdout),
+                stderr=_shorten_output(volume_proc.stderr),
+            )
+
+    state_dir = runner_dir / ".instances"
+    instance_dir = state_dir / normalized_instance
+    legacy_env_file = state_dir / f"{normalized_instance}.env"
+    if instance_dir.exists():
+        shutil.rmtree(instance_dir, ignore_errors=True)
+    if legacy_env_file.exists():
+        try:
+            legacy_env_file.unlink()
+        except Exception as exc:
+            raise BotRunnerError(
+                f"Runner purge failed while removing legacy state file '{legacy_env_file}'."
+            ) from exc
+
+    combined_stdout = "\n".join(
+        part
+        for part in [
+            _shorten_output(down_proc.stdout),
+            _shorten_output(volume_proc.stdout),
+            f"purged_instance={normalized_instance}",
+        ]
+        if part
+    )
+    combined_stderr = "\n".join(
+        part
+        for part in [
+            _shorten_output(down_proc.stderr),
+            _shorten_output(volume_proc.stderr),
+        ]
+        if part
+    )
+
+    return RunnerCommandResult(
+        stdout=combined_stdout,
+        stderr=combined_stderr,
+        project_name=project_name,
+        container_id=None,
+    )
+
+
 def pull_docker_image(image_ref: str, timeout_sec: int = 1200) -> RunnerCommandResult:
     image = str(image_ref or "").strip()
     if not image:
@@ -273,38 +373,16 @@ try:
 except Exception:
     timeout_ms = 180000
 
-login_text = str(os.getenv("MT5_LOGIN", "") or "").strip()
-password = str(os.getenv("MT5_PASSWORD", "") or "").strip()
-server = str(os.getenv("MT5_SERVER", "") or "").strip()
-login_id = None
-if login_text:
-    try:
-        login_id = int(login_text)
-    except Exception:
-        login_id = None
-
 try:
     mt5 = MetaTrader5(host="localhost", port=8001)
-    init_kwargs = {"timeout": timeout_ms}
-    if login_id is not None and password:
-        init_kwargs["login"] = login_id
-        init_kwargs["password"] = password
-        if server:
-            init_kwargs["server"] = server
-
-    if not mt5.initialize(**init_kwargs):
+    # Runtime health check must be read-only.
+    # Do not call login() or initialize() with credentials here, because
+    # the endpoint is polled frequently by UI and can create repeated
+    # re-login side-effects in MT5.
+    if not mt5.initialize(timeout=timeout_ms):
         payload["detail"] = "initialize_failed"
         print(json.dumps(payload))
         sys.exit(2)
-
-    if login_id is not None and password:
-        login_kwargs = {"login": login_id, "password": password}
-        if server:
-            login_kwargs["server"] = server
-        if not mt5.login(**login_kwargs):
-            payload["detail"] = "login_failed"
-            print(json.dumps(payload))
-            sys.exit(5)
 
     info = mt5.terminal_info()
     if info is None:

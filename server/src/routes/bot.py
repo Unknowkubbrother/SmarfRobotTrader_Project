@@ -22,6 +22,7 @@ from ..utils.mt5_bot_runner import (
     build_profile_name,
     check_bot_runtime_health,
     decrypt_mt5_password,
+    purge_bot_instance_state,
     pull_docker_image,
     run_bot_instance_action,
 )
@@ -1151,6 +1152,26 @@ async def delete_bot(request: Request, data: Delete_Bot):
                 status_code=500,
                 detail=_runner_error_message("Failed to stop bot docker instance before delete", exc),
             ) from exc
+
+    try:
+        await asyncio.to_thread(
+            purge_bot_instance_state,
+            instance_name=str(data.botConfigId),
+            timeout_sec=300,
+        )
+    except BotRunnerError as exc:
+        await _emit_lifecycle_event(
+            bot_config_id=str(data.botConfigId),
+            action="delete",
+            phase="failed",
+            detail=f"purge_failed: {exc}",
+            status="error",
+            owner_user_id=request.state.user_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=_runner_error_message("Failed to purge bot runtime state during delete", exc),
+        ) from exc
 
     await db.botconfiguration.update(
         where={"id": data.botConfigId},

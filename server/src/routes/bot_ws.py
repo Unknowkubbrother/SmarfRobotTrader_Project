@@ -223,7 +223,7 @@ async def _persist_closed_orders_only(
         else:
             create_data = {
                 "ticketId": ticket,
-                "account": {"connect": {"id": account_id}},
+                "accountId": account_id,
                 "botInstanceId": bot_instance_id,
                 "magicNumber": _safe_int(pos.get("magic", 0), 0) or None,
                 "symbol": pos.get("symbol"),
@@ -426,7 +426,7 @@ async def _persist_closed_deals_from_state(
             await db.orderhistory.create(
                 data={
                     "ticketId": ticket,
-                    "account": {"connect": {"id": account_id}},
+                    "accountId": account_id,
                     **data,
                 }
             )

@@ -44,6 +44,7 @@ from .config import (
     LIVE_PREWARM_SEMANTIC_ON_START,
     LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS,
     LIVE_MANAGED_MAGIC_SET,
+    LIVE_MT5_HISTORY_END_AHEAD_HOURS,
     LIVE_PERFORMANCE_MAGIC_SET,
     LIVE_PERFORMANCE_SCOPE,
     LIVE_PERFORMANCE_SYNC_INTERVAL_SEC,
@@ -55,6 +56,8 @@ from .config import (
     MT5_RETRY_SECONDS,
     MT5_RPC_TIMEOUT_MS,
     MT5_SERVER,
+    MT5_SERVER_FALLBACKS,
+    MT5_STRICT_SERVER_MATCH,
     ORDER_TICK_RETRIES,
     ORDER_TICK_RETRY_SEC,
     PIP_VALUE,
@@ -120,6 +123,8 @@ class LiveTradingBot:
         self._closed_deal_cursor_msc = 0
         self._last_closed_deal_poll_at = 0.0
         self._last_closed_deal_reconcile_at = 0.0
+        self._closed_deal_retry_payload = []
+        self._closed_deal_retry_until = 0.0
         self._perf_last_sync_at = 0.0
         self._perf_cursor_msc = 0
         self._perf_seeded = False
@@ -153,9 +158,16 @@ class LiveTradingBot:
         self.mt5_login_text = str(MT5_LOGIN or "").strip()
         self.mt5_password = str(MT5_PASSWORD or "").strip()
         self.mt5_server = str(MT5_SERVER or "").strip()
+        self.mt5_server_fallbacks = tuple(
+            str(item or "").strip()
+            for item in (MT5_SERVER_FALLBACKS or [])
+            if str(item or "").strip()
+        )
+        self.mt5_strict_server_match = bool(MT5_STRICT_SERVER_MATCH)
         self.mt5_rpc_timeout_ms = max(30000, int(MT5_RPC_TIMEOUT_MS or 180000))
         self.mt5_login_retries = max(1, int(MT5_LOGIN_RETRIES or 20))
         self.mt5_retry_seconds = max(1.0, float(MT5_RETRY_SECONDS or 5.0))
+        self.mt5_history_end_ahead_hours = max(0.0, float(LIVE_MT5_HISTORY_END_AHEAD_HOURS or 0.0))
         try:
             self.mt5_login_id = int(self.mt5_login_text) if self.mt5_login_text else None
         except ValueError:
@@ -166,55 +178,99 @@ class LiveTradingBot:
         self.timeframe = getattr(mt5, tf_attr, mt5.TIMEFRAME_H1)
         self.timeframe_seconds = int(TIMEFRAME_SECONDS_MAP.get(TIMEFRAME_NAME, 3600))
 
-    def _build_mt5_initialize_kwargs(self) -> dict:
+    def _server_candidates(self) -> list[str]:
+        candidates: list[str] = []
+
+        def add(value: str) -> None:
+            normalized = " ".join(str(value or "").split()).strip()
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+
+        primary = str(self.mt5_server or "").strip()
+        add(primary)
+
+        for fallback in self.mt5_server_fallbacks:
+            add(fallback)
+
+        if self.mt5_strict_server_match:
+            if len(candidates) == 0:
+                return [""]
+            return candidates
+
+        if primary:
+            if primary.lower().startswith("mt5 "):
+                add(primary[4:])
+            else:
+                add(f"MT5 {primary}")
+
+        if len(candidates) == 0:
+            return [""]
+        return candidates
+
+    def _build_mt5_initialize_kwargs(self, server_name: str | None = None) -> dict:
         kwargs = {"timeout": int(self.mt5_rpc_timeout_ms)}
         if self.mt5_login_id is not None and self.mt5_password:
             kwargs["login"] = int(self.mt5_login_id)
             kwargs["password"] = self.mt5_password
-            if self.mt5_server:
-                kwargs["server"] = self.mt5_server
+            if server_name:
+                kwargs["server"] = str(server_name).strip()
         return kwargs
 
-    def _build_mt5_login_kwargs(self) -> dict | None:
+    def _build_mt5_login_kwargs(self, server_name: str | None = None) -> dict | None:
         if self.mt5_login_id is None or not self.mt5_password:
             return None
         kwargs = {"login": int(self.mt5_login_id), "password": self.mt5_password}
-        if self.mt5_server:
-            kwargs["server"] = self.mt5_server
+        if server_name:
+            kwargs["server"] = str(server_name).strip()
         return kwargs
 
     def _initialize_mt5_session(self) -> bool:
-        try:
-            if not bool(mt5.initialize(**self._build_mt5_initialize_kwargs())):
-                return False
-        except Exception:
-            return False
+        for server_name in self._server_candidates():
+            try:
+                if not bool(mt5.initialize(**self._build_mt5_initialize_kwargs(server_name))):
+                    continue
+            except Exception:
+                continue
 
-        login_kwargs = self._build_mt5_login_kwargs()
-        if not login_kwargs:
-            return True
+            login_kwargs = self._build_mt5_login_kwargs(server_name)
+            if not login_kwargs:
+                if server_name:
+                    self.mt5_server = str(server_name).strip()
+                return True
 
-        try:
-            login_ok = bool(mt5.login(**login_kwargs))
-        except Exception:
-            login_ok = False
+            try:
+                login_ok = bool(mt5.login(**login_kwargs))
+            except Exception:
+                login_ok = False
 
-        if login_ok:
-            return True
+            if login_ok:
+                if server_name:
+                    self.mt5_server = str(server_name).strip()
+                return True
 
-        # Some MT5 builds can return login=False while account session is still active.
-        try:
-            account_info = mt5.account_info()
-        except Exception:
-            account_info = None
-        if account_info is None:
-            return False
-        if self.mt5_login_id is None:
-            return True
-        try:
-            return int(account_info.login) == int(self.mt5_login_id)
-        except Exception:
-            return False
+            # Some MT5 builds can return login=False while account session is still active.
+            try:
+                account_info = mt5.account_info()
+            except Exception:
+                account_info = None
+            if account_info is None:
+                continue
+            if self.mt5_login_id is None:
+                if server_name:
+                    self.mt5_server = str(server_name).strip()
+                return True
+            try:
+                if int(account_info.login) == int(self.mt5_login_id):
+                    resolved_server = str(getattr(account_info, "server", "") or "").strip()
+                    if resolved_server:
+                        self.mt5_server = resolved_server
+                    elif server_name:
+                        self.mt5_server = str(server_name).strip()
+                    return True
+            except Exception:
+                continue
+
+        return False
 
     def connect(self):
         account_info = None
@@ -1016,6 +1072,16 @@ class LiveTradingBot:
         managed_positions = self._get_symbol_positions_safe()
         if managed_positions:
             for p in managed_positions:
+                try:
+                    position_fields = set(getattr(p, "_fields", ()) or ())
+                except Exception:
+                    position_fields = set()
+                commission_value = 0.0
+                if "commission" in position_fields:
+                    try:
+                        commission_value = float(getattr(p, "commission", 0.0) or 0.0)
+                    except Exception:
+                        commission_value = 0.0
                 opened_at_utc = datetime.fromtimestamp(p.time, tz=timezone.utc)
                 positions_data.append({
                     "ticket": int(p.ticket),
@@ -1026,7 +1092,7 @@ class LiveTradingBot:
                     "price_current": float(p.price_current),
                     "profit": float(p.profit),
                     "swap": float(p.swap),
-                    "commission": float(getattr(p, "commission", 0.0) or 0.0),
+                    "commission": commission_value,
                     "sl": float(p.sl),
                     "tp": float(p.tp),
                     "opened_at": opened_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1067,6 +1133,36 @@ class LiveTradingBot:
             except Exception as exc:
                 print(f" WS state: closed deals fetch failed: {exc}")
                 closed_deals = []
+
+        # Keep recently discovered closed deals in outgoing state for a short window.
+        # This gives server-side persistence a few retries if one WS frame is dropped.
+        if closed_deals:
+            latest_by_ticket = {}
+            for row in list(getattr(self, "_closed_deal_retry_payload", []) or []) + list(closed_deals):
+                if not isinstance(row, dict):
+                    continue
+                ticket = int(row.get("ticket", 0) or 0)
+                if ticket <= 0:
+                    continue
+                close_msc = int(row.get("closeTimeMsc", 0) or 0)
+                prev = latest_by_ticket.get(ticket)
+                prev_msc = int((prev or {}).get("closeTimeMsc", 0) or 0)
+                if prev is None or close_msc >= prev_msc:
+                    latest_by_ticket[ticket] = row
+            retry_rows = sorted(
+                list(latest_by_ticket.values()),
+                key=lambda row: int(row.get("closeTimeMsc", 0) or 0),
+                reverse=True,
+            )
+            self._closed_deal_retry_payload = retry_rows[:200]
+            self._closed_deal_retry_until = now + 20.0
+        else:
+            retry_rows = list(getattr(self, "_closed_deal_retry_payload", []) or [])
+            retry_until = float(getattr(self, "_closed_deal_retry_until", 0.0) or 0.0)
+            if retry_rows and now < retry_until:
+                closed_deals = retry_rows
+            elif retry_rows and now >= retry_until:
+                self._closed_deal_retry_payload = []
         if closed_deals:
             self._sync_performance_from_mt5_history(
                 force=True,
@@ -1755,6 +1851,7 @@ class LiveTradingBot:
 
     def _collect_recent_closed_deals(self, expected_tickets=None, force_lookback_sec: int | None = None):
         now_utc = datetime.now(timezone.utc)
+        history_end_utc = self._history_deals_end_utc(now_utc)
         cursor_msc = int(getattr(self, "_closed_deal_cursor_msc", 0) or 0)
         use_cursor = True
         if isinstance(force_lookback_sec, int) and force_lookback_sec > 0:
@@ -1766,7 +1863,7 @@ class LiveTradingBot:
             start_utc = now_utc - timedelta(days=3)
 
         try:
-            deals = mt5.history_deals_get(start_utc, now_utc)
+            deals = mt5.history_deals_get(start_utc, history_end_utc)
         except Exception as exc:
             print(f" WS state: history_deals_get failed: {exc}")
             deals = None
@@ -1876,6 +1973,15 @@ class LiveTradingBot:
             ticket = int(getattr(deal, "ticket", 0) or 0)
         return int(ticket)
 
+    def _history_deals_end_utc(self, now_utc: datetime | None = None) -> datetime:
+        end_utc = now_utc if isinstance(now_utc, datetime) else datetime.now(timezone.utc)
+        if end_utc.tzinfo is None:
+            end_utc = end_utc.replace(tzinfo=timezone.utc)
+        ahead_hours = max(0.0, float(getattr(self, "mt5_history_end_ahead_hours", 0.0) or 0.0))
+        if ahead_hours <= 0.0:
+            return end_utc
+        return end_utc + timedelta(hours=ahead_hours)
+
     def _fetch_managed_closed_deal_events(self, start_utc: datetime, end_utc: datetime):
         try:
             deals = mt5.history_deals_get(start_utc, end_utc)
@@ -1968,6 +2074,7 @@ class LiveTradingBot:
         )
 
         now_utc = datetime.now(timezone.utc)
+        history_end_utc = self._history_deals_end_utc(now_utc)
         mode = "incremental"
         updates = 0
 
@@ -1975,7 +2082,7 @@ class LiveTradingBot:
             mode = "full"
             lookback_days = max(30, int(LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS))
             start_utc = now_utc - timedelta(days=int(lookback_days))
-            events = self._fetch_managed_closed_deal_events(start_utc, now_utc)
+            events = self._fetch_managed_closed_deal_events(start_utc, history_end_utc)
             self._perf_last_sync_at = now_epoch
             if events is None:
                 return False
@@ -2007,7 +2114,7 @@ class LiveTradingBot:
                 start_utc = datetime.fromtimestamp(max(0, cursor_msc - 5000) / 1000.0, tz=timezone.utc)
             else:
                 start_utc = now_utc - timedelta(days=1)
-            events = self._fetch_managed_closed_deal_events(start_utc, now_utc)
+            events = self._fetch_managed_closed_deal_events(start_utc, history_end_utc)
             self._perf_last_sync_at = now_epoch
             if events is None:
                 return False
