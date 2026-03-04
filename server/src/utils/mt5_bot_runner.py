@@ -70,6 +70,7 @@ def build_bot_runtime_env(
     mt5_login: str,
     mt5_password: str,
     mt5_server: str,
+    broker_name: str | None = None,
     live_symbol: str,
     live_timeframe: str,
     docker_image_id: str | None = None,
@@ -129,6 +130,18 @@ def build_bot_runtime_env(
         "MT5_ALLOW_DLL_IMPORTS": os.getenv("BOT_RUNNER_ALLOW_DLL_IMPORTS", "1").strip() or "1",
         "MT5_ALLOW_WEBREQUEST": os.getenv("BOT_RUNNER_ALLOW_WEBREQUEST", "1").strip() or "1",
         "MT5_ALLOW_PARTIAL_START": os.getenv("BOT_RUNNER_ALLOW_PARTIAL_START", "0").strip() or "0",
+        "MT5_CLEAN_ACCOUNT_CACHE_ON_START": os.getenv(
+            "BOT_RUNNER_MT5_CLEAN_ACCOUNT_CACHE_ON_START", "1"
+        ).strip()
+        or "1",
+        "MT5_COMPANY_DISCOVERY_BEFORE_LOGIN": os.getenv(
+            "BOT_RUNNER_COMPANY_DISCOVERY_BEFORE_LOGIN", "1"
+        ).strip()
+        or "1",
+        "MT5_COMPANY_DIALOG_CLEANUP_AFTER_LOGIN": os.getenv(
+            "BOT_RUNNER_COMPANY_DIALOG_CLEANUP_AFTER_LOGIN", "1"
+        ).strip()
+        or "1",
         "BOT_WAIT_FOR_WS_REGISTER": os.getenv("BOT_RUNNER_WAIT_FOR_WS_REGISTER", "1").strip() or "1",
         "BOT_WS_READY_TIMEOUT_SECONDS": os.getenv("BOT_RUNNER_WS_READY_TIMEOUT_SECONDS", "120").strip() or "120",
         "BOT_STREAM_LOG_TO_CONTAINER_STDOUT": os.getenv("BOT_RUNNER_STREAM_CONTAINER_LOGS", "1").strip() or "1",
@@ -138,6 +151,10 @@ def build_bot_runtime_env(
         "PULL_LATEST_IMAGE": os.getenv("BOT_RUNNER_PULL_LATEST", "1").strip() or "1",
         "FORCE_REBUILD": os.getenv("BOT_RUNNER_FORCE_REBUILD", "0").strip() or "0",
     }
+
+    broker_query = str(broker_name or "").strip()
+    if broker_query:
+        env["MT5_COMPANY_SEARCH_QUERY"] = broker_query
 
     optional_passthrough = {
         "BOT_RUNNER_MODELS_DIR": "LIVE_MODELS_DIR",
@@ -156,6 +173,14 @@ def build_bot_runtime_env(
         "BOT_RUNNER_PREWARM_REQUEST_TIMEOUT_SEC": "LIVE_PREWARM_REQUEST_TIMEOUT_SEC",
         "BOT_RUNNER_STRICT_SERVER_MATCH": "MT5_STRICT_SERVER_MATCH",
         "BOT_RUNNER_SERVER_FALLBACKS": "MT5_SERVER_FALLBACKS",
+        "BOT_RUNNER_COMPANY_SEARCH_QUERY": "MT5_COMPANY_SEARCH_QUERY",
+        "BOT_RUNNER_MT5_SNAPSHOT_PATH": "MT5_SNAPSHOT_PATH",
+        "BOT_RUNNER_MT5_SEED_CONFIG_DIR": "MT5_SEED_CONFIG_DIR",
+        "BOT_RUNNER_MT5_BASELINE_INSTANCE_ID": "MT5_BASELINE_INSTANCE_ID",
+        "BOT_RUNNER_MT5_AUTO_EXPORT_BASELINE_SNAPSHOT": "MT5_AUTO_EXPORT_BASELINE_SNAPSHOT",
+        "BOT_RUNNER_MT5_AUTO_EXPORT_BASELINE_SEED": "MT5_AUTO_EXPORT_BASELINE_SEED",
+        "BOT_RUNNER_MT5_REFRESH_BASELINE_SNAPSHOT": "MT5_REFRESH_BASELINE_SNAPSHOT",
+        "BOT_RUNNER_MT5_REFRESH_BASELINE_SEED": "MT5_REFRESH_BASELINE_SEED",
     }
     for source_name, target_name in optional_passthrough.items():
         raw_value = os.getenv(source_name)

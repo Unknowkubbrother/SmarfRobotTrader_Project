@@ -85,6 +85,12 @@ trim_outer_whitespace() {
   printf '%s' "$raw" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
 }
 
+is_truthy() {
+  local raw="${1:-}"
+  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  [[ "$raw" =~ ^(1|true|yes|on)$ ]]
+}
+
 sanitize_instance_name() {
   local raw="$1"
   local cleaned
@@ -97,6 +103,107 @@ sanitize_profile_token() {
   local cleaned
   cleaned="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+//g')"
   printf '%s' "$cleaned"
+}
+
+resolve_baseline_instance_name() {
+  local raw
+  raw="${MT5_BASELINE_INSTANCE_ID:-$(read_dotenv_value MT5_BASELINE_INSTANCE_ID)}"
+  raw="$(trim_outer_whitespace "$raw")"
+  if [[ -z "$raw" ]]; then
+    raw="182bdab8_9274_4a4e_922f_700645086705"
+  fi
+  raw="${raw#mt5_}"
+  sanitize_instance_name "$raw"
+}
+
+prepare_mt5_seed_from_baseline_instance() {
+  local baseline_instance="$1"
+  local baseline_volume="mt5_${baseline_instance}_config"
+  local seed_dir="$STATE_DIR/mt5-seed"
+  local had_seed=0
+
+  if [[ -f "$seed_dir/servers.dat" || -f "$seed_dir/accounts.dat" ]]; then
+    had_seed=1
+  fi
+
+  if (( had_seed == 1 )) && ! is_truthy "${MT5_REFRESH_BASELINE_SEED:-0}"; then
+    export MT5_SEED_CONFIG_DIR="/instances/mt5-seed"
+    echo "[baseline] Reusing existing MT5 seed cache at $seed_dir."
+    return 0
+  fi
+
+  if ! docker volume inspect "$baseline_volume" >/dev/null 2>&1; then
+    echo "[baseline] warning: baseline volume '$baseline_volume' not found; skip MT5 seed cache export."
+    return 1
+  fi
+
+  mkdir -p "$seed_dir"
+  if ! docker run --rm \
+      -v "${baseline_volume}:/from:ro" \
+      -v "${seed_dir}:/to" \
+      alpine:3.20 sh -lc '
+set -e
+src="/from/.wine/drive_c/Program Files/MetaTrader 5/Config"
+mkdir -p /to
+copied=0
+if [ -f "$src/servers.dat" ]; then
+  cp -f "$src/servers.dat" /to/servers.dat
+  copied=$((copied+1))
+fi
+if [ -f "$src/accounts.dat" ]; then
+  cp -f "$src/accounts.dat" /to/accounts.dat
+  copied=$((copied+1))
+fi
+if [ "$copied" -eq 0 ]; then
+  exit 7
+fi
+' >/dev/null; then
+    echo "[baseline] warning: failed to export MT5 seed cache from '$baseline_volume'."
+    return 1
+  fi
+
+  export MT5_SEED_CONFIG_DIR="/instances/mt5-seed"
+  echo "[baseline] Exported MT5 seed cache from '$baseline_volume' to $seed_dir."
+  return 0
+}
+
+ensure_mt5_baseline_snapshot() {
+  local baseline_instance="$1"
+  local snapshot_host_path="$2"
+  local baseline_volume="mt5_${baseline_instance}_config"
+
+  if [[ -f "$snapshot_host_path" ]] && ! is_truthy "${MT5_REFRESH_BASELINE_SNAPSHOT:-0}"; then
+    echo "[baseline] Reusing MT5 snapshot: $snapshot_host_path"
+    return 0
+  fi
+
+  if ! docker volume inspect "$baseline_volume" >/dev/null 2>&1; then
+    echo "[baseline] warning: baseline volume '$baseline_volume' not found; skip MT5 snapshot export."
+    return 1
+  fi
+
+  local snapshot_dir
+  local snapshot_name
+  snapshot_dir="$(dirname "$snapshot_host_path")"
+  snapshot_name="$(basename "$snapshot_host_path")"
+  mkdir -p "$snapshot_dir"
+
+  if ! docker run --rm \
+      -v "${baseline_volume}:/from:ro" \
+      -v "${snapshot_dir}:/out" \
+      alpine:3.20 sh -lc "
+set -e
+if [ ! -d /from/.wine ]; then
+  exit 8
+fi
+tar --warning=no-file-changed -C /from -czf \"/out/$snapshot_name\" .wine
+"; then
+    echo "[baseline] warning: failed to export MT5 snapshot from '$baseline_volume'."
+    return 1
+  fi
+
+  echo "[baseline] Exported MT5 snapshot to $snapshot_host_path"
+  return 0
 }
 
 resolve_mt5_login() {
@@ -412,6 +519,18 @@ else
   SNAPSHOT_HOST_DIR_ABS="$ROOT_DIR/${SNAPSHOT_HOST_DIR_RAW#./}"
 fi
 mkdir -p "$SNAPSHOT_HOST_DIR_ABS"
+
+BASELINE_INSTANCE_NAME="$(resolve_baseline_instance_name)"
+if [[ -n "$BASELINE_INSTANCE_NAME" ]]; then
+  if is_truthy "${MT5_AUTO_EXPORT_BASELINE_SEED:-1}"; then
+    prepare_mt5_seed_from_baseline_instance "$BASELINE_INSTANCE_NAME" || true
+  fi
+
+  BASELINE_SNAPSHOT_HOST_PATH="$SNAPSHOT_HOST_DIR_ABS/mt5-config-snapshot.tgz"
+  if is_truthy "${MT5_AUTO_EXPORT_BASELINE_SNAPSHOT:-1}"; then
+    ensure_mt5_baseline_snapshot "$BASELINE_INSTANCE_NAME" "$BASELINE_SNAPSHOT_HOST_PATH" || true
+  fi
+fi
 
 export COMPOSE_PROJECT_NAME
 export MT5_WEB_PORT

@@ -15,6 +15,11 @@ from ..models.trading_model import (
     UpsertTradingJournalRequest,
 )
 from ..database.client import db
+from ..constants.mt5_server_catalog import (
+    get_all_mt5_servers,
+    get_mt5_broker_server_catalog,
+    validate_mt5_broker_server_pair,
+)
 from ..utils.mt5_bot_runner import BotRunnerError, build_profile_name, run_bot_instance_action
 from ..utils.trading_schedule import normalize_trading_schedule
 
@@ -920,20 +925,53 @@ async def get_accounts_with_bots(
         print(f"[ERROR] get_accounts_with_bots: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@trading_router.get("/mt5_server_catalog", tags=["trading"])
+async def get_mt5_server_catalog(request: Request):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    return {
+        "status_code": 200,
+        "data": {
+            "brokers": get_mt5_broker_server_catalog(),
+            "all_servers": get_all_mt5_servers(),
+        },
+    }
+
+
 @trading_router.post("/create_account", tags=["trading"])
 async def create_account(request: Request, data: Create_Trading_Account):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
 
-    encrypted_password = _encrypt_mt5_password(data.mt5Password)
+    broker_name = str(data.brokerName or "").strip()
+    server_name = str(data.serverName or "").strip()
+    mt5_login_id = str(data.mt5LoginId or "").strip()
+    mt5_password = str(data.mt5Password or "").strip()
+
+    if not broker_name:
+        raise HTTPException(status_code=400, detail="brokerName cannot be empty")
+    if not server_name:
+        raise HTTPException(status_code=400, detail="serverName cannot be empty")
+    if not mt5_login_id:
+        raise HTTPException(status_code=400, detail="mt5LoginId cannot be empty")
+    if not mt5_password:
+        raise HTTPException(status_code=400, detail="mt5Password cannot be empty")
+
+    pair_ok, pair_error = validate_mt5_broker_server_pair(broker_name, server_name)
+    if not pair_ok:
+        raise HTTPException(status_code=400, detail=pair_error or "Invalid brokerName/serverName")
+
+    encrypted_password = _encrypt_mt5_password(mt5_password)
     userId = request.state.user_id
 
     trading_account = await db.tradingaccount.create(
         data={
             "userId": userId,
-            "brokerName": data.brokerName,
-            "serverName": data.serverName,
-            "mt5LoginId": data.mt5LoginId,
+            "brokerName": broker_name,
+            "serverName": server_name,
+            "mt5LoginId": mt5_login_id,
             "mt5Password": encrypted_password,
             "recordStatus": ACTIVE_RECORD_STATUS,
             "deletedAt": None,
@@ -974,18 +1012,22 @@ async def update_account(request: Request, data: Update_Trading_Account):
         raise HTTPException(status_code=404, detail="Trading account not found")
 
     update_payload = {}
+    next_broker_name = str(getattr(account, "brokerName", "") or "").strip()
+    next_server_name = str(getattr(account, "serverName", "") or "").strip()
 
     if data.brokerName is not None:
         broker_name = str(data.brokerName).strip()
         if not broker_name:
             raise HTTPException(status_code=400, detail="brokerName cannot be empty")
         update_payload["brokerName"] = broker_name
+        next_broker_name = broker_name
 
     if data.serverName is not None:
         server_name = str(data.serverName).strip()
         if not server_name:
             raise HTTPException(status_code=400, detail="serverName cannot be empty")
         update_payload["serverName"] = server_name
+        next_server_name = server_name
 
     if data.mt5LoginId is not None:
         mt5_login_id = str(data.mt5LoginId).strip()
@@ -998,6 +1040,11 @@ async def update_account(request: Request, data: Update_Trading_Account):
         if not mt5_password:
             raise HTTPException(status_code=400, detail="mt5Password cannot be empty")
         update_payload["mt5Password"] = _encrypt_mt5_password(mt5_password)
+
+    if data.brokerName is not None or data.serverName is not None:
+        pair_ok, pair_error = validate_mt5_broker_server_pair(next_broker_name, next_server_name)
+        if not pair_ok:
+            raise HTTPException(status_code=400, detail=pair_error or "Invalid brokerName/serverName")
 
     if not update_payload:
         raise HTTPException(status_code=400, detail="No update fields provided")

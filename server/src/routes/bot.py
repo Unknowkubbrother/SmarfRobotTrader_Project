@@ -142,6 +142,7 @@ async def _extract_runtime_context(
         mt5_login=mt5_login,
         mt5_password=mt5_password,
         mt5_server=mt5_server,
+        broker_name=str(getattr(account, "brokerName", "") or "").strip(),
         live_symbol=live_symbol,
         live_timeframe=live_timeframe,
         docker_image_id=image_ref,

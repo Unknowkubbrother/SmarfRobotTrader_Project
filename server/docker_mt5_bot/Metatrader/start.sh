@@ -96,6 +96,45 @@ cleanup_mt5_ghost_account_cache() {
     fi
 }
 
+restore_mt5_seed_account_cache() {
+    local config_dir="/config/.wine/drive_c/Program Files/MetaTrader 5/Config"
+    local seed_dir_override="${MT5_SEED_CONFIG_DIR:-}"
+    local seed_dir=""
+    local copied_count=0
+    local candidates=()
+
+    if [ -n "$seed_dir_override" ]; then
+        candidates+=("$seed_dir_override")
+    fi
+    if [ -n "${BOT_CONFIG_ID:-}" ]; then
+        candidates+=("/instances/${BOT_CONFIG_ID}/mt5-seed")
+    fi
+    candidates+=("/instances/mt5-seed")
+
+    mkdir -p "$config_dir"
+
+    for seed_dir in "${candidates[@]}"; do
+        [ -d "$seed_dir" ] || continue
+
+        if [ -f "$seed_dir/servers.dat" ]; then
+            cp -f "$seed_dir/servers.dat" "$config_dir/servers.dat"
+            copied_count=$((copied_count + 1))
+        fi
+        if [ -f "$seed_dir/accounts.dat" ]; then
+            cp -f "$seed_dir/accounts.dat" "$config_dir/accounts.dat"
+            copied_count=$((copied_count + 1))
+        fi
+
+        if [ "$copied_count" -gt 0 ]; then
+            show_message "[cache] Restored MT5 seed config from $seed_dir (files=$copied_count)."
+            return 0
+        fi
+    done
+
+    show_message "[cache] No MT5 seed config found (servers.dat/accounts.dat)."
+    return 0
+}
+
 # Function to check if a dependency is installed
 check_dependency() {
     if ! command -v "$1" &> /dev/null; then
@@ -221,6 +260,7 @@ fi
 # Recheck if MetaTrader 5 is installed
 if [ -e "$mt5file" ]; then
     cleanup_mt5_ghost_account_cache
+    restore_mt5_seed_account_cache
     show_message "[4/7] File $mt5file is installed. Running MT5..."
     # Change directory to MT5 folder to ensure it finds its resources
     cd "/config/.wine/drive_c/Program Files/MetaTrader 5/"

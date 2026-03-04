@@ -22,6 +22,9 @@ SHARED_PYDEPS_DIR="${SHARED_PYDEPS_DIR:-/shared-pydeps}"
 MT5_LOGIN_CHECK_TIMEOUT_SECONDS="${MT5_LOGIN_CHECK_TIMEOUT_SECONDS:-180}"
 MT5_TRADE_CHECK_TIMEOUT_SECONDS="${MT5_TRADE_CHECK_TIMEOUT_SECONDS:-45}"
 MT5_DIALOG_SEARCH_WAIT_SECONDS="${MT5_DIALOG_SEARCH_WAIT_SECONDS:-6}"
+MT5_COMPANY_DISCOVERY_BEFORE_LOGIN="${MT5_COMPANY_DISCOVERY_BEFORE_LOGIN:-1}"
+MT5_COMPANY_DIALOG_CLEANUP_AFTER_LOGIN="${MT5_COMPANY_DIALOG_CLEANUP_AFTER_LOGIN:-1}"
+MT5_COMPANY_SEARCH_QUERY="${MT5_COMPANY_SEARCH_QUERY:-}"
 MT5_SKIP_PRECHECKS="${MT5_SKIP_PRECHECKS:-0}"
 MT5_ALLOW_PARTIAL_START="${MT5_ALLOW_PARTIAL_START:-0}"
 BOT_WAIT_FOR_WS_REGISTER="${BOT_WAIT_FOR_WS_REGISTER:-1}"
@@ -303,6 +306,13 @@ ensure_mt5_login_if_configured() {
   append_runner_progress "[2.4/6] Ensuring MT5 account login via API..."
   cleanup_stale_mt5_exec_processes || true
 
+  if is_truthy "$MT5_COMPANY_DISCOVERY_BEFORE_LOGIN" && [[ -n "$MT5_SERVER_VAL" ]]; then
+    echo "  discovering MT5 company list for server: $MT5_SERVER_VAL"
+    append_runner_progress "discovering MT5 company list for server: $MT5_SERVER_VAL"
+    search_company_dialog_by_server "$MT5_SERVER_VAL" "1" || true
+    dismiss_mt5_dialogs_retry 3 1 || true
+  fi
+
   local login_output=""
   local rc=0
   login_output="$(
@@ -512,6 +522,8 @@ PY
   if [[ "$rc" -ne 0 ]]; then
     search_company_dialog_by_server "$MT5_SERVER_VAL" || true
     dismiss_mt5_dialogs || true
+  elif is_truthy "$MT5_COMPANY_DIALOG_CLEANUP_AFTER_LOGIN"; then
+    dismiss_mt5_dialogs_retry 6 1 || true
   fi
 
   cleanup_stale_mt5_exec_processes || true
@@ -543,26 +555,150 @@ for pattern in "Select a company" "Open an account" "Find your company"; do
   for wid in $(DISPLAY="$display" xdotool search --onlyvisible --name "$pattern" 2>/dev/null | head -n 5); do
     DISPLAY="$display" xdotool windowactivate --sync "$wid" >/dev/null 2>&1 || true
     DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Escape >/dev/null 2>&1 || true
+    DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Alt+c >/dev/null 2>&1 || true
     DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Alt+F4 >/dev/null 2>&1 || true
   done
 done
 '
 }
 
+dismiss_mt5_dialogs_retry() {
+  local retries="${1:-5}"
+  local interval_seconds="${2:-1}"
+  local i=0
+  if [[ -z "$retries" || ! "$retries" =~ ^[0-9]+$ ]]; then
+    retries=5
+  fi
+  if [[ -z "$interval_seconds" || ! "$interval_seconds" =~ ^[0-9]+$ ]]; then
+    interval_seconds=1
+  fi
+  for (( i=1; i<=retries; i++ )); do
+    dismiss_mt5_dialogs || true
+    sleep "$interval_seconds"
+  done
+}
+
+ensure_company_dialog_open() {
+  if ! ensure_xdotool; then
+    return 1
+  fi
+
+  compose exec -T -u abc "$SERVICE_NAME" sh -lc '
+display=":1"
+
+wid="$(DISPLAY="$display" xdotool search --onlyvisible --name "Select a company" 2>/dev/null | head -n1 || true)"
+if [ -n "$wid" ]; then
+  exit 0
+fi
+
+main_wid="$(DISPLAY="$display" xdotool search --onlyvisible --name "MetaTrader|Netting|MetaQuotes" 2>/dev/null | head -n1 || true)"
+if [ -z "$main_wid" ]; then
+  exit 1
+fi
+
+DISPLAY="$display" xdotool windowactivate --sync "$main_wid" >/dev/null 2>&1 || true
+sleep 0.2
+
+# Try File -> Open an Account (common hotkey "O" on English UI)
+DISPLAY="$display" xdotool key --window "$main_wid" --clearmodifiers alt+f >/dev/null 2>&1 || true
+sleep 0.25
+DISPLAY="$display" xdotool key --window "$main_wid" --clearmodifiers o >/dev/null 2>&1 || true
+sleep 1.0
+
+wid="$(DISPLAY="$display" xdotool search --onlyvisible --name "Select a company" 2>/dev/null | head -n1 || true)"
+if [ -n "$wid" ]; then
+  exit 0
+fi
+
+# Fallback alternate accelerator.
+DISPLAY="$display" xdotool key --window "$main_wid" --clearmodifiers alt+f >/dev/null 2>&1 || true
+sleep 0.25
+DISPLAY="$display" xdotool key --window "$main_wid" --clearmodifiers a >/dev/null 2>&1 || true
+sleep 1.0
+
+wid="$(DISPLAY="$display" xdotool search --onlyvisible --name "Select a company" 2>/dev/null | head -n1 || true)"
+[ -n "$wid" ] && exit 0 || exit 1
+'
+}
+
 search_company_dialog_by_server() {
   local server_name="${1:-}"
+  local force_open="${2:-0}"
+  local -a company_queries=()
+  local server_no_suffix=""
+  local server_spaced=""
+  local company_query_hint_raw=""
+  local company_query_hint_item=""
+  local query_debug=""
   server_name="$(printf '%s' "$server_name" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
   if [[ -z "$server_name" ]]; then
     return 0
+  fi
+  company_query_hint_raw="$(printf '%s' "$MT5_COMPANY_SEARCH_QUERY" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+
+  add_company_query() {
+    local raw_query="${1:-}"
+    local normalized_query=""
+    normalized_query="$(printf '%s' "$raw_query" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+    if [[ -z "$normalized_query" ]]; then
+      return 0
+    fi
+    local existing=""
+    for existing in "${company_queries[@]:-}"; do
+      if [[ "$existing" == "$normalized_query" ]]; then
+        return 0
+      fi
+    done
+    company_queries+=("$normalized_query")
+  }
+
+  add_company_query "$server_name"
+  server_no_suffix="$(printf '%s' "$server_name" | sed -E 's/[[:space:]]*[-_](demo|live|real|ecn|pro)$//I')"
+  add_company_query "$server_no_suffix"
+  add_company_query "$(printf '%s' "$server_name" | sed -E 's/[[:space:]]*[-_].*$//')"
+  add_company_query "$(printf '%s' "$server_name" | sed -E 's/[-_]+/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//')"
+  server_spaced="$(printf '%s' "$server_no_suffix" | sed -E 's/([[:lower:]])([[:upper:]])/\1 \2/g; s/[[:space:]]+/ /g; s/^ //; s/ $//')"
+  add_company_query "$server_spaced"
+  add_company_query "$(printf '%s' "$server_spaced" | awk '{print $1}')"
+  add_company_query "$(printf '%s' "$server_spaced" | awk '{print $1, $2}' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+  add_company_query "$(printf '%s' "$server_spaced" | awk '{print $1$2}')"
+  add_company_query "$(printf '%s' "$server_spaced" | awk '{print tolower($1$2)}')"
+  add_company_query "$(printf '%s' "$server_name" | sed -E 's/[[:space:]]+.*$//')"
+  if [[ -n "$company_query_hint_raw" ]]; then
+    while IFS= read -r company_query_hint_item; do
+      add_company_query "$company_query_hint_item"
+    done < <(
+      printf '%s' "$company_query_hint_raw" \
+        | tr ';|' '\n' \
+        | tr ',' '\n'
+    )
+  fi
+  if [[ "${#company_queries[@]}" -eq 0 ]]; then
+    company_queries+=("$server_name")
+  fi
+  query_debug="$(printf '%s | ' "${company_queries[@]}")"
+  query_debug="${query_debug% | }"
+  if [[ -n "$query_debug" ]]; then
+    echo "  company discovery queries: $query_debug"
+    append_runner_progress "company discovery queries: $query_debug"
   fi
 
   if ! ensure_xdotool; then
     return 1
   fi
 
-  compose exec -T -u abc -e MT5_SERVER="$server_name" -e MT5_DIALOG_SEARCH_WAIT_SECONDS="$MT5_DIALOG_SEARCH_WAIT_SECONDS" "$SERVICE_NAME" sh -lc '
+  if [[ "$force_open" =~ ^(1|true|yes|on)$ ]]; then
+    ensure_company_dialog_open || true
+  fi
+
+  compose exec -T -u abc \
+    -e MT5_SERVER="$server_name" \
+    -e MT5_COMPANY_QUERIES="$(printf '%s\n' "${company_queries[@]}")" \
+    -e MT5_DIALOG_SEARCH_WAIT_SECONDS="$MT5_DIALOG_SEARCH_WAIT_SECONDS" \
+    "$SERVICE_NAME" sh -lc '
 display=":1"
 server="${MT5_SERVER:-}"
+query_list="${MT5_COMPANY_QUERIES:-}"
 wait_seconds="${MT5_DIALOG_SEARCH_WAIT_SECONDS:-6}"
 
 wid="$(DISPLAY="$display" xdotool search --onlyvisible --name "Select a company" 2>/dev/null | head -n1 || true)"
@@ -570,23 +706,84 @@ if [ -z "$wid" ]; then
   exit 0
 fi
 
-DISPLAY="$display" xdotool windowactivate --sync "$wid" >/dev/null 2>&1 || true
-sleep 0.2
+if [ -z "$query_list" ]; then
+  query_list="$server"
+fi
 
-# Focus company search input.
-DISPLAY="$display" xdotool mousemove --window "$wid" 280 132 click 1 >/dev/null 2>&1 || true
-sleep 0.2
-DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers ctrl+a BackSpace >/dev/null 2>&1 || true
-sleep 0.1
-DISPLAY="$display" xdotool type --window "$wid" --delay 1 "$server" >/dev/null 2>&1 || true
-sleep 0.2
+while IFS= read -r query; do
+  [ -n "$query" ] || continue
+  wid="$(DISPLAY="$display" xdotool search --onlyvisible --name "Select a company" 2>/dev/null | head -n1 || true)"
+  [ -n "$wid" ] || exit 0
 
-# Click "Find your company".
-DISPLAY="$display" xdotool mousemove --window "$wid" 820 132 click 1 >/dev/null 2>&1 || true
-sleep "$wait_seconds"
+  DISPLAY="$display" xdotool windowactivate --sync "$wid" >/dev/null 2>&1 || true
+  sleep 0.2
 
-# Close dialog if it is still blocking.
-DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Escape >/dev/null 2>&1 || true
+  WIDTH=""
+  HEIGHT=""
+  eval "$(DISPLAY="$display" xdotool getwindowgeometry --shell "$wid" 2>/dev/null | grep -E "^(WIDTH|HEIGHT)=")" || true
+  WIDTH="${WIDTH:-700}"
+  HEIGHT="${HEIGHT:-520}"
+
+  search_x=$(( WIDTH / 3 ))
+  search_y=$(( HEIGHT / 5 ))
+  find_x=$(( WIDTH - 75 ))
+  find_y="$search_y"
+  result_x=$(( WIDTH / 3 ))
+  result_y=$(( HEIGHT / 3 ))
+  result_link_x=$(( WIDTH - 70 ))
+  next_x=$(( WIDTH - 130 ))
+  next_y=$(( HEIGHT - 28 ))
+
+  [ "$search_x" -lt 120 ] && search_x=120
+  [ "$search_y" -lt 80 ] && search_y=80
+  [ "$find_x" -lt 220 ] && find_x=220
+  [ "$result_x" -lt 150 ] && result_x=150
+  [ "$result_y" -lt 140 ] && result_y=140
+  [ "$result_link_x" -lt 260 ] && result_link_x=260
+  [ "$next_x" -lt 220 ] && next_x=220
+  [ "$next_y" -lt 220 ] && next_y=220
+
+  # Focus company search input.
+  DISPLAY="$display" xdotool mousemove --window "$wid" "$search_x" "$search_y" click 1 >/dev/null 2>&1 || true
+  sleep 0.2
+  DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers ctrl+a BackSpace >/dev/null 2>&1 || true
+  sleep 0.1
+  DISPLAY="$display" xdotool type --window "$wid" --delay 1 "$query" >/dev/null 2>&1 || true
+  sleep 0.2
+
+  # Trigger "Find your company" using both click and keyboard fallback.
+  DISPLAY="$display" xdotool mousemove --window "$wid" "$find_x" "$find_y" click 1 >/dev/null 2>&1 || true
+  DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Return >/dev/null 2>&1 || true
+  DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Tab Return >/dev/null 2>&1 || true
+  sleep "$wait_seconds"
+
+  # Try selecting first result row to seed broker/company into terminal cache.
+  DISPLAY="$display" xdotool mousemove --window "$wid" "$result_x" "$result_y" click 1 >/dev/null 2>&1 || true
+  sleep 0.2
+  DISPLAY="$display" xdotool mousemove --window "$wid" "$result_link_x" "$result_y" click 1 >/dev/null 2>&1 || true
+  sleep 0.2
+  DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Down >/dev/null 2>&1 || true
+  sleep 0.1
+  DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Return >/dev/null 2>&1 || true
+  DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Alt+n >/dev/null 2>&1 || true
+  DISPLAY="$display" xdotool mousemove --window "$wid" "$next_x" "$next_y" click 1 >/dev/null 2>&1 || true
+  sleep 0.8
+
+  # Stop early if the dialog disappeared after selection.
+  still_open="$(DISPLAY="$display" xdotool search --onlyvisible --name "Select a company" 2>/dev/null | head -n1 || true)"
+  if [ -z "$still_open" ]; then
+    exit 0
+  fi
+done <<EOF
+$query_list
+EOF
+
+wid="$(DISPLAY="$display" xdotool search --onlyvisible --name "Select a company" 2>/dev/null | head -n1 || true)"
+if [ -n "$wid" ]; then
+  # Close dialog if it is still blocking.
+  DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Escape >/dev/null 2>&1 || true
+  DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Alt+F4 >/dev/null 2>&1 || true
+fi
 '
 }
 
@@ -1341,9 +1538,9 @@ if bot_process_is_running; then
       fi
     fi
   fi
-  if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
-    echo "[6.6/6] Final MT5 Algo Trading check after bot startup..."
-    append_runner_progress "[6.6/6] Final MT5 Algo Trading check after bot startup..."
+	  if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
+	    echo "[6.6/6] Final MT5 Algo Trading check after bot startup..."
+	    append_runner_progress "[6.6/6] Final MT5 Algo Trading check after bot startup..."
     if ! check_trade_allowed; then
       echo "  trade_allowed dropped after bot startup. Retrying auto-enable..."
       append_runner_progress "trade_allowed dropped after bot startup. Retrying auto-enable..."
@@ -1360,12 +1557,18 @@ if bot_process_is_running; then
           compose exec -T "$SERVICE_NAME" bash -lc "tail -n 120 '${BOT_LOG}'" || true
           exit 1
         fi
-      fi
-    fi
-  fi
-  append_bot_log_marker "[RUNNER] start_ok"
-  append_runner_progress "Bot started successfully."
-  echo "Bot started successfully."
+	      fi
+	    fi
+	  fi
+	  if is_truthy "$MT5_COMPANY_DISCOVERY_BEFORE_LOGIN" && [[ -n "$MT5_SERVER_VAL" ]]; then
+	    echo "[6.7/6] Refreshing MT5 company cache after startup..."
+	    append_runner_progress "[6.7/6] Refreshing MT5 company cache after startup..."
+	    search_company_dialog_by_server "$MT5_SERVER_VAL" "1" || true
+	  fi
+	  dismiss_mt5_dialogs_retry 3 1 || true
+	  append_bot_log_marker "[RUNNER] start_ok"
+	  append_runner_progress "Bot started successfully."
+	  echo "Bot started successfully."
   echo "Log file: ${BOT_LOG}"
   echo "Follow logs with:"
   echo "  docker compose exec -it ${SERVICE_NAME} tail -f ${BOT_LOG}"

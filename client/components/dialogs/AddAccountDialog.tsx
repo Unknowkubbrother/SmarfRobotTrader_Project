@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Plus, Server, Lock, User } from "lucide-react";
+import { Lock, User } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -7,6 +7,8 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
 import { useTradingAccounts } from "@/hooks/useTradingAccounts";
+import { useMt5ServerCatalog } from "@/hooks/useMt5ServerCatalog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 interface AddAccountDialogProps {
   onAccountAdded?: () => void;
@@ -24,6 +26,7 @@ export function AddAccountDialog({ onAccountAdded, open, onOpenChange, trigger }
   const [loading, setLoading] = useState(false);
   const { user } = useAuth();
   const { createAccount } = useTradingAccounts();
+  const { catalog, loading: catalogLoading } = useMt5ServerCatalog();
   const [formData, setFormData] = useState({
     broker_name: "",
     server_name: "",
@@ -74,25 +77,64 @@ export function AddAccountDialog({ onAccountAdded, open, onOpenChange, trigger }
       <div className="space-y-4 py-4">
         <div>
           <Label htmlFor="broker">Broker Name</Label>
-          <div className="relative mt-1">
-            <Server className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-            <Input
-              id="broker"
-              placeholder="e.g., XM, ICMarkets"
-              className="pl-10"
-              value={formData.broker_name}
-              onChange={(e) => setFormData({ ...formData, broker_name: e.target.value })}
-            />
-          </div>
+          <Select
+            value={formData.broker_name}
+            onValueChange={(nextBroker) =>
+              setFormData((prev) => ({
+                ...prev,
+                broker_name: nextBroker,
+                server_name: "",
+              }))
+            }
+            disabled={catalogLoading || catalog.brokers.length === 0}
+          >
+            <SelectTrigger id="broker" className="mt-1">
+              <SelectValue
+                placeholder={
+                  catalogLoading
+                    ? "Loading broker list..."
+                    : "Select broker"
+                }
+              />
+            </SelectTrigger>
+            <SelectContent>
+              {catalog.brokers.map((entry) => (
+                <SelectItem key={entry.broker_name} value={entry.broker_name}>
+                  {entry.broker_name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
         <div>
           <Label htmlFor="server">Server Name</Label>
-          <Input
-            id="server"
-            placeholder="e.g., XMGlobal-MT5"
+          <Select
             value={formData.server_name}
-            onChange={(e) => setFormData({ ...formData, server_name: e.target.value })}
-          />
+            onValueChange={(nextServer) =>
+              setFormData((prev) => ({
+                ...prev,
+                server_name: nextServer,
+              }))
+            }
+            disabled={!formData.broker_name}
+          >
+            <SelectTrigger id="server" className="mt-1">
+              <SelectValue
+                placeholder={
+                  !formData.broker_name
+                    ? "Select broker first"
+                    : "Select server"
+                }
+              />
+            </SelectTrigger>
+            <SelectContent>
+              {(catalog.brokers.find((entry) => entry.broker_name === formData.broker_name)?.server_names || []).map((serverName) => (
+                <SelectItem key={serverName} value={serverName}>
+                  {serverName}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
         <div>
           <Label htmlFor="login">MT5 Login ID</Label>
