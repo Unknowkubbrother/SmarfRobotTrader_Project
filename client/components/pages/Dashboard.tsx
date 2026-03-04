@@ -222,6 +222,7 @@ export default function Dashboard() {
   const accountTotalPnl = selectedAccount?.total_net_pnl ?? accountTodayPnl;
   const liveBalance = liveState?.balance ?? accountBalance;
   const liveEquity = liveState?.equity ?? accountEquity;
+  const liveEquityDelta = liveEquity - liveBalance;
   const liveTotalPnl = liveState?.total_pnl ?? accountTotalPnl;
   const liveUnrealized = liveState?.unrealized_pnl ?? 0;
   const liveWins = liveState?.wins ?? 0;
@@ -239,6 +240,13 @@ export default function Dashboard() {
       value: `$${liveBalance.toFixed(2)}`,
       change: liveTotalPnl >= 0 ? `+${liveTotalPnl.toFixed(2)}` : liveTotalPnl.toFixed(2),
       changeType: liveTotalPnl >= 0 ? "positive" as const : "negative" as const,
+    },
+    {
+      icon: Wallet,
+      label: "Equity",
+      value: `$${liveEquity.toFixed(2)}`,
+      change: (liveEquityDelta >= 0 ? "+" : "") + liveEquityDelta.toFixed(2),
+      changeType: liveEquityDelta >= 0 ? "positive" as const : "negative" as const,
     },
     {
       icon: TrendingUp,
@@ -427,7 +435,7 @@ export default function Dashboard() {
               </span>
             )}
           </div>
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-4">
             {stats.map((stat, index) => (
               <div
                 key={stat.label}

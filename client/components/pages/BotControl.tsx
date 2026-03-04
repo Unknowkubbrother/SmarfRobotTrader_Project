@@ -199,6 +199,7 @@ export default function BotControl() {
 
   // Safe live state properties with fallbacks
   const botTodayPnl = selectedBot?.today_pnl ?? 0;
+  const liveBalance = liveState?.balance ?? selectedAccount?.balance ?? 0;
   const liveEquity = liveState?.equity ?? selectedAccount?.equity ?? selectedAccount?.balance ?? 0;
   const liveTotalPnl = liveState?.total_pnl ?? botTodayPnl;
   const liveUnrealized = liveState?.unrealized_pnl ?? botTodayPnl;
@@ -1108,6 +1109,10 @@ export default function BotControl() {
                     )}>
                       {liveUnrealized >= 0 ? "+" : ""}{liveUnrealized.toFixed(2)}
                     </p>
+                  </div>
+                  <div className="p-3 rounded-xl bg-secondary/50">
+                    <p className="text-xs text-muted-foreground mb-1">Total Balance</p>
+                    <p className="text-lg font-semibold font-mono">${liveBalance.toFixed(2)}</p>
                   </div>
                   <div className="p-3 rounded-xl bg-secondary/50">
                     <p className="text-xs text-muted-foreground mb-1">Equity</p>
