@@ -6,7 +6,16 @@ WINEPREFIX='/config/.wine'
 WINEDEBUG='-all'
 export WINEARCH=win64
 export WINEDLLOVERRIDES="mscoree,mshtml="
-wine_executable="/usr/lib/wine/wine64"
+winedir_default="/usr/lib/wine/wine64"
+if [ -x "$winedir_default" ]; then
+    wine_executable="$winedir_default"
+elif command -v wine64 >/dev/null 2>&1; then
+    wine_executable="$(command -v wine64)"
+elif command -v wine >/dev/null 2>&1; then
+    wine_executable="$(command -v wine)"
+else
+    wine_executable="$winedir_default"
+fi
 metatrader_version="5.0.36"
 mt5server_port="8001"
 PYTHON_DIR="/config/.wine/drive_c/Python311"
@@ -35,9 +44,61 @@ show_message() {
     echo $1
 }
 
+is_truthy() {
+    local raw
+    raw="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    case "$raw" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+cleanup_mt5_ghost_account_cache() {
+    local config_dir="/config/.wine/drive_c/Program Files/MetaTrader 5/Config"
+    local roaming_terminal_root="/config/.wine/drive_c/users/abc/AppData/Roaming/MetaQuotes/Terminal"
+    local base_default_dir="/config/.wine/drive_c/Program Files/MetaTrader 5/Bases/Default"
+    local removed_count=0
+    local file
+
+    if ! is_truthy "${MT5_CLEAN_ACCOUNT_CACHE_ON_START:-1}"; then
+        show_message "[cache] MT5 account/server cleanup disabled (MT5_CLEAN_ACCOUNT_CACHE_ON_START=0)."
+        return 0
+    fi
+
+    for file in \
+        "$base_default_dir/Symbols/symbols-0.dat" \
+        "$base_default_dir/Symbols/selected-0.dat" \
+        "$base_default_dir/Mail/mail-0.dat"; do
+        if [ -f "$file" ]; then
+            rm -f "$file" && removed_count=$((removed_count + 1))
+        fi
+    done
+
+    for file in "$config_dir/accounts.dat" "$config_dir/servers.dat"; do
+        if [ -f "$file" ]; then
+            rm -f "$file" && removed_count=$((removed_count + 1))
+        fi
+    done
+
+    if [ -d "$roaming_terminal_root" ]; then
+        while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            if [ -f "$file" ]; then
+                rm -f "$file" && removed_count=$((removed_count + 1))
+            fi
+        done < <(find "$roaming_terminal_root" -maxdepth 3 -type f \( -name accounts.dat -o -name servers.dat \) 2>/dev/null)
+    fi
+
+    if [ "$removed_count" -gt 0 ]; then
+        show_message "[cache] Cleared stale MT5 account/server cache files (count=$removed_count)."
+    else
+        show_message "[cache] No stale MT5 account/server cache files found."
+    fi
+}
+
 # Function to check if a dependency is installed
 check_dependency() {
-    if ! command -v $1 &> /dev/null; then
+    if ! command -v "$1" &> /dev/null; then
         echo "$1 is not installed. Please install it to continue."
         exit 1
     fi
@@ -58,6 +119,8 @@ is_wine_python_package_installed() {
 # Check for necessary dependencies
 check_dependency "curl"
 check_dependency "$wine_executable"
+show_message "Using Wine executable: $wine_executable"
+"$wine_executable" --version || true
 
 # Optional: restore a prebuilt MT5/Wine snapshot to skip first-time installation.
 if [ ! -e "$mt5file" ]; then
@@ -157,6 +220,7 @@ fi
 
 # Recheck if MetaTrader 5 is installed
 if [ -e "$mt5file" ]; then
+    cleanup_mt5_ghost_account_cache
     show_message "[4/7] File $mt5file is installed. Running MT5..."
     # Change directory to MT5 folder to ensure it finds its resources
     cd "/config/.wine/drive_c/Program Files/MetaTrader 5/"
@@ -225,8 +289,8 @@ else
     $wine_executable "$WINE_PYTHON" -m pip install --no-warn-script-location "MetaTrader5<5.0.5500"
     # Pin rpyc to 5.0.1 to match Linux side for protocol compatibility
     # Pin numpy to 1.24.4 - last version that works in Wine without ucrtbase.dll.crealf
-    # Install mt5linux with --no-deps to avoid building cffi/cryptography from source
-    $wine_executable "$WINE_PYTHON" -m pip install --no-warn-script-location --no-deps mt5linux rpyc==5.0.1 plumbum "numpy<1.25" pyzmq
+    # Pin mt5linux to legacy-compatible version paired with rpyc==5.0.1
+    $wine_executable "$WINE_PYTHON" -m pip install --no-warn-script-location --no-deps mt5linux==0.2.4 rpyc==5.0.1 plumbum "numpy<1.25" pyzmq
     $wine_executable "$WINE_PYTHON" -m pip install --no-cache-dir python-dateutil
     touch "$WINE_BOOTSTRAP_MARKER"
     show_message "[6/7] Python libraries installed in Wine."
@@ -242,7 +306,7 @@ fi
 # Install mt5linux library in Linux if not installed.
 show_message "[6/7] Checking and installing mt5linux library in Linux if necessary"
 if ! is_python_package_installed "mt5linux"; then
-    pip install --break-system-packages --no-cache-dir --no-deps mt5linux && \
+    pip install --break-system-packages --no-cache-dir --no-deps mt5linux==0.2.4 && \
     pip install --break-system-packages --no-cache-dir rpyc==5.0.1 plumbum numpy
 fi
 

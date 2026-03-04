@@ -10,4 +10,4 @@ FlagEmbedding
 # ==================================================
 # MT5 / Live / Strategy Tester
 # ==================================================
-git+https://github.com/lucas-campagna/mt5linux.git@master
+mt5linux==0.2.4

@@ -6,4 +6,4 @@ numpy>=2.0.0,<3.0.0
 pandas>=2.1.0,<3.0.0
 joblib
 torch
-mt5linux
+mt5linux==0.2.4

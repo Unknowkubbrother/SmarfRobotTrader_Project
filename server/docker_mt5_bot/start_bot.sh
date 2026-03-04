@@ -20,7 +20,12 @@ SHARED_PYDEPS_DIR="${SHARED_PYDEPS_DIR:-/shared-pydeps}"
 MT5_LOGIN_CHECK_TIMEOUT_SECONDS="${MT5_LOGIN_CHECK_TIMEOUT_SECONDS:-180}"
 MT5_TRADE_CHECK_TIMEOUT_SECONDS="${MT5_TRADE_CHECK_TIMEOUT_SECONDS:-45}"
 MT5_DIALOG_SEARCH_WAIT_SECONDS="${MT5_DIALOG_SEARCH_WAIT_SECONDS:-6}"
-MT5_SKIP_PRECHECKS="${MT5_SKIP_PRECHECKS:-1}"
+MT5_SKIP_PRECHECKS="${MT5_SKIP_PRECHECKS:-0}"
+
+trim_outer_whitespace() {
+  local raw="$1"
+  printf '%s' "$raw" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
 
 read_dotenv_value() {
   local key="$1"
@@ -53,6 +58,21 @@ MT5_STRICT_SERVER_MATCH_VAL="${MT5_STRICT_SERVER_MATCH:-$(read_dotenv_value MT5_
 CUSTOM_USER_VAL="${CUSTOM_USER:-$(read_dotenv_value CUSTOM_USER)}"
 VNC_PASSWORD_VAL="${PASSWORD:-$(read_dotenv_value PASSWORD)}"
 
+MT5_LOGIN_VAL="$(printf '%s' "$MT5_LOGIN_VAL" | tr -d '[:space:]')"
+MT5_SERVER_VAL="$(trim_outer_whitespace "$MT5_SERVER_VAL")"
+MT5_STRICT_SERVER_MATCH_VAL="$(trim_outer_whitespace "$MT5_STRICT_SERVER_MATCH_VAL")"
+
+if [[ -z "$MT5_SERVER_VAL" && -n "${MT5_SERVER_FALLBACKS:-}" ]]; then
+  MT5_SERVER_VAL="$(
+    printf '%s' "${MT5_SERVER_FALLBACKS}" \
+      | tr ';' ',' \
+      | awk -F, '{for (i=1;i<=NF;i++){gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", $i); if(length($i)>0){print $i; exit}}}'
+  )"
+  if [[ -n "$MT5_SERVER_VAL" ]]; then
+    echo "warning: MT5_SERVER is blank, using first MT5_SERVER_FALLBACKS value: '$MT5_SERVER_VAL'"
+  fi
+fi
+
 # If VNC credentials are not explicitly configured, reuse MT5 credentials.
 if [[ -z "$CUSTOM_USER_VAL" && -n "$MT5_LOGIN_VAL" ]]; then
   CUSTOM_USER_VAL="$MT5_LOGIN_VAL"
@@ -61,7 +81,7 @@ if [[ -z "$VNC_PASSWORD_VAL" && -n "$MT5_PASSWORD_VAL" ]]; then
   VNC_PASSWORD_VAL="$MT5_PASSWORD_VAL"
 fi
 if [[ -z "$MT5_STRICT_SERVER_MATCH_VAL" ]]; then
-  MT5_STRICT_SERVER_MATCH_VAL="0"
+  MT5_STRICT_SERVER_MATCH_VAL="1"
 fi
 
 # Final fallback for first-time setup without MT5 credentials.
@@ -266,9 +286,6 @@ ensure_mt5_login_if_configured() {
   fi
 
   echo "[2.4/6] Ensuring MT5 account login via API..."
-  dismiss_mt5_dialogs || true
-  search_company_dialog_by_server "$MT5_SERVER_VAL" || true
-  dismiss_mt5_dialogs || true
   cleanup_stale_mt5_exec_processes || true
 
   local login_output=""
@@ -340,6 +357,9 @@ def build_server_candidates(primary: str, fallbacks: str) -> list[str]:
         else:
             add_candidate(candidates, f"MT5 {primary_name}")
 
+    if not candidates:
+        # Allow MT5 to resolve the server automatically when env is blank.
+        return [""]
     return candidates
 
 
@@ -393,6 +413,7 @@ if not server_candidates:
 
 for attempt in range(1, retries + 1):
     for server_name in server_candidates:
+        server_display = server_name if server_name else "<auto>"
         queue = mp.Queue()
         proc = mp.Process(
             target=probe_login,
@@ -405,7 +426,7 @@ for attempt in range(1, retries + 1):
         if proc.is_alive():
             proc.terminate()
             proc.join(3)
-            print(f"login_attempt_{attempt}_server={server_name} result=timeout")
+            print(f"login_attempt_{attempt}_server={server_display} result=timeout")
             continue
 
         result = None
@@ -421,7 +442,7 @@ for attempt in range(1, retries + 1):
             }
 
         print(
-            f"login_attempt_{attempt}_server={result.get('server','')}"
+            f"login_attempt_{attempt}_server={result.get('server','') or '<auto>'}"
             f" ok={int(bool(result.get('ok')))}"
             f" login={int(result.get('login') or 0)}"
             f" account_server={result.get('account_server','')}"
@@ -550,6 +571,10 @@ login_mt5_account_via_ui() {
 
   if [[ -z "$login_text" || -z "$password_text" ]]; then
     return 0
+  fi
+  if [[ -z "$server_name" ]]; then
+    echo "  warning: skip MT5 UI login fallback because server is blank."
+    return 1
   fi
   if ! ensure_xdotool; then
     return 1
@@ -846,11 +871,15 @@ until compose exec -T "$SERVICE_NAME" python3 -c "import socket,sys;s=socket.soc
 done
 echo "  mt5linux server is ready."
 dismiss_mt5_dialogs || true
-search_company_dialog_by_server "$MT5_SERVER_VAL" || true
-dismiss_mt5_dialogs || true
-login_mt5_account_via_ui "$MT5_LOGIN_VAL" "$MT5_PASSWORD_VAL" "$MT5_SERVER_VAL" || true
 if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
-  ensure_mt5_login_if_configured || true
+  if ! ensure_mt5_login_if_configured; then
+    echo "  warning: MT5 API login precheck failed, trying UI login fallback."
+    search_company_dialog_by_server "$MT5_SERVER_VAL" || true
+    dismiss_mt5_dialogs || true
+    login_mt5_account_via_ui "$MT5_LOGIN_VAL" "$MT5_PASSWORD_VAL" "$MT5_SERVER_VAL" || true
+    dismiss_mt5_dialogs || true
+    ensure_mt5_login_if_configured || true
+  fi
 else
   echo "[2.4/6] Skipping MT5 API prechecks (MT5_SKIP_PRECHECKS=$MT5_SKIP_PRECHECKS)."
 fi
@@ -933,7 +962,7 @@ mkdir -p "$stamp_dir"
 if [ "$pip_mode" = "venv" ]; then
   if ! "$python_cmd" -c "import mt5linux" >/dev/null 2>&1; then
     echo "  installing mt5linux runtime into shared venv ..."
-    "$python_cmd" -m pip install --no-cache-dir --no-deps mt5linux
+    "$python_cmd" -m pip install --no-cache-dir --no-deps mt5linux==0.2.4
     "$python_cmd" -m pip install --no-cache-dir rpyc==5.0.1 plumbum numpy pyxdg pyzmq
   fi
 fi

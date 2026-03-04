@@ -113,6 +113,22 @@ MT5_EXPERTS_DISABLE_VIA_PYTHON_API=0
 - ตั้งค่าใน `common.ini` ([Experts])
 - fallback ด้วย UI automation (`Ctrl+E` และเปิด `Options -> Expert Advisors`) ถ้ายังไม่ขึ้น
 
+เพื่อให้เริ่มบอทหลังล็อกอิน MT5 ชัวร์ขึ้น (แนะนำ):
+
+```env
+MT5_SKIP_PRECHECKS=0
+```
+
+ค่า `0` จะไม่ข้ามขั้น precheck และจะพยายามล็อกอิน MT5 ผ่าน API ก่อนเริ่มบอท
+
+ถ้าเคยมี account/server ghost ใน Navigator (บรรทัดว่างเหนือชื่อ server):
+
+```env
+MT5_CLEAN_ACCOUNT_CACHE_ON_START=1
+```
+
+ระบบจะล้าง cache ผีของ account id `0` อัตโนมัติ และรีเซ็ตรายการ server/account cache ตอน start
+
 ## Docker Outside of Docker (Server อยู่ใน container แต่สร้าง bot container บน host)
 
 ให้ mount docker socket ของ host เข้า container server:

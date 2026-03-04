@@ -10,7 +10,8 @@ ENV TITLE=Metatrader5
 ENV WINEPREFIX="/config/.wine"
 ENV WINEDEBUG=-all
 
-# Install all packages in a single layer to reduce image size
+# Install all packages in a single layer to reduce image size.
+# Keep Debian wine packages for qemu/Apple Silicon compatibility.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
     python3 \
@@ -30,7 +31,7 @@ RUN apt-get update \
 
 # Install Python dependencies for Linux environment
 # Pin rpyc to 5.0.1 to match Windows side
-RUN pip3 install --break-system-packages --no-cache-dir --no-deps mt5linux \
+RUN pip3 install --break-system-packages --no-cache-dir --no-deps mt5linux==0.2.4 \
     && pip3 install --break-system-packages --no-cache-dir rpyc==5.0.1 plumbum numpy pyxdg pyzmq
 
 # Pre-download installers to cache them in the image

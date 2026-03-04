@@ -80,6 +80,11 @@ read_dotenv_value() {
   printf '%s' "$value"
 }
 
+trim_outer_whitespace() {
+  local raw="$1"
+  printf '%s' "$raw" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
 sanitize_instance_name() {
   local raw="$1"
   local cleaned
@@ -336,8 +341,13 @@ MT5_PASSWORD_VAL="$(resolve_required_env MT5_PASSWORD)"
 MT5_SERVER_VAL="$(resolve_required_env MT5_SERVER)"
 MT5_SERVER_FALLBACKS_VAL="${MT5_SERVER_FALLBACKS:-$(read_dotenv_value MT5_SERVER_FALLBACKS)}"
 MT5_LOGIN_VAL="$(printf '%s' "$MT5_LOGIN_VAL" | tr -d '[:space:]')"
+MT5_SERVER_VAL="$(trim_outer_whitespace "$MT5_SERVER_VAL")"
 if [[ -z "$MT5_LOGIN_VAL" ]]; then
   echo "Error: MT5_LOGIN is required (set in env or .env)"
+  exit 1
+fi
+if [[ -z "$MT5_SERVER_VAL" ]]; then
+  echo "Error: MT5_SERVER is required and cannot be blank/whitespace."
   exit 1
 fi
 
