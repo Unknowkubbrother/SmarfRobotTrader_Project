@@ -1155,9 +1155,11 @@ class LiveTradingBot:
         """Add a log entry to be sent to the dashboard Activity Log."""
         if not hasattr(self, "recent_logs"):
             self.recent_logs = []
-        now_str = datetime.now().strftime("%H:%M:%S")
+        now_utc = datetime.now(timezone.utc)
+        now_str = now_utc.strftime("%H:%M:%S")
         entry = {
             "timestamp": now_str,
+            "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
             "type": str(log_type or "info"),
             "message": str(message or "").strip(),
         }

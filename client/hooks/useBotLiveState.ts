@@ -19,6 +19,7 @@ export interface MT5Position {
 
 export interface BotLiveLogEntry {
     timestamp: string;
+    timestamp_utc?: string;
     type: "info" | "analysis" | "action" | "warning" | "success";
     message: string;
     phase?: string;

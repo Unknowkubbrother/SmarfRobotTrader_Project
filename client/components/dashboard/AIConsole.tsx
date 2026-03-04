@@ -10,6 +10,40 @@ interface LogEntry {
   message: string;
 }
 
+function parseUtcLike(raw: string): Date | null {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+
+  const direct = new Date(text);
+  if (!Number.isNaN(direct.getTime())) return direct;
+
+  // Handle "YYYY-MM-DD HH:mm:ssZ" (space before time + trailing Z)
+  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}Z$/i.test(text)) {
+    const patched = text.replace(" ", "T");
+    const parsed = new Date(patched);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  return null;
+}
+
+function toLocalClockText(rawUtc?: string, fallback?: string): string {
+  const parsed = parseUtcLike(String(rawUtc || ""));
+  if (!parsed) {
+    return String(fallback || "--:--:--");
+  }
+  return parsed.toLocaleTimeString([], { hour12: false });
+}
+
+function toLocalDateTimeText(rawUtc?: string): string {
+  const parsed = parseUtcLike(String(rawUtc || ""));
+  if (!parsed) {
+    return String(rawUtc || "").trim();
+  }
+  const dateText = parsed.toLocaleDateString();
+  const timeText = parsed.toLocaleTimeString([], { hour12: false });
+  return `${dateText} ${timeText}`;
+}
+
 const typeConfig = {
   info: { icon: Bot, color: "text-primary" },
   analysis: { icon: TrendingUp, color: "text-muted-foreground" },
@@ -73,7 +107,7 @@ function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
   if (phase === "CLOCK" && event === "waiting_new_candle") return "Waiting for next candle";
   if (phase === "CLOCK" && event === "new_closed_candle") {
     const ts = String(meta?.closed_utc || "").trim();
-    return ts ? `New candle closed (${ts})` : "New candle closed";
+    return ts ? `New candle closed (${toLocalDateTimeText(ts)})` : "New candle closed";
   }
 
   if (phase === "STARTUP" && event === "snapshot_no_order") {
@@ -92,7 +126,7 @@ function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
   }
   if (phase === "BAR" && event === "bar_start") {
     const endUtc = String(meta?.end_utc || "").trim();
-    return endUtc ? `Evaluating closed bar (${endUtc})` : "Evaluating closed bar";
+    return endUtc ? `Evaluating closed bar (${toLocalDateTimeText(endUtc)})` : "Evaluating closed bar";
   }
   if (phase === "BAR" && event === "bar_complete") {
     const finalAction = String(meta?.final_action || "").trim().toUpperCase();
@@ -163,7 +197,10 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
     for (let i = 0; i < wsLogs.length; i += 1) {
       const row = wsLogs[i];
       const type = row?.type && row.type in typeConfig ? row.type : "info";
-      const timestamp = String(row?.timestamp || "");
+      const timestamp = toLocalClockText(
+        typeof row?.timestamp_utc === "string" ? row.timestamp_utc : undefined,
+        String(row?.timestamp || "")
+      );
       if (shouldHideLog(row)) continue;
       const message = toFriendlyMessage(row);
       if (!message) continue;
