@@ -127,6 +127,7 @@ CREATE TABLE "orders_history" (
   "ticket_id" BIGINT PRIMARY KEY, -- MT5 Ticket ID
   "account_id" UUID NOT NULL REFERENCES "trading_accounts" ("account_id") ON DELETE CASCADE,
   "bot_instance_id" INT, -- Links to specific bot
+  "magic_number" INT,
   
   "symbol" VARCHAR(20),
   "type" order_type_enum,
@@ -146,6 +147,7 @@ CREATE TABLE "orders_history" (
 
 -- Index for querying orders by bot
 CREATE INDEX "idx_orders_bot_instance" ON "orders_history" ("account_id", "bot_instance_id");
+CREATE INDEX "idx_orders_account_magic" ON "orders_history" ("account_id", "magic_number");
 
 CREATE TABLE "daily_aggregates" (
   "id" UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -223,8 +225,11 @@ ALTER TABLE "bot_configurations"
 
 CREATE INDEX IF NOT EXISTS "idx_trading_accounts_record_status" ON "trading_accounts" ("record_status");
 CREATE INDEX IF NOT EXISTS "idx_bot_configurations_record_status" ON "bot_configurations" ("record_status");
+ALTER TABLE "orders_history"
+  ADD COLUMN IF NOT EXISTS "magic_number" INT;
 DROP INDEX IF EXISTS "idx_bot_configurations_account_magic";
 CREATE UNIQUE INDEX IF NOT EXISTS "idx_bot_configurations_account_magic" ON "bot_configurations" ("account_id", "magic_number");
+CREATE INDEX IF NOT EXISTS "idx_orders_account_magic" ON "orders_history" ("account_id", "magic_number");
 
 -- ==============================================================
 -- 6. Billing & Subscriptions

@@ -46,6 +46,39 @@ def _env_bool(default: bool, *names: str) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _env_int_set(default_values: set[int], *names: str) -> set[int]:
+    raw = _env_first(*names)
+    if not raw:
+        return set(int(v) for v in default_values)
+
+    out: set[int] = set()
+    for chunk in str(raw).replace(";", ",").split(","):
+        text = str(chunk or "").strip()
+        if not text:
+            continue
+        try:
+            out.add(int(float(text)))
+        except Exception:
+            continue
+    if len(out) == 0:
+        return set(int(v) for v in default_values)
+    return out
+
+
+def _safe_token(raw: str, fallback: str = "default") -> str:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return fallback
+    out = []
+    for ch in text:
+        if ch.isalnum() or ch in {"_", "-"}:
+            out.append(ch)
+        else:
+            out.append("_")
+    token = "".join(out).strip("_")
+    return token or fallback
+
+
 def _parse_risk_profile(raw: str) -> dict[str, float]:
     profile = {"low": 0.5, "medium": 1.0, "high": 1.5}
     if not raw:
@@ -176,6 +209,42 @@ def _derive_vision_llm_api_url(bot_ws_url: str) -> str:
 
 VISION_LLM_API_URL = _derive_vision_llm_api_url(BOT_WS_URL)
 VISION_LLM_TIMEOUT_SEC = _env_float(420.00, "VISION_LLM_TIMEOUT_SEC")
+LIVE_PERFORMANCE_SYNC_INTERVAL_SEC = max(
+    5.0,
+    _env_float(120.0, "LIVE_PERFORMANCE_SYNC_INTERVAL_SEC"),
+)
+LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS = max(
+    30,
+    _env_int(3650, "LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS"),
+)
+LIVE_PERFORMANCE_SCOPE = (_env_first("LIVE_PERFORMANCE_SCOPE") or "symbol").strip().lower()
+if LIVE_PERFORMANCE_SCOPE not in {"managed", "symbol", "account"}:
+    LIVE_PERFORMANCE_SCOPE = "symbol"
+LIVE_MANAGED_MAGIC_SET = _env_int_set(
+    {int(MAGIC_NUMBER), 123456, 12345, 0},
+    "LIVE_MANAGED_MAGIC_SET",
+    "LIVE_MANAGED_MAGIC_NUMBERS",
+    "LIVE_MAGIC_SET",
+    "LIVE_MAGIC_NUMBERS",
+)
+LIVE_PERFORMANCE_MAGIC_SET = _env_int_set(
+    set(LIVE_MANAGED_MAGIC_SET),
+    "LIVE_PERFORMANCE_MAGIC_SET",
+    "LIVE_PERFORMANCE_MAGIC_NUMBERS",
+)
+LIVE_PREWARM_SEMANTIC_ON_START = _env_bool(True, "LIVE_PREWARM_SEMANTIC_ON_START")
+LIVE_PREWARM_SEMANTIC_MAX_SECONDS = max(
+    0.0,
+    _env_float(45.0, "LIVE_PREWARM_SEMANTIC_MAX_SECONDS"),
+)
+LIVE_PREWARM_SEMANTIC_MAX_MISSING = max(
+    1,
+    _env_int(24, "LIVE_PREWARM_SEMANTIC_MAX_MISSING"),
+)
+LIVE_PREWARM_REQUEST_TIMEOUT_SEC = max(
+    5.0,
+    _env_float(20.0, "LIVE_PREWARM_REQUEST_TIMEOUT_SEC"),
+)
 
 
 # ---- Live feature / gate / bridge parameters (owned by live config)
@@ -265,7 +334,16 @@ LLM_TEXT_LOG_FILE = (
     or os.path.join(MODELS_DIR, "time_to_llm_text.jsonl")
 )
 LLM_SEMANTIC_CACHE_SCHEMA = "utc_v2"
-STATE_FILE = _env_first("LIVE_STATE_FILE") or os.path.join(MODELS_DIR, "run_live_state.json")
+STATE_FILE = _env_first("LIVE_STATE_FILE")
+if not STATE_FILE:
+    state_identity = (
+        _safe_token(BOT_CONFIG_ID)
+        if BOT_CONFIG_ID
+        else _safe_token(_env_first("MT5_LOGIN"), fallback="")
+    )
+    if not state_identity:
+        state_identity = _safe_token(f"{SYMBOL}_{TIMEFRAME_NAME}")
+    STATE_FILE = os.path.join(MODELS_DIR, f"run_live_state_{state_identity}.json")
 MODEL_PATH = os.path.join(MODELS_DIR, "ppo_trading.zip")
 VEC_NORM_PATH = os.path.join(MODELS_DIR, "vec_normalize.pkl")
 

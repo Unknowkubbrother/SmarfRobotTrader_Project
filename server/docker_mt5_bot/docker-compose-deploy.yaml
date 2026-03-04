@@ -6,6 +6,7 @@ services:
       - config:/config
       - ./bots:/bots
       - ${MT5_SNAPSHOT_HOST_DIR:-./snapshots}:/snapshots
+      - ${MT5_INSTANCE_HOST_DIR:-./.instances}:/instances
       - pydeps:/shared-pydeps
     ports:
       - ${MT5_WEB_PORT:-3000}:3000

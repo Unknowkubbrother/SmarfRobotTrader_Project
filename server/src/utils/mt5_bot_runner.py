@@ -101,6 +101,29 @@ def build_bot_runtime_env(
         "FORCE_REBUILD": os.getenv("BOT_RUNNER_FORCE_REBUILD", "0").strip() or "0",
     }
 
+    optional_passthrough = {
+        "BOT_RUNNER_MODELS_DIR": "LIVE_MODELS_DIR",
+        "BOT_RUNNER_LLM_SEMANTIC_CACHE_FILE": "LIVE_LLM_SEMANTIC_CACHE_FILE",
+        "BOT_RUNNER_LLM_TEXT_LOG_FILE": "LIVE_LLM_TEXT_LOG_FILE",
+        "BOT_RUNNER_STATE_FILE": "LIVE_STATE_FILE",
+        "BOT_RUNNER_MANAGED_MAGIC_SET": "LIVE_MANAGED_MAGIC_SET",
+        "BOT_RUNNER_PERFORMANCE_MAGIC_SET": "LIVE_PERFORMANCE_MAGIC_SET",
+        "BOT_RUNNER_PERFORMANCE_SCOPE": "LIVE_PERFORMANCE_SCOPE",
+        "BOT_RUNNER_PERFORMANCE_SYNC_INTERVAL_SEC": "LIVE_PERFORMANCE_SYNC_INTERVAL_SEC",
+        "BOT_RUNNER_PERFORMANCE_BOOT_LOOKBACK_DAYS": "LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS",
+        "BOT_RUNNER_PREWARM_SEMANTIC_ON_START": "LIVE_PREWARM_SEMANTIC_ON_START",
+        "BOT_RUNNER_PREWARM_SEMANTIC_MAX_SECONDS": "LIVE_PREWARM_SEMANTIC_MAX_SECONDS",
+        "BOT_RUNNER_PREWARM_SEMANTIC_MAX_MISSING": "LIVE_PREWARM_SEMANTIC_MAX_MISSING",
+        "BOT_RUNNER_PREWARM_REQUEST_TIMEOUT_SEC": "LIVE_PREWARM_REQUEST_TIMEOUT_SEC",
+    }
+    for source_name, target_name in optional_passthrough.items():
+        raw_value = os.getenv(source_name)
+        if raw_value is None:
+            continue
+        value = str(raw_value).strip()
+        if value:
+            env[target_name] = value
+
     if magic_number is not None:
         env["LIVE_MAGIC_NUMBER"] = str(int(magic_number))
 

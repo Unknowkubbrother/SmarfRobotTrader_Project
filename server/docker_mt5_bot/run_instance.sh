@@ -14,6 +14,22 @@ COMMAND="start"
 INSTANCE_RAW=""
 PROFILE=""
 
+migrate_legacy_instance_env_files() {
+  shopt -s nullglob
+  local legacy_file legacy_name target_dir target_file
+  for legacy_file in "$STATE_DIR"/*.env; do
+    [[ -f "$legacy_file" ]] || continue
+    legacy_name="$(basename "$legacy_file" .env)"
+    [[ -n "$legacy_name" ]] || continue
+    target_dir="$STATE_DIR/$legacy_name"
+    target_file="$target_dir/.env"
+    mkdir -p "$target_dir"
+    if [[ ! -f "$target_file" ]]; then
+      mv "$legacy_file" "$target_file"
+    fi
+  done
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -208,27 +224,38 @@ pick_free_port() {
 show_list() {
   echo "Profiles:"
   local any_profiles=0
+  local profiles=()
+  local profile_name
   while IFS= read -r profile_name; do
     [[ -n "$profile_name" ]] || continue
-    echo "  $profile_name"
+    profiles+=("$profile_name")
     any_profiles=1
   done < <(list_available_profiles)
   if [[ "$any_profiles" -eq 0 ]]; then
     echo "  (none)"
+  else
+    printf '%s\n' "${profiles[@]}" | LC_ALL=C sort -u | sed 's/^/  /'
   fi
   echo ""
   echo "Instances:"
   shopt -s nullglob
-  local files=("$STATE_DIR"/*.env)
-  if (( ${#files[@]} == 0 )); then
-    echo "  (none)"
-    return 0
-  fi
-  for f in "${files[@]}"; do
-    local name
-    name="$(basename "$f" .env)"
-    echo "  $name"
+  local any_instances=0
+  local instances=()
+  local f
+  for f in "$STATE_DIR"/*/.env "$STATE_DIR"/*.env; do
+    [[ -f "$f" ]] || continue
+    if [[ "$(basename "$(dirname "$f")")" == ".instances" ]]; then
+      instances+=("$(basename "$f" .env)")
+    else
+      instances+=("$(basename "$(dirname "$f")")")
+    fi
+    any_instances=1
   done
+  if [[ "$any_instances" -eq 0 ]]; then
+    echo "  (none)"
+  else
+    printf '%s\n' "${instances[@]}" | LC_ALL=C sort -u | sed 's/^/  /'
+  fi
 }
 
 resolve_instance_and_profile() {
@@ -262,6 +289,7 @@ resolve_instance_and_profile() {
 }
 
 if [[ "$CMD_RAW" == "list" ]]; then
+  migrate_legacy_instance_env_files
   show_list
   exit 0
 fi
@@ -292,6 +320,7 @@ if [[ "$COMMAND" == "stop" ]]; then
 fi
 
 resolve_instance_and_profile
+migrate_legacy_instance_env_files
 
 if [[ "$COMMAND" == "restart" ]]; then
   export COMPOSE_PROJECT_NAME="mt5_${INSTANCE_NAME}"
@@ -309,7 +338,14 @@ LIVE_MAGIC_NUMBER_VAL="${LIVE_MAGIC_NUMBER:-$(read_dotenv_value LIVE_MAGIC_NUMBE
 LIVE_MANAGE_MANUAL_POSITIONS_VAL="${LIVE_MANAGE_MANUAL_POSITIONS:-$(read_dotenv_value LIVE_MANAGE_MANUAL_POSITIONS)}"
 validate_link_env "$BOT_WS_URL_VAL" "$VISION_LLM_API_URL_VAL"
 
-INSTANCE_ENV_FILE="$STATE_DIR/${INSTANCE_NAME}.env"
+INSTANCE_DIR="$STATE_DIR/${INSTANCE_NAME}"
+INSTANCE_ENV_FILE="$INSTANCE_DIR/.env"
+LEGACY_INSTANCE_ENV_FILE="$STATE_DIR/${INSTANCE_NAME}.env"
+mkdir -p "$INSTANCE_DIR"
+if [[ -f "$LEGACY_INSTANCE_ENV_FILE" && ! -f "$INSTANCE_ENV_FILE" ]]; then
+  mv "$LEGACY_INSTANCE_ENV_FILE" "$INSTANCE_ENV_FILE"
+fi
+
 FORCED_WEB_PORT="${MT5_WEB_PORT:-}"
 if [[ -f "$INSTANCE_ENV_FILE" ]]; then
   # shellcheck disable=SC1090
@@ -360,6 +396,7 @@ mkdir -p "$SNAPSHOT_HOST_DIR_ABS"
 export COMPOSE_PROJECT_NAME
 export MT5_WEB_PORT
 export MT5_SNAPSHOT_HOST_DIR="$SNAPSHOT_HOST_DIR_ABS"
+export MT5_INSTANCE_HOST_DIR="$STATE_DIR"
 export BOT_CONFIG_ID="$BOT_CONFIG_ID_VAL"
 export BOT_WS_URL="$BOT_WS_URL_VAL"
 export VISION_LLM_API_URL="$VISION_LLM_API_URL_VAL"
@@ -375,6 +412,48 @@ if [[ -z "${MT5_SNAPSHOT_PATH:-}" ]]; then
   export MT5_SNAPSHOT_PATH="/snapshots/mt5-config-snapshot.tgz"
 fi
 
+if [[ -z "${LIVE_MODELS_DIR:-}" ]]; then
+  export LIVE_MODELS_DIR="/bots/${PROFILE}/models"
+fi
+if [[ -z "${LIVE_LLM_SEMANTIC_CACHE_FILE:-}" ]]; then
+  export LIVE_LLM_SEMANTIC_CACHE_FILE="${LIVE_MODELS_DIR}/time_to_embedding_llm_cls.joblib"
+fi
+if [[ -z "${LIVE_LLM_TEXT_LOG_FILE:-}" ]]; then
+  export LIVE_LLM_TEXT_LOG_FILE="${LIVE_MODELS_DIR}/time_to_llm_text.jsonl"
+fi
+if [[ -z "${LIVE_PREWARM_SEMANTIC_ON_START:-}" ]]; then
+  export LIVE_PREWARM_SEMANTIC_ON_START="1"
+fi
+if [[ -z "${LIVE_PREWARM_SEMANTIC_MAX_SECONDS:-}" ]]; then
+  export LIVE_PREWARM_SEMANTIC_MAX_SECONDS="45"
+fi
+if [[ -z "${LIVE_PREWARM_SEMANTIC_MAX_MISSING:-}" ]]; then
+  export LIVE_PREWARM_SEMANTIC_MAX_MISSING="24"
+fi
+if [[ -z "${LIVE_PREWARM_REQUEST_TIMEOUT_SEC:-}" ]]; then
+  export LIVE_PREWARM_REQUEST_TIMEOUT_SEC="20"
+fi
+if [[ -z "${LIVE_PERFORMANCE_SYNC_INTERVAL_SEC:-}" ]]; then
+  export LIVE_PERFORMANCE_SYNC_INTERVAL_SEC="120"
+fi
+if [[ -z "${LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS:-}" ]]; then
+  export LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS="3650"
+fi
+if [[ -z "${LIVE_PERFORMANCE_SCOPE:-}" ]]; then
+  export LIVE_PERFORMANCE_SCOPE="symbol"
+fi
+if [[ -z "${LIVE_MANAGED_MAGIC_SET:-}" ]]; then
+  BASE_MANAGED_MAGIC="${LIVE_MAGIC_NUMBER:-123456}"
+  BASE_MANAGED_MAGIC="$(printf '%s' "$BASE_MANAGED_MAGIC" | tr -d '[:space:]')"
+  if [[ -z "$BASE_MANAGED_MAGIC" ]]; then
+    BASE_MANAGED_MAGIC="123456"
+  fi
+  export LIVE_MANAGED_MAGIC_SET="${BASE_MANAGED_MAGIC},123456,12345,0"
+fi
+if [[ -z "${LIVE_PERFORMANCE_MAGIC_SET:-}" ]]; then
+  export LIVE_PERFORMANCE_MAGIC_SET="${LIVE_MANAGED_MAGIC_SET}"
+fi
+
 if [[ -z "${BOT_SCRIPT:-}" ]]; then
   export BOT_SCRIPT="$BOT_SCRIPT_DEFAULT"
 fi
@@ -384,6 +463,11 @@ fi
 if [[ -z "${BOT_LOG:-}" ]]; then
   export BOT_LOG="/config/${INSTANCE_NAME}_${PROFILE}.log"
 fi
+if [[ -z "${LIVE_STATE_FILE:-}" ]]; then
+  export LIVE_STATE_FILE="/instances/${INSTANCE_NAME}/run_live_state.json"
+fi
+
+INSTANCE_STATE_HOST_FILE="$INSTANCE_DIR/run_live_state.json"
 
 echo "Instance: $INSTANCE_NAME"
 echo "Project: $COMPOSE_PROJECT_NAME"
@@ -395,6 +479,20 @@ echo "BOT_WS_URL: $BOT_WS_URL"
 echo "VISION_LLM_API_URL: $VISION_LLM_API_URL"
 echo "LIVE_MAGIC_NUMBER: ${LIVE_MAGIC_NUMBER:-auto}"
 echo "LIVE_MANAGE_MANUAL_POSITIONS: ${LIVE_MANAGE_MANUAL_POSITIONS:-0}"
+echo "LIVE_MODELS_DIR: ${LIVE_MODELS_DIR:-auto}"
+echo "LIVE_LLM_SEMANTIC_CACHE_FILE: ${LIVE_LLM_SEMANTIC_CACHE_FILE:-auto}"
+echo "LIVE_LLM_TEXT_LOG_FILE: ${LIVE_LLM_TEXT_LOG_FILE:-auto}"
+echo "LIVE_PREWARM_SEMANTIC_ON_START: ${LIVE_PREWARM_SEMANTIC_ON_START:-auto}"
+echo "LIVE_PREWARM_SEMANTIC_MAX_SECONDS: ${LIVE_PREWARM_SEMANTIC_MAX_SECONDS:-auto}"
+echo "LIVE_PREWARM_SEMANTIC_MAX_MISSING: ${LIVE_PREWARM_SEMANTIC_MAX_MISSING:-auto}"
+echo "LIVE_PREWARM_REQUEST_TIMEOUT_SEC: ${LIVE_PREWARM_REQUEST_TIMEOUT_SEC:-auto}"
+echo "LIVE_PERFORMANCE_SYNC_INTERVAL_SEC: ${LIVE_PERFORMANCE_SYNC_INTERVAL_SEC:-auto}"
+echo "LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS: ${LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS:-auto}"
+echo "LIVE_PERFORMANCE_SCOPE: ${LIVE_PERFORMANCE_SCOPE:-auto}"
+echo "LIVE_MANAGED_MAGIC_SET: ${LIVE_MANAGED_MAGIC_SET:-auto}"
+echo "LIVE_PERFORMANCE_MAGIC_SET: ${LIVE_PERFORMANCE_MAGIC_SET:-auto}"
+echo "LIVE_STATE_FILE: ${LIVE_STATE_FILE:-auto}"
+echo "HOST_STATE_FILE: $INSTANCE_STATE_HOST_FILE"
 echo "Snapshot host dir: $MT5_SNAPSHOT_HOST_DIR"
 echo "Snapshot path in container: $MT5_SNAPSHOT_PATH"
 

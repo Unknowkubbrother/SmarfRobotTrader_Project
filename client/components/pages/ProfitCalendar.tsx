@@ -36,6 +36,7 @@ interface TradeHistoryRow {
   commission: number;
   swap: number;
   profit: number;
+  netProfit?: number;
   openTime: string | null;
   closeTime: string | null;
 }
@@ -58,6 +59,11 @@ interface TradingAccountSource {
 const weekDays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const ALL_ACCOUNTS_FILTER = "__all_accounts__";
 const INCLUDE_ARCHIVED_STORAGE_KEY = "profit-calendar-include-archived";
+const toDateKey = (year: number, monthZeroBased: number, day: number): string => {
+  const mm = String(monthZeroBased + 1).padStart(2, "0");
+  const dd = String(day).padStart(2, "0");
+  return `${year}-${mm}-${dd}`;
+};
 
 export default function ProfitCalendar() {
   const [currentDate, setCurrentDate] = useState(new Date());
@@ -77,7 +83,7 @@ export default function ProfitCalendar() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historySummary, setHistorySummary] = useState<TradeHistorySummary | null>(null);
   const [tradingAccounts, setTradingAccounts] = useState<TradingAccountSource[]>([]);
-  const [historyAccountFilter, setHistoryAccountFilter] = useState<string>(ALL_ACCOUNTS_FILTER);
+  const [calendarAccountFilter, setCalendarAccountFilter] = useState<string>(ALL_ACCOUNTS_FILTER);
   const [includeArchived, setIncludeArchived] = useState<boolean>(() => {
     if (typeof window === "undefined") return true;
     const raw = window.localStorage.getItem(INCLUDE_ARCHIVED_STORAGE_KEY);
@@ -88,6 +94,7 @@ export default function ProfitCalendar() {
 
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth();
+  const selectedAccountId = calendarAccountFilter === ALL_ACCOUNTS_FILTER ? null : calendarAccountFilter;
 
   const firstDayOfMonth = new Date(year, month, 1).getDay();
   const daysInMonth = new Date(year, month + 1, 0).getDate();
@@ -129,8 +136,16 @@ export default function ProfitCalendar() {
     const fetchCalendarData = async () => {
       setLoading(true);
       try {
+        const params: Record<string, number | string> = {
+          year,
+          month: month + 1,
+          includeArchived: includeArchived ? 1 : 0,
+        };
+        if (selectedAccountId) {
+          params.accountId = selectedAccountId;
+        }
         const res = await api.get("/trading/calendar", {
-          params: { year, month: month + 1, includeArchived: includeArchived ? 1 : 0 },
+          params,
         });
         const result = res.data || {};
         const apiData: { date: number; profit: number; trades: number; winRate: number }[] = Array.isArray(result.data)
@@ -189,7 +204,7 @@ export default function ProfitCalendar() {
     };
 
     fetchCalendarData();
-  }, [year, month, daysInMonth, includeArchived]);
+  }, [year, month, daysInMonth, includeArchived, selectedAccountId]);
 
   const navigateMonth = (direction: number) => {
     setCurrentDate(new Date(year, month + direction, 1));
@@ -199,7 +214,7 @@ export default function ProfitCalendar() {
   };
 
   const selectedDateKey = selectedDay
-    ? new Date(year, month, selectedDay.date).toISOString().split("T")[0]
+    ? toDateKey(year, month, selectedDay.date)
     : "";
 
   const accountById = useMemo(() => {
@@ -239,52 +254,49 @@ export default function ProfitCalendar() {
     return ids.map((id) => formatAccountLabel(id));
   }, [tradeHistory, accountById]);
 
-  const historyAccountOptions = useMemo(() => {
-    const ids = Array.from(
-      new Set(
-        tradeHistory
-          .map((row) => String(row.accountId || "").trim())
-          .filter((id) => id.length > 0)
-      )
-    );
-    return ids
-      .map((id) => ({ id, label: formatAccountLabel(id) }))
-      .sort((a, b) => a.label.localeCompare(b.label));
-  }, [tradeHistory, accountById]);
-
-  const filteredTradeHistory = useMemo(() => {
-    if (historyAccountFilter === ALL_ACCOUNTS_FILTER) return tradeHistory;
-    return tradeHistory.filter((row) => String(row.accountId || "").trim() === historyAccountFilter);
-  }, [tradeHistory, historyAccountFilter]);
+  const calendarAccountOptions = useMemo(
+    () =>
+      tradingAccounts
+        .filter((account) => Boolean(account.id))
+        .map((account) => ({ id: account.id, label: formatAccountLabel(account.id) }))
+        .sort((a, b) => a.label.localeCompare(b.label)),
+    [tradingAccounts, accountById]
+  );
 
   const effectiveHistorySummary = useMemo<TradeHistorySummary>(() => {
-    if (historyAccountFilter === ALL_ACCOUNTS_FILTER && historySummary) {
+    if (historySummary) {
       return {
         date: String(historySummary.date || selectedDateKey),
-        totalTrades: Number(historySummary.totalTrades || filteredTradeHistory.length || 0),
+        totalTrades: Number(historySummary.totalTrades || tradeHistory.length || 0),
         netProfit: Number(historySummary.netProfit || 0),
         wins: Number(historySummary.wins || 0),
         losses: Number(historySummary.losses || 0),
       };
     }
-    const wins = filteredTradeHistory.filter((r) => Number(r.profit || 0) > 0).length;
-    const losses = filteredTradeHistory.filter((r) => Number(r.profit || 0) < 0).length;
-    const netProfit = filteredTradeHistory.reduce((sum, r) => sum + Number(r.profit || 0), 0);
+    const wins = tradeHistory.filter((r) => Number(r.profit || 0) > 0).length;
+    const losses = tradeHistory.filter((r) => Number(r.profit || 0) < 0).length;
+    const netProfit = tradeHistory.reduce((sum, r) => sum + Number(r.profit || 0), 0);
     return {
       date: selectedDateKey,
-      totalTrades: filteredTradeHistory.length,
+      totalTrades: tradeHistory.length,
       netProfit,
       wins,
       losses,
     };
-  }, [historyAccountFilter, historySummary, filteredTradeHistory, selectedDateKey]);
+  }, [historySummary, tradeHistory, selectedDateKey]);
+
+  useEffect(() => {
+    if (calendarAccountFilter === ALL_ACCOUNTS_FILTER) return;
+    if (!accountById.has(calendarAccountFilter)) {
+      setCalendarAccountFilter(ALL_ACCOUNTS_FILTER);
+    }
+  }, [calendarAccountFilter, accountById]);
 
   useEffect(() => {
     setTradeHistory([]);
     setHistoryLoadedForDate("");
     setHistorySummary(null);
     setHistoryOpen(false);
-    setHistoryAccountFilter(ALL_ACCOUNTS_FILTER);
   }, [selectedDateKey]);
 
   useEffect(() => {
@@ -293,20 +305,23 @@ export default function ProfitCalendar() {
     setHistoryLoadedForDate("");
     setHistorySummary(null);
     setHistoryOpen(false);
-    setHistoryAccountFilter(ALL_ACCOUNTS_FILTER);
-  }, [includeArchived]);
+  }, [includeArchived, selectedAccountId]);
 
   const loadTradeHistory = async () => {
     if (!selectedDay) return;
     setHistoryLoading(true);
     try {
+      const params: Record<string, number | string> = {
+        year,
+        month: month + 1,
+        day: selectedDay.date,
+        includeArchived: includeArchived ? 1 : 0,
+      };
+      if (selectedAccountId) {
+        params.accountId = selectedAccountId;
+      }
       const res = await api.get("/trading/history_by_day", {
-        params: {
-          year,
-          month: month + 1,
-          day: selectedDay.date,
-          includeArchived: includeArchived ? 1 : 0,
-        },
+        params,
       });
       const rows = Array.isArray(res.data?.data) ? res.data.data : [];
       const summary = res.data?.summary && typeof res.data.summary === "object" ? res.data.summary : null;
@@ -320,9 +335,11 @@ export default function ProfitCalendar() {
           losses: Number(summary.losses || 0),
         });
       } else {
-        const wins = (rows as TradeHistoryRow[]).filter((r) => Number(r.profit || 0) > 0).length;
-        const losses = (rows as TradeHistoryRow[]).filter((r) => Number(r.profit || 0) < 0).length;
-        const netProfit = (rows as TradeHistoryRow[]).reduce((sum, r) => sum + Number(r.profit || 0), 0);
+        const normalizeRowNetProfit = (row: TradeHistoryRow) =>
+          Number(row.netProfit ?? Number(row.profit || 0) + Number(row.commission || 0) + Number(row.swap || 0));
+        const wins = (rows as TradeHistoryRow[]).filter((r) => normalizeRowNetProfit(r) > 0).length;
+        const losses = (rows as TradeHistoryRow[]).filter((r) => normalizeRowNetProfit(r) < 0).length;
+        const netProfit = (rows as TradeHistoryRow[]).reduce((sum, r) => sum + normalizeRowNetProfit(r), 0);
         setHistorySummary({
           date: selectedDateKey,
           totalTrades: rows.length,
@@ -371,7 +388,24 @@ export default function ProfitCalendar() {
           <h1 className="text-2xl font-bold text-foreground">Profit Calendar</h1>
           <p className="text-sm text-muted-foreground">Visualize your daily trading performance</p>
         </div>
-        <div className="rounded-lg border border-border bg-card px-3 py-2">
+        <div className="w-full max-w-[420px] rounded-lg border border-border bg-card px-3 py-3 space-y-3">
+          <div className="space-y-1">
+            <p className="text-xs text-muted-foreground">Filter by Account</p>
+            <Select value={calendarAccountFilter} onValueChange={setCalendarAccountFilter}>
+              <SelectTrigger className="h-9">
+                <SelectValue placeholder="Select account" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL_ACCOUNTS_FILTER}>All accounts</SelectItem>
+                {calendarAccountOptions.map((option) => (
+                  <SelectItem key={option.id} value={option.id}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
           <div className="flex items-center gap-2">
             <Switch
               id="calendar-include-archived"
@@ -463,7 +497,7 @@ export default function ProfitCalendar() {
                     <span className="text-xs text-white/90 font-medium">{day.date}</span>
                     {day.profit !== null && (
                       <span className="text-[10px] font-mono font-semibold mt-0.5 text-white">
-                        {day.profit >= 0 ? "+" : ""}${Math.abs(day.profit).toFixed(0)}
+                        {day.profit >= 0 ? "+" : ""}${Math.abs(day.profit).toFixed(2)}
                       </span>
                     )}
                   </button>
@@ -585,28 +619,10 @@ export default function ProfitCalendar() {
                 </DialogDescription>
               </DialogHeader>
 
-              <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-                <div className="text-xs text-muted-foreground">
-                  {historyAccountFilter === ALL_ACCOUNTS_FILTER
-                    ? "Showing all accounts"
-                    : `Showing account: ${formatAccountLabel(historyAccountFilter)}`}
-                </div>
-                <div className="w-full md:w-[320px] space-y-1">
-                  <p className="text-xs text-muted-foreground">Filter by Profit Account</p>
-                  <Select value={historyAccountFilter} onValueChange={setHistoryAccountFilter}>
-                    <SelectTrigger className="h-9">
-                      <SelectValue placeholder="Select account" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={ALL_ACCOUNTS_FILTER}>All accounts</SelectItem>
-                      {historyAccountOptions.map((option) => (
-                        <SelectItem key={option.id} value={option.id}>
-                          {option.label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+              <div className="text-xs text-muted-foreground">
+                {selectedAccountId
+                  ? `Filtered account: ${formatAccountLabel(selectedAccountId)}`
+                  : "Filtered account: All accounts"}
               </div>
 
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -647,14 +663,14 @@ export default function ProfitCalendar() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {historyLoadedForDate === selectedDateKey && filteredTradeHistory.length === 0 && (
+                    {historyLoadedForDate === selectedDateKey && tradeHistory.length === 0 && (
                       <TableRow>
                         <TableCell colSpan={10} className="text-center text-muted-foreground py-8">
                           No trade history found for this day
                         </TableCell>
                       </TableRow>
                     )}
-                    {filteredTradeHistory.map((row) => {
+                    {tradeHistory.map((row) => {
                       const fee = Number(row.commission || 0) + Number(row.swap || 0);
                       return (
                         <TableRow key={`${row.ticketId}-${row.closeTime || ""}`}>

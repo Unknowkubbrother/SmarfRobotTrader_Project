@@ -106,12 +106,22 @@ async def _get_bot_context(bot_config_id: str) -> dict | None:
     context = {
         "account_id": str(config.accountId),
         "bot_instance_id": _safe_int(getattr(config, "botInstanceId", 0), 0),
+        "magic_number": _safe_int(getattr(config, "magicNumber", 0), 0),
     }
     _BOT_CONTEXT[bot_config_id] = context
     return context
 
 
-def _extract_live_positions(state: dict) -> dict[int, dict]:
+def _resolve_allowed_magic_set(context: dict | None = None) -> set[int]:
+    out = {0, 12345, 123456}
+    if isinstance(context, dict):
+        magic_number = _safe_int(context.get("magic_number"), 0)
+        if magic_number > 0:
+            out.add(magic_number)
+    return out
+
+
+def _extract_live_positions(state: dict, allowed_magic_set: set[int] | None = None) -> dict[int, dict]:
     raw_positions = state.get("positions")
     if not isinstance(raw_positions, list):
         return {}
@@ -123,30 +133,46 @@ def _extract_live_positions(state: dict) -> dict[int, dict]:
         ticket = _safe_int(item.get("ticket"), 0)
         if ticket <= 0:
             continue
+        magic = _safe_int(item.get("magic"), 0)
+        if isinstance(allowed_magic_set, set) and len(allowed_magic_set) > 0:
+            if magic not in allowed_magic_set:
+                continue
         side_raw = str(item.get("type", "")).strip().upper()
         side = "buy" if side_raw == "BUY" else "sell" if side_raw == "SELL" else None
         pos_payload = {
             "ticket": ticket,
             "symbol": str(item.get("symbol") or state.get("symbol") or "").strip().upper() or None,
             "type": side,
+            "magic": magic,
             "volume": _safe_float(item.get("volume", 0.0)),
             "openPrice": _safe_float(item.get("price_open", 0.0)),
             "closePrice": _safe_float(item.get("price_current", 0.0)),
             "profit": _safe_float(item.get("profit", 0.0)),
             "swap": _safe_float(item.get("swap", 0.0)),
+            "commission": _safe_float(item.get("commission", 0.0)),
             "openTime": _parse_open_time(item),
         }
         positions[ticket] = pos_payload
     return positions
 
 
-async def _persist_closed_orders_only(bot_config_id: str, account_id: str, bot_instance_id: int, state: dict) -> None:
-    current_positions = _extract_live_positions(state)
+async def _persist_closed_orders_only(
+    bot_config_id: str,
+    account_id: str,
+    bot_instance_id: int,
+    state: dict,
+    *,
+    allowed_magic_set: set[int] | None = None,
+    skip_ticket_ids: set[int] | None = None,
+) -> None:
+    current_positions = _extract_live_positions(state, allowed_magic_set=allowed_magic_set)
     previous_positions = _BOT_OPEN_POSITIONS.get(bot_config_id, {})
     closed_ticket_ids = [
         int(ticket) for ticket in previous_positions.keys()
         if int(ticket) not in current_positions
     ]
+    if skip_ticket_ids:
+        closed_ticket_ids = [ticket for ticket in closed_ticket_ids if int(ticket) not in skip_ticket_ids]
     if not closed_ticket_ids:
         _BOT_OPEN_POSITIONS[bot_config_id] = current_positions
         return
@@ -164,6 +190,7 @@ async def _persist_closed_orders_only(bot_config_id: str, account_id: str, bot_i
         pos = previous_positions.get(ticket) or {}
         data = {
             "botInstanceId": bot_instance_id,
+            "magicNumber": _safe_int(pos.get("magic", 0), 0) or None,
             "symbol": pos.get("symbol"),
             "volume": pos.get("volume"),
             "openPrice": _safe_float(pos.get("openPrice", 0.0)) or None,
@@ -172,6 +199,7 @@ async def _persist_closed_orders_only(bot_config_id: str, account_id: str, bot_i
             "closeTime": close_dt,
             "profit": _safe_float(pos.get("profit", 0.0)),
             "swap": _safe_float(pos.get("swap", 0.0)),
+            "commission": _safe_float(pos.get("commission", 0.0)),
             "status": "closed",
         }
         if pos.get("type") is not None:
@@ -197,6 +225,7 @@ async def _persist_closed_orders_only(bot_config_id: str, account_id: str, bot_i
                 "ticketId": ticket,
                 "account": {"connect": {"id": account_id}},
                 "botInstanceId": bot_instance_id,
+                "magicNumber": _safe_int(pos.get("magic", 0), 0) or None,
                 "symbol": pos.get("symbol"),
                 "volume": pos.get("volume"),
                 "openPrice": _safe_float(pos.get("openPrice", 0.0)) or None,
@@ -205,6 +234,7 @@ async def _persist_closed_orders_only(bot_config_id: str, account_id: str, bot_i
                 "closeTime": close_dt,
                 "profit": _safe_float(pos.get("profit", 0.0)),
                 "swap": _safe_float(pos.get("swap", 0.0)),
+                "commission": _safe_float(pos.get("commission", 0.0)),
                 "status": "closed",
             }
             if pos.get("type") is not None:
@@ -214,6 +244,195 @@ async def _persist_closed_orders_only(bot_config_id: str, account_id: str, bot_i
             )
 
     _BOT_OPEN_POSITIONS[bot_config_id] = current_positions
+
+
+def _parse_closed_time(raw) -> datetime | None:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+
+    text = str(raw or "").strip()
+    if not text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _as_utc_datetime(value) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _almost_equal(left: float | int | None, right: float | int | None, tolerance: float = 1e-6) -> bool:
+    try:
+        l_val = float(left or 0.0)
+        r_val = float(right or 0.0)
+    except Exception:
+        return False
+    return abs(l_val - r_val) <= tolerance
+
+
+def _should_update_closed_order(existing, incoming: dict) -> bool:
+    existing_magic = _safe_int(getattr(existing, "magicNumber", None), 0)
+    incoming_magic = _safe_int(incoming.get("magicNumber"), 0)
+    if existing_magic != incoming_magic:
+        return True
+
+    existing_symbol = str(getattr(existing, "symbol", "") or "").strip().upper()
+    incoming_symbol = str(incoming.get("symbol", "") or "").strip().upper()
+    if existing_symbol != incoming_symbol:
+        return True
+
+    if not _almost_equal(getattr(existing, "volume", 0.0), incoming.get("volume", 0.0), tolerance=1e-4):
+        return True
+
+    incoming_close_price = incoming.get("closePrice")
+    if incoming_close_price is not None and not _almost_equal(getattr(existing, "closePrice", 0.0), incoming_close_price, tolerance=1e-6):
+        return True
+
+    if not _almost_equal(getattr(existing, "profit", 0.0), incoming.get("profit", 0.0), tolerance=1e-4):
+        return True
+
+    if not _almost_equal(getattr(existing, "swap", 0.0), incoming.get("swap", 0.0), tolerance=1e-4):
+        return True
+
+    if not _almost_equal(getattr(existing, "commission", 0.0), incoming.get("commission", 0.0), tolerance=1e-4):
+        return True
+
+    existing_close_time = _as_utc_datetime(getattr(existing, "closeTime", None))
+    incoming_close_time = _as_utc_datetime(incoming.get("closeTime"))
+    if existing_close_time is None and incoming_close_time is not None:
+        return True
+    if existing_close_time is not None and incoming_close_time is None:
+        return True
+    if existing_close_time is not None and incoming_close_time is not None:
+        if abs((existing_close_time - incoming_close_time).total_seconds()) > 0.5:
+            return True
+
+    existing_status = str(getattr(existing, "status", "") or "").strip().lower()
+    if existing_status != "closed":
+        return True
+
+    return False
+
+
+async def _persist_closed_deals_from_state(
+    account_id: str,
+    bot_instance_id: int,
+    state: dict,
+    *,
+    allowed_magic_set: set[int] | None = None,
+) -> set[int]:
+    raw_deals = state.get("closed_deals")
+    if not isinstance(raw_deals, list) or len(raw_deals) == 0:
+        return set()
+
+    normalized = []
+    for raw in raw_deals:
+        if not isinstance(raw, dict):
+            continue
+        ticket = _safe_int(raw.get("ticket"), 0)
+        if ticket <= 0:
+            continue
+        magic = _safe_int(raw.get("magic"), 0)
+        if isinstance(allowed_magic_set, set) and len(allowed_magic_set) > 0:
+            if magic not in allowed_magic_set:
+                continue
+
+        close_time = _parse_closed_time(raw.get("closeTime"))
+        if close_time is None:
+            close_time_msc = _safe_int(raw.get("closeTimeMsc"), 0)
+            if close_time_msc > 0:
+                close_time = datetime.fromtimestamp(close_time_msc / 1000.0, tz=timezone.utc)
+        if close_time is None:
+            close_time = datetime.now(timezone.utc)
+
+        close_price = _safe_float(raw.get("closePrice"), 0.0)
+        normalized.append(
+            {
+                "ticket": int(ticket),
+                "magic": magic,
+                "symbol": str(raw.get("symbol", "") or "").strip().upper() or None,
+                "volume": _safe_float(raw.get("volume"), 0.0),
+                "closePrice": close_price if close_price > 0 else None,
+                "closeTime": close_time,
+                "profit": _safe_float(raw.get("profit"), 0.0),
+                "swap": _safe_float(raw.get("swap"), 0.0),
+                "commission": _safe_float(raw.get("commission"), 0.0),
+            }
+        )
+
+    if len(normalized) == 0:
+        return set()
+
+    existing_rows = await db.orderhistory.find_many(
+        where={"ticketId": {"in": [row["ticket"] for row in normalized]}},
+    )
+    existing_by_ticket = {
+        _safe_int(row.ticketId, 0): row
+        for row in existing_rows
+    }
+
+    synced_ticket_ids: set[int] = set()
+    for row in normalized:
+        ticket = int(row["ticket"])
+        data: dict = {
+            "botInstanceId": bot_instance_id,
+            "magicNumber": _safe_int(row.get("magic"), 0) or None,
+            "symbol": row["symbol"],
+            "volume": row["volume"],
+            "closeTime": row["closeTime"],
+            "profit": row["profit"],
+            "swap": row["swap"],
+            "commission": row["commission"],
+            "status": "closed",
+        }
+        if row["closePrice"] is not None:
+            data["closePrice"] = row["closePrice"]
+
+        existing = existing_by_ticket.get(ticket)
+        if existing:
+            row_account_id = str(getattr(existing, "accountId", "") or "").strip()
+            if row_account_id and row_account_id != account_id:
+                logger.warning(
+                    "closed_deal ticket collision skipped ticket=%s existing_account=%s incoming_account=%s",
+                    ticket,
+                    row_account_id,
+                    account_id,
+                )
+                continue
+            if not _should_update_closed_order(existing, data):
+                synced_ticket_ids.add(ticket)
+                continue
+            await db.orderhistory.update(
+                where={"ticketId": ticket},
+                data=data,
+            )
+            synced_ticket_ids.add(ticket)
+        else:
+            await db.orderhistory.create(
+                data={
+                    "ticketId": ticket,
+                    "account": {"connect": {"id": account_id}},
+                    **data,
+                }
+            )
+            synced_ticket_ids.add(ticket)
+
+    return synced_ticket_ids
 
 
 def _build_account_update_payload(state: dict) -> dict:
@@ -297,14 +516,33 @@ async def _persist_bot_state(bot_config_id: str, state: dict) -> None:
     bot_instance_id = _safe_int(context.get("bot_instance_id", 0), 0)
     if not account_id:
         return
+    allowed_magic_set = _resolve_allowed_magic_set(context)
 
     try:
         await _persist_account_snapshot(bot_config_id, account_id, state)
     except Exception as exc:
         logger.warning("account snapshot sync failed for %s: %s", bot_config_id, exc)
 
+    synced_deal_ticket_ids: set[int] = set()
     try:
-        await _persist_closed_orders_only(bot_config_id, account_id, bot_instance_id, state)
+        synced_deal_ticket_ids = await _persist_closed_deals_from_state(
+            account_id,
+            bot_instance_id,
+            state,
+            allowed_magic_set=allowed_magic_set,
+        )
+    except Exception as exc:
+        logger.warning("closed deals sync failed for %s: %s", bot_config_id, exc)
+
+    try:
+        await _persist_closed_orders_only(
+            bot_config_id,
+            account_id,
+            bot_instance_id,
+            state,
+            allowed_magic_set=allowed_magic_set,
+            skip_ticket_ids=synced_deal_ticket_ids,
+        )
     except Exception as exc:
         logger.warning("closed orders sync failed for %s: %s", bot_config_id, exc)
 
@@ -384,6 +622,7 @@ async def bot_websocket(websocket: WebSocket):
                         _BOT_CONTEXT[bot_config_id] = {
                             "account_id": str(config.accountId),
                             "bot_instance_id": _safe_int(getattr(config, "botInstanceId", 0), 0),
+                            "magic_number": _safe_int(getattr(config, "magicNumber", 0), 0),
                         }
                         raw_schedule = getattr(config, "tradingSchedule", None)
                         schedule = normalize_trading_schedule(raw_schedule)

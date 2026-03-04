@@ -242,6 +242,7 @@ model OrderHistory {
   ticketId      BigInt @id @map("ticket_id")
   accountId     String @map("account_id") @db.Uuid
   botInstanceId Int?   @map("bot_instance_id")
+  magicNumber   Int?   @map("magic_number")
 
   symbol     String?    @db.VarChar(20)
   type       OrderType?
@@ -262,6 +263,7 @@ model OrderHistory {
   tradingJournal TradingJournal?
 
   @@index([accountId, botInstanceId])
+  @@index([accountId, magicNumber])
   @@map("orders_history")
 }
 

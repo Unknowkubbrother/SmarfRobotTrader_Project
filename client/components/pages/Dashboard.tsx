@@ -219,6 +219,7 @@ export default function Dashboard() {
   const accountBalance = selectedAccount?.balance ?? 0;
   const accountEquity = selectedAccount?.equity ?? accountBalance;
   const accountTodayPnl = selectedAccount?.total_today_pnl ?? 0;
+  const liveBalance = liveState?.balance ?? accountBalance;
   const liveEquity = liveState?.equity ?? accountEquity;
   const liveTotalPnl = liveState?.total_pnl ?? accountTodayPnl;
   const liveUnrealized = liveState?.unrealized_pnl ?? accountTodayPnl;
@@ -234,7 +235,7 @@ export default function Dashboard() {
     {
       icon: Wallet,
       label: "Total Balance",
-      value: `$${liveEquity.toFixed(2)}`,
+      value: `$${liveBalance.toFixed(2)}`,
       change: liveTotalPnl >= 0 ? `+${liveTotalPnl.toFixed(2)}` : liveTotalPnl.toFixed(2),
       changeType: liveTotalPnl >= 0 ? "positive" as const : "negative" as const,
     },

@@ -4,6 +4,7 @@ import shutil
 import sys
 import time
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from urllib import error as urlerror
@@ -16,6 +17,11 @@ from mt5linux import MetaTrader5
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
+try:
+    import fcntl
+except Exception:  # pragma: no cover - non-POSIX runtime
+    fcntl = None
+
 from .config import (
     BAR_HISTORY,
     CORE_DIR,
@@ -24,7 +30,6 @@ from .config import (
     EVAL_ON_START,
     EXECUTE_STALE_REPLAY_ORDERS,
     LIVE_DYNAMIC_LOT,
-    LIVE_MANAGE_MANUAL_POSITIONS,
     LIVE_SYNC_ACCOUNT_STATE,
     LLM_SEMANTIC_CACHE_FILE,
     LLM_SEMANTIC_CACHE_SCHEMA,
@@ -33,6 +38,15 @@ from .config import (
     MAX_CATCHUP_BARS,
     MODEL_PATH,
     MODELS_DIR,
+    LIVE_PREWARM_REQUEST_TIMEOUT_SEC,
+    LIVE_PREWARM_SEMANTIC_MAX_MISSING,
+    LIVE_PREWARM_SEMANTIC_MAX_SECONDS,
+    LIVE_PREWARM_SEMANTIC_ON_START,
+    LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS,
+    LIVE_MANAGED_MAGIC_SET,
+    LIVE_PERFORMANCE_MAGIC_SET,
+    LIVE_PERFORMANCE_SCOPE,
+    LIVE_PERFORMANCE_SYNC_INTERVAL_SEC,
     MT5_HOST,
     MT5_LOGIN,
     MT5_LOGIN_RETRIES,
@@ -102,6 +116,15 @@ class LiveTradingBot:
         self._ws_state_lock = threading.Lock()
         self._ws_pending_state_payload = None
         self._ws_last_enqueued_at = 0.0
+        self._open_position_tickets = set()
+        self._closed_deal_cursor_msc = 0
+        self._last_closed_deal_poll_at = 0.0
+        self._last_closed_deal_reconcile_at = 0.0
+        self._perf_last_sync_at = 0.0
+        self._perf_cursor_msc = 0
+        self._perf_seeded = False
+        self._perf_deal_seen = set()
+        self._perf_ticket_net = {}
         self._sem_retry_not_before = {}  # ts_key -> epoch seconds
         self.last_action = "HOLD"
         self._last_status_tick = None  # {"bid": float, "ask": float, "time": int}
@@ -388,6 +411,30 @@ class LiveTradingBot:
             res = None
         return res, retried
 
+    @contextmanager
+    def _exclusive_file_lock(self, target_path: str):
+        lock_path = f"{target_path}.lock"
+        lock_dir = os.path.dirname(lock_path)
+        lock_fh = None
+        try:
+            if lock_dir:
+                os.makedirs(lock_dir, exist_ok=True)
+            lock_fh = open(lock_path, "a+", encoding="utf-8")
+            if fcntl is not None:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            if lock_fh is not None:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+                try:
+                    lock_fh.close()
+                except Exception:
+                    pass
+
     def _load_llm_semantic_cache(self):
         self.llm_semantic_cache = {}
         cache_file = self.llm_semantic_cache_file
@@ -431,15 +478,59 @@ class LiveTradingBot:
             cache_dir = os.path.dirname(cache_file)
             if cache_dir:
                 os.makedirs(cache_dir, exist_ok=True)
-            tmp_path = f"{cache_file}.tmp"
-            serializable = {k: np.asarray(v, dtype=np.float32) for k, v in self.llm_semantic_cache.items()}
-            payload = {
-                "schema": LLM_SEMANTIC_CACHE_SCHEMA,
-                "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                "rows": serializable,
-            }
-            joblib.dump(payload, tmp_path)
-            os.replace(tmp_path, cache_file)
+            with self._exclusive_file_lock(cache_file):
+                merged_rows = {}
+                if os.path.exists(cache_file):
+                    try:
+                        existing_payload = joblib.load(cache_file)
+                    except Exception:
+                        existing_payload = None
+                    existing_rows = None
+                    if isinstance(existing_payload, dict):
+                        if (
+                            existing_payload.get("schema") == LLM_SEMANTIC_CACHE_SCHEMA
+                            and isinstance(existing_payload.get("rows"), dict)
+                        ):
+                            existing_rows = existing_payload.get("rows")
+                        elif existing_payload and all(isinstance(k, str) for k in existing_payload.keys()):
+                            existing_rows = existing_payload
+                    if isinstance(existing_rows, dict):
+                        for key, vec in existing_rows.items():
+                            if not isinstance(key, str):
+                                continue
+                            arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+                            if arr.size == 0:
+                                continue
+                            merged_rows[key] = arr
+
+                for key, vec in self.llm_semantic_cache.items():
+                    if not isinstance(key, str):
+                        continue
+                    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+                    if arr.size == 0:
+                        continue
+                    merged_rows[key] = arr
+
+                if not merged_rows:
+                    return
+
+                serializable = {k: np.asarray(v, dtype=np.float32) for k, v in merged_rows.items()}
+                payload = {
+                    "schema": LLM_SEMANTIC_CACHE_SCHEMA,
+                    "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "rows": serializable,
+                }
+                tmp_path = f"{cache_file}.tmp.{os.getpid()}.{int(time.time() * 1000000)}"
+                try:
+                    joblib.dump(payload, tmp_path)
+                    os.replace(tmp_path, cache_file)
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                self.llm_semantic_cache = merged_rows
         except Exception as exc:
             print(f" LLM semantic cache save failed ({reason}): {exc}")
 
@@ -457,8 +548,9 @@ class LiveTradingBot:
                 "text": str(llm_text or "").strip(),
                 "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             }
-            with open(self.llm_text_log_file, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            with self._exclusive_file_lock(self.llm_text_log_file):
+                with open(self.llm_text_log_file, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception as exc:
             print(f" LLM text log failed: {exc}")
 
@@ -934,6 +1026,7 @@ class LiveTradingBot:
                     "price_current": float(p.price_current),
                     "profit": float(p.profit),
                     "swap": float(p.swap),
+                    "commission": float(getattr(p, "commission", 0.0) or 0.0),
                     "sl": float(p.sl),
                     "tp": float(p.tp),
                     "opened_at": opened_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
@@ -944,6 +1037,42 @@ class LiveTradingBot:
                     "comment": str(p.comment) if p.comment else "",
                     "magic": int(getattr(p, "magic", 0) or 0),
                 })
+
+        current_open_tickets = {
+            int(item.get("ticket", 0) or 0)
+            for item in positions_data
+            if int(item.get("ticket", 0) or 0) > 0
+        }
+        previous_open_tickets = set(getattr(self, "_open_position_tickets", set()) or set())
+        closed_ticket_candidates = previous_open_tickets - current_open_tickets
+        self._open_position_tickets = current_open_tickets
+
+        closed_deals = []
+        is_reconcile_due = (
+            now - float(getattr(self, "_last_closed_deal_reconcile_at", 0.0) or 0.0)
+        ) >= 900.0
+        should_poll_closed_deals = bool(closed_ticket_candidates) or is_reconcile_due
+        if not should_poll_closed_deals:
+            should_poll_closed_deals = (now - float(getattr(self, "_last_closed_deal_poll_at", 0.0) or 0.0)) >= 60.0
+        if should_poll_closed_deals:
+            self._last_closed_deal_poll_at = now
+            try:
+                if is_reconcile_due:
+                    self._last_closed_deal_reconcile_at = now
+                    closed_deals = self._collect_recent_closed_deals(force_lookback_sec=3 * 24 * 60 * 60)
+                else:
+                    closed_deals = self._collect_recent_closed_deals(
+                        expected_tickets=closed_ticket_candidates if closed_ticket_candidates else None
+                    )
+            except Exception as exc:
+                print(f" WS state: closed deals fetch failed: {exc}")
+                closed_deals = []
+        if closed_deals:
+            self._sync_performance_from_mt5_history(
+                force=True,
+                full_resync=False,
+                reason="closed_deals_snapshot",
+            )
 
         last_err = self._safe_last_error()
         if self._is_mt5_ipc_error(last_err):
@@ -959,7 +1088,7 @@ class LiveTradingBot:
             "symbol": SYMBOL,
             "timeframe": TIMEFRAME_NAME,
             "magic_number": int(MAGIC_NUMBER),
-            "manage_manual_positions": bool(LIVE_MANAGE_MANUAL_POSITIONS),
+            "manage_manual_positions": bool(0 in set(int(v) for v in (LIVE_MANAGED_MAGIC_SET or set()))),
             # Bot model state
             "position": int(current_pos),
             "entry_price": float(self.bridge.entry_price) if self.bridge else 0.0,
@@ -981,6 +1110,7 @@ class LiveTradingBot:
             **account_data,
             # MT5 Positions
             "positions": positions_data,
+            "closed_deals": closed_deals,
             # Logs
             "llm_text": llm_text,
             "recent_logs": list(getattr(self, "recent_logs", [])[-40:]),
@@ -1207,6 +1337,115 @@ class LiveTradingBot:
                 event="server_request_failed",
                 meta={"ts": ts_key, "error": str(exc)},
             )
+
+    def _resolve_live_llm_semantic_quick(self, ts_key: str, timeout_sec: float):
+        if self.semantic_runtime is None:
+            return False
+        if ts_key in self.semantic_runtime.global_time_to_vec:
+            return True
+
+        cached_vec = self.llm_semantic_cache.get(ts_key)
+        if cached_vec is not None:
+            self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(cached_vec, dtype=np.float32)
+            return True
+
+        prev_timeout = float(self.vision_llm_timeout_sec)
+        quick_timeout = max(5.0, float(timeout_sec))
+        self.vision_llm_timeout_sec = min(prev_timeout, quick_timeout)
+        try:
+            llm_text, cls_vec = self._request_llm_semantic_from_server(ts_key)
+            self._save_llm_semantic_entry(ts_key, cls_vec, llm_text, source="startup_prewarm")
+            return True
+        except Exception as exc:
+            self._sem_retry_not_before[ts_key] = time.time() + max(2.0, min(float(POLL_SECONDS) * 4.0, 12.0))
+            self._add_log(
+                "warning",
+                f"Startup prewarm failed for {ts_key}",
+                phase="sem",
+                event="startup_prewarm_failed",
+                meta={"ts": ts_key, "error": str(exc)},
+            )
+            return False
+        finally:
+            self.vision_llm_timeout_sec = prev_timeout
+
+    def _prewarm_semantic_on_start(self):
+        if not bool(LIVE_PREWARM_SEMANTIC_ON_START):
+            return
+        if self.semantic_runtime is None:
+            return
+
+        max_seconds = max(0.0, float(LIVE_PREWARM_SEMANTIC_MAX_SECONDS))
+        if max_seconds <= 0.0:
+            return
+
+        current_bar_time = self._current_bar_time()
+        if current_bar_time <= 0:
+            return
+        window_df = self._fetch_window(current_bar_time)
+        if window_df is None:
+            return
+
+        ts_keys = pd.to_datetime(window_df["time"]).dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+        missing = [ts for ts in ts_keys if ts not in self.semantic_runtime.global_time_to_vec]
+        if not missing:
+            self._add_log(
+                "info",
+                "Startup prewarm skipped: semantic cache already warm",
+                phase="sem",
+                event="startup_prewarm_skip_full",
+            )
+            return
+
+        max_missing = max(1, int(LIVE_PREWARM_SEMANTIC_MAX_MISSING))
+        target_keys = missing[-max_missing:]
+        started_at = time.time()
+        deadline = time.time() + max_seconds
+        timeout_per_request = max(5.0, float(LIVE_PREWARM_REQUEST_TIMEOUT_SEC))
+        resolved_count = 0
+        attempted_count = 0
+
+        print(
+            "\n [SEM] startup prewarm "
+            f"targets={len(target_keys)} missing={len(missing)} budget={max_seconds:.1f}s"
+        )
+        self._add_log(
+            "info",
+            f"Startup semantic prewarm targets={len(target_keys)}",
+            phase="sem",
+            event="startup_prewarm_start",
+            meta={
+                "missing_total": int(len(missing)),
+                "targets": int(len(target_keys)),
+                "budget_sec": float(max_seconds),
+            },
+        )
+
+        for ts_key in target_keys:
+            if time.time() >= deadline:
+                break
+            attempted_count += 1
+            if self._resolve_live_llm_semantic_quick(ts_key, timeout_sec=timeout_per_request):
+                resolved_count += 1
+
+        elapsed = max(0.0, float(time.time() - started_at))
+        pending_after = len([ts for ts in target_keys if ts not in self.semantic_runtime.global_time_to_vec])
+        print(
+            "\n [SEM] startup prewarm done "
+            f"resolved={resolved_count}/{attempted_count} pending={pending_after} elapsed={elapsed:.1f}s"
+        )
+        self._add_log(
+            "success" if pending_after == 0 else "info",
+            f"Startup semantic prewarm resolved={resolved_count}/{attempted_count}",
+            phase="sem",
+            event="startup_prewarm_done",
+            meta={
+                "resolved": int(resolved_count),
+                "attempted": int(attempted_count),
+                "pending_after": int(pending_after),
+                "elapsed_sec": float(round(elapsed, 2)),
+            },
+        )
 
     def _ensure_window_real_semantic(self, window_df: pd.DataFrame):
         if self.semantic_runtime is None:
@@ -1452,11 +1691,20 @@ class LiveTradingBot:
             magic = int(raw_magic or 0)
         except Exception:
             magic = 0
-        if magic == int(MAGIC_NUMBER):
+        allowed = set(int(v) for v in (LIVE_MANAGED_MAGIC_SET or set()))
+        if len(allowed) == 0:
             return True
-        if bool(LIVE_MANAGE_MANUAL_POSITIONS) and magic == 0:
+        return int(magic) in allowed
+
+    def _is_performance_magic(self, raw_magic) -> bool:
+        try:
+            magic = int(raw_magic or 0)
+        except Exception:
+            magic = 0
+        allowed = set(int(v) for v in (LIVE_PERFORMANCE_MAGIC_SET or set()))
+        if len(allowed) == 0:
             return True
-        return False
+        return int(magic) in allowed
 
     def _filter_managed_symbol_positions(self, positions):
         if not positions:
@@ -1502,6 +1750,310 @@ class LiveTradingBot:
         except Exception:
             pass
         return []
+
+    def _collect_recent_closed_deals(self, expected_tickets=None, force_lookback_sec: int | None = None):
+        now_utc = datetime.now(timezone.utc)
+        cursor_msc = int(getattr(self, "_closed_deal_cursor_msc", 0) or 0)
+        use_cursor = True
+        if isinstance(force_lookback_sec, int) and force_lookback_sec > 0:
+            use_cursor = False
+            start_utc = now_utc - timedelta(seconds=int(force_lookback_sec))
+        elif cursor_msc > 0:
+            start_utc = datetime.fromtimestamp(max(0, cursor_msc - 5000) / 1000.0, tz=timezone.utc)
+        else:
+            start_utc = now_utc - timedelta(days=3)
+
+        try:
+            deals = mt5.history_deals_get(start_utc, now_utc)
+        except Exception as exc:
+            print(f" WS state: history_deals_get failed: {exc}")
+            deals = None
+
+        if deals is None:
+            last_err = self._safe_last_error()
+            if self._is_mt5_ipc_error(last_err):
+                self._try_reconnect_mt5(reason="history_deals_get")
+            return []
+
+        expected = set()
+        if expected_tickets:
+            for raw_ticket in expected_tickets:
+                try:
+                    ticket = int(raw_ticket or 0)
+                except Exception:
+                    ticket = 0
+                if ticket > 0:
+                    expected.add(ticket)
+
+        entry_out_values = set()
+        for name in ("DEAL_ENTRY_OUT", "DEAL_ENTRY_OUT_BY", "DEAL_ENTRY_INOUT"):
+            value = getattr(mt5, name, None)
+            if value is not None:
+                entry_out_values.add(int(value))
+
+        latest_by_ticket = {}
+        max_seen_msc = cursor_msc
+        symbol_upper = str(SYMBOL or "").upper()
+
+        for deal in deals:
+            deal_symbol = str(getattr(deal, "symbol", "") or "").upper()
+            if deal_symbol != symbol_upper:
+                continue
+            if not self._is_performance_magic(getattr(deal, "magic", 0)):
+                continue
+
+            entry = int(getattr(deal, "entry", -999) or -999)
+            if entry_out_values and entry not in entry_out_values:
+                continue
+
+            ticket = int(getattr(deal, "position_id", 0) or 0)
+            if ticket <= 0:
+                ticket = int(getattr(deal, "order", 0) or 0)
+            if ticket <= 0:
+                ticket = int(getattr(deal, "ticket", 0) or 0)
+            if ticket <= 0:
+                continue
+
+            if expected and ticket not in expected:
+                continue
+
+            close_time_msc = int(getattr(deal, "time_msc", 0) or 0)
+            if close_time_msc <= 0:
+                close_time_msc = int(getattr(deal, "time", 0) or 0) * 1000
+            if close_time_msc <= 0:
+                continue
+            if use_cursor and cursor_msc > 0 and close_time_msc < cursor_msc:
+                continue
+
+            close_dt = datetime.fromtimestamp(close_time_msc / 1000.0, tz=timezone.utc)
+            payload = {
+                "ticket": ticket,
+                "symbol": deal_symbol or symbol_upper,
+                "magic": int(getattr(deal, "magic", 0) or 0),
+                "volume": float(getattr(deal, "volume", 0.0) or 0.0),
+                "closePrice": float(getattr(deal, "price", 0.0) or 0.0),
+                "profit": float(getattr(deal, "profit", 0.0) or 0.0),
+                "swap": float(getattr(deal, "swap", 0.0) or 0.0),
+                "commission": float(getattr(deal, "commission", 0.0) or 0.0),
+                "closeTime": close_dt.isoformat(),
+                "closeTimeMsc": close_time_msc,
+            }
+
+            previous = latest_by_ticket.get(ticket)
+            if not previous or int(previous.get("closeTimeMsc", 0) or 0) <= close_time_msc:
+                latest_by_ticket[ticket] = payload
+
+            if close_time_msc > max_seen_msc:
+                max_seen_msc = close_time_msc
+
+        if use_cursor and max_seen_msc > cursor_msc:
+            self._closed_deal_cursor_msc = max_seen_msc + 1
+
+        rows = sorted(
+            list(latest_by_ticket.values()),
+            key=lambda row: int(row.get("closeTimeMsc", 0) or 0),
+            reverse=True,
+        )
+        if len(rows) > 200:
+            rows = rows[:200]
+        return rows
+
+    def _deal_entry_out_values(self):
+        values = set()
+        for name in ("DEAL_ENTRY_OUT", "DEAL_ENTRY_OUT_BY", "DEAL_ENTRY_INOUT"):
+            value = getattr(mt5, name, None)
+            if value is not None:
+                values.add(int(value))
+        return values
+
+    def _resolve_deal_ticket(self, deal) -> int:
+        ticket = int(getattr(deal, "position_id", 0) or 0)
+        if ticket <= 0:
+            ticket = int(getattr(deal, "order", 0) or 0)
+        if ticket <= 0:
+            ticket = int(getattr(deal, "ticket", 0) or 0)
+        return int(ticket)
+
+    def _fetch_managed_closed_deal_events(self, start_utc: datetime, end_utc: datetime):
+        try:
+            deals = mt5.history_deals_get(start_utc, end_utc)
+        except Exception as exc:
+            print(f" Performance sync: history_deals_get failed: {exc}")
+            deals = None
+
+        if deals is None:
+            last_err = self._safe_last_error()
+            if self._is_mt5_ipc_error(last_err):
+                self._try_reconnect_mt5(reason="history_perf_sync")
+            return None
+
+        entry_out_values = self._deal_entry_out_values()
+        symbol_upper = str(SYMBOL or "").upper()
+        scope = str(LIVE_PERFORMANCE_SCOPE or "symbol").strip().lower()
+        include_all_symbols = scope == "account"
+        events = []
+
+        for deal in deals:
+            if not include_all_symbols and str(getattr(deal, "symbol", "") or "").upper() != symbol_upper:
+                continue
+            if not self._is_performance_magic(getattr(deal, "magic", 0)):
+                continue
+
+            entry = int(getattr(deal, "entry", -999) or -999)
+            if entry_out_values and entry not in entry_out_values:
+                continue
+
+            deal_id = int(getattr(deal, "ticket", 0) or 0)
+            if deal_id <= 0:
+                continue
+
+            ticket = self._resolve_deal_ticket(deal)
+            if ticket <= 0:
+                continue
+
+            close_time_msc = int(getattr(deal, "time_msc", 0) or 0)
+            if close_time_msc <= 0:
+                close_time_msc = int(getattr(deal, "time", 0) or 0) * 1000
+            if close_time_msc <= 0:
+                continue
+
+            net_pnl = (
+                float(getattr(deal, "profit", 0.0) or 0.0)
+                + float(getattr(deal, "commission", 0.0) or 0.0)
+                + float(getattr(deal, "swap", 0.0) or 0.0)
+            )
+            events.append(
+                {
+                    "deal_id": int(deal_id),
+                    "ticket": int(ticket),
+                    "close_time_msc": int(close_time_msc),
+                    "net_pnl": float(net_pnl),
+                }
+            )
+
+        return events
+
+    def _apply_mt5_performance_stats(self):
+        if self.bridge is None:
+            return
+        trade_nets = [float(value) for value in dict(self._perf_ticket_net or {}).values()]
+        self.bridge.trades = int(len(trade_nets))
+        self.bridge.wins = int(sum(1 for value in trade_nets if value > 1e-9))
+        self.bridge.total_pnl = float(sum(trade_nets))
+
+    def _sync_performance_from_mt5_history(
+        self,
+        force: bool = False,
+        full_resync: bool = False,
+        reason: str = "periodic",
+    ) -> bool:
+        if self.bridge is None:
+            return False
+
+        now_epoch = time.time()
+        interval_sec = max(5.0, float(LIVE_PERFORMANCE_SYNC_INTERVAL_SEC))
+        if (
+            not force
+            and float(getattr(self, "_perf_last_sync_at", 0.0) or 0.0) > 0.0
+            and (now_epoch - float(self._perf_last_sync_at)) < interval_sec
+        ):
+            return False
+
+        prev_stats = (
+            int(getattr(self.bridge, "trades", 0) or 0),
+            int(getattr(self.bridge, "wins", 0) or 0),
+            float(getattr(self.bridge, "total_pnl", 0.0) or 0.0),
+        )
+
+        now_utc = datetime.now(timezone.utc)
+        mode = "incremental"
+        updates = 0
+
+        if bool(full_resync) or not bool(getattr(self, "_perf_seeded", False)):
+            mode = "full"
+            lookback_days = max(30, int(LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS))
+            start_utc = now_utc - timedelta(days=int(lookback_days))
+            events = self._fetch_managed_closed_deal_events(start_utc, now_utc)
+            self._perf_last_sync_at = now_epoch
+            if events is None:
+                return False
+
+            events = sorted(events, key=lambda row: int(row.get("close_time_msc", 0) or 0))
+            next_seen = set()
+            next_ticket_net = {}
+            max_seen_msc = 0
+            for row in events:
+                deal_id = int(row.get("deal_id", 0) or 0)
+                ticket = int(row.get("ticket", 0) or 0)
+                close_time_msc = int(row.get("close_time_msc", 0) or 0)
+                net_pnl = float(row.get("net_pnl", 0.0) or 0.0)
+                if deal_id <= 0 or ticket <= 0:
+                    continue
+                next_seen.add(deal_id)
+                next_ticket_net[ticket] = float(next_ticket_net.get(ticket, 0.0) or 0.0) + net_pnl
+                if close_time_msc > max_seen_msc:
+                    max_seen_msc = close_time_msc
+                updates += 1
+
+            self._perf_deal_seen = next_seen
+            self._perf_ticket_net = next_ticket_net
+            self._perf_cursor_msc = int(max_seen_msc + 1) if max_seen_msc > 0 else int(now_utc.timestamp() * 1000) + 1
+            self._perf_seeded = True
+        else:
+            cursor_msc = int(getattr(self, "_perf_cursor_msc", 0) or 0)
+            if cursor_msc > 0:
+                start_utc = datetime.fromtimestamp(max(0, cursor_msc - 5000) / 1000.0, tz=timezone.utc)
+            else:
+                start_utc = now_utc - timedelta(days=1)
+            events = self._fetch_managed_closed_deal_events(start_utc, now_utc)
+            self._perf_last_sync_at = now_epoch
+            if events is None:
+                return False
+
+            events = sorted(events, key=lambda row: int(row.get("close_time_msc", 0) or 0))
+            max_seen_msc = int(cursor_msc)
+            for row in events:
+                deal_id = int(row.get("deal_id", 0) or 0)
+                ticket = int(row.get("ticket", 0) or 0)
+                close_time_msc = int(row.get("close_time_msc", 0) or 0)
+                net_pnl = float(row.get("net_pnl", 0.0) or 0.0)
+                if deal_id <= 0 or ticket <= 0:
+                    continue
+                if deal_id in self._perf_deal_seen:
+                    continue
+                self._perf_deal_seen.add(deal_id)
+                self._perf_ticket_net[ticket] = float(self._perf_ticket_net.get(ticket, 0.0) or 0.0) + net_pnl
+                if close_time_msc > max_seen_msc:
+                    max_seen_msc = close_time_msc
+                updates += 1
+
+            if max_seen_msc > cursor_msc:
+                self._perf_cursor_msc = int(max_seen_msc + 1)
+
+        self._apply_mt5_performance_stats()
+        next_stats = (
+            int(getattr(self.bridge, "trades", 0) or 0),
+            int(getattr(self.bridge, "wins", 0) or 0),
+            float(getattr(self.bridge, "total_pnl", 0.0) or 0.0),
+        )
+        changed = bool(prev_stats != next_stats)
+        if full_resync or changed or updates > 0:
+            self._add_log(
+                "info",
+                f"Performance sync ({mode}) trades={next_stats[0]} wins={next_stats[1]} pnl={next_stats[2]:+.2f}",
+                phase="mt5",
+                event="performance_sync",
+                meta={
+                    "mode": mode,
+                    "reason": str(reason),
+                    "scope": str(LIVE_PERFORMANCE_SCOPE),
+                    "magic_set": ",".join(str(int(v)) for v in sorted(set(LIVE_PERFORMANCE_MAGIC_SET or set()))),
+                    "updates": int(updates),
+                    "tickets": int(len(self._perf_ticket_net)),
+                    "deals_seen": int(len(self._perf_deal_seen)),
+                },
+            )
+        return changed or updates > 0
 
     def _get_mt5_position(self):
         positions = self._get_symbol_positions_safe()
@@ -1625,7 +2177,6 @@ class LiveTradingBot:
         if self.sync_account_state and account is not None:
             self.bridge.balance = float(account.balance)
             self.bridge.equity = float(account.equity)
-            self.bridge.total_pnl = float(account.balance - self.initial_balance)
             self.bridge.max_equity = max(float(self.bridge.max_equity), float(self.bridge.equity))
         else:
             self.bridge.max_equity = max(float(self.bridge.max_equity), float(self.bridge.equity))
@@ -1649,6 +2200,7 @@ class LiveTradingBot:
 
         self.current_lot = self.bridge.lot_size
         self.last_known_ticket = current_ticket
+        self._sync_performance_from_mt5_history(force=False, full_resync=False, reason="bridge_heartbeat")
 
     def _fetch_window(self, bar_end_ts: int):
         rates = None
@@ -2727,7 +3279,9 @@ class LiveTradingBot:
         self.connect()
         self._load_model()
         self._load_runtime_state()
+        self._sync_performance_from_mt5_history(force=True, full_resync=True, reason="startup")
         self._sync_bridge_from_mt5()
+        self._prewarm_semantic_on_start()
         if self.bridge is not None:
             print(
                 " [READY] "

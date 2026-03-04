@@ -35,6 +35,13 @@ def _to_float(value, default: float = 0.0) -> float:
         return float(default)
 
 
+def _order_net_profit(order) -> float:
+    profit = _to_float(getattr(order, "profit", 0.0), 0.0)
+    commission = _to_float(getattr(order, "commission", 0.0), 0.0)
+    swap = _to_float(getattr(order, "swap", 0.0), 0.0)
+    return profit + commission + swap
+
+
 def _normalize_string_list(value) -> list[str]:
     if value is None:
         return []
@@ -137,6 +144,39 @@ async def _build_user_order_scope(user_id: str, *, include_archived: bool) -> tu
     return account_ids, {"OR": [manual_filter, *pair_filters]}
 
 
+async def _resolve_requested_account_id(
+    user_id: str,
+    requested_account_id: str | None,
+    *,
+    include_archived: bool,
+) -> str | None:
+    account_id = str(requested_account_id or "").strip()
+    if not account_id:
+        return None
+
+    account_where: dict = {
+        "id": account_id,
+        "userId": user_id,
+    }
+    if not include_archived:
+        account_where["recordStatus"] = ACTIVE_RECORD_STATUS
+
+    account = await db.tradingaccount.find_first(where=account_where)
+    if not account:
+        raise HTTPException(status_code=404, detail="Trading account not found")
+
+    return str(account.id)
+
+
+def _combine_where_and(*conditions: dict) -> dict:
+    valid_conditions = [c for c in conditions if c]
+    if not valid_conditions:
+        return {}
+    if len(valid_conditions) == 1:
+        return valid_conditions[0]
+    return {"AND": valid_conditions}
+
+
 async def _sync_daily_aggregates_from_orders(
     user_id: str,
     start_date: date,
@@ -172,7 +212,7 @@ async def _sync_daily_aggregates_from_orders(
             continue
 
         account_id = str(order.accountId)
-        pnl = _to_float(getattr(order, "profit", 0.0))
+        pnl = _order_net_profit(order)
 
         acc_key = (account_id, trade_day)
         acc_item = account_day.setdefault(
@@ -232,9 +272,15 @@ async def get_trading_calendar(
     year: int,
     month: int,
     include_archived: bool = Query(True, alias="includeArchived"),
+    account_id: str | None = Query(None, alias="accountId"),
 ):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
+    selected_account_id = await _resolve_requested_account_id(
+        request.state.user_id,
+        account_id,
+        include_archived=include_archived,
+    )
     
     # Calculate start and end date for the month
     try:
@@ -261,14 +307,18 @@ async def get_trading_calendar(
     calendar_data = {}
     if include_archived:
         account_filter: dict = {"userId": request.state.user_id}
+        aggregate_where: dict = {
+            "account": account_filter,
+            "date": {
+                "gte": datetime.combine(start_date, datetime.min.time()),
+                "lt": datetime.combine(end_date, datetime.min.time())
+            },
+        }
+        if selected_account_id:
+            aggregate_where["accountId"] = selected_account_id
+
         aggregates = await db.dailyaggregate.find_many(
-            where={
-                "account": account_filter,
-                "date": {
-                    "gte": datetime.combine(start_date, datetime.min.time()),
-                    "lt": datetime.combine(end_date, datetime.min.time())
-                }
-            }
+            where=aggregate_where
         )
 
         for agg in aggregates:
@@ -285,6 +335,32 @@ async def get_trading_calendar(
             trades = agg.totalTrades if agg.totalTrades else 0
             calendar_data[day]["profit"] += profit
             calendar_data[day]["trades"] += trades
+
+        if selected_account_id:
+            day_rollup = {}
+            winrate_orders = await db.orderhistory.find_many(
+                where={
+                    "accountId": selected_account_id,
+                    "closeTime": {
+                        "gte": datetime.combine(start_date, datetime.min.time()),
+                        "lt": datetime.combine(end_date, datetime.min.time()),
+                    },
+                },
+            )
+            for order in winrate_orders:
+                close_time = getattr(order, "closeTime", None)
+                if close_time is None:
+                    continue
+                trade_day = _as_date(close_time)
+                if trade_day < start_date or trade_day >= end_date:
+                    continue
+
+                day = int(trade_day.day)
+                profit = _order_net_profit(order)
+                day_item = day_rollup.setdefault(day, {"wins": 0, "trades": 0})
+                day_item["trades"] += 1
+                if profit > 0:
+                    day_item["wins"] += 1
     else:
         day_rollup = {}
         _, order_scope = await _build_user_order_scope(
@@ -292,14 +368,18 @@ async def get_trading_calendar(
             include_archived=False,
         )
         if order_scope:
-            orders = await db.orderhistory.find_many(
-                where={
-                    **order_scope,
+            where_scope = _combine_where_and(
+                order_scope,
+                {"accountId": selected_account_id} if selected_account_id else {},
+                {
                     "closeTime": {
                         "gte": datetime.combine(start_date, datetime.min.time()),
                         "lt": datetime.combine(end_date, datetime.min.time()),
                     },
                 },
+            )
+            orders = await db.orderhistory.find_many(
+                where=where_scope,
             )
 
             for order in orders:
@@ -319,7 +399,7 @@ async def get_trading_calendar(
                         "winRate": 0.0,
                     }
 
-                profit = _to_float(getattr(order, "profit", 0.0), 0.0)
+                profit = _order_net_profit(order)
                 calendar_data[day]["profit"] += profit
                 calendar_data[day]["trades"] += 1
 
@@ -367,9 +447,15 @@ async def get_trading_history_by_day(
     month: int,
     day: int,
     include_archived: bool = Query(True, alias="includeArchived"),
+    account_id: str | None = Query(None, alias="accountId"),
 ):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
+    selected_account_id = await _resolve_requested_account_id(
+        request.state.user_id,
+        account_id,
+        include_archived=include_archived,
+    )
 
     try:
         target_date = date(year, month, day)
@@ -396,10 +482,11 @@ async def get_trading_history_by_day(
             },
         }
 
-    where_scope = {
-        **order_scope,
-        "closeTime": {"gte": start_dt, "lt": end_dt},
-    }
+    where_scope = _combine_where_and(
+        order_scope,
+        {"accountId": selected_account_id} if selected_account_id else {},
+        {"closeTime": {"gte": start_dt, "lt": end_dt}},
+    )
     orders = await db.orderhistory.find_many(
         where=where_scope,
         order={"closeTime": "desc"},
@@ -411,11 +498,14 @@ async def get_trading_history_by_day(
     losses = 0
 
     for order in orders:
-        profit = _to_float(getattr(order, "profit", 0.0), 0.0)
-        total_profit += profit
-        if profit > 0:
+        gross_profit = _to_float(getattr(order, "profit", 0.0), 0.0)
+        commission = _to_float(getattr(order, "commission", 0.0), 0.0)
+        swap = _to_float(getattr(order, "swap", 0.0), 0.0)
+        net_profit = gross_profit + commission + swap
+        total_profit += net_profit
+        if net_profit > 0:
             wins += 1
-        elif profit < 0:
+        elif net_profit < 0:
             losses += 1
 
         open_time = getattr(order, "openTime", None)
@@ -424,15 +514,17 @@ async def get_trading_history_by_day(
             {
                 "ticketId": int(getattr(order, "ticketId", 0) or 0),
                 "accountId": str(getattr(order, "accountId", "") or ""),
+                "magicNumber": int(getattr(order, "magicNumber", 0) or 0) or None,
                 "symbol": str(getattr(order, "symbol", "") or ""),
                 "type": str(getattr(order, "type", "") or "").upper(),
                 "status": str(getattr(order, "status", "") or ""),
                 "volume": _to_float(getattr(order, "volume", 0.0), 0.0),
                 "openPrice": _to_float(getattr(order, "openPrice", 0.0), 0.0),
                 "closePrice": _to_float(getattr(order, "closePrice", 0.0), 0.0),
-                "commission": _to_float(getattr(order, "commission", 0.0), 0.0),
-                "swap": _to_float(getattr(order, "swap", 0.0), 0.0),
-                "profit": round(float(profit), 2),
+                "commission": commission,
+                "swap": swap,
+                "profit": round(float(gross_profit), 2),
+                "netProfit": round(float(net_profit), 2),
                 "openTime": open_time.isoformat() if open_time else None,
                 "closeTime": close_time.isoformat() if close_time else None,
             }
@@ -525,6 +617,7 @@ async def get_trading_journal_feed(
             "journalId": str(getattr(journal, "id", "") or "") if journal else None,
             "ticketId": int(ticket_id),
             "accountId": str(getattr(order, "accountId", "") or ""),
+            "magicNumber": int(getattr(order, "magicNumber", 0) or 0) or None,
             "symbol": str(getattr(order, "symbol", "") or ""),
             "type": str(getattr(order, "type", "") or "").upper(),
             "status": str(getattr(order, "status", "") or ""),
