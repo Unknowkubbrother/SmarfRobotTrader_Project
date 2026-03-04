@@ -85,7 +85,7 @@ from datetime import datetime, timezone
 
 from .routes.bot_ws import _get_cached, _set_cached
 from .utils.vision_llm.use_llm import generate_llm_cls_for_bar
-from .utils.vision_llm.chart import NoMarketDataError
+from .utils.vision_llm.chart import MT5ConnectionError, NoMarketDataError
 from .utils.ws_manager import bot_hub
 
 logger = logging.getLogger(__name__)
@@ -154,6 +154,14 @@ async def _cron_worker(symbol: str, timeframe: str):
         except NoMarketDataError as exc:
             logger.warning(
                 "cron skip %s/%s at %s: %s",
+                symbol,
+                timeframe,
+                dt_str,
+                exc,
+            )
+        except MT5ConnectionError as exc:
+            logger.warning(
+                "cron mt5 unavailable %s/%s at %s: %s",
                 symbol,
                 timeframe,
                 dt_str,

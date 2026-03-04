@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from ..models.vision_llm_model import VisionLLMRequest
-from ..utils.vision_llm.chart import NoMarketDataError
+from ..utils.vision_llm.chart import MT5ConnectionError, NoMarketDataError
 from ..utils.trading_schedule import normalize_trading_schedule
 from ..utils.vision_llm.use_llm import generate_llm_cls_for_bar
 from ..utils.ws_manager import bot_hub
@@ -739,6 +739,9 @@ async def bot_ws_cron(data: VisionLLMRequest):
                 "date_time": dt_str,
                 "detail": str(exc),
             }
+        except MT5ConnectionError as exc:
+            logger.warning("cron MT5 unavailable %s/%s %s: %s", data.symbol, timeframe, dt_str, exc)
+            raise HTTPException(status_code=503, detail=str(exc))
         except Exception as exc:
             logger.exception("cron pipeline failed for %s", data.symbol)
             raise HTTPException(status_code=500, detail=str(exc))
