@@ -8,6 +8,8 @@ SERVICE_NAME="${SERVICE_NAME:-metatrader5-macos}"
 BOT_SCRIPT="${BOT_SCRIPT:-run_live.py}"
 BOT_LOG="${BOT_LOG:-/config/bot.log}"
 BOT_REQUIREMENTS="${BOT_REQUIREMENTS:-/bots/requirements-live.txt}"
+BOT_STREAM_LOG_TO_CONTAINER_STDOUT="${BOT_STREAM_LOG_TO_CONTAINER_STDOUT:-1}"
+RUNNER_PROGRESS_TO_CONTAINER_LOGS="${RUNNER_PROGRESS_TO_CONTAINER_LOGS:-1}"
 WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-900}"
 WAIT_INTERVAL_SECONDS="${WAIT_INTERVAL_SECONDS:-5}"
 TORCH_VERSION="${TORCH_VERSION:-2.5.1}"
@@ -21,10 +23,19 @@ MT5_LOGIN_CHECK_TIMEOUT_SECONDS="${MT5_LOGIN_CHECK_TIMEOUT_SECONDS:-180}"
 MT5_TRADE_CHECK_TIMEOUT_SECONDS="${MT5_TRADE_CHECK_TIMEOUT_SECONDS:-45}"
 MT5_DIALOG_SEARCH_WAIT_SECONDS="${MT5_DIALOG_SEARCH_WAIT_SECONDS:-6}"
 MT5_SKIP_PRECHECKS="${MT5_SKIP_PRECHECKS:-0}"
+MT5_ALLOW_PARTIAL_START="${MT5_ALLOW_PARTIAL_START:-0}"
+BOT_WAIT_FOR_WS_REGISTER="${BOT_WAIT_FOR_WS_REGISTER:-1}"
+BOT_WS_READY_TIMEOUT_SECONDS="${BOT_WS_READY_TIMEOUT_SECONDS:-120}"
 
 trim_outer_whitespace() {
   local raw="$1"
   printf '%s' "$raw" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+is_truthy() {
+  local raw="${1:-}"
+  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  [[ "$raw" =~ ^(1|true|yes|on)$ ]]
 }
 
 read_dotenv_value() {
@@ -231,15 +242,17 @@ check_trade_allowed() {
         -e MT5_RPC_TIMEOUT_MS="${MT5_RPC_TIMEOUT_MS_VAL:-180000}" \
         "$SERVICE_NAME" python3 - <<'PY'
 from mt5linux import MetaTrader5
+import rpyc
 import os
 import sys
 
 try:
-    mt5 = MetaTrader5(host="localhost", port=8001)
     login_text = os.getenv("MT5_LOGIN", "").strip()
     password = os.getenv("MT5_PASSWORD", "").strip()
     server = os.getenv("MT5_SERVER", "").strip()
     timeout_ms = int(os.getenv("MT5_RPC_TIMEOUT_MS", "180000"))
+    rpyc.core.protocol.DEFAULT_CONFIG["sync_request_timeout"] = max(60.0, float(timeout_ms) / 1000.0)
+    mt5 = MetaTrader5(host="localhost", port=8001)
 
     init_kwargs = {"timeout": timeout_ms}
     if login_text and password:
@@ -282,10 +295,12 @@ PY
 ensure_mt5_login_if_configured() {
   if [[ -z "$MT5_LOGIN_VAL" || -z "$MT5_PASSWORD_VAL" ]]; then
     echo "[2.4/6] MT5 credentials not set, skip forced API login."
+    append_runner_progress "[2.4/6] MT5 credentials not set, skip forced API login."
     return 0
   fi
 
   echo "[2.4/6] Ensuring MT5 account login via API..."
+  append_runner_progress "[2.4/6] Ensuring MT5 account login via API..."
   cleanup_stale_mt5_exec_processes || true
 
   local login_output=""
@@ -304,6 +319,7 @@ ensure_mt5_login_if_configured() {
         -e MT5_STRICT_SERVER_MATCH="${MT5_STRICT_SERVER_MATCH_VAL}" \
         "$SERVICE_NAME" python3 - <<'PY'
 from mt5linux import MetaTrader5
+import rpyc
 import multiprocessing as mp
 import os
 import sys
@@ -315,6 +331,7 @@ server = os.getenv("MT5_SERVER", "").strip()
 retries = int(os.getenv("MT5_LOGIN_RETRIES", "20"))
 retry_seconds = int(os.getenv("MT5_RETRY_SECONDS", "5"))
 timeout_ms = int(os.getenv("MT5_RPC_TIMEOUT_MS", "180000"))
+rpyc.core.protocol.DEFAULT_CONFIG["sync_request_timeout"] = max(60.0, float(timeout_ms) / 1000.0)
 attempt_timeout_sec = int(os.getenv("MT5_LOGIN_ATTEMPT_TIMEOUT_SEC", "25"))
 fallbacks_raw = str(os.getenv("MT5_SERVER_FALLBACKS", "") or "").strip()
 strict_server = str(os.getenv("MT5_STRICT_SERVER_MATCH", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -373,6 +390,10 @@ def probe_login(server_name: str, login_id: int, pwd: str, rpc_timeout: int, res
     }
     mt5 = None
     try:
+        try:
+            rpyc.core.protocol.DEFAULT_CONFIG["sync_request_timeout"] = max(60.0, float(rpc_timeout) / 1000.0)
+        except Exception:
+            pass
         mt5 = MetaTrader5(host="localhost", port=8001)
         init_kwargs = {"timeout": rpc_timeout, "login": login_id, "password": pwd}
         if server_name:
@@ -467,10 +488,14 @@ PY
 
   if [[ -n "$login_output" ]]; then
     printf '%s\n' "$login_output"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && append_runner_progress "$line"
+    done <<< "$login_output"
   fi
 
   if [[ "$rc" -eq 124 ]]; then
     echo "  warning: MT5 login probe timed out (${MT5_LOGIN_CHECK_TIMEOUT_SECONDS}s)."
+    append_runner_progress "warning: MT5 login probe timed out (${MT5_LOGIN_CHECK_TIMEOUT_SECONDS}s)."
     cleanup_stale_mt5_exec_processes || true
     return 1
   fi
@@ -479,6 +504,7 @@ PY
   resolved_server="$(printf '%s\n' "$login_output" | sed -n 's/^resolved_server=//p' | tail -n 1 | tr -d '\r')"
   if [[ -n "$resolved_server" && "$resolved_server" != "$MT5_SERVER_VAL" ]]; then
     echo "  resolved MT5 server alias: '$MT5_SERVER_VAL' -> '$resolved_server'"
+    append_runner_progress "resolved MT5 server alias: '$MT5_SERVER_VAL' -> '$resolved_server'"
     MT5_SERVER_VAL="$resolved_server"
     export MT5_SERVER="$MT5_SERVER_VAL"
   fi
@@ -696,9 +722,11 @@ DISPLAY="$display" xdotool key --window "$opt_wid" --clearmodifiers Return >/dev
 
 enable_algo_trading_if_needed() {
   echo "[2.5/6] Ensuring MT5 Algo Trading is enabled..."
+  append_runner_progress "[2.5/6] Ensuring MT5 Algo Trading is enabled..."
   for probe_attempt in $(seq 1 15); do
     if check_trade_allowed; then
       echo "  trade_allowed already enabled."
+      append_runner_progress "trade_allowed already enabled."
       return 0
     fi
     probe_rc=$?
@@ -706,16 +734,20 @@ enable_algo_trading_if_needed() {
       break
     fi
     echo "  MT5 trade API not ready yet (rc=${probe_rc}), retry probe ${probe_attempt}/15..."
+    append_runner_progress "MT5 trade API not ready yet (rc=${probe_rc}), retry probe ${probe_attempt}/15..."
     sleep 2
   done
 
   echo "  trade_allowed is OFF. Trying automatic Ctrl+E toggle..."
+  append_runner_progress "trade_allowed is OFF. Trying automatic Ctrl+E toggle..."
   if ! ensure_xdotool; then
     echo "  warning: cannot install/find xdotool, auto-toggle skipped."
+    append_runner_progress "warning: cannot install/find xdotool, auto-toggle skipped."
     return 1
   fi
   if ! wait_for_mt5_main_window; then
     echo "  warning: MT5 UI window not ready, auto-toggle skipped for now."
+    append_runner_progress "warning: MT5 UI window not ready, auto-toggle skipped for now."
     return 1
   fi
 
@@ -735,38 +767,47 @@ DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers ctrl+e >/dev/nul
     sleep 2
     if check_trade_allowed; then
       echo "  Algo Trading enabled."
+      append_runner_progress "Algo Trading enabled."
       return 0
     fi
     echo "  attempt ${attempt}/5 did not enable yet, retrying..."
+    append_runner_progress "attempt ${attempt}/5 did not enable yet, retrying..."
   done
 
   echo "  Ctrl+E toggle failed. Trying Options -> Expert Advisors fallback..."
+  append_runner_progress "Ctrl+E toggle failed. Trying Options -> Expert Advisors fallback..."
   for fallback_attempt in 1 2 3; do
     dismiss_mt5_dialogs || true
     force_enable_algo_via_options_dialog || true
     sleep 2
     if check_trade_allowed; then
       echo "  Algo Trading enabled via Options dialog."
+      append_runner_progress "Algo Trading enabled via Options dialog."
       return 0
     fi
     echo "  options fallback attempt ${fallback_attempt}/3 did not enable yet."
+    append_runner_progress "options fallback attempt ${fallback_attempt}/3 did not enable yet."
   done
 
   echo "  warning: auto-toggle failed. MT5 may have a modal dialog open in VNC."
+  append_runner_progress "warning: auto-toggle failed. MT5 may have a modal dialog open in VNC."
   return 1
 }
 
 ensure_experts_common_ini() {
   echo "[2.45/6] Ensuring MT5 Experts config in common.ini..."
-  compose exec -T \
+  append_runner_progress "[2.45/6] Ensuring MT5 Experts config in common.ini..."
+  local patch_output=""
+  patch_output="$(
+    compose exec -T \
     -e MT5_COMMON_INI_WAIT_SECONDS="${MT5_COMMON_INI_WAIT_SECONDS:-120}" \
     -e MT5_FORCE_ALGO_TRADING="${MT5_FORCE_ALGO_TRADING:-1}" \
     -e MT5_EXPERTS_DISABLE_ON_ACCOUNT_CHANGE="${MT5_EXPERTS_DISABLE_ON_ACCOUNT_CHANGE:-0}" \
     -e MT5_EXPERTS_DISABLE_ON_PROFILE_CHANGE="${MT5_EXPERTS_DISABLE_ON_PROFILE_CHANGE:-0}" \
     -e MT5_EXPERTS_DISABLE_ON_CHART_CHANGE="${MT5_EXPERTS_DISABLE_ON_CHART_CHANGE:-0}" \
     -e MT5_EXPERTS_DISABLE_VIA_PYTHON_API="${MT5_EXPERTS_DISABLE_VIA_PYTHON_API:-0}" \
-    -e MT5_ALLOW_DLL_IMPORTS="${MT5_ALLOW_DLL_IMPORTS:-}" \
-    -e MT5_ALLOW_WEBREQUEST="${MT5_ALLOW_WEBREQUEST:-}" \
+    -e MT5_ALLOW_DLL_IMPORTS="${MT5_ALLOW_DLL_IMPORTS:-1}" \
+    -e MT5_ALLOW_WEBREQUEST="${MT5_ALLOW_WEBREQUEST:-1}" \
     "$SERVICE_NAME" python3 - <<'PY'
 import configparser
 import io
@@ -834,15 +875,146 @@ print(
     f" WebRequest={cfg.get('Experts', 'WebRequest', fallback='')}"
 )
 PY
+  )"
+  if [[ -n "$patch_output" ]]; then
+    printf '%s\n' "$patch_output"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && append_runner_progress "$line"
+    done <<< "$patch_output"
+  fi
+}
+
+bot_process_is_running() {
+  compose exec -T "$SERVICE_NAME" bash -lc "
+set -euo pipefail
+script='/bots/${BOT_SCRIPT}'
+for proc in /proc/[0-9]*; do
+  [ -r \"\$proc/cmdline\" ] || continue
+  if tr '\0' '\n' < \"\$proc/cmdline\" | grep -Fxq \"\$script\"; then
+    exit 0
+  fi
+done
+exit 1
+"
+}
+
+wait_for_bot_ws_registration() {
+  local timeout_seconds="${BOT_WS_READY_TIMEOUT_SECONDS:-120}"
+  timeout_seconds="$(printf '%s' "$timeout_seconds" | tr -dc '0-9')"
+  if [[ -z "$timeout_seconds" ]]; then
+    timeout_seconds=120
+  fi
+  if (( timeout_seconds <= 0 )); then
+    return 0
+  fi
+
+  local elapsed=0
+  while (( elapsed < timeout_seconds )); do
+    local ws_line=""
+    ws_line="$(
+      compose exec -T "$SERVICE_NAME" sh -lc \
+        "grep -E '\\[WS\\] registered|WS registered with BotHub' '${BOT_LOG}' 2>/dev/null | tail -n 1"
+    )" || true
+    if [[ -n "$ws_line" ]]; then
+      echo "  bot websocket registered."
+      append_runner_progress "bot websocket registered."
+      return 0
+    fi
+
+    if ! bot_process_is_running >/dev/null 2>&1; then
+      echo "  bot process exited while waiting websocket registration."
+      append_runner_progress "bot process exited while waiting websocket registration."
+      return 1
+    fi
+
+    sleep 5
+    elapsed=$((elapsed + 5))
+    echo "  waiting bot websocket register... ${elapsed}s/${timeout_seconds}s"
+    append_runner_progress "waiting bot websocket register... ${elapsed}s/${timeout_seconds}s"
+  done
+
+  return 1
+}
+
+ensure_bot_log_relay() {
+  if ! is_truthy "$BOT_STREAM_LOG_TO_CONTAINER_STDOUT"; then
+    return 0
+  fi
+
+  local relay_tag relay_name
+  relay_tag="$(printf '%s' "$BOT_LOG" | tr '[:space:]/:.' '_' | tr -cd '[:alnum:]_-')"
+  if [[ -z "$relay_tag" ]]; then
+    relay_tag="botlog"
+  fi
+  relay_name="mt5-bot-log-relay-${relay_tag}"
+
+  compose exec -T \
+    -e BOT_LOG_PATH="$BOT_LOG" \
+    -e BOT_LOG_RELAY_NAME="$relay_name" \
+    "$SERVICE_NAME" bash -lc '
+set -euo pipefail
+log_path="${BOT_LOG_PATH:-/config/bot.log}"
+relay_name="${BOT_LOG_RELAY_NAME:-mt5-bot-log-relay}"
+
+# Avoid duplicate relays for the same bot log.
+pkill -f "$relay_name" >/dev/null 2>&1 || true
+
+touch "$log_path"
+nohup bash -lc "exec -a \"$relay_name\" tail -n 0 -F \"$log_path\" >> /proc/1/fd/1 2>> /proc/1/fd/2" >/dev/null 2>&1 &
+'
+}
+
+append_bot_log_marker() {
+  local marker="${1:-}"
+  if [[ -z "$marker" ]]; then
+    return 0
+  fi
+  compose exec -T "$SERVICE_NAME" sh -lc \
+    "printf '\n%s\n' \"${marker}\" >> '${BOT_LOG}'" >/dev/null 2>&1 || true
+}
+
+BOT_LOG_RELAY_READY=0
+
+enable_bot_log_stream_if_needed() {
+  if [[ "$BOT_LOG_RELAY_READY" -eq 1 ]]; then
+    return 0
+  fi
+  if ! is_truthy "$BOT_STREAM_LOG_TO_CONTAINER_STDOUT"; then
+    return 0
+  fi
+
+  if ensure_bot_log_relay; then
+    BOT_LOG_RELAY_READY=1
+    append_bot_log_marker "[RUNNER] bot_log_stream_enabled"
+    return 0
+  fi
+  return 1
+}
+
+append_runner_progress() {
+  local message="$*"
+  if [[ -z "$message" ]]; then
+    return 0
+  fi
+  if ! is_truthy "$RUNNER_PROGRESS_TO_CONTAINER_LOGS"; then
+    return 0
+  fi
+  append_bot_log_marker "[RUNNER] ${message}"
 }
 
 ensure_image_ready
 
 echo "[1/6] Starting MT5 container..."
 compose up -d --no-build "$SERVICE_NAME"
+if ! enable_bot_log_stream_if_needed; then
+  echo "  warning: failed to enable runner progress stream to Docker logs."
+fi
+append_runner_progress "[1/6] Starting MT5 container..."
 
 echo "[2/6] Waiting for mt5linux server (port 8001)..."
 echo "  note: first startup can take 10-30 minutes while Wine Python packages are installed."
+append_runner_progress "[2/6] Waiting for mt5linux server (port 8001)..."
+append_runner_progress "note: first startup can take 10-30 minutes while Wine Python packages are installed."
 elapsed=0
 last_status=""
 
@@ -851,15 +1023,18 @@ until compose exec -T "$SERVICE_NAME" python3 -c "import socket,sys;s=socket.soc
 
   if [[ -n "$status_line" && "$status_line" != "$last_status" ]]; then
     echo "  startup: $status_line"
+    append_runner_progress "startup: $status_line"
     last_status="$status_line"
 
     if [[ "$status_line" == *"[6/7] Installing Python libraries"* ]]; then
       echo "  info: step [6/7] may take several minutes on Apple Silicon emulation."
+      append_runner_progress "info: step [6/7] may take several minutes on Apple Silicon emulation."
     fi
   fi
 
   if (( elapsed >= WAIT_TIMEOUT_SECONDS )); then
     echo "Error: timeout waiting for mt5linux server."
+    append_runner_progress "Error: timeout waiting for mt5linux server."
     echo "Recent startup log:"
     compose exec -T "$SERVICE_NAME" sh -lc "tail -n 80 /config/startup.log" || true
     exit 1
@@ -868,29 +1043,63 @@ until compose exec -T "$SERVICE_NAME" python3 -c "import socket,sys;s=socket.soc
   sleep "$WAIT_INTERVAL_SECONDS"
   elapsed=$((elapsed + WAIT_INTERVAL_SECONDS))
   echo "  waiting... ${elapsed}s/${WAIT_TIMEOUT_SECONDS}s"
+  append_runner_progress "waiting... ${elapsed}s/${WAIT_TIMEOUT_SECONDS}s"
 done
 echo "  mt5linux server is ready."
+append_runner_progress "mt5linux server is ready."
 dismiss_mt5_dialogs || true
 if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
+  mt5_login_ready=0
   if ! ensure_mt5_login_if_configured; then
     echo "  warning: MT5 API login precheck failed, trying UI login fallback."
+    append_runner_progress "warning: MT5 API login precheck failed, trying UI login fallback."
     search_company_dialog_by_server "$MT5_SERVER_VAL" || true
     dismiss_mt5_dialogs || true
     login_mt5_account_via_ui "$MT5_LOGIN_VAL" "$MT5_PASSWORD_VAL" "$MT5_SERVER_VAL" || true
     dismiss_mt5_dialogs || true
-    ensure_mt5_login_if_configured || true
+    if ensure_mt5_login_if_configured; then
+      mt5_login_ready=1
+    fi
+  else
+    mt5_login_ready=1
+  fi
+
+  if [[ "$mt5_login_ready" -ne 1 ]]; then
+    if is_truthy "$MT5_ALLOW_PARTIAL_START"; then
+      echo "  warning: MT5 login precheck still failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+      append_runner_progress "warning: MT5 login precheck still failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+    else
+      echo "Error: MT5 login precheck failed and fallback login did not succeed."
+      append_runner_progress "Error: MT5 login precheck failed and fallback login did not succeed."
+      echo "       Set MT5_ALLOW_PARTIAL_START=1 only if you intentionally want best-effort start."
+      exit 1
+    fi
   fi
 else
   echo "[2.4/6] Skipping MT5 API prechecks (MT5_SKIP_PRECHECKS=$MT5_SKIP_PRECHECKS)."
+  append_runner_progress "[2.4/6] Skipping MT5 API prechecks (MT5_SKIP_PRECHECKS=$MT5_SKIP_PRECHECKS)."
 fi
 ensure_experts_common_ini || true
 if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
-  enable_algo_trading_if_needed || true
+  if ! enable_algo_trading_if_needed; then
+    if is_truthy "$MT5_ALLOW_PARTIAL_START"; then
+      echo "  warning: MT5 Algo Trading precheck failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+      append_runner_progress "warning: MT5 Algo Trading precheck failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+    else
+      echo "Error: MT5 Algo Trading is still disabled after auto-toggle attempts."
+      append_runner_progress "Error: MT5 Algo Trading is still disabled after auto-toggle attempts."
+      echo "       Set MT5_ALLOW_PARTIAL_START=1 only if you intentionally want best-effort start."
+      exit 1
+    fi
+  fi
 else
   echo "[2.5/6] Skipping trade_allowed probe/toggle precheck."
+  append_runner_progress "[2.5/6] Skipping trade_allowed probe/toggle precheck."
 fi
 
 echo "[3/6] Installing bot dependencies (only when requirements changed)..."
+append_runner_progress "[3/6] Installing bot dependencies (only when requirements changed)..."
+step3_output="$(
 compose exec -T \
   -e USE_SHARED_PYDEPS="${USE_SHARED_PYDEPS}" \
   -e SHARED_PYDEPS_DIR="${SHARED_PYDEPS_DIR}" \
@@ -963,7 +1172,7 @@ if [ "$pip_mode" = "venv" ]; then
   if ! "$python_cmd" -c "import mt5linux" >/dev/null 2>&1; then
     echo "  installing mt5linux runtime into shared venv ..."
     "$python_cmd" -m pip install --no-cache-dir --no-deps mt5linux==0.2.4
-    "$python_cmd" -m pip install --no-cache-dir rpyc==5.0.1 plumbum numpy pyxdg pyzmq
+    "$python_cmd" -m pip install --no-cache-dir rpyc==5.2.3 plumbum==1.7.0 "pyparsing>=3.1.0,<4" numpy pyxdg pyzmq
   fi
 fi
 
@@ -993,9 +1202,18 @@ if [ ! -f "$stamp_file" ]; then
 else
   echo "  requirements already installed (hash: $req_hash), skipping install"
 fi
-'
+' 2>&1
+)"
+if [[ -n "${step3_output:-}" ]]; then
+  printf '%s\n' "$step3_output"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && append_runner_progress "$line"
+  done <<< "$step3_output"
+fi
 
 echo "[4/6] Stopping old bot process (if any)..."
+append_runner_progress "[4/6] Stopping old bot process (if any)..."
+step4_output="$(
 compose exec -T "$SERVICE_NAME" bash -lc "
 set -euo pipefail
 script='/bots/${BOT_SCRIPT}'
@@ -1011,17 +1229,37 @@ if [ -n \"\$pids\" ]; then
   echo \"  stopping existing bot pid(s): \$pids\"
   kill \$pids
 fi
-"
+" 2>&1
+)"
+if [[ -n "${step4_output:-}" ]]; then
+  printf '%s\n' "$step4_output"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && append_runner_progress "$line"
+  done <<< "$step4_output"
+fi
 
 echo "[4.5/6] Re-checking MT5 Algo Trading before bot launch..."
+append_runner_progress "[4.5/6] Re-checking MT5 Algo Trading before bot launch..."
 ensure_experts_common_ini || true
 if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
-  enable_algo_trading_if_needed || true
+  if ! enable_algo_trading_if_needed; then
+    if is_truthy "$MT5_ALLOW_PARTIAL_START"; then
+      echo "  warning: second MT5 Algo precheck failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+      append_runner_progress "warning: second MT5 Algo precheck failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+    else
+      echo "Error: MT5 Algo Trading precheck failed before bot launch."
+      append_runner_progress "Error: MT5 Algo Trading precheck failed before bot launch."
+      echo "       Set MT5_ALLOW_PARTIAL_START=1 only if you intentionally want best-effort start."
+      exit 1
+    fi
+  fi
 else
   echo "[4.5/6] Skipping second MT5 API precheck."
+  append_runner_progress "[4.5/6] Skipping second MT5 API precheck."
 fi
 
 echo "[5/6] Starting bot..."
+append_runner_progress "[5/6] Starting bot..."
 bot_python_cmd="python3"
 require_shared_python="0"
 use_shared_pydeps_lc_host="$(printf '%s' "$USE_SHARED_PYDEPS" | tr '[:upper:]' '[:lower:]')"
@@ -1034,6 +1272,7 @@ case "$use_shared_pydeps_lc_host" in
     ;;
 esac
 
+step5_output="$(
 compose exec -T \
   -e MT5_LOGIN="$MT5_LOGIN_VAL" \
   -e MT5_PASSWORD="$MT5_PASSWORD_VAL" \
@@ -1059,28 +1298,81 @@ compose exec -T \
   -e MT5_RETRY_SECONDS="${MT5_RETRY_SECONDS_VAL:-5}" \
   -e MT5_RPC_TIMEOUT_MS="${MT5_RPC_TIMEOUT_MS_VAL:-180000}" \
   "$SERVICE_NAME" \
-  bash -lc "set -euo pipefail; py_cmd='${bot_python_cmd}'; require_shared='${require_shared_python}'; if [ ! -x \"\$py_cmd\" ]; then if [ \"\$require_shared\" = '1' ]; then echo \"Error: shared python not found at \$py_cmd\"; exit 1; fi; py_cmd='python3'; fi; echo \"  bot python: \$py_cmd\"; cd /bots && nohup env PYTHONUNBUFFERED=1 \"\$py_cmd\" -u /bots/${BOT_SCRIPT} > '${BOT_LOG}' 2>&1 &"
+  bash -lc "set -euo pipefail; py_cmd='${bot_python_cmd}'; require_shared='${require_shared_python}'; if [ ! -x \"\$py_cmd\" ]; then if [ \"\$require_shared\" = '1' ]; then echo \"Error: shared python not found at \$py_cmd\"; exit 1; fi; py_cmd='python3'; fi; echo \"  bot python: \$py_cmd\"; cd /bots && nohup env PYTHONUNBUFFERED=1 \"\$py_cmd\" -u /bots/${BOT_SCRIPT} > '${BOT_LOG}' 2>&1 &" 2>&1
+)"
+if [[ -n "${step5_output:-}" ]]; then
+  printf '%s\n' "$step5_output"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && append_runner_progress "$line"
+  done <<< "$step5_output"
+fi
 
 sleep 5
+if is_truthy "$BOT_STREAM_LOG_TO_CONTAINER_STDOUT"; then
+  echo "[5.5/6] Streaming bot log to Docker container logs..."
+  append_runner_progress "[5.5/6] Streaming bot log to Docker container logs..."
+  if enable_bot_log_stream_if_needed; then
+    :
+  else
+    echo "  warning: failed to enable bot log stream."
+    append_runner_progress "warning: failed to enable bot log stream."
+  fi
+fi
+append_bot_log_marker "[RUNNER] bot_process_started"
 
 echo "[6/6] Verifying bot process..."
-if compose exec -T "$SERVICE_NAME" bash -lc "
-set -euo pipefail
-script='/bots/${BOT_SCRIPT}'
-for proc in /proc/[0-9]*; do
-  [ -r \"\$proc/cmdline\" ] || continue
-  if tr '\0' '\n' < \"\$proc/cmdline\" | grep -Fxq \"\$script\"; then
-    exit 0
+append_runner_progress "[6/6] Verifying bot process..."
+if bot_process_is_running; then
+  if is_truthy "$BOT_WAIT_FOR_WS_REGISTER"; then
+    echo "[6.5/6] Waiting for bot websocket registration..."
+    append_runner_progress "[6.5/6] Waiting for bot websocket registration..."
+    if ! wait_for_bot_ws_registration; then
+      if is_truthy "$MT5_ALLOW_PARTIAL_START"; then
+        echo "  warning: websocket registration not confirmed yet, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+        append_runner_progress "warning: websocket registration not confirmed yet, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+        append_bot_log_marker "[RUNNER] start_warn reason=ws_register_timeout"
+      else
+        echo "Error: bot websocket registration timed out (${BOT_WS_READY_TIMEOUT_SECONDS}s)."
+        append_runner_progress "Error: bot websocket registration timed out (${BOT_WS_READY_TIMEOUT_SECONDS}s)."
+        append_bot_log_marker "[RUNNER] start_failed reason=ws_register_timeout"
+        echo "Recent bot log:"
+        compose exec -T "$SERVICE_NAME" bash -lc "tail -n 120 '${BOT_LOG}'" || true
+        exit 1
+      fi
+    fi
   fi
-done
-exit 1
-"; then
+  if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
+    echo "[6.6/6] Final MT5 Algo Trading check after bot startup..."
+    append_runner_progress "[6.6/6] Final MT5 Algo Trading check after bot startup..."
+    if ! check_trade_allowed; then
+      echo "  trade_allowed dropped after bot startup. Retrying auto-enable..."
+      append_runner_progress "trade_allowed dropped after bot startup. Retrying auto-enable..."
+      if ! enable_algo_trading_if_needed; then
+        if is_truthy "$MT5_ALLOW_PARTIAL_START"; then
+          echo "  warning: final MT5 Algo check failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+          append_runner_progress "warning: final MT5 Algo check failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+          append_bot_log_marker "[RUNNER] start_warn reason=final_algo_check_failed"
+        else
+          echo "Error: final MT5 Algo Trading check failed after bot startup."
+          append_runner_progress "Error: final MT5 Algo Trading check failed after bot startup."
+          append_bot_log_marker "[RUNNER] start_failed reason=final_algo_check_failed"
+          echo "Recent bot log:"
+          compose exec -T "$SERVICE_NAME" bash -lc "tail -n 120 '${BOT_LOG}'" || true
+          exit 1
+        fi
+      fi
+    fi
+  fi
+  append_bot_log_marker "[RUNNER] start_ok"
+  append_runner_progress "Bot started successfully."
   echo "Bot started successfully."
   echo "Log file: ${BOT_LOG}"
   echo "Follow logs with:"
   echo "  docker compose exec -it ${SERVICE_NAME} tail -f ${BOT_LOG}"
 else
   echo "Error: bot process not found, showing last log lines:"
+  append_runner_progress "Error: bot process not found, showing last log lines."
+  append_bot_log_marker "[RUNNER] start_failed reason=bot_process_missing"
   compose exec -T "$SERVICE_NAME" bash -lc "tail -n 50 '${BOT_LOG}'" || true
   exit 1
 fi

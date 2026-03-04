@@ -11,3 +11,5 @@ FlagEmbedding
 # MT5 / Live / Strategy Tester
 # ==================================================
 mt5linux==0.2.4
+rpyc==5.2.3
+websockets>=11,<13

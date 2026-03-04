@@ -1072,16 +1072,7 @@ class LiveTradingBot:
         managed_positions = self._get_symbol_positions_safe()
         if managed_positions:
             for p in managed_positions:
-                try:
-                    position_fields = set(getattr(p, "_fields", ()) or ())
-                except Exception:
-                    position_fields = set()
                 commission_value = 0.0
-                if "commission" in position_fields:
-                    try:
-                        commission_value = float(getattr(p, "commission", 0.0) or 0.0)
-                    except Exception:
-                        commission_value = 0.0
                 opened_at_utc = datetime.fromtimestamp(p.time, tz=timezone.utc)
                 positions_data.append({
                     "ticket": int(p.ticket),

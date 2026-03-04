@@ -287,10 +287,10 @@ else
     show_message "[6/7] Installing Python libraries"
     $wine_executable "$WINE_PYTHON" -m pip install --upgrade pip
     $wine_executable "$WINE_PYTHON" -m pip install --no-warn-script-location "MetaTrader5<5.0.5500"
-    # Pin rpyc to 5.0.1 to match Linux side for protocol compatibility
+    # Pin rpyc to 5.2.3 to match mt5linux 0.2.4 on Linux side.
     # Pin numpy to 1.24.4 - last version that works in Wine without ucrtbase.dll.crealf
-    # Pin mt5linux to legacy-compatible version paired with rpyc==5.0.1
-    $wine_executable "$WINE_PYTHON" -m pip install --no-warn-script-location --no-deps mt5linux==0.2.4 rpyc==5.0.1 plumbum "numpy<1.25" pyzmq
+    # Pin mt5linux to legacy-compatible version paired with rpyc==5.2.3.
+    $wine_executable "$WINE_PYTHON" -m pip install --no-warn-script-location --no-deps mt5linux==0.2.4 rpyc==5.2.3 plumbum==1.7.0 "pyparsing>=3.1.0,<4" "numpy<1.25" pyzmq
     $wine_executable "$WINE_PYTHON" -m pip install --no-cache-dir python-dateutil
     touch "$WINE_BOOTSTRAP_MARKER"
     show_message "[6/7] Python libraries installed in Wine."
@@ -307,7 +307,7 @@ fi
 show_message "[6/7] Checking and installing mt5linux library in Linux if necessary"
 if ! is_python_package_installed "mt5linux"; then
     pip install --break-system-packages --no-cache-dir --no-deps mt5linux==0.2.4 && \
-    pip install --break-system-packages --no-cache-dir rpyc==5.0.1 plumbum numpy
+    pip install --break-system-packages --no-cache-dir rpyc==5.2.3 plumbum==1.7.0 "pyparsing>=3.1.0,<4" numpy
 fi
 
 # Install pyxdg library in Linux if not installed

@@ -30,9 +30,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Install Python dependencies for Linux environment
-# Pin rpyc to 5.0.1 to match Windows side
+# Pin rpyc to 5.2.3 to match mt5linux 0.2.4 on Windows side
 RUN pip3 install --break-system-packages --no-cache-dir --no-deps mt5linux==0.2.4 \
-    && pip3 install --break-system-packages --no-cache-dir rpyc==5.0.1 plumbum numpy pyxdg pyzmq
+    && pip3 install --break-system-packages --no-cache-dir rpyc==5.2.3 plumbum==1.7.0 "pyparsing>=3.1.0,<4" numpy pyxdg pyzmq
 
 # Pre-download installers to cache them in the image
 RUN mkdir -p /defaults/installers \

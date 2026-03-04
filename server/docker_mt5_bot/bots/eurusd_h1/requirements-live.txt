@@ -7,3 +7,5 @@ pandas>=2.1.0,<3.0.0
 joblib
 torch
 mt5linux==0.2.4
+rpyc==5.2.3
+websockets>=11,<13

@@ -511,7 +511,13 @@ async def get_bot_runtime_health(request: Request, botConfigId: str):
     probe_stdout = ""
     probe_stderr = ""
 
-    should_probe_runtime = container_status == "running" or is_active or bool(db_container_id)
+    should_probe_runtime = (container_status == "running" or is_active or bool(db_container_id)) and not live_hub_connected
+    if live_hub_connected:
+        # Live WS heartbeat from bot runtime is already active; avoid expensive MT5 RPC probing
+        # on every polling request.
+        health_detail = "ok"
+        trade_allowed = True
+        tradeapi_disabled = False
     if should_probe_runtime:
         try:
             probe = await asyncio.to_thread(

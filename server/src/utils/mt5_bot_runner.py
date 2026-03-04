@@ -86,6 +86,18 @@ def build_bot_runtime_env(
         or "http://host.docker.internal:8000/vision_llm/"
     )
 
+    rpc_timeout_ms_raw = str(os.getenv("BOT_RUNNER_MT5_RPC_TIMEOUT_MS", "180000") or "").strip()
+    try:
+        rpc_timeout_ms = max(30000, int(rpc_timeout_ms_raw))
+    except ValueError:
+        rpc_timeout_ms = 180000
+
+    sync_timeout_raw = str(os.getenv("BOT_RUNNER_MT5_SYNC_TIMEOUT_SEC", "") or "").strip()
+    try:
+        sync_timeout_sec = max(60, int(sync_timeout_raw)) if sync_timeout_raw else max(60, rpc_timeout_ms // 1000)
+    except ValueError:
+        sync_timeout_sec = max(60, rpc_timeout_ms // 1000)
+
     env = {
         "MT5_LOGIN": str(mt5_login).strip(),
         "MT5_PASSWORD": str(mt5_password).strip(),
@@ -95,6 +107,32 @@ def build_bot_runtime_env(
         "BOT_CONFIG_ID": str(bot_config_id).strip(),
         "BOT_WS_URL": ws_url.strip(),
         "VISION_LLM_API_URL": vision_url.strip(),
+        "MT5_RPC_TIMEOUT_MS": str(rpc_timeout_ms),
+        "LIVE_MT5_SYNC_TIMEOUT_SEC": str(sync_timeout_sec),
+        "MT5_FORCE_ALGO_TRADING": os.getenv("BOT_RUNNER_FORCE_ALGO_TRADING", "1").strip() or "1",
+        "MT5_EXPERTS_DISABLE_ON_ACCOUNT_CHANGE": os.getenv(
+            "BOT_RUNNER_DISABLE_EXPERTS_ON_ACCOUNT_CHANGE", "0"
+        ).strip()
+        or "0",
+        "MT5_EXPERTS_DISABLE_ON_PROFILE_CHANGE": os.getenv(
+            "BOT_RUNNER_DISABLE_EXPERTS_ON_PROFILE_CHANGE", "0"
+        ).strip()
+        or "0",
+        "MT5_EXPERTS_DISABLE_ON_CHART_CHANGE": os.getenv(
+            "BOT_RUNNER_DISABLE_EXPERTS_ON_CHART_CHANGE", "0"
+        ).strip()
+        or "0",
+        "MT5_EXPERTS_DISABLE_VIA_PYTHON_API": os.getenv(
+            "BOT_RUNNER_DISABLE_EXPERTS_VIA_API", "0"
+        ).strip()
+        or "0",
+        "MT5_ALLOW_DLL_IMPORTS": os.getenv("BOT_RUNNER_ALLOW_DLL_IMPORTS", "1").strip() or "1",
+        "MT5_ALLOW_WEBREQUEST": os.getenv("BOT_RUNNER_ALLOW_WEBREQUEST", "1").strip() or "1",
+        "MT5_ALLOW_PARTIAL_START": os.getenv("BOT_RUNNER_ALLOW_PARTIAL_START", "0").strip() or "0",
+        "BOT_WAIT_FOR_WS_REGISTER": os.getenv("BOT_RUNNER_WAIT_FOR_WS_REGISTER", "1").strip() or "1",
+        "BOT_WS_READY_TIMEOUT_SECONDS": os.getenv("BOT_RUNNER_WS_READY_TIMEOUT_SECONDS", "120").strip() or "120",
+        "BOT_STREAM_LOG_TO_CONTAINER_STDOUT": os.getenv("BOT_RUNNER_STREAM_CONTAINER_LOGS", "1").strip() or "1",
+        "RUNNER_PROGRESS_TO_CONTAINER_LOGS": os.getenv("BOT_RUNNER_PROGRESS_TO_CONTAINER_LOGS", "1").strip() or "1",
         "LIVE_MANAGE_MANUAL_POSITIONS": os.getenv("BOT_RUNNER_MANAGE_MANUAL_POSITIONS", "0").strip() or "0",
         "AUTO_BUILD": os.getenv("BOT_RUNNER_AUTO_BUILD", "0").strip() or "0",
         "PULL_LATEST_IMAGE": os.getenv("BOT_RUNNER_PULL_LATEST", "1").strip() or "1",
@@ -360,6 +398,7 @@ def check_bot_runtime_health(
 import json
 import os
 import sys
+import rpyc
 from mt5linux import MetaTrader5
 
 payload = {
@@ -372,6 +411,11 @@ try:
     timeout_ms = int(os.getenv("MT5_RPC_TIMEOUT_MS", "180000"))
 except Exception:
     timeout_ms = 180000
+
+try:
+    rpyc.core.protocol.DEFAULT_CONFIG["sync_request_timeout"] = max(60.0, float(timeout_ms) / 1000.0)
+except Exception:
+    pass
 
 try:
     mt5 = MetaTrader5(host="localhost", port=8001)
@@ -403,17 +447,51 @@ except Exception as exc:
 
     env = os.environ.copy()
     env["MT5_RPC_TIMEOUT_MS"] = str(rpc_timeout_ms)
+    # Avoid health-check process pile-up inside container (can starve MT5 RPC slots).
+    cleanup_cmd = (
+        'pkill -f "python3 -c import json import os import sys.*mt5linux import MetaTrader5" '
+        '>/dev/null 2>&1 || true'
+    )
     try:
-        proc = subprocess.run(
-            ["docker", "exec", "-e", f"MT5_RPC_TIMEOUT_MS={rpc_timeout_ms}", container_id, "python3", "-c", probe_script],
+        subprocess.run(
+            ["docker", "exec", container_id, "sh", "-lc", cleanup_cmd],
             capture_output=True,
             text=True,
-            timeout=timeout_sec,
+            timeout=20,
+            env=env,
+        )
+    except Exception:
+        pass
+
+    try:
+        rpc_timeout_ms_int = max(30000, int(rpc_timeout_ms))
+    except Exception:
+        rpc_timeout_ms_int = 180000
+    inner_timeout_sec = max(30, min(max(30, rpc_timeout_ms_int // 1000 + 30), max(30, int(timeout_sec))))
+    outer_timeout_sec = max(int(timeout_sec), inner_timeout_sec + 15)
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "exec",
+                "-i",
+                "-e",
+                f"MT5_RPC_TIMEOUT_MS={rpc_timeout_ms_int}",
+                container_id,
+                "timeout",
+                str(inner_timeout_sec),
+                "python3",
+                "-",
+            ],
+            input=probe_script,
+            capture_output=True,
+            text=True,
+            timeout=outer_timeout_sec,
             env=env,
         )
     except subprocess.TimeoutExpired as exc:
         raise BotRunnerError(
-            f"Runtime health check timed out after {timeout_sec}s.",
+            f"Runtime health check timed out after {outer_timeout_sec}s.",
             stdout=_shorten_output(exc.stdout),
             stderr=_shorten_output(exc.stderr),
         ) from exc

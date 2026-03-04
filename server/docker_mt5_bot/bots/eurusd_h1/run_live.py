@@ -5,8 +5,14 @@ import traceback
 try:
     import rpyc
 
+    # MT5 RPC handshake can take >20s under Apple Silicon qemu emulation.
+    # Keep a safer default while allowing explicit override.
+    default_sync_timeout = max(
+        60.0,
+        float(int(os.getenv("MT5_RPC_TIMEOUT_MS", "180000")) / 1000.0),
+    )
     rpyc.core.protocol.DEFAULT_CONFIG["sync_request_timeout"] = float(
-        os.getenv("LIVE_MT5_SYNC_TIMEOUT_SEC", "20")
+        os.getenv("LIVE_MT5_SYNC_TIMEOUT_SEC", str(default_sync_timeout))
     )
 except Exception:
     pass
