@@ -6,7 +6,6 @@ from typing import Annotated, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from lib.untils import send_email
-from prisma.errors import ForeignKeyViolationError
 
 from ..database.client import db
 from ..models.admin_model import (
@@ -48,6 +47,7 @@ ALLOWED_BOT_STATUSES = {"running", "stopped"}
 ALLOWED_SUB_STATUSES = {"active", "past_due", "canceled"}
 ALLOWED_FEE_TYPES = {"percentage", "fixed"}
 MAGIC_RESEED_LIMIT = 128
+SOFT_DELETED_LABEL_PREFIX = "[DELETED] "
 
 
 def _to_float(value: Optional[Decimal]) -> float:
@@ -203,6 +203,20 @@ def _runner_error_message(prefix: str, exc: BotRunnerError) -> str:
     if stdout:
         return f"{prefix}: {exc}. stdout={stdout}"
     return f"{prefix}: {exc}"
+
+
+def _is_soft_deleted_bot_version(version) -> bool:
+    label = str(getattr(version, "label", "") or "").strip()
+    return label.startswith(SOFT_DELETED_LABEL_PREFIX)
+
+
+def _to_soft_deleted_label(label: Optional[str], model_id: str) -> str:
+    current = str(label or "").strip()
+    if current.startswith(SOFT_DELETED_LABEL_PREFIX):
+        return current
+    base = current or str(model_id)
+    max_base_length = max(1, 100 - len(SOFT_DELETED_LABEL_PREFIX))
+    return f"{SOFT_DELETED_LABEL_PREFIX}{base[:max_base_length]}"
 
 
 async def _allocate_magic_number_for_account(
@@ -1158,6 +1172,8 @@ async def get_admin_bot_versions(
     results: List[AdminBotVersionItemResponse] = []
 
     for version in versions:
+        if _is_soft_deleted_bot_version(version):
+            continue
         usage_count = await db.botconfiguration.count(
             where={
                 "modelId": str(version.modelId),
@@ -1183,6 +1199,11 @@ async def create_admin_bot_version(
 
     if not data.label.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="label is required")
+    if data.label.strip().startswith(SOFT_DELETED_LABEL_PREFIX):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="label cannot start with reserved prefix [DELETED]",
+        )
     if not data.version_tag.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="version_tag is required")
 
@@ -1211,6 +1232,11 @@ async def update_admin_bot_version(
     existing = await db.botversion.find_unique(where={"modelId": model_id})
     if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot version not found")
+    if _is_soft_deleted_bot_version(existing):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot edit a deleted bot version",
+        )
 
     update_payload = {}
 
@@ -1218,6 +1244,11 @@ async def update_admin_bot_version(
         label = data.label.strip()
         if not label:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="label cannot be empty")
+        if label.startswith(SOFT_DELETED_LABEL_PREFIX):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="label cannot start with reserved prefix [DELETED]",
+            )
         update_payload["label"] = label
 
     if data.version_tag is not None:
@@ -1288,6 +1319,11 @@ async def publish_admin_bot_update(
     existing = await db.botversion.find_unique(where={"modelId": model_id})
     if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot version not found")
+    if _is_soft_deleted_bot_version(existing):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot publish update for a deleted bot version",
+        )
 
     release_notes = _clean_release_notes(data.release_notes) if data.release_notes is not None else None
     next_version_tag = data.version_tag.strip() if data.version_tag is not None else None
@@ -1373,6 +1409,11 @@ async def update_admin_bot_version_active(
     existing = await db.botversion.find_unique(where={"modelId": model_id})
     if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot version not found")
+    if _is_soft_deleted_bot_version(existing):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot change active status for a deleted bot version",
+        )
 
     next_active = bool(data.is_active)
     stopped_bots_count = 0
@@ -1410,34 +1451,33 @@ async def delete_admin_bot_version(
     existing = await db.botversion.find_unique(where={"modelId": model_id})
     if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot version not found")
+    if _is_soft_deleted_bot_version(existing):
+        return {
+            "message": "Bot version already deleted",
+            "soft_deleted": True,
+            "stopped_bots": 0,
+        }
 
-    total_reference_count = await db.botconfiguration.count(
-        where={"modelId": model_id}
+    stopped_bots_count, failed_stops_count = await _stop_active_bots_using_version(model_id)
+    if failed_stops_count > 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                f"Failed to stop {failed_stops_count} bot runtime(s) while deleting this version. "
+                "Please retry delete."
+            ),
+        )
+
+    await db.botversion.update(
+        where={"modelId": model_id},
+        data={
+            "isActive": False,
+            "label": _to_soft_deleted_label(existing.label, model_id),
+        },
     )
-    if total_reference_count > 0:
-        active_usage_count = await db.botconfiguration.count(
-            where={
-                "modelId": model_id,
-                "recordStatus": "active",
-                "account": {"recordStatus": "active"},
-            }
-        )
-        detail = (
-            f"Cannot delete bot version while {active_usage_count} active bot(s) still use it"
-            if active_usage_count > 0
-            else f"Cannot delete bot version because {total_reference_count} bot configuration(s) still reference it"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=detail,
-        )
 
-    try:
-        await db.botversion.delete(where={"modelId": model_id})
-    except ForeignKeyViolationError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot delete bot version because related bot configurations still reference it",
-        )
-
-    return {"message": "Bot version deleted"}
+    return {
+        "message": "Bot version deleted (soft delete)",
+        "soft_deleted": True,
+        "stopped_bots": int(stopped_bots_count),
+    }
