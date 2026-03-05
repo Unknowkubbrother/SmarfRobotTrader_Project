@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { BellRing, Boxes, Clock, PenSquare, Plus, Power, Rocket, Tag, Trash2, Upload } from "lucide-react";
+import { BellRing, Boxes, Clock, PenSquare, Plus, Power, Tag, Trash2, Upload } from "lucide-react";
 import { toast } from "sonner";
 
 import { api } from "@/lib/api";
@@ -240,31 +240,6 @@ export function AdminBotVersions() {
     } catch (error: any) {
       console.error("Error toggling version active state:", error);
       toast.error(error?.message || "Failed to toggle version status");
-    } finally {
-      setActionKey(null);
-    }
-  };
-
-  const rolloutVersion = async (version: BotVersion) => {
-    if (!version.is_active) {
-      toast.error("Please activate this version before rollout");
-      return;
-    }
-
-    const confirmed = window.confirm(
-      `Rollout ${version.label || version.version_tag || "this version"} to existing bots?`
-    );
-    if (!confirmed) return;
-
-    setActionKey(`rollout-${version.id}`);
-    try {
-      const { data } = await api.post(`/admin/bot-versions/${version.id}/rollout`);
-      const updatedBots = Number(data?.updated_bots || 0);
-      toast.success(`Rollout complete. Updated ${updatedBots} bot(s).`);
-      await fetchVersions();
-    } catch (error: any) {
-      console.error("Error rolling out version:", error);
-      toast.error(error?.message || "Failed to rollout bot version");
     } finally {
       setActionKey(null);
     }
@@ -595,16 +570,6 @@ export function AdminBotVersions() {
                   <Button size="sm" onClick={() => openPublishDialog(version)}>
                     <BellRing className="w-4 h-4 mr-1" />
                     Update Bot
-                  </Button>
-
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={actionKey === `rollout-${version.id}` || !version.is_active}
-                    onClick={() => rolloutVersion(version)}
-                  >
-                    <Rocket className="w-4 h-4 mr-1" />
-                    {actionKey === `rollout-${version.id}` ? "Rolling out..." : "Rollout Model"}
                   </Button>
 
                   <Button

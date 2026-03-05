@@ -6,6 +6,7 @@ from typing import Annotated, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from lib.untils import send_email
+from prisma.errors import ForeignKeyViolationError
 
 from ..database.client import db
 from ..models.admin_model import (
@@ -1355,76 +1356,6 @@ async def update_admin_bot_version_active(
     }
 
 
-@admin_router.post("/bot-versions/{model_id}/rollout")
-async def rollout_admin_bot_version(
-    model_id: str,
-    current_user: Annotated[Any, Depends(get_current_active_user)],
-):
-    _require_admin(current_user)
-
-    target_version = await db.botversion.find_unique(where={"modelId": model_id})
-    if not target_version:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot version not found")
-
-    if not bool(getattr(target_version, "isActive", True)):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot rollout an inactive bot version",
-        )
-
-    source_where = {"modelId": {"not": model_id}}
-    if target_version.symbol:
-        source_where["symbol"] = target_version.symbol
-    if target_version.timeframe:
-        source_where["timeframe"] = target_version.timeframe
-    if not target_version.symbol and not target_version.timeframe and target_version.label:
-        source_where["label"] = target_version.label
-    if not target_version.symbol and not target_version.timeframe and not target_version.label:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Target version needs symbol/timeframe or label to rollout safely",
-        )
-
-    source_versions = await db.botversion.find_many(where=source_where)
-    source_model_ids = [str(version.modelId) for version in source_versions]
-
-    if not source_model_ids:
-        return {
-            "message": "No older bot versions found for rollout",
-            "updated_bots": 0,
-            "source_versions": 0,
-        }
-
-    affected_bots = await db.botconfiguration.count(
-        where={
-            "modelId": {"in": source_model_ids},
-            "recordStatus": "active",
-            "account": {"recordStatus": "active"},
-        }
-    )
-
-    if affected_bots > 0:
-        await db.botconfiguration.update_many(
-            where={
-                "modelId": {"in": source_model_ids},
-                "recordStatus": "active",
-                "account": {"recordStatus": "active"},
-            },
-            data={
-                "modelId": model_id,
-                "installedDockerImageId": target_version.dockerImageId,
-                "installedVersionTag": target_version.versionTag,
-            },
-        )
-
-    return {
-        "message": "Bot rollout completed",
-        "updated_bots": affected_bots,
-        "source_versions": len(source_model_ids),
-        "target_version": model_id,
-    }
-
-
 @admin_router.delete("/bot-versions/{model_id}")
 async def delete_admin_bot_version(
     model_id: str,
@@ -1436,18 +1367,33 @@ async def delete_admin_bot_version(
     if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot version not found")
 
-    usage_count = await db.botconfiguration.count(
-        where={
-            "modelId": model_id,
-            "recordStatus": "active",
-            "account": {"recordStatus": "active"},
-        }
+    total_reference_count = await db.botconfiguration.count(
+        where={"modelId": model_id}
     )
-    if usage_count > 0:
+    if total_reference_count > 0:
+        active_usage_count = await db.botconfiguration.count(
+            where={
+                "modelId": model_id,
+                "recordStatus": "active",
+                "account": {"recordStatus": "active"},
+            }
+        )
+        detail = (
+            f"Cannot delete bot version while {active_usage_count} active bot(s) still use it"
+            if active_usage_count > 0
+            else f"Cannot delete bot version because {total_reference_count} bot configuration(s) still reference it"
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot delete a bot version that is currently in use",
+            detail=detail,
         )
 
-    await db.botversion.delete(where={"modelId": model_id})
+    try:
+        await db.botversion.delete(where={"modelId": model_id})
+    except ForeignKeyViolationError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete bot version because related bot configurations still reference it",
+        )
+
     return {"message": "Bot version deleted"}
