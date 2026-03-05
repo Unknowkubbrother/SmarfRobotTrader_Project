@@ -1118,13 +1118,44 @@ trade_allowed_confirmed() {
   return 0
 }
 
+trade_gate_definitively_off() {
+  local attempt
+  local rc=0
+  local disabled_hits=0
+  for attempt in 1 2 3; do
+    if check_trade_allowed; then
+      return 1
+    fi
+    rc=$?
+    if [[ "$rc" -eq 1 || "$rc" -eq 5 ]]; then
+      disabled_hits=$((disabled_hits + 1))
+      if (( disabled_hits >= 2 )); then
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 force_set_algo_trading_on() {
   local cycle=0
 
+  # Fast path: avoid UI toggle if trade gate is already enabled.
+  if trade_allowed_confirmed; then
+    return 0
+  fi
+
   if ! ensure_xdotool; then
+    if trade_allowed_confirmed; then
+      return 0
+    fi
     return 1
   fi
   if ! wait_for_mt5_main_window; then
+    if trade_allowed_confirmed; then
+      return 0
+    fi
     return 1
   fi
 
@@ -1795,15 +1826,21 @@ if bot_process_is_running; then
       echo "[6.66/6] Forcing deterministic MT5 Algo ON state..."
       append_runner_progress "[6.66/6] Forcing deterministic MT5 Algo ON state..."
       if ! force_set_algo_trading_on; then
-        if is_truthy "$MT5_ALLOW_PARTIAL_START"; then
-          echo "  warning: deterministic MT5 Algo ON enforcement failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
-          append_runner_progress "warning: deterministic MT5 Algo ON enforcement failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
-          append_bot_log_marker "[RUNNER] start_warn reason=algo_force_on_failed"
+        if trade_gate_definitively_off; then
+          if is_truthy "$MT5_ALLOW_PARTIAL_START"; then
+            echo "  warning: deterministic MT5 Algo ON enforcement failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+            append_runner_progress "warning: deterministic MT5 Algo ON enforcement failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+            append_bot_log_marker "[RUNNER] start_warn reason=algo_force_on_failed"
+          else
+            echo "Error: unable to force MT5 Algo Trading ON state."
+            append_runner_progress "Error: unable to force MT5 Algo Trading ON state."
+            append_bot_log_marker "[RUNNER] start_failed reason=algo_force_on_failed"
+            exit 1
+          fi
         else
-          echo "Error: unable to force MT5 Algo Trading ON state."
-          append_runner_progress "Error: unable to force MT5 Algo Trading ON state."
-          append_bot_log_marker "[RUNNER] start_failed reason=algo_force_on_failed"
-          exit 1
+          echo "  warning: deterministic MT5 Algo ON enforcement was inconclusive, continuing because trade gate is not definitively OFF."
+          append_runner_progress "warning: deterministic MT5 Algo ON enforcement was inconclusive, continuing because trade gate is not definitively OFF."
+          append_bot_log_marker "[RUNNER] start_warn reason=algo_force_on_inconclusive"
         fi
       fi
 	  fi

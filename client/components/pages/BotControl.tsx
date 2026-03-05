@@ -146,7 +146,6 @@ export default function BotControl() {
     emergencyStopBot,
     applyBotUpdate,
     deleteBot,
-    getBotRuntimeHealth,
     getBotOperationLogs,
     updateAccount,
     deleteAccount,
@@ -176,7 +175,6 @@ export default function BotControl() {
   const [actionLogs, setActionLogs] = useState<PersistedBotLog[]>([]);
   const [runtimeHealth, setRuntimeHealth] = useState<BotRuntimeHealth | null>(null);
   const [storeReady, setStoreReady] = useState(false);
-  const healthLogKeysRef = useRef<Set<string>>(new Set());
   const processedLifecycleIdsRef = useRef<Set<string>>(new Set());
   const lastLifecycleRefetchAtRef = useRef<number>(0);
   const lastLogsRefreshAtRef = useRef<number>(0);
@@ -195,8 +193,9 @@ export default function BotControl() {
   const isBusy = Boolean(activeActionForSelectedBot) || isStatusStarting;
   const isApplyingUpdateAction = activeActionForSelectedBot?.kind === "apply_update";
 
-  const { getBotState, lifecycleEvents } = useBotLiveState();
+  const { getBotState, lifecycleEvents, isConnected: isBotWsConnected } = useBotLiveState();
   const liveState = selectedBot ? getBotState(selectedBot.id) : undefined;
+  const isLiveHubConnected = Boolean(liveState?.connected || liveState?.ws_connected);
 
   // Safe live state properties with fallbacks
   const botTodayPnl = selectedBot?.today_pnl ?? 0;
@@ -305,8 +304,61 @@ export default function BotControl() {
   }, [selectedBot]);
 
   useEffect(() => {
+    if (!selectedBot) {
+      setRuntimeHealth(null);
+      return;
+    }
+
+    const normalizedStatus = String(selectedBot.status || selectedBot.container_status || "").toLowerCase();
+    const expectsLiveData =
+      normalizedStatus === "running" ||
+      normalizedStatus === "starting" ||
+      activeAction?.botId === selectedBot.id;
+
+    if (isLiveHubConnected) {
+      setRuntimeHealth({
+        bot_config_id: selectedBot.id,
+        magic_number: selectedBot.magic_number ?? null,
+        container_status: selectedBot.container_status || selectedBot.status || null,
+        is_active: Boolean(selectedBot.is_active),
+        docker_project_name: null,
+        docker_container_id: selectedBot.docker_container_id || null,
+        live_hub_connected: true,
+        trade_allowed: null,
+        tradeapi_disabled: null,
+        health_detail: "live_stream_connected",
+      });
+      return;
+    }
+
+    if (expectsLiveData) {
+      setRuntimeHealth({
+        bot_config_id: selectedBot.id,
+        magic_number: selectedBot.magic_number ?? null,
+        container_status: selectedBot.container_status || selectedBot.status || null,
+        is_active: Boolean(selectedBot.is_active),
+        docker_project_name: null,
+        docker_container_id: selectedBot.docker_container_id || null,
+        live_hub_connected: false,
+        trade_allowed: null,
+        tradeapi_disabled: null,
+        health_detail: isBotWsConnected ? "waiting_for_live_stream" : "ws_dashboard_disconnected",
+      });
+      return;
+    }
+
     setRuntimeHealth(null);
-  }, [selectedBot?.id]);
+  }, [
+    activeAction?.botId,
+    isBotWsConnected,
+    isLiveHubConnected,
+    selectedBot?.container_status,
+    selectedBot?.docker_container_id,
+    selectedBot?.id,
+    selectedBot?.is_active,
+    selectedBot?.magic_number,
+    selectedBot?.status,
+  ]);
 
   useEffect(() => {
     const botId = selectedBot?.id;
@@ -416,7 +468,6 @@ export default function BotControl() {
     const selectedBotId = selectedBot?.id || null;
     const pendingSelectedEvents: BotLifecycleEvent[] = [];
     let shouldRefetch = false;
-    let shouldRefreshSelectedLogs = false;
 
     const orderedEvents = [...lifecycleEvents].reverse();
     for (const event of orderedEvents) {
@@ -432,7 +483,6 @@ export default function BotControl() {
       shouldRefetch = true;
       if (selectedBotId && event.bot_config_id === selectedBotId) {
         pendingSelectedEvents.push(event);
-        shouldRefreshSelectedLogs = true;
       }
     }
 
@@ -480,9 +530,6 @@ export default function BotControl() {
         void refetch();
       }
     }
-    if (selectedBotId && shouldRefreshSelectedLogs) {
-      void refreshSelectedBotLogs(selectedBotId);
-    }
   }, [accounts, lifecycleEvents, selectedBot?.id, activeAction, refetch]);
 
   useEffect(() => {
@@ -510,87 +557,30 @@ export default function BotControl() {
       finishUiAction();
 
       if (completedAction.kind === "starting" && completedAction.botId) {
-        const actionKey = `${completedAction.botId}:${completedAction.startedAt}:post_start_health`;
-        if (!healthLogKeysRef.current.has(actionKey)) {
-          healthLogKeysRef.current.add(actionKey);
-          void (async () => {
-            let health: BotRuntimeHealth | null = null;
-            for (let attempt = 1; attempt <= 6; attempt += 1) {
-              health = await getBotRuntimeHealth(completedAction.botId as string);
-              if (health && health.trade_allowed !== null) {
-                break;
-              }
-              if (attempt < 6) {
-                await new Promise((resolve) => window.setTimeout(resolve, 2000));
-              }
-            }
-            if (!health) {
-              appendActionLog("info", "Bot started. Runtime health check is pending...", completedAction.botId);
-              return;
-            }
-            if (selectedBot?.id === health.bot_config_id) {
-              setRuntimeHealth(health);
-            }
-            if (health.trade_allowed === true) {
-              appendActionLog("success", "MT5 algorithmic trading is enabled", completedAction.botId);
-            } else if (health.trade_allowed === false) {
-              appendActionLog("error", "MT5 algorithmic trading is disabled", completedAction.botId);
-            } else {
-              appendActionLog(
-                "info",
-                `MT5 runtime health: ${health.health_detail || "waiting for data"}`,
-                completedAction.botId,
-              );
-            }
-          })();
-        }
+        appendActionLog("info", "Bot started. Waiting for live stream handshake...", completedAction.botId);
       }
     }
-  }, [accounts, activeAction, selectedBot?.id]);
+  }, [accounts, activeAction]);
 
   useEffect(() => {
     if (!activeAction) return;
+    if (isBotWsConnected) return;
     const timer = window.setInterval(() => {
       void refetch();
-    }, 4000);
+    }, 15000);
     return () => window.clearInterval(timer);
-  }, [activeAction, refetch]);
+  }, [activeAction, isBotWsConnected, refetch]);
 
   useEffect(() => {
     if (!selectedBot) return;
+    if (isBotWsConnected) return;
     const normalizedStatus = String(selectedBot.status || selectedBot.container_status || "").toLowerCase();
     if (normalizedStatus !== "starting") return;
     const timer = window.setInterval(() => {
       void refetch();
-      void refreshSelectedBotLogs(selectedBot.id);
-    }, 3000);
+    }, 12000);
     return () => window.clearInterval(timer);
-  }, [selectedBot?.id, selectedBot?.status, selectedBot?.container_status, refetch]);
-
-  useEffect(() => {
-    if (!selectedBot) return;
-    const selectedBotId = selectedBot.id;
-    const normalizedStatus = String(selectedBot.status || selectedBot.container_status || "").toLowerCase();
-    const shouldPoll = normalizedStatus === "running" || activeAction?.botId === selectedBotId;
-    if (!shouldPoll) return;
-
-    let cancelled = false;
-    const pollRuntimeHealth = async () => {
-      const health = await getBotRuntimeHealth(selectedBotId);
-      if (!cancelled && health) {
-        setRuntimeHealth(health);
-      }
-    };
-
-    void pollRuntimeHealth();
-    const timer = window.setInterval(() => {
-      void pollRuntimeHealth();
-    }, 5000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [selectedBot, activeAction?.botId]);
+  }, [selectedBot?.id, selectedBot?.status, selectedBot?.container_status, isBotWsConnected, refetch]);
 
   useEffect(() => {
     if (!activeAction?.startedAt) return;
@@ -875,7 +865,7 @@ export default function BotControl() {
   const normalizedBotStatus = String(botStatus || "").toLowerCase();
   const isRunningStatus = normalizedBotStatus === "running";
   const isStartingStatus = normalizedBotStatus === "starting";
-  const hasLiveStream = Boolean(liveState?.connected);
+  const hasLiveStream = isLiveHubConnected;
   const isLiveConnecting =
     !hasLiveStream && (isRunningStatus || isStartingStatus || activeActionForSelectedBot?.kind === "starting");
   const botSymbol = selectedBot?.bot_version?.symbol || "N/A";
