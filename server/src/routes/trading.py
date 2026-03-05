@@ -40,6 +40,29 @@ def _to_float(value, default: float = 0.0) -> float:
         return float(default)
 
 
+def _normalize_order_type_display(value) -> str:
+    raw = value.value if hasattr(value, "value") else value
+    text = str(raw or "").strip().lower()
+    if text.endswith(".buy"):
+        text = "buy"
+    elif text.endswith(".sell"):
+        text = "sell"
+    if text in {"buy", "0"}:
+        return "BUY"
+    if text in {"sell", "1"}:
+        return "SELL"
+    return ""
+
+
+def _to_optional_price(value) -> float | None:
+    if value is None:
+        return None
+    parsed = _to_float(value, 0.0)
+    if parsed <= 0.0:
+        return None
+    return float(parsed)
+
+
 def _order_net_profit(order) -> float:
     profit = _to_float(getattr(order, "profit", 0.0), 0.0)
     commission = _to_float(getattr(order, "commission", 0.0), 0.0)
@@ -515,17 +538,20 @@ async def get_trading_history_by_day(
 
         open_time = getattr(order, "openTime", None)
         close_time = getattr(order, "closeTime", None)
+        order_type = _normalize_order_type_display(getattr(order, "type", ""))
+        open_price = _to_optional_price(getattr(order, "openPrice", None))
+        close_price = _to_optional_price(getattr(order, "closePrice", None))
         rows.append(
             {
                 "ticketId": int(getattr(order, "ticketId", 0) or 0),
                 "accountId": str(getattr(order, "accountId", "") or ""),
                 "magicNumber": int(getattr(order, "magicNumber", 0) or 0) or None,
                 "symbol": str(getattr(order, "symbol", "") or ""),
-                "type": str(getattr(order, "type", "") or "").upper(),
+                "type": order_type,
                 "status": str(getattr(order, "status", "") or ""),
                 "volume": _to_float(getattr(order, "volume", 0.0), 0.0),
-                "openPrice": _to_float(getattr(order, "openPrice", 0.0), 0.0),
-                "closePrice": _to_float(getattr(order, "closePrice", 0.0), 0.0),
+                "openPrice": open_price,
+                "closePrice": close_price,
                 "commission": commission,
                 "swap": swap,
                 "profit": round(float(gross_profit), 2),
@@ -618,17 +644,20 @@ async def get_trading_journal_feed(
         trade_rationale = str(getattr(journal, "tradeRationale", "") or "").strip() if journal else ""
         mistake_lesson = str(getattr(journal, "mistakeLesson", "") or "").strip() if journal else ""
 
+        order_type = _normalize_order_type_display(getattr(order, "type", ""))
+        open_price = _to_optional_price(getattr(order, "openPrice", None))
+        close_price = _to_optional_price(getattr(order, "closePrice", None))
         row = {
             "journalId": str(getattr(journal, "id", "") or "") if journal else None,
             "ticketId": int(ticket_id),
             "accountId": str(getattr(order, "accountId", "") or ""),
             "magicNumber": int(getattr(order, "magicNumber", 0) or 0) or None,
             "symbol": str(getattr(order, "symbol", "") or ""),
-            "type": str(getattr(order, "type", "") or "").upper(),
+            "type": order_type,
             "status": str(getattr(order, "status", "") or ""),
             "volume": _to_float(getattr(order, "volume", 0.0), 0.0),
-            "openPrice": _to_float(getattr(order, "openPrice", 0.0), 0.0),
-            "closePrice": _to_float(getattr(order, "closePrice", 0.0), 0.0),
+            "openPrice": open_price,
+            "closePrice": close_price,
             "profit": round(_to_float(getattr(order, "profit", 0.0), 0.0), 2),
             "commission": _to_float(getattr(order, "commission", 0.0), 0.0),
             "swap": _to_float(getattr(order, "swap", 0.0), 0.0),

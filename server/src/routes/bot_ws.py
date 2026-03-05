@@ -57,6 +57,17 @@ def _safe_int(value, default: int = 0) -> int:
         return int(default)
 
 
+def _normalize_order_side(value) -> str | None:
+    text = str(_enum_value(value) or "").strip().lower()
+    if text in {"buy", "sell"}:
+        return text
+    if text in {"0", "buy market", "deal_type_buy"}:
+        return "buy"
+    if text in {"1", "sell market", "deal_type_sell"}:
+        return "sell"
+    return None
+
+
 def _safe_finite_float(value, default: float | None = None) -> float | None:
     try:
         parsed = float(value)
@@ -137,8 +148,7 @@ def _extract_live_positions(state: dict, allowed_magic_set: set[int] | None = No
         if isinstance(allowed_magic_set, set) and len(allowed_magic_set) > 0:
             if magic not in allowed_magic_set:
                 continue
-        side_raw = str(item.get("type", "")).strip().upper()
-        side = "buy" if side_raw == "BUY" else "sell" if side_raw == "SELL" else None
+        side = _normalize_order_side(item.get("type"))
         pos_payload = {
             "ticket": ticket,
             "symbol": str(item.get("symbol") or state.get("symbol") or "").strip().upper() or None,
@@ -171,11 +181,6 @@ async def _persist_closed_orders_only(
         int(ticket) for ticket in previous_positions.keys()
         if int(ticket) not in current_positions
     ]
-    if skip_ticket_ids:
-        closed_ticket_ids = [ticket for ticket in closed_ticket_ids if int(ticket) not in skip_ticket_ids]
-    if not closed_ticket_ids:
-        _BOT_OPEN_POSITIONS[bot_config_id] = current_positions
-        return
 
     existing = await db.orderhistory.find_many(
         where={"ticketId": {"in": closed_ticket_ids}},
@@ -184,6 +189,27 @@ async def _persist_closed_orders_only(
         _safe_int(row.ticketId, 0): row
         for row in existing
     }
+    if skip_ticket_ids:
+        filtered_ticket_ids: list[int] = []
+        for ticket in closed_ticket_ids:
+            if int(ticket) not in skip_ticket_ids:
+                filtered_ticket_ids.append(int(ticket))
+                continue
+            existing_row = existing_by_ticket.get(int(ticket))
+            # Keep tickets synced by closed_deals only when row already has complete open-side data.
+            if existing_row is None:
+                filtered_ticket_ids.append(int(ticket))
+                continue
+            existing_type = _normalize_order_side(getattr(existing_row, "type", None))
+            existing_open_price = _safe_float(getattr(existing_row, "openPrice", 0.0), 0.0)
+            existing_open_time = _as_utc_datetime(getattr(existing_row, "openTime", None))
+            if existing_type is None or existing_open_price <= 0.0 or existing_open_time is None:
+                filtered_ticket_ids.append(int(ticket))
+        closed_ticket_ids = filtered_ticket_ids
+
+    if not closed_ticket_ids:
+        _BOT_OPEN_POSITIONS[bot_config_id] = current_positions
+        return
 
     close_dt = datetime.now(timezone.utc)
     for ticket in closed_ticket_ids:
@@ -296,7 +322,16 @@ def _should_update_closed_order(existing, incoming: dict) -> bool:
     if existing_symbol != incoming_symbol:
         return True
 
+    existing_type = _normalize_order_side(getattr(existing, "type", None))
+    incoming_type = _normalize_order_side(incoming.get("type"))
+    if incoming_type is not None and existing_type != incoming_type:
+        return True
+
     if not _almost_equal(getattr(existing, "volume", 0.0), incoming.get("volume", 0.0), tolerance=1e-4):
+        return True
+
+    incoming_open_price = incoming.get("openPrice")
+    if incoming_open_price is not None and not _almost_equal(getattr(existing, "openPrice", 0.0), incoming_open_price, tolerance=1e-6):
         return True
 
     incoming_close_price = incoming.get("closePrice")
@@ -322,6 +357,16 @@ def _should_update_closed_order(existing, incoming: dict) -> bool:
         if abs((existing_close_time - incoming_close_time).total_seconds()) > 0.5:
             return True
 
+    existing_open_time = _as_utc_datetime(getattr(existing, "openTime", None))
+    incoming_open_time = _as_utc_datetime(incoming.get("openTime"))
+    if existing_open_time is None and incoming_open_time is not None:
+        return True
+    if existing_open_time is not None and incoming_open_time is None:
+        return True
+    if existing_open_time is not None and incoming_open_time is not None:
+        if abs((existing_open_time - incoming_open_time).total_seconds()) > 0.5:
+            return True
+
     existing_status = str(getattr(existing, "status", "") or "").strip().lower()
     if existing_status != "closed":
         return True
@@ -330,6 +375,7 @@ def _should_update_closed_order(existing, incoming: dict) -> bool:
 
 
 async def _persist_closed_deals_from_state(
+    bot_config_id: str,
     account_id: str,
     bot_instance_id: int,
     state: dict,
@@ -340,6 +386,7 @@ async def _persist_closed_deals_from_state(
     if not isinstance(raw_deals, list) or len(raw_deals) == 0:
         return set()
 
+    previous_positions = _BOT_OPEN_POSITIONS.get(bot_config_id, {}) if bot_config_id else {}
     normalized = []
     for raw in raw_deals:
         if not isinstance(raw, dict):
@@ -360,13 +407,33 @@ async def _persist_closed_deals_from_state(
         if close_time is None:
             close_time = datetime.now(timezone.utc)
 
+        previous_pos = previous_positions.get(int(ticket)) or {}
+        side = _normalize_order_side(raw.get("type")) or _normalize_order_side(previous_pos.get("type"))
+        open_price = _safe_float(raw.get("openPrice"), 0.0)
+        if open_price <= 0.0:
+            open_price = _safe_float(previous_pos.get("openPrice"), 0.0)
+        open_time = _parse_closed_time(raw.get("openTime"))
+        if open_time is None:
+            open_time_msc = _safe_int(raw.get("openTimeMsc"), 0)
+            if open_time_msc > 0:
+                open_time = datetime.fromtimestamp(open_time_msc / 1000.0, tz=timezone.utc)
+        if open_time is None:
+            open_time_ts = _safe_int(raw.get("openTimeTs"), 0)
+            if open_time_ts > 0:
+                open_time = datetime.fromtimestamp(open_time_ts, tz=timezone.utc)
+        if open_time is None:
+            open_time = _as_utc_datetime(previous_pos.get("openTime"))
+
         close_price = _safe_float(raw.get("closePrice"), 0.0)
         normalized.append(
             {
                 "ticket": int(ticket),
                 "magic": magic,
                 "symbol": str(raw.get("symbol", "") or "").strip().upper() or None,
+                "type": side,
                 "volume": _safe_float(raw.get("volume"), 0.0),
+                "openPrice": open_price if open_price > 0 else None,
+                "openTime": open_time,
                 "closePrice": close_price if close_price > 0 else None,
                 "closeTime": close_time,
                 "profit": _safe_float(raw.get("profit"), 0.0),
@@ -400,6 +467,12 @@ async def _persist_closed_deals_from_state(
             "commission": row["commission"],
             "status": "closed",
         }
+        if row["type"] is not None:
+            data["type"] = row["type"]
+        if row["openPrice"] is not None:
+            data["openPrice"] = row["openPrice"]
+        if row["openTime"] is not None:
+            data["openTime"] = row["openTime"]
         if row["closePrice"] is not None:
             data["closePrice"] = row["closePrice"]
 
@@ -526,6 +599,7 @@ async def _persist_bot_state(bot_config_id: str, state: dict) -> None:
     synced_deal_ticket_ids: set[int] = set()
     try:
         synced_deal_ticket_ids = await _persist_closed_deals_from_state(
+            bot_config_id,
             account_id,
             bot_instance_id,
             state,

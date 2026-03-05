@@ -31,8 +31,8 @@ interface TradeHistoryRow {
   type: string;
   status: string;
   volume: number;
-  openPrice: number;
-  closePrice: number;
+  openPrice: number | null;
+  closePrice: number | null;
   commission: number;
   swap: number;
   profit: number;
@@ -63,6 +63,12 @@ const toDateKey = (year: number, monthZeroBased: number, day: number): string =>
   const mm = String(monthZeroBased + 1).padStart(2, "0");
   const dd = String(day).padStart(2, "0");
   return `${year}-${mm}-${dd}`;
+};
+
+const formatPriceOrDash = (value: number | null | undefined): string => {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed) || parsed <= 0) return "-";
+  return parsed.toFixed(5);
 };
 
 export default function ProfitCalendar() {
@@ -672,6 +678,7 @@ export default function ProfitCalendar() {
                     )}
                     {tradeHistory.map((row) => {
                       const fee = Number(row.commission || 0) + Number(row.swap || 0);
+                      const rowType = String(row.type || "").toUpperCase();
                       return (
                         <TableRow key={`${row.ticketId}-${row.closeTime || ""}`}>
                           <TableCell className="font-mono text-xs">#{row.ticketId}</TableCell>
@@ -680,13 +687,13 @@ export default function ProfitCalendar() {
                           </TableCell>
                           <TableCell>{row.symbol || "-"}</TableCell>
                           <TableCell>
-                            <span className={cn("text-xs font-semibold", row.type === "BUY" ? "text-success" : row.type === "SELL" ? "text-destructive" : "text-foreground")}>
-                              {row.type || "-"}
+                            <span className={cn("text-xs font-semibold", rowType === "BUY" ? "text-success" : rowType === "SELL" ? "text-destructive" : "text-foreground")}>
+                              {rowType || "-"}
                             </span>
                           </TableCell>
                           <TableCell className="font-mono">{Number(row.volume || 0).toFixed(2)}</TableCell>
-                          <TableCell className="font-mono">{Number(row.openPrice || 0).toFixed(5)}</TableCell>
-                          <TableCell className="font-mono">{Number(row.closePrice || 0).toFixed(5)}</TableCell>
+                          <TableCell className="font-mono">{formatPriceOrDash(row.openPrice)}</TableCell>
+                          <TableCell className="font-mono">{formatPriceOrDash(row.closePrice)}</TableCell>
                           <TableCell className="font-mono">{fee >= 0 ? "+" : ""}${Math.abs(fee).toFixed(2)}</TableCell>
                           <TableCell className={cn("font-mono text-right", Number(row.profit || 0) >= 0 ? "text-success" : "text-destructive")}>
                             {Number(row.profit || 0) >= 0 ? "+" : ""}${Math.abs(Number(row.profit || 0)).toFixed(2)}
