@@ -45,6 +45,8 @@ from .config import (
     LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS,
     LIVE_MANAGED_MAGIC_SET,
     LIVE_MT5_HISTORY_END_AHEAD_HOURS,
+    LIVE_SEMANTIC_ALIAS_HOURS,
+    LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS,
     LIVE_PERFORMANCE_MAGIC_SET,
     LIVE_PERFORMANCE_SCOPE,
     LIVE_PERFORMANCE_SYNC_INTERVAL_SEC,
@@ -74,6 +76,7 @@ from .config import (
     TIMEFRAME_SECONDS_MAP,
     VEC_NORM_PATH,
     VISION_LLM_API_URL,
+    VISION_LLM_EMBED_TEXT_API_URL,
     VISION_LLM_TIMEOUT_SEC,
     BOT_WS_URL,
     BOT_CONFIG_ID,
@@ -114,6 +117,7 @@ class LiveTradingBot:
         self.llm_semantic_cache_file = LLM_SEMANTIC_CACHE_FILE
         self.llm_text_log_file = LLM_TEXT_LOG_FILE
         self.llm_semantic_cache = {}
+        self.llm_text_cache = {}
         self._ws_connected = False
         self._ws_send_lock = threading.Lock()
         self._ws_state_lock = threading.Lock()
@@ -145,6 +149,7 @@ class LiveTradingBot:
             float(max(1, int(ORDER_TICK_RETRIES)) * max(0.05, float(ORDER_TICK_RETRY_SEC))),
         )
         self.vision_llm_api_url = str(VISION_LLM_API_URL or "").strip()
+        self.vision_llm_embed_text_api_url = str(VISION_LLM_EMBED_TEXT_API_URL or "").strip()
         # Live real-only semantic can take long on model warmup; avoid false timeout loops.
         self.vision_llm_timeout_sec = max(420.0, float(VISION_LLM_TIMEOUT_SEC or 420.0))
         self.risk_profile_map = dict(RISK_PROFILE_MAP or {"low": 0.5, "medium": 1.0, "high": 1.5})
@@ -168,6 +173,10 @@ class LiveTradingBot:
         self.mt5_login_retries = max(1, int(MT5_LOGIN_RETRIES or 20))
         self.mt5_retry_seconds = max(1.0, float(MT5_RETRY_SECONDS or 5.0))
         self.mt5_history_end_ahead_hours = max(0.0, float(LIVE_MT5_HISTORY_END_AHEAD_HOURS or 0.0))
+        self.semantic_alias_hours = tuple(int(v) for v in (LIVE_SEMANTIC_ALIAS_HOURS or (0,)))
+        if 0 not in self.semantic_alias_hours:
+            self.semantic_alias_hours = (0,) + self.semantic_alias_hours
+        self.semantic_no_data_retry_seconds = max(10.0, float(LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS or 180.0))
         try:
             self.mt5_login_id = int(self.mt5_login_text) if self.mt5_login_text else None
         except ValueError:
@@ -526,6 +535,32 @@ class LiveTradingBot:
             restored[key] = arr
         self.llm_semantic_cache = restored
 
+    def _load_llm_text_log_cache(self):
+        self.llm_text_cache = {}
+        log_file = self.llm_text_log_file
+        if not log_file or not os.path.exists(log_file):
+            return
+        try:
+            with self._exclusive_file_lock(log_file):
+                with open(log_file, "r", encoding="utf-8") as fh:
+                    for raw_line in fh:
+                        line = str(raw_line or "").strip()
+                        if not line:
+                            continue
+                        try:
+                            payload = json.loads(line)
+                        except Exception:
+                            continue
+                        if not isinstance(payload, dict):
+                            continue
+                        ts_key = str(payload.get("time", "") or "").strip()
+                        llm_text = str(payload.get("text", "") or "").strip()
+                        if not ts_key or not llm_text:
+                            continue
+                        self.llm_text_cache[ts_key] = llm_text
+        except Exception as exc:
+            print(f" LLM text cache skipped (invalid file): {exc}")
+
     def _save_llm_semantic_cache(self, reason: str = "periodic"):
         if not self.llm_semantic_cache:
             return
@@ -590,18 +625,177 @@ class LiveTradingBot:
         except Exception as exc:
             print(f" LLM semantic cache save failed ({reason}): {exc}")
 
+    def _resolve_cached_semantic_alias(self, ts_key: str):
+        if not ts_key:
+            return None, None
+
+        # 1) Exact lookup first.
+        vec = self.llm_semantic_cache.get(ts_key)
+        if vec is not None:
+            return ts_key, np.asarray(vec, dtype=np.float32).reshape(-1)
+
+        # 2) Broker server time can be offset by whole hours.
+        try:
+            base_dt = datetime.strptime(str(ts_key), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None, None
+
+        for hour_offset in self.semantic_alias_hours:
+            try:
+                offset = int(hour_offset)
+            except Exception:
+                continue
+            if offset == 0:
+                continue
+            candidate_key = (base_dt + timedelta(hours=offset)).strftime("%Y-%m-%d %H:%M:%S")
+            vec = self.llm_semantic_cache.get(candidate_key)
+            if vec is not None:
+                return candidate_key, np.asarray(vec, dtype=np.float32).reshape(-1)
+
+        return None, None
+
+    def _adopt_semantic_alias(self, ts_key: str, alias_key: str, alias_vec: np.ndarray):
+        vec = np.asarray(alias_vec, dtype=np.float32).reshape(-1)
+        if vec.size == 0:
+            return False
+        self.llm_semantic_cache[ts_key] = vec
+        if self.semantic_runtime is not None:
+            self.semantic_runtime.global_time_to_vec[ts_key] = vec
+        self._sem_retry_not_before.pop(ts_key, None)
+        self._save_llm_semantic_cache(reason="cache_alias")
+        print(f"\n [SEM] ready (cache_alias) ts={ts_key} <- {alias_key} dim={vec.size}")
+        self._add_log(
+            "analysis",
+            f"Semantic alias hit for {ts_key}",
+            phase="sem",
+            event="cache_alias_hit",
+            meta={"ts": ts_key, "alias_ts": alias_key, "dim": int(vec.size)},
+        )
+        return True
+
+    def _resolve_cached_llm_text_alias(self, ts_key: str):
+        if not ts_key:
+            return None, None
+
+        llm_text = str(self.llm_text_cache.get(ts_key, "") or "").strip()
+        if llm_text:
+            return ts_key, llm_text
+
+        try:
+            base_dt = datetime.strptime(str(ts_key), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None, None
+
+        for hour_offset in self.semantic_alias_hours:
+            try:
+                offset = int(hour_offset)
+            except Exception:
+                continue
+            if offset == 0:
+                continue
+            candidate_key = (base_dt + timedelta(hours=offset)).strftime("%Y-%m-%d %H:%M:%S")
+            llm_text = str(self.llm_text_cache.get(candidate_key, "") or "").strip()
+            if llm_text:
+                return candidate_key, llm_text
+
+        return None, None
+
+    def _request_llm_text_embedding_from_server(self, llm_text: str, timeout_sec: float | None = None):
+        if not self.vision_llm_embed_text_api_url:
+            raise RuntimeError("VISION_LLM_EMBED_TEXT_API_URL is empty")
+
+        payload = {"text": str(llm_text or "")}
+        body = json.dumps(payload).encode("utf-8")
+        req = urlrequest.Request(
+            self.vision_llm_embed_text_api_url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        timeout = float(timeout_sec or 0.0)
+        if timeout <= 0:
+            timeout = max(10.0, min(float(self.vision_llm_timeout_sec), 120.0))
+        try:
+            with urlrequest.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except urlerror.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8")
+            except Exception:
+                detail = ""
+            raise RuntimeError(
+                f"text-embed server returned HTTP {exc.code}"
+                + (f" | {detail}" if detail else "")
+            ) from exc
+        except urlerror.URLError as exc:
+            raise RuntimeError(f"text-embed server unavailable: {exc}") from exc
+
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception as exc:
+            raise RuntimeError(f"text-embed invalid server JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("text-embed invalid server payload type")
+        cls_raw = data.get("cls_vec")
+        if cls_raw is None:
+            raise RuntimeError("text-embed server payload missing cls_vec")
+        return np.asarray(cls_raw, dtype=np.float32).reshape(-1)
+
+    def _try_resolve_semantic_from_text_log(self, ts_key: str, timeout_sec: float | None = None) -> bool:
+        text_key, llm_text = self._resolve_cached_llm_text_alias(ts_key)
+        if not llm_text:
+            return False
+
+        source = "text_log_embed" if text_key == ts_key else "text_log_alias_embed"
+        try:
+            cls_vec = self._request_llm_text_embedding_from_server(llm_text, timeout_sec=timeout_sec)
+            self._save_llm_semantic_entry(ts_key, cls_vec, llm_text, source=source)
+            self._add_log(
+                "analysis",
+                f"Semantic restored from text log for {ts_key}",
+                phase="sem",
+                event="text_log_embed_ready",
+                meta={
+                    "ts": ts_key,
+                    "text_ts": text_key,
+                    "source": source,
+                    "text_len": int(len(llm_text)),
+                },
+            )
+            return True
+        except Exception as exc:
+            self._add_log(
+                "warning",
+                f"Text-log semantic restore failed for {ts_key}",
+                phase="sem",
+                event="text_log_embed_failed",
+                meta={"ts": ts_key, "text_ts": text_key, "error": str(exc)},
+            )
+            return False
+
+    def _semantic_retry_delay(self, exc: Exception) -> float:
+        err_text = str(exc or "")
+        if "No M1 data" in err_text:
+            return max(10.0, float(self.semantic_no_data_retry_seconds))
+        return max(2.0, min(float(POLL_SECONDS) * 4.0, 12.0))
+
     def _append_llm_text_log(self, ts_key: str, llm_text: str):
         if not self.llm_text_log_file:
             return
+        ts_val = str(ts_key or "").strip()
+        text_val = str(llm_text or "").strip()
+        if ts_val and text_val:
+            self.llm_text_cache[ts_val] = text_val
         try:
             log_dir = os.path.dirname(self.llm_text_log_file)
             if log_dir:
                 os.makedirs(log_dir, exist_ok=True)
             record = {
-                "time": ts_key,
+                "time": ts_val,
                 "symbol": SYMBOL,
                 "timeframe": TIMEFRAME_NAME,
-                "text": str(llm_text or "").strip(),
+                "text": text_val,
                 "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             }
             with self._exclusive_file_lock(self.llm_text_log_file):
@@ -659,7 +853,9 @@ class LiveTradingBot:
         )
 
         self._load_llm_semantic_cache()
+        self._load_llm_text_log_cache()
         llm_cache_rows = 0
+        llm_text_rows = int(len(self.llm_text_cache))
         # Strict real-only semantic for live:
         # do not keep any non-LLM preloaded map in runtime.
         self.semantic_runtime.global_time_to_vec = {}
@@ -675,7 +871,7 @@ class LiveTradingBot:
         print(
             " [MODEL] "
             f"ready features={len(self.feature_columns)} sem_dim={self.semantic_runtime.semantic_feature_count} "
-            f"llm_cache_rows={llm_cache_rows}"
+            f"llm_cache_rows={llm_cache_rows} llm_text_rows={llm_text_rows}"
         )
         self._add_log(
             "success",
@@ -686,6 +882,7 @@ class LiveTradingBot:
                 "features": int(len(self.feature_columns)),
                 "semantic_dim": int(self.semantic_runtime.semantic_feature_count),
                 "llm_cache_rows": int(llm_cache_rows),
+                "llm_text_rows": int(llm_text_rows),
             },
         )
 
@@ -1385,22 +1582,33 @@ class LiveTradingBot:
         if ts_key in self.semantic_runtime.global_time_to_vec:
             return
 
-        now_epoch = time.time()
-        retry_not_before = float(self._sem_retry_not_before.get(ts_key, 0.0) or 0.0)
-        if now_epoch < retry_not_before:
-            return
-
         # 1. Check local disk cache
-        cached_vec = self.llm_semantic_cache.get(ts_key)
-        if cached_vec is not None:
-            self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(cached_vec, dtype=np.float32)
+        alias_key, alias_vec = self._resolve_cached_semantic_alias(ts_key)
+        if alias_vec is not None:
+            if alias_key == ts_key:
+                self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(alias_vec, dtype=np.float32)
+            else:
+                self._adopt_semantic_alias(ts_key, alias_key, alias_vec)
             self._add_log(
                 "analysis",
                 f"Semantic cache hit for {ts_key}",
                 phase="sem",
-                event="cache_hit",
-                meta={"ts": ts_key, "source": "disk_cache"},
+                event="cache_hit" if alias_key == ts_key else "cache_alias_hit",
+                meta={
+                    "ts": ts_key,
+                    "source": "disk_cache" if alias_key == ts_key else "cache_alias",
+                    "alias_ts": alias_key if alias_key != ts_key else None,
+                },
             )
+            return
+
+        # 1.5 Check historical llm_text log and rebuild embedding without chart fetch.
+        if self._try_resolve_semantic_from_text_log(ts_key):
+            return
+
+        now_epoch = time.time()
+        retry_not_before = float(self._sem_retry_not_before.get(ts_key, 0.0) or 0.0)
+        if now_epoch < retry_not_before:
             return
 
         # 2. Request from server HTTP endpoint
@@ -1417,7 +1625,7 @@ class LiveTradingBot:
             self._save_llm_semantic_entry(ts_key, cls_vec, llm_text, source="server_post")
         except Exception as exc:
             # Avoid hammering the endpoint immediately after a timeout/failure.
-            self._sem_retry_not_before[ts_key] = time.time() + max(2.0, min(float(POLL_SECONDS) * 4.0, 12.0))
+            self._sem_retry_not_before[ts_key] = time.time() + self._semantic_retry_delay(exc)
             print(f"\n [SEM] request failed ts={ts_key}: {exc} | fallback=blocked_real_only")
             self._add_log(
                 "warning",
@@ -1433,20 +1641,26 @@ class LiveTradingBot:
         if ts_key in self.semantic_runtime.global_time_to_vec:
             return True
 
-        cached_vec = self.llm_semantic_cache.get(ts_key)
-        if cached_vec is not None:
-            self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(cached_vec, dtype=np.float32)
+        alias_key, alias_vec = self._resolve_cached_semantic_alias(ts_key)
+        if alias_vec is not None:
+            if alias_key == ts_key:
+                self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(alias_vec, dtype=np.float32)
+            else:
+                self._adopt_semantic_alias(ts_key, alias_key, alias_vec)
+            return True
+
+        quick_timeout = max(5.0, float(timeout_sec))
+        if self._try_resolve_semantic_from_text_log(ts_key, timeout_sec=min(quick_timeout, 30.0)):
             return True
 
         prev_timeout = float(self.vision_llm_timeout_sec)
-        quick_timeout = max(5.0, float(timeout_sec))
         self.vision_llm_timeout_sec = min(prev_timeout, quick_timeout)
         try:
             llm_text, cls_vec = self._request_llm_semantic_from_server(ts_key)
             self._save_llm_semantic_entry(ts_key, cls_vec, llm_text, source="startup_prewarm")
             return True
         except Exception as exc:
-            self._sem_retry_not_before[ts_key] = time.time() + max(2.0, min(float(POLL_SECONDS) * 4.0, 12.0))
+            self._sem_retry_not_before[ts_key] = time.time() + self._semantic_retry_delay(exc)
             self._add_log(
                 "warning",
                 f"Startup prewarm failed for {ts_key}",

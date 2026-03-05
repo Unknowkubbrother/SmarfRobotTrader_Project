@@ -21,3 +21,7 @@ class VisionLLMRequest(BaseModel):
                 "Expected: '2025.12.31 15.00' or '2025-12-31 15:00:00'"
             )
         return v
+
+
+class VisionLLMTextEmbeddingRequest(BaseModel):
+    text: str

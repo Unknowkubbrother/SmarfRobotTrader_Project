@@ -65,6 +65,30 @@ def _env_int_set(default_values: set[int], *names: str) -> set[int]:
     return out
 
 
+def _env_int_tuple(default_values: tuple[int, ...], *names: str) -> tuple[int, ...]:
+    raw = _env_first(*names)
+    if not raw:
+        return tuple(int(v) for v in default_values)
+
+    out: list[int] = []
+    seen: set[int] = set()
+    for chunk in str(raw).replace(";", ",").split(","):
+        text = str(chunk or "").strip()
+        if not text:
+            continue
+        try:
+            value = int(float(text))
+        except Exception:
+            continue
+        if value in seen:
+            continue
+        out.append(value)
+        seen.add(value)
+    if len(out) == 0:
+        return tuple(int(v) for v in default_values)
+    return tuple(out)
+
+
 def _safe_token(raw: str, fallback: str = "default") -> str:
     text = str(raw or "").strip().lower()
     if not text:
@@ -188,11 +212,19 @@ ORDER_TICK_RETRY_SEC = _env_float(0.25, "LIVE_ORDER_TICK_RETRY_SEC")
 SYNC_EXTERNAL_LOT = _env_bool(True, "LIVE_SYNC_EXTERNAL_LOT")
 EVAL_ON_START = _env_bool(True, "LIVE_EVAL_ON_START")
 ENABLE_CATCHUP_REPLAY = _env_bool(True, "LIVE_ENABLE_CATCHUP_REPLAY")
-MAX_CATCHUP_BARS = _env_int(0, "LIVE_CATCHUP_MAX_BARS")
+MAX_CATCHUP_BARS = _env_int(24, "LIVE_CATCHUP_MAX_BARS")
 EXECUTE_STALE_REPLAY_ORDERS = _env_bool(False, "LIVE_CATCHUP_EXECUTE_STALE")
 LIVE_SYNC_ACCOUNT_STATE = _env_bool(True, "LIVE_SYNC_ACCOUNT_STATE")
 LIVE_DYNAMIC_LOT = _env_bool(True, "LIVE_DYNAMIC_LOT")
 LIVE_MANAGE_MANUAL_POSITIONS = _env_bool(False, "LIVE_MANAGE_MANUAL_POSITIONS")
+LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS = max(
+    10.0,
+    _env_float(180.0, "LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS"),
+)
+LIVE_SEMANTIC_ALIAS_HOURS = _env_int_tuple(
+    (0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8, 9, -9, 10, -10, 11, -11, 12, -12),
+    "LIVE_SEMANTIC_ALIAS_HOURS",
+)
 
 BOT_WS_URL = _env_first("BOT_WS_URL") or "ws://localhost:8000/bot/ws"
 BOT_CONFIG_ID = _env_first("BOT_CONFIG_ID") or ""
@@ -213,7 +245,21 @@ def _derive_vision_llm_api_url(bot_ws_url: str) -> str:
     return "http://localhost:8000/vision_llm/"
 
 
+def _derive_vision_llm_embed_text_api_url(vision_llm_api_url: str) -> str:
+    explicit = _env_first("VISION_LLM_EMBED_TEXT_API_URL")
+    if explicit:
+        return explicit
+
+    base = str(vision_llm_api_url or "").strip()
+    if not base:
+        return "http://localhost:8000/vision_llm/embed_text"
+    if base.endswith("/"):
+        return f"{base}embed_text"
+    return f"{base}/embed_text"
+
+
 VISION_LLM_API_URL = _derive_vision_llm_api_url(BOT_WS_URL)
+VISION_LLM_EMBED_TEXT_API_URL = _derive_vision_llm_embed_text_api_url(VISION_LLM_API_URL)
 VISION_LLM_TIMEOUT_SEC = _env_float(420.00, "VISION_LLM_TIMEOUT_SEC")
 LIVE_PERFORMANCE_SYNC_INTERVAL_SEC = max(
     5.0,
@@ -249,7 +295,7 @@ LIVE_PREWARM_SEMANTIC_MAX_SECONDS = max(
 )
 LIVE_PREWARM_SEMANTIC_MAX_MISSING = max(
     1,
-    _env_int(24, "LIVE_PREWARM_SEMANTIC_MAX_MISSING"),
+    _env_int(8, "LIVE_PREWARM_SEMANTIC_MAX_MISSING"),
 )
 LIVE_PREWARM_REQUEST_TIMEOUT_SEC = max(
     5.0,

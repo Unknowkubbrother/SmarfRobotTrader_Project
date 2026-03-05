@@ -5,14 +5,16 @@ WebSocket and cron endpoints have been moved to ``bot_ws.py``.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 
 from fastapi import APIRouter, HTTPException, Request
 
-from ..models.vision_llm_model import VisionLLMRequest
+from ..models.vision_llm_model import VisionLLMRequest, VisionLLMTextEmbeddingRequest
 from ..utils.vision_llm.chart import MT5ConnectionError
+from ..utils.vision_llm.embedding import text_to_cls_embedding
 from ..utils.vision_llm.use_llm import generate_llm_cls_for_bar
 from ..database.client import r_cache
 
@@ -21,6 +23,7 @@ logger = logging.getLogger(__name__)
 vision_llm_router = APIRouter()
 
 _CACHE_TTL = 3900  # 65 minutes
+_TEXT_EMBED_CACHE_TTL = 86400 * 7
 _INFLIGHT_LOCKS: dict[str, asyncio.Lock] = {}
 _INFLIGHT_LOCKS_GUARD = asyncio.Lock()
 
@@ -36,6 +39,11 @@ def _normalize_timeframe(timeframe: str) -> str:
 
 def _cache_key(symbol: str, timeframe: str, dt_str: str) -> str:
     return f"vision_llm:{_normalize_symbol(symbol)}:{_normalize_timeframe(timeframe)}:{dt_str}"
+
+
+def _text_embed_cache_key(text: str) -> str:
+    digest = hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+    return f"vision_llm:text_embed:{digest}"
 
 
 def _get_cached(symbol: str, timeframe: str, dt_str: str) -> dict | None:
@@ -57,6 +65,33 @@ def _set_cached(symbol: str, timeframe: str, dt_str: str, data: dict) -> None:
         )
     except Exception as exc:
         logger.warning("Redis cache set failed: %s", exc)
+
+
+def _get_cached_text_embedding(text: str) -> list[float] | None:
+    try:
+        raw = r_cache.get(_text_embed_cache_key(text))
+        if not raw:
+            return None
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return None
+        cls_vec = payload.get("cls_vec")
+        if isinstance(cls_vec, list) and len(cls_vec) > 0:
+            return cls_vec
+    except Exception:
+        return None
+    return None
+
+
+def _set_cached_text_embedding(text: str, cls_vec: list[float]) -> None:
+    try:
+        r_cache.setex(
+            _text_embed_cache_key(text),
+            _TEXT_EMBED_CACHE_TTL,
+            json.dumps({"cls_vec": cls_vec}, ensure_ascii=False),
+        )
+    except Exception as exc:
+        logger.warning("Redis text-embed cache set failed: %s", exc)
 
 
 async def _acquire_inflight_lock(cache_key: str) -> asyncio.Lock:
@@ -131,3 +166,35 @@ async def vision_llm(request: Request, data: VisionLLMRequest):
 
     logger.info("vision_llm  ✔  %.1fs", elapsed)
     return {"message": "success", "cached": False, **result_data}
+
+
+@vision_llm_router.post("/embed_text")
+async def vision_llm_embed_text(data: VisionLLMTextEmbeddingRequest):
+    text = str(getattr(data, "text", "") or "")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+
+    cached_vec = _get_cached_text_embedding(text)
+    if cached_vec is not None:
+        return {
+            "message": "success",
+            "cached": True,
+            "cls_vec": cached_vec,
+            "text_len": len(text),
+        }
+
+    try:
+        cls_vec = await asyncio.to_thread(text_to_cls_embedding, text)
+        cls_list = cls_vec.tolist()
+        _set_cached_text_embedding(text, cls_list)
+        return {
+            "message": "success",
+            "cached": False,
+            "cls_vec": cls_list,
+            "text_len": len(text),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("vision_llm text embedding failed")
+        raise HTTPException(status_code=500, detail=str(exc))
