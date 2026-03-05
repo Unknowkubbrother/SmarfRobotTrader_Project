@@ -34,16 +34,20 @@ export function BotCard({
   isBusy = false
 }: BotCardProps) {
   const [showStopConfirm, setShowStopConfirm] = useState(false);
-  const status = bot.status || "stopped";
+  const status = String(bot.status || "stopped").toLowerCase();
   const isStarting = status === "starting";
+  const isRunning = status === "running";
+  const isVersionInactive = bot.bot_version?.is_active === false;
+  const isStartLockedByVersion = isVersionInactive && !isRunning && !isStarting;
   const isActionLocked = isBusy || isStarting;
+  const isToggleDisabled = isActionLocked || isStartLockedByVersion;
   const symbol = bot.bot_version?.symbol || "N/A";
   const label = bot.bot_version?.label || "No Model";
   const riskLevel = bot.risk_level || "medium";
 
   const handleToggleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (isActionLocked) return;
+    if (isToggleDisabled) return;
     if (status === "running") {
       setShowStopConfirm(true);
     } else {
@@ -126,6 +130,12 @@ export function BotCard({
                     Processing
                   </span>
                 )}
+                {isVersionInactive && (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-destructive/10 text-destructive">
+                    <AlertTriangle className="w-3 h-3" />
+                    Locked
+                  </span>
+                )}
                 {bot.has_pending_update && (
                   <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-primary/10 text-primary">
                     <DownloadCloud className="w-3 h-3" />
@@ -162,10 +172,13 @@ export function BotCard({
               size="sm"
               className="h-8 w-8 p-0"
               onClick={handleToggleClick}
-              disabled={isActionLocked}
+              disabled={isToggleDisabled}
+              title={isStartLockedByVersion ? "This bot model is inactive. Change model to an active version first." : undefined}
             >
               {status === "running" ? (
                 <Power className="w-4 h-4 text-destructive" />
+              ) : isStartLockedByVersion ? (
+                <AlertTriangle className="w-4 h-4 text-destructive" />
               ) : status === "starting" ? (
                 <RefreshCw className="w-4 h-4 text-warning animate-spin" />
               ) : (

@@ -192,6 +192,11 @@ export default function BotControl() {
   const isStatusStarting = selectedBotStatusNormalized === "starting";
   const isBusy = Boolean(activeActionForSelectedBot) || isStatusStarting;
   const isApplyingUpdateAction = activeActionForSelectedBot?.kind === "apply_update";
+  const isSelectedBotVersionInactive = selectedBot?.bot_version?.is_active === false;
+  const isSelectedBotStartLockedByVersion =
+    Boolean(isSelectedBotVersionInactive) &&
+    selectedBotStatusNormalized !== "running" &&
+    selectedBotStatusNormalized !== "starting";
 
   const { getBotState, lifecycleEvents, isConnected: isBotWsConnected } = useBotLiveState();
   const liveState = selectedBot ? getBotState(selectedBot.id) : undefined;
@@ -598,6 +603,13 @@ export default function BotControl() {
     return () => window.clearTimeout(timer);
   }, [activeAction]);
 
+  const guardStartWhenVersionInactive = (actionLabel: string): boolean => {
+    if (!selectedBot) return false;
+    if (!isSelectedBotVersionInactive) return false;
+    toast.error(`Cannot ${actionLabel}. This bot model is inactive by admin.`);
+    return true;
+  };
+
   const handleToggleBotClick = () => {
     if (isBusy) return;
     if (!selectedBot) return;
@@ -605,6 +617,7 @@ export default function BotControl() {
     if (currentStatus === "running") {
       setStopConfirmOpen(true);
     } else {
+      if (guardStartWhenVersionInactive("start")) return;
       performBotToggle("running");
     }
   };
@@ -612,6 +625,7 @@ export default function BotControl() {
   const performBotToggle = async (newStatus: "running" | "stopped") => {
     if (isBusy) return;
     if (!selectedBot) return;
+    if (newStatus === "running" && guardStartWhenVersionInactive("start")) return;
     const actionTitle = newStatus === "running" ? "Starting Bot" : "Stopping Bot";
     startUiAction(
       actionTitle,
@@ -641,6 +655,7 @@ export default function BotControl() {
   const performBotRestart = async () => {
     if (isBusy) return;
     if (!selectedBot) return;
+    if (guardStartWhenVersionInactive("restart")) return;
     const actionTitle = "Restarting Bot";
     startUiAction(
       actionTitle,
@@ -950,6 +965,20 @@ export default function BotControl() {
         </div>
       )}
 
+      {selectedBot && isSelectedBotVersionInactive && (
+        <div className="rounded-xl border border-destructive/30 bg-destructive/5 p-4">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="mt-0.5 h-4 w-4 text-destructive" />
+            <div>
+              <p className="text-sm font-semibold text-destructive">Bot model is inactive</p>
+              <p className="text-xs text-muted-foreground">
+                Admin disabled this model. Start/Restart is locked until you switch to an active model.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {visibleActionLogs.length > 0 && (
         <div className="glass-card p-4">
           <div className="mb-2 flex items-center justify-between">
@@ -992,9 +1021,17 @@ export default function BotControl() {
                   <div className="flex items-center gap-3">
                     <h3 className="font-semibold">{selectedBot ? botLabel : "No Bot Selected"}</h3>
                     {selectedBot && getStatusBadge(botStatus)}
+                    {selectedBot && isSelectedBotVersionInactive && (
+                      <span className="inline-flex items-center gap-1.5 rounded-full bg-destructive/10 px-2.5 py-1 text-xs font-medium text-destructive">
+                        <AlertTriangle className="h-3 w-3" />
+                        Locked
+                      </span>
+                    )}
                   </div>
                   {selectedBot && (
-                    <p className="text-sm text-muted-foreground">Trading <span className="font-mono font-medium">{botSymbol}</span></p>
+                    <p className="text-sm text-muted-foreground">
+                      Trading <span className="font-mono font-medium">{botSymbol}</span>
+                    </p>
                   )}
                 </div>
               </div>
@@ -1035,8 +1072,23 @@ export default function BotControl() {
                       <RefreshCw className="w-4 h-4" />
                       Change Model
                     </Button>
-                    <Button variant="outline" className="gap-2" onClick={handleToggleBotClick} disabled={isBusy}>
-                      {botStatus === "running" ? (
+                    <Button
+                      variant="outline"
+                      className="gap-2"
+                      onClick={handleToggleBotClick}
+                      disabled={isBusy || isSelectedBotStartLockedByVersion}
+                      title={
+                        isSelectedBotStartLockedByVersion
+                          ? "This bot model is inactive. Change model before starting."
+                          : undefined
+                      }
+                    >
+                      {isSelectedBotStartLockedByVersion ? (
+                        <>
+                          <AlertTriangle className="w-4 h-4 text-destructive" />
+                          Locked
+                        </>
+                      ) : botStatus === "running" ? (
                         <>
                           <Power className="w-4 h-4" />
                           Stop
@@ -1054,7 +1106,17 @@ export default function BotControl() {
                       )}
                     </Button>
                     {botStatus === "running" && (
-                      <Button variant="outline" className="gap-2" onClick={performBotRestart} disabled={isBusy}>
+                      <Button
+                        variant="outline"
+                        className="gap-2"
+                        onClick={performBotRestart}
+                        disabled={isBusy || Boolean(isSelectedBotVersionInactive)}
+                        title={
+                          isSelectedBotVersionInactive
+                            ? "This bot model is inactive. Change model before restarting."
+                            : undefined
+                        }
+                      >
                         <RefreshCw className="w-4 h-4" />
                         Restart
                       </Button>
@@ -1183,6 +1245,13 @@ export default function BotControl() {
                       <p className="text-xs mt-1">
                         Container is running. Waiting for live data stream...
                         {runtimeHealth?.health_detail ? ` (${runtimeHealth.health_detail})` : ""}
+                      </p>
+                    </>
+                  ) : isSelectedBotVersionInactive ? (
+                    <>
+                      <p className="text-sm text-destructive">Bot model is inactive</p>
+                      <p className="text-xs mt-1">
+                        Change model to an active version before starting this bot again.
                       </p>
                     </>
                   ) : (

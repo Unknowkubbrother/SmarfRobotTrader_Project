@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronDown, Bot, Plus, Check, Play, Square } from "lucide-react";
+import { ChevronDown, Bot, Plus, Check, Play, Square, AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
@@ -25,6 +25,7 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
 
   const selectedBot = bots.find(b => b.id === selectedBotId);
   const runningCount = bots.filter((b) => b.status === "running" || b.status === "starting").length;
+  const selectedBotVersionInactive = selectedBot?.bot_version?.is_active === false;
 
   return (
     <div className="flex items-center gap-3">
@@ -41,12 +42,20 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
                     <p className="text-sm font-medium">{selectedBot.bot_version?.label || "Unknown Bot"}</p>
                     <span className={cn(
                       "w-2 h-2 rounded-full",
-                      selectedBot.status === "running"
+                      selectedBotVersionInactive
+                        ? "bg-destructive"
+                        : selectedBot.status === "running"
                         ? "bg-success"
                         : selectedBot.status === "starting"
                           ? "bg-warning"
                           : "bg-muted-foreground"
                     )} />
+                    {selectedBotVersionInactive && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">
+                        <AlertTriangle className="h-2.5 w-2.5" />
+                        Locked
+                      </span>
+                    )}
                   </div>
                   <p className="text-xs text-muted-foreground">
                     {selectedBot.bot_version?.symbol || "No Pair"} • {selectedBot.bot_version?.timeframe || "TF"}
@@ -101,12 +110,20 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
                   <div className="flex-1">
                     <div className="flex items-center justify-between">
                       <p className="text-sm font-medium">{bot.bot_version?.label || "Bot"}</p>
-                      <span className={cn(
-                        "text-xs font-mono",
-                        bot.today_pnl >= 0 ? "text-success" : "text-destructive"
-                      )}>
-                        {bot.today_pnl >= 0 ? "+" : ""}${bot.today_pnl.toFixed(2)}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        {bot.bot_version?.is_active === false && (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">
+                            <AlertTriangle className="h-2.5 w-2.5" />
+                            Locked
+                          </span>
+                        )}
+                        <span className={cn(
+                          "text-xs font-mono",
+                          bot.today_pnl >= 0 ? "text-success" : "text-destructive"
+                        )}>
+                          {bot.today_pnl >= 0 ? "+" : ""}${bot.today_pnl.toFixed(2)}
+                        </span>
+                      </div>
                     </div>
                     <div className="flex items-center gap-2 text-xs text-muted-foreground">
                       <span>{bot.bot_version?.symbol}</span>

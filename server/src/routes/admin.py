@@ -518,8 +518,8 @@ async def _notify_users_for_bot_update(
     return len(user_map), emails_sent
 
 
-async def _stop_active_bots_using_version(model_id: str) -> int:
-    active_bots_count = await db.botconfiguration.count(
+async def _stop_active_bots_using_version(model_id: str) -> tuple[int, int]:
+    active_bots = await db.botconfiguration.find_many(
         where={
             "modelId": model_id,
             "recordStatus": "active",
@@ -531,24 +531,51 @@ async def _stop_active_bots_using_version(model_id: str) -> int:
         }
     )
 
-    if active_bots_count > 0:
+    if not active_bots:
+        return 0, 0
+
+    stopped_config_ids: list[str] = []
+    failed_config_ids: list[str] = []
+    for bot_config in active_bots:
+        bot_config_id = str(bot_config.id)
+        try:
+            await asyncio.to_thread(
+                run_bot_instance_action,
+                action="stop",
+                instance_name=bot_config_id,
+                timeout_sec=300,
+            )
+            stopped_config_ids.append(bot_config_id)
+        except BotRunnerError as exc:
+            failed_config_ids.append(bot_config_id)
+            logger.error(
+                "failed to stop bot runtime for config %s while deactivating version %s: %s",
+                bot_config_id,
+                model_id,
+                _runner_error_message("runner stop failed", exc),
+            )
+        except Exception as exc:
+            failed_config_ids.append(bot_config_id)
+            logger.exception(
+                "unexpected error stopping bot runtime for config %s while deactivating version %s: %s",
+                bot_config_id,
+                model_id,
+                exc,
+            )
+
+    if stopped_config_ids:
         await db.botconfiguration.update_many(
             where={
-                "modelId": model_id,
-                "recordStatus": "active",
-                "account": {"recordStatus": "active"},
-                "OR": [
-                    {"containerStatus": "running"},
-                    {"isActive": True},
-                ],
+                "id": {"in": stopped_config_ids},
             },
             data={
                 "containerStatus": "stopped",
                 "isActive": False,
+                "dockerContainerId": None,
             },
         )
 
-    return active_bots_count
+    return len(stopped_config_ids), len(failed_config_ids)
 
 
 @admin_router.get("/stats", response_model=AdminStatsResponse)
@@ -1222,7 +1249,15 @@ async def update_admin_bot_version(
         next_active = bool(data.is_active)
         update_payload["isActive"] = next_active
         if not next_active:
-            await _stop_active_bots_using_version(model_id)
+            _, failed_stops_count = await _stop_active_bots_using_version(model_id)
+            if failed_stops_count > 0:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        f"Failed to stop {failed_stops_count} bot runtime(s) while deactivating this version. "
+                        "Please retry Set Inactive."
+                    ),
+                )
 
     if update_payload:
         updated = await db.botversion.update(
@@ -1341,8 +1376,17 @@ async def update_admin_bot_version_active(
 
     next_active = bool(data.is_active)
     stopped_bots_count = 0
+    failed_stops_count = 0
     if not next_active:
-        stopped_bots_count = await _stop_active_bots_using_version(model_id)
+        stopped_bots_count, failed_stops_count = await _stop_active_bots_using_version(model_id)
+        if failed_stops_count > 0:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    f"Failed to stop {failed_stops_count} bot runtime(s) while deactivating this version. "
+                    "Please retry Set Inactive."
+                ),
+            )
 
     await db.botversion.update(
         where={"modelId": model_id},

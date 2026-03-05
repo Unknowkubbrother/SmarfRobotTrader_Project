@@ -192,6 +192,15 @@ export default function Dashboard() {
 
   const handleToggleBotStatus = async (botId: string, newStatus: "running" | "stopped") => {
     if (botActionState) return;
+    if (newStatus === "running") {
+      const targetBot = accounts
+        .flatMap((account) => account.bot_configurations || [])
+        .find((bot) => bot.id === botId);
+      if (targetBot?.bot_version?.is_active === false) {
+        toast.error("This bot model is inactive by admin. Change model before starting.");
+        return;
+      }
+    }
     const nextAction: PersistedBotAction = {
       title: newStatus === "running" ? "Starting Bot" : "Stopping Bot",
       detail: "Waiting for Docker operation to complete...",

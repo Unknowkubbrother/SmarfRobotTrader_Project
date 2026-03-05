@@ -24,6 +24,7 @@ export interface BotVersion {
   version_tag: string | null;
   symbol: string | null;
   timeframe: string | null;
+  is_active: boolean;
   runner_profile?: string | null;
   release_notes: string[];
 }
@@ -243,6 +244,15 @@ export function useTradingAccounts() {
           latest_docker_image_id: config.latest_docker_image_id || null,
           latest_release_notes: Array.isArray(config.latest_release_notes) ? config.latest_release_notes : [],
           latest_release_date: config.latest_release_date || null,
+          bot_version: config.bot_version
+            ? {
+                ...config.bot_version,
+                is_active: config.bot_version.is_active !== false,
+                release_notes: Array.isArray(config.bot_version.release_notes)
+                  ? config.bot_version.release_notes
+                  : [],
+              }
+            : null,
           today_pnl: 0,
         })),
       }));

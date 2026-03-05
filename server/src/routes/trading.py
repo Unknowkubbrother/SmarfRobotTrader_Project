@@ -883,6 +883,7 @@ async def get_accounts_with_bots(
                         "version_tag": bv.versionTag,
                         "symbol": bv.symbol,
                         "timeframe": bv.timeframe,
+                        "is_active": bool(getattr(bv, "isActive", True)),
                         "runner_profile": runner_profile,
                         "release_notes": bv.releaseNotes,
                     }

@@ -265,6 +265,7 @@ async def get_bot_versions(request: Request):
             "version_tag": bv.versionTag,
             "symbol": bv.symbol,
             "timeframe": bv.timeframe,
+            "is_active": bool(getattr(bv, "isActive", True)),
             "runner_profile": runner_profile,
             "release_notes": bv.releaseNotes,
             "release_date": bv.releaseDate.strftime("%Y-%m-%d") if bv.releaseDate else None,
