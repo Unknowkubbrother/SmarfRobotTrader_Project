@@ -21,6 +21,7 @@ mt5server_port="8001"
 PYTHON_DIR="/config/.wine/drive_c/Python311"
 WINE_BOOTSTRAP_MARKER="/config/.wine/.wine_python_bootstrap_v1"
 MT5_SNAPSHOT_PATH="${MT5_SNAPSHOT_PATH:-}"
+MT5_INSTALL_TIMEOUT_SECONDS="${MT5_INSTALL_TIMEOUT_SECONDS:-1800}"
 
 # Installer paths (pre-downloaded in Dockerfile)
 mono_installer="/defaults/installers/wine-mono-10.3.0-x86.msi"
@@ -60,7 +61,7 @@ cleanup_mt5_ghost_account_cache() {
     local removed_count=0
     local file
 
-    if ! is_truthy "${MT5_CLEAN_ACCOUNT_CACHE_ON_START:-1}"; then
+    if ! is_truthy "${MT5_CLEAN_ACCOUNT_CACHE_ON_START:-0}"; then
         show_message "[cache] MT5 account/server cleanup disabled (MT5_CLEAN_ACCOUNT_CACHE_ON_START=0)."
         return 0
     fi
@@ -74,13 +75,17 @@ cleanup_mt5_ghost_account_cache() {
         fi
     done
 
-    for file in "$config_dir/accounts.dat" "$config_dir/servers.dat"; do
-        if [ -f "$file" ]; then
-            rm -f "$file" && removed_count=$((removed_count + 1))
-        fi
-    done
+    if is_truthy "${MT5_CLEAN_LOGIN_CACHE_FILES:-0}"; then
+        for file in "$config_dir/accounts.dat" "$config_dir/servers.dat"; do
+            if [ -f "$file" ]; then
+                rm -f "$file" && removed_count=$((removed_count + 1))
+            fi
+        done
+    else
+        show_message "[cache] Preserving accounts.dat/servers.dat (MT5_CLEAN_LOGIN_CACHE_FILES=0)."
+    fi
 
-    if [ -d "$roaming_terminal_root" ]; then
+    if is_truthy "${MT5_CLEAN_LOGIN_CACHE_FILES:-0}" && [ -d "$roaming_terminal_root" ]; then
         while IFS= read -r file; do
             [ -z "$file" ] && continue
             if [ -f "$file" ]; then
@@ -106,6 +111,7 @@ restore_mt5_seed_account_cache() {
     if [ -n "$seed_dir_override" ]; then
         candidates+=("$seed_dir_override")
     fi
+    candidates+=("/mt5-seed")
     if [ -n "${BOT_CONFIG_ID:-}" ]; then
         candidates+=("/instances/${BOT_CONFIG_ID}/mt5-seed")
     fi
@@ -224,16 +230,28 @@ else
     # Start installer in background
     $wine_executable "/tmp/mt5setup.exe" "/auto" &
     INSTALLER_PID=$!
+
+    install_timeout="$MT5_INSTALL_TIMEOUT_SECONDS"
+    if ! [[ "$install_timeout" =~ ^[0-9]+$ ]]; then
+        install_timeout=1800
+    fi
+    if [ "$install_timeout" -lt 300 ]; then
+        install_timeout=300
+    fi
+    show_message "MT5 installer timeout: ${install_timeout}s"
     
     # Wait for terminal64.exe to appear
     count=0
     while [ ! -f "$mt5file" ]; do
         sleep 1
         count=$((count+1))
-        if [ $count -gt 300 ]; then # 5 minutes timeout
-            show_message "Error: Installation timed out."
+        if [ $count -gt "$install_timeout" ]; then
+            show_message "Error: Installation timed out after ${install_timeout}s."
             kill $INSTALLER_PID
             exit 1
+        fi
+        if [ $((count % 15)) -eq 0 ]; then
+            show_message "Waiting MT5 installer... ${count}s/${install_timeout}s"
         fi
         # Check if installer died prematurely
         if ! kill -0 $INSTALLER_PID 2>/dev/null; then

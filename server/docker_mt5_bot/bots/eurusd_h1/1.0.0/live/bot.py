@@ -173,6 +173,28 @@ class LiveTradingBot:
         self.mt5_login_retries = max(1, int(MT5_LOGIN_RETRIES or 20))
         self.mt5_retry_seconds = max(1.0, float(MT5_RETRY_SECONDS or 5.0))
         self.mt5_history_end_ahead_hours = max(0.0, float(LIVE_MT5_HISTORY_END_AHEAD_HOURS or 0.0))
+        def _env_float_runtime(name: str, default: float) -> float:
+            raw = str(os.getenv(name, "") or "").strip()
+            if not raw:
+                return float(default)
+            try:
+                return float(raw)
+            except Exception:
+                return float(default)
+
+        self.trade_allowed_wait_timeout_sec = max(
+            0.0,
+            _env_float_runtime("LIVE_TRADE_ALLOWED_WAIT_TIMEOUT_SEC", 20.0),
+        )
+        self.trade_allowed_probe_interval_sec = max(
+            0.1,
+            _env_float_runtime("LIVE_TRADE_ALLOWED_PROBE_INTERVAL_SEC", 1.0),
+        )
+        self.trade_allowed_warn_cooldown_sec = max(
+            1.0,
+            _env_float_runtime("LIVE_TRADE_ALLOWED_WARN_COOLDOWN_SEC", 10.0),
+        )
+        self._last_trade_allowed_blocked_log_at = 0.0
         self.semantic_alias_hours = tuple(int(v) for v in (LIVE_SEMANTIC_ALIAS_HOURS or (0,)))
         if 0 not in self.semantic_alias_hours:
             self.semantic_alias_hours = (0,) + self.semantic_alias_hours
@@ -216,13 +238,17 @@ class LiveTradingBot:
             return [""]
         return candidates
 
-    def _build_mt5_initialize_kwargs(self, server_name: str | None = None) -> dict:
+    def _build_mt5_initialize_kwargs(
+        self,
+        server_name: str | None = None,
+        include_credentials: bool = True,
+    ) -> dict:
         kwargs = {"timeout": int(self.mt5_rpc_timeout_ms)}
-        if self.mt5_login_id is not None and self.mt5_password:
+        if server_name:
+            kwargs["server"] = str(server_name).strip()
+        if include_credentials and self.mt5_login_id is not None and self.mt5_password:
             kwargs["login"] = int(self.mt5_login_id)
             kwargs["password"] = self.mt5_password
-            if server_name:
-                kwargs["server"] = str(server_name).strip()
         return kwargs
 
     def _build_mt5_login_kwargs(self, server_name: str | None = None) -> dict | None:
@@ -233,10 +259,69 @@ class LiveTradingBot:
             kwargs["server"] = str(server_name).strip()
         return kwargs
 
-    def _initialize_mt5_session(self) -> bool:
+    def _account_matches_expected_login(self, account_info) -> bool:
+        if account_info is None:
+            return False
+        if self.mt5_login_id is None:
+            return True
+        try:
+            return int(account_info.login) == int(self.mt5_login_id)
+        except Exception:
+            return False
+
+    def _remember_mt5_server(self, account_info=None, fallback_server: str | None = None) -> None:
+        resolved_server = ""
+        if account_info is not None:
+            resolved_server = str(getattr(account_info, "server", "") or "").strip()
+        if resolved_server:
+            self.mt5_server = resolved_server
+        elif fallback_server:
+            self.mt5_server = str(fallback_server).strip()
+
+    def _initialize_mt5_session(self, prefer_session_reuse: bool = False) -> bool:
+        if prefer_session_reuse:
+            reuse_candidates: list[str | None] = [None]
+            for candidate in self._server_candidates():
+                normalized = str(candidate or "").strip()
+                if normalized and normalized not in reuse_candidates:
+                    reuse_candidates.append(normalized)
+
+            # Reconnect path: avoid credentialed login because some MT5 builds
+            # can flip AutoTrading off when login() is called repeatedly.
+            for server_name in reuse_candidates:
+                try:
+                    if not bool(
+                        mt5.initialize(
+                            **self._build_mt5_initialize_kwargs(
+                                server_name=server_name,
+                                include_credentials=False,
+                            )
+                        )
+                    ):
+                        continue
+                except Exception:
+                    continue
+
+                try:
+                    account_info = mt5.account_info()
+                except Exception:
+                    account_info = None
+
+                if self._account_matches_expected_login(account_info):
+                    self._remember_mt5_server(account_info, server_name)
+                    return True
+            return False
+
         for server_name in self._server_candidates():
             try:
-                if not bool(mt5.initialize(**self._build_mt5_initialize_kwargs(server_name))):
+                if not bool(
+                    mt5.initialize(
+                        **self._build_mt5_initialize_kwargs(
+                            server_name=server_name,
+                            include_credentials=True,
+                        )
+                    )
+                ):
                     continue
             except Exception:
                 continue
@@ -264,20 +349,9 @@ class LiveTradingBot:
                 account_info = None
             if account_info is None:
                 continue
-            if self.mt5_login_id is None:
-                if server_name:
-                    self.mt5_server = str(server_name).strip()
+            if self._account_matches_expected_login(account_info):
+                self._remember_mt5_server(account_info, server_name)
                 return True
-            try:
-                if int(account_info.login) == int(self.mt5_login_id):
-                    resolved_server = str(getattr(account_info, "server", "") or "").strip()
-                    if resolved_server:
-                        self.mt5_server = resolved_server
-                    elif server_name:
-                        self.mt5_server = str(server_name).strip()
-                    return True
-            except Exception:
-                continue
 
         return False
 
@@ -285,7 +359,7 @@ class LiveTradingBot:
         account_info = None
         last_err = None
         for attempt in range(1, self.mt5_login_retries + 1):
-            if self._initialize_mt5_session():
+            if self._initialize_mt5_session(prefer_session_reuse=True) or self._initialize_mt5_session():
                 account_info = mt5.account_info()
                 if account_info is not None:
                     break
@@ -390,7 +464,7 @@ class LiveTradingBot:
                     pass
                 time.sleep(0.05)
 
-                ok = self._initialize_mt5_session()
+                ok = self._initialize_mt5_session(prefer_session_reuse=True)
                 if not ok:
                     last_err = self._safe_last_error()
                     time.sleep(min(self.mt5_retry_seconds, 5.0))
@@ -418,7 +492,11 @@ class LiveTradingBot:
                         f"MT5 reconnected on attempt {attempt}",
                         phase="mt5",
                         event="reconnect_ok",
-                        meta={"attempt": int(attempt), "account": int(account_info.login)},
+                        meta={
+                            "attempt": int(attempt),
+                            "account": int(account_info.login),
+                            "session_reuse": bool(attempt == 1),
+                        },
                     )
                     return True
 
@@ -442,6 +520,30 @@ class LiveTradingBot:
         res = mt5.order_send(req)
         retried = False
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            return res, retried
+
+        retcode = getattr(res, "retcode", None) if res is not None else None
+        comment = str(getattr(res, "comment", "") or "").strip() if res is not None else ""
+        if self._is_autotrading_disabled_result(retcode, comment):
+            if not self._ensure_trade_allowed_before_order(
+                reason=f"order_send:{reason}",
+                action_label="Order retry",
+                force_log=True,
+            ):
+                return res, retried
+            retried = True
+            if callable(refresh_price_fn):
+                try:
+                    next_price = refresh_price_fn()
+                except Exception:
+                    next_price = None
+                if next_price is None:
+                    return res, retried
+                req["price"] = float(next_price)
+            try:
+                res = mt5.order_send(req)
+            except Exception:
+                res = None
             return res, retried
 
         last_err = self._safe_last_error()
@@ -475,6 +577,250 @@ class LiveTradingBot:
         except Exception:
             res = None
         return res, retried
+
+    def _trade_retcode_name(self, retcode) -> str:
+        try:
+            code = int(retcode)
+        except Exception:
+            return str(retcode or "")
+        for attr in dir(mt5):
+            if not attr.startswith("TRADE_RETCODE_"):
+                continue
+            try:
+                if int(getattr(mt5, attr)) == code:
+                    return attr
+            except Exception:
+                continue
+        return str(code)
+
+    def _is_autotrading_disabled_result(self, retcode=None, text: str = "") -> bool:
+        try:
+            code = int(retcode) if retcode is not None else None
+        except Exception:
+            code = None
+
+        client_disabled_code = getattr(mt5, "TRADE_RETCODE_CLIENT_DISABLES_AT", 10027)
+        try:
+            if code is not None and int(code) == int(client_disabled_code):
+                return True
+        except Exception:
+            pass
+
+        haystack = str(text or "").strip().lower()
+        if not haystack:
+            return False
+        keywords = (
+            "autotrading disabled by client",
+            "auto trading disabled by client",
+            "client disables autotrading",
+            "client disables auto trading",
+            "disabled by client",
+        )
+        return any(word in haystack for word in keywords)
+
+    def _probe_trade_allowed_state(self) -> tuple[bool | None, str]:
+        try:
+            info = mt5.terminal_info()
+        except Exception as exc:
+            return None, f"terminal_info_exception={exc}"
+
+        if info is None:
+            return None, "terminal_info_none"
+
+        trade_allowed = bool(getattr(info, "trade_allowed", False))
+        tradeapi_disabled = bool(getattr(info, "tradeapi_disabled", False))
+        effective_allowed = bool(trade_allowed and not tradeapi_disabled)
+        detail = (
+            f"trade_allowed={int(trade_allowed)}"
+            f" tradeapi_disabled={int(tradeapi_disabled)}"
+            f" effective_allowed={int(effective_allowed)}"
+        )
+        return effective_allowed, detail
+
+    def _ensure_trade_allowed_before_order(
+        self,
+        reason: str,
+        action_label: str = "Order",
+        force_log: bool = False,
+    ) -> bool:
+        timeout_sec = max(0.0, float(self.trade_allowed_wait_timeout_sec))
+        probe_interval = max(0.1, float(self.trade_allowed_probe_interval_sec))
+        deadline = time.time() + timeout_sec
+        attempt = 0
+        last_detail = "trade_allowed_probe_unavailable"
+        wait_logged = False
+
+        while True:
+            attempt += 1
+            trade_allowed, detail = self._probe_trade_allowed_state()
+            last_detail = str(detail or last_detail)
+            if trade_allowed is True:
+                if attempt > 1:
+                    print(f" [MT5] AutoTrading recovered ({reason}) | {last_detail}")
+                    self._add_log(
+                        "info",
+                        f"MT5 AutoTrading recovered ({reason})",
+                        phase="order",
+                        event="autotrading_recovered",
+                        meta={
+                            "reason": str(reason),
+                            "attempt": int(attempt),
+                            "detail": last_detail,
+                        },
+                    )
+                return True
+
+            if not wait_logged and timeout_sec > 0:
+                wait_logged = True
+                self._add_log(
+                    "warning",
+                    "Waiting for MT5 AutoTrading to be enabled",
+                    phase="order",
+                    event="autotrading_wait",
+                    meta={
+                        "reason": str(reason),
+                        "timeout_sec": float(timeout_sec),
+                    },
+                )
+
+            if trade_allowed is None:
+                last_err = self._safe_last_error()
+                if self._is_mt5_ipc_error(last_err):
+                    self._try_reconnect_mt5(reason=f"trade_allowed_probe:{reason}")
+
+            if time.time() >= deadline:
+                break
+            time.sleep(probe_interval)
+
+        now_epoch = time.time()
+        should_log = bool(force_log) or (
+            (now_epoch - float(self._last_trade_allowed_blocked_log_at))
+            >= float(self.trade_allowed_warn_cooldown_sec)
+        )
+        if should_log:
+            msg = f"{action_label} blocked: AutoTrading disabled by client"
+            print(f" {msg} | {last_detail}")
+            self._add_log(
+                "warning",
+                msg,
+                phase="order",
+                event="autotrading_disabled",
+                meta={
+                    "reason": str(reason),
+                    "detail": last_detail,
+                    "timeout_sec": float(timeout_sec),
+                },
+            )
+            self._last_trade_allowed_blocked_log_at = now_epoch
+        return False
+
+    def _is_insufficient_funds_result(self, retcode=None, text: str = "") -> bool:
+        try:
+            code = int(retcode) if retcode is not None else None
+        except Exception:
+            code = None
+        no_money_code = getattr(mt5, "TRADE_RETCODE_NO_MONEY", 10019)
+        try:
+            if code is not None and int(code) == int(no_money_code):
+                return True
+        except Exception:
+            pass
+
+        haystack = str(text or "").strip().lower()
+        if not haystack:
+            return False
+        keywords = (
+            "no money",
+            "not enough money",
+            "insufficient",
+            "insufficient funds",
+            "insufficient margin",
+            "margin",
+            "funds",
+        )
+        return any(word in haystack for word in keywords)
+
+    def _precheck_open_order_funds(self, req: dict, side: str) -> tuple[bool, dict]:
+        side_text = str(side or "").strip().upper() or "ORDER"
+        account = None
+        try:
+            account = mt5.account_info()
+        except Exception:
+            account = None
+        balance = float(getattr(account, "balance", 0.0) or 0.0) if account is not None else 0.0
+        free_margin = float(getattr(account, "margin_free", 0.0) or 0.0) if account is not None else 0.0
+        if account is not None and free_margin <= 0.0:
+            return False, {
+                "reason": f"{side_text} blocked: free margin is {free_margin:.2f}",
+                "retcode": getattr(mt5, "TRADE_RETCODE_NO_MONEY", 10019),
+                "retcode_name": "TRADE_RETCODE_NO_MONEY",
+                "balance": balance,
+                "free_margin": free_margin,
+                "required_margin": 0.0,
+            }
+
+        try:
+            check = mt5.order_check(req)
+        except Exception:
+            check = None
+
+        if check is None:
+            last_err = self._safe_last_error()
+            err_text = str(last_err)
+            if self._is_insufficient_funds_result(None, err_text):
+                return False, {
+                    "reason": f"{side_text} blocked: {err_text}",
+                    "retcode": getattr(mt5, "TRADE_RETCODE_NO_MONEY", 10019),
+                    "retcode_name": "TRADE_RETCODE_NO_MONEY",
+                    "balance": balance,
+                    "free_margin": free_margin,
+                    "required_margin": 0.0,
+                }
+            return True, {
+                "reason": "",
+                "retcode": None,
+                "retcode_name": "",
+                "balance": balance,
+                "free_margin": free_margin,
+                "required_margin": 0.0,
+            }
+
+        retcode = getattr(check, "retcode", None)
+        comment = str(getattr(check, "comment", "") or "").strip()
+        required_margin = float(getattr(check, "margin", 0.0) or 0.0)
+        done_code = getattr(mt5, "TRADE_RETCODE_DONE", None)
+        try:
+            if done_code is not None and int(retcode) == int(done_code):
+                return True, {
+                    "reason": "",
+                    "retcode": retcode,
+                    "retcode_name": self._trade_retcode_name(retcode),
+                    "balance": balance,
+                    "free_margin": free_margin,
+                    "required_margin": required_margin,
+                }
+        except Exception:
+            pass
+
+        detail = comment or self._trade_retcode_name(retcode)
+        if self._is_insufficient_funds_result(retcode, detail):
+            return False, {
+                "reason": f"{side_text} blocked: {detail}",
+                "retcode": retcode,
+                "retcode_name": self._trade_retcode_name(retcode),
+                "balance": balance,
+                "free_margin": free_margin,
+                "required_margin": required_margin,
+            }
+
+        return True, {
+            "reason": "",
+            "retcode": retcode,
+            "retcode_name": self._trade_retcode_name(retcode),
+            "balance": balance,
+            "free_margin": free_margin,
+            "required_margin": required_margin,
+        }
 
     @contextmanager
     def _exclusive_file_lock(self, target_path: str):
@@ -785,8 +1131,6 @@ class LiveTradingBot:
             return
         ts_val = str(ts_key or "").strip()
         text_val = str(llm_text or "").strip()
-        if ts_val and text_val:
-            self.llm_text_cache[ts_val] = text_val
         try:
             log_dir = os.path.dirname(self.llm_text_log_file)
             if log_dir:
@@ -853,25 +1197,46 @@ class LiveTradingBot:
         )
 
         self._load_llm_semantic_cache()
-        self._load_llm_text_log_cache()
+        # Keep time_to_llm_text as append-only log; do not load it for semantic restore.
         llm_cache_rows = 0
-        llm_text_rows = int(len(self.llm_text_cache))
-        # Strict real-only semantic for live:
-        # do not keep any non-LLM preloaded map in runtime.
-        self.semantic_runtime.global_time_to_vec = {}
+        llm_text_rows = 0
+        base_cache_rows = 0
+        merged_cache_rows = 0
+
+        # Use static CLS map as baseline, then overlay live LLM cache.
+        base_map = {}
+        if isinstance(self.semantic_runtime.global_time_to_vec, dict):
+            for key, vec in self.semantic_runtime.global_time_to_vec.items():
+                if not isinstance(key, str):
+                    continue
+                arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+                if arr.size == 0:
+                    continue
+                base_map[key] = arr
+        base_cache_rows = int(len(base_map))
+
+        self.semantic_runtime.global_time_to_vec = dict(base_map)
         self.semantic_runtime.cache = {}
         self.semantic_runtime.quality_cache = {}
         if self.llm_semantic_cache:
-            self.semantic_runtime.global_time_to_vec = {
-                key: np.asarray(vec, dtype=np.float32)
-                for key, vec in self.llm_semantic_cache.items()
-            }
-            llm_cache_rows = int(len(self.semantic_runtime.global_time_to_vec))
+            llm_applied = 0
+            for key, vec in self.llm_semantic_cache.items():
+                if not isinstance(key, str):
+                    continue
+                arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+                if arr.size == 0:
+                    continue
+                # LLM vector overrides baseline CLS when timestamps collide.
+                self.semantic_runtime.global_time_to_vec[key] = arr
+                llm_applied += 1
+            llm_cache_rows = int(llm_applied)
+        merged_cache_rows = int(len(self.semantic_runtime.global_time_to_vec))
 
         print(
             " [MODEL] "
             f"ready features={len(self.feature_columns)} sem_dim={self.semantic_runtime.semantic_feature_count} "
-            f"llm_cache_rows={llm_cache_rows} llm_text_rows={llm_text_rows}"
+            f"base_cache_rows={base_cache_rows} llm_cache_rows={llm_cache_rows} "
+            f"merged_cache_rows={merged_cache_rows} llm_text_rows={llm_text_rows}"
         )
         self._add_log(
             "success",
@@ -881,7 +1246,9 @@ class LiveTradingBot:
             meta={
                 "features": int(len(self.feature_columns)),
                 "semantic_dim": int(self.semantic_runtime.semantic_feature_count),
+                "base_cache_rows": int(base_cache_rows),
                 "llm_cache_rows": int(llm_cache_rows),
+                "merged_cache_rows": int(merged_cache_rows),
                 "llm_text_rows": int(llm_text_rows),
             },
         )
@@ -1602,10 +1969,6 @@ class LiveTradingBot:
             )
             return
 
-        # 1.5 Check historical llm_text log and rebuild embedding without chart fetch.
-        if self._try_resolve_semantic_from_text_log(ts_key):
-            return
-
         now_epoch = time.time()
         retry_not_before = float(self._sem_retry_not_before.get(ts_key, 0.0) or 0.0)
         if now_epoch < retry_not_before:
@@ -1650,8 +2013,6 @@ class LiveTradingBot:
             return True
 
         quick_timeout = max(5.0, float(timeout_sec))
-        if self._try_resolve_semantic_from_text_log(ts_key, timeout_sec=min(quick_timeout, 30.0)):
-            return True
 
         prev_timeout = float(self.vision_llm_timeout_sec)
         self.vision_llm_timeout_sec = min(prev_timeout, quick_timeout)
@@ -2962,6 +3323,9 @@ class LiveTradingBot:
             )
             return True
 
+        if not self._ensure_trade_allowed_before_order(reason="close_all", action_label="Close order"):
+            return False
+
         all_ok = True
         for pos in positions:
             tick = self._get_trade_tick()
@@ -3124,6 +3488,12 @@ class LiveTradingBot:
         return None, False
 
     def send_order(self, order_type):
+        if not self._ensure_trade_allowed_before_order(
+            reason="open_buy" if order_type == mt5.ORDER_TYPE_BUY else "open_sell",
+            action_label="Open order",
+        ):
+            return False
+
         tick = self._get_trade_tick()
         if tick is None:
             print(" Order Skipped: no live tick (market closed or quote unavailable)")
@@ -3136,6 +3506,7 @@ class LiveTradingBot:
             )
             return False
 
+        side = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
         if self.dynamic_lot:
@@ -3164,6 +3535,30 @@ class LiveTradingBot:
             "type_filling": self._get_filling_mode(),
         }
 
+        funds_ok, funds_meta = self._precheck_open_order_funds(req, side=side)
+        if not funds_ok:
+            reason = str((funds_meta or {}).get("reason") or "Insufficient funds/margin").strip()
+            retcode_name = str((funds_meta or {}).get("retcode_name") or "").strip()
+            print(f" Order Blocked: {reason}")
+            self._add_log(
+                "warning",
+                reason,
+                phase="order",
+                event="open_blocked_insufficient_funds",
+                meta={
+                    "side": side,
+                    "lot": float(self.current_lot),
+                    "price": float(price),
+                    "retcode": str((funds_meta or {}).get("retcode") or ""),
+                    "retcode_name": retcode_name,
+                    "balance": float((funds_meta or {}).get("balance") or 0.0),
+                    "free_margin": float((funds_meta or {}).get("free_margin") or 0.0),
+                    "required_margin": float((funds_meta or {}).get("required_margin") or 0.0),
+                    "reason": reason,
+                },
+            )
+            return False
+
         def _refresh_open_price():
             retry_tick = self._get_trade_tick()
             if retry_tick is None:
@@ -3176,7 +3571,6 @@ class LiveTradingBot:
             refresh_price_fn=_refresh_open_price,
         )
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-            side = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
             price = float(req.get("price", price))
             if self.bridge is not None:
                 self.bridge.lot_size = float(self.current_lot)
@@ -3200,12 +3594,29 @@ class LiveTradingBot:
                 if isinstance(last_err, tuple) and len(last_err) >= 2:
                     comment = f"{comment} | mt5_error={last_err[0]}:{last_err[1]}"
             print(f" Order Failed: {comment}")
+            retcode = getattr(res, "retcode", None) if res is not None else None
+            retcode_name = self._trade_retcode_name(retcode)
+            is_no_money = self._is_insufficient_funds_result(retcode, comment)
+            is_autotrading_disabled = self._is_autotrading_disabled_result(retcode, comment)
+            if is_no_money:
+                event_name = "open_failed_insufficient_funds"
+            elif is_autotrading_disabled:
+                event_name = "open_failed_autotrading_disabled"
+            else:
+                event_name = "open_failed"
             self._add_log(
                 "warning",
                 f"Order failed: {comment}",
                 phase="order",
-                event="open_failed",
-                meta={"reason": str(comment)},
+                event=event_name,
+                meta={
+                    "side": side,
+                    "lot": float(self.current_lot),
+                    "price": float(price),
+                    "retcode": str(retcode or ""),
+                    "retcode_name": retcode_name,
+                    "reason": str(comment),
+                },
             )
             return False
 

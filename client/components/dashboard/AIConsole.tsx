@@ -8,6 +8,9 @@ interface LogEntry {
   timestamp: string;
   type: "info" | "analysis" | "action" | "warning" | "success";
   message: string;
+  phase?: string;
+  event?: string;
+  isInsufficientFunds?: boolean;
 }
 
 function parseUtcLike(raw: string): Date | null {
@@ -68,6 +71,29 @@ function toNum(value: unknown): number | null {
     if (Number.isFinite(parsed)) return parsed;
   }
   return null;
+}
+
+const INSUFFICIENT_FUNDS_HINTS = [
+  "no money",
+  "not enough money",
+  "insufficient funds",
+  "insufficient margin",
+  "free margin",
+];
+
+function isInsufficientFundsLog(log: Partial<BotLiveLogEntry>): boolean {
+  const phase = String(log?.phase || "").trim().toUpperCase();
+  const event = String(log?.event || "").trim().toLowerCase();
+  const message = String(log?.message || "").trim().toLowerCase();
+  const reason = String(normalizeMeta(log?.meta)?.reason || "").trim().toLowerCase();
+  if (phase === "ORDER" && (event === "open_blocked_insufficient_funds" || event === "open_failed_insufficient_funds")) {
+    return true;
+  }
+  if (phase === "ORDER" && event === "open_failed") {
+    const text = `${message} ${reason}`;
+    return INSUFFICIENT_FUNDS_HINTS.some((hint) => text.includes(hint));
+  }
+  return false;
 }
 
 function compactLlmText(raw: string, limit = 280): string {
@@ -161,6 +187,27 @@ function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
     const reason = String(meta?.reason || "").trim();
     return reason ? `Open order failed: ${reason}` : "Open order failed";
   }
+  if (phase === "ORDER" && event === "open_blocked_insufficient_funds") {
+    const reason = String(meta?.reason || "").trim();
+    const freeMargin = toNum(meta?.free_margin);
+    const requiredMargin = toNum(meta?.required_margin);
+    const marginText = freeMargin !== null
+      ? `free margin=${freeMargin.toFixed(2)}`
+      : "";
+    const requiredText = requiredMargin !== null && requiredMargin > 0
+      ? ` required=${requiredMargin.toFixed(2)}`
+      : "";
+    const detail = reason || `${marginText}${requiredText}`.trim();
+    return detail
+      ? `Order blocked (insufficient funds): ${detail}`
+      : "Order blocked (insufficient funds)";
+  }
+  if (phase === "ORDER" && event === "open_failed_insufficient_funds") {
+    const reason = String(meta?.reason || "").trim();
+    return reason
+      ? `Open order failed (insufficient funds): ${reason}`
+      : "Open order failed (insufficient funds)";
+  }
   if (phase === "ORDER" && event === "close_failed") {
     const reason = String(meta?.reason || "").trim();
     return reason ? `Close order failed: ${reason}` : "Close order failed";
@@ -197,6 +244,9 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
     for (let i = 0; i < wsLogs.length; i += 1) {
       const row = wsLogs[i];
       const type = row?.type && row.type in typeConfig ? row.type : "info";
+      const phase = String(row?.phase || "").trim().toUpperCase();
+      const event = String(row?.event || "").trim().toLowerCase();
+      const insufficientFunds = isInsufficientFundsLog(row);
       const timestamp = toLocalClockText(
         typeof row?.timestamp_utc === "string" ? row.timestamp_utc : undefined,
         String(row?.timestamp || "")
@@ -212,6 +262,9 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
         timestamp: timestamp || "--:--:--",
         type,
         message,
+        phase,
+        event,
+        isInsufficientFunds: insufficientFunds,
       });
     }
 
@@ -269,7 +322,14 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
               >
                 <span className="text-xs text-muted-foreground font-mono shrink-0">{log.timestamp}</span>
                 <Icon className={cn("w-3.5 h-3.5 shrink-0 mt-0.5", config.color)} />
-                <span className={cn("text-sm break-all", config.color)}>{log.message}</span>
+                <div className="min-w-0 flex-1">
+                  {log.isInsufficientFunds && (
+                    <span className="inline-flex items-center rounded px-1.5 py-0.5 mr-1.5 text-[10px] font-semibold tracking-wide bg-destructive/10 text-destructive border border-destructive/30">
+                      INSUFFICIENT FUNDS
+                    </span>
+                  )}
+                  <span className={cn("text-sm break-all", config.color)}>{log.message}</span>
+                </div>
               </div>
             );
           })

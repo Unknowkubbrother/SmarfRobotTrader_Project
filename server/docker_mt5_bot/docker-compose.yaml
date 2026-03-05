@@ -8,6 +8,7 @@ services:
       - ./bots:/bots
       - ${MT5_SNAPSHOT_HOST_DIR:-./snapshots}:/snapshots
       - ${MT5_INSTANCE_HOST_DIR:-./.instances}:/instances
+      - ${MT5_SEED_HOST_DIR:-./mt5-seed}:/mt5-seed
       - pydeps:/shared-pydeps
     ports:
       - ${MT5_WEB_PORT:-3000}:3000
@@ -22,7 +23,7 @@ services:
       - MT5_PASSWORD=${MT5_PASSWORD:-}
       - MT5_SERVER=${MT5_SERVER:-}
       - MT5_STRICT_SERVER_MATCH=${MT5_STRICT_SERVER_MATCH:-0}
-      - MT5_CLEAN_ACCOUNT_CACHE_ON_START=${MT5_CLEAN_ACCOUNT_CACHE_ON_START:-1}
+      - MT5_CLEAN_ACCOUNT_CACHE_ON_START=${MT5_CLEAN_ACCOUNT_CACHE_ON_START:-0}
       - MT5_SEED_CONFIG_DIR=${MT5_SEED_CONFIG_DIR:-}
       - MT5_SNAPSHOT_PATH=${MT5_SNAPSHOT_PATH:-/snapshots/mt5-config-snapshot.tgz}
       - BOT_WS_URL=${BOT_WS_URL:-}

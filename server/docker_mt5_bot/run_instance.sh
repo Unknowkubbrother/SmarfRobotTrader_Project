@@ -105,6 +105,13 @@ sanitize_profile_token() {
   printf '%s' "$cleaned"
 }
 
+sanitize_version_token() {
+  local raw="$1"
+  local cleaned
+  cleaned="$(printf '%s' "$raw" | sed -E 's/[^A-Za-z0-9._-]+/_/g; s/^_+//; s/_+$//')"
+  printf '%s' "$cleaned"
+}
+
 resolve_baseline_instance_name() {
   local raw
   raw="${MT5_BASELINE_INSTANCE_ID:-$(read_dotenv_value MT5_BASELINE_INSTANCE_ID)}"
@@ -119,7 +126,7 @@ resolve_baseline_instance_name() {
 prepare_mt5_seed_from_baseline_instance() {
   local baseline_instance="$1"
   local baseline_volume="mt5_${baseline_instance}_config"
-  local seed_dir="$STATE_DIR/mt5-seed"
+  local seed_dir="${MT5_SEED_HOST_DIR_ABS:-$ROOT_DIR/mt5-seed}"
   local had_seed=0
 
   if [[ -f "$seed_dir/servers.dat" || -f "$seed_dir/accounts.dat" ]]; then
@@ -127,7 +134,7 @@ prepare_mt5_seed_from_baseline_instance() {
   fi
 
   if (( had_seed == 1 )) && ! is_truthy "${MT5_REFRESH_BASELINE_SEED:-0}"; then
-    export MT5_SEED_CONFIG_DIR="/instances/mt5-seed"
+    export MT5_SEED_CONFIG_DIR="${MT5_SEED_CONFIG_DIR_VAL:-/mt5-seed}"
     echo "[baseline] Reusing existing MT5 seed cache at $seed_dir."
     return 0
   fi
@@ -162,7 +169,7 @@ fi
     return 1
   fi
 
-  export MT5_SEED_CONFIG_DIR="/instances/mt5-seed"
+  export MT5_SEED_CONFIG_DIR="${MT5_SEED_CONFIG_DIR_VAL:-/mt5-seed}"
   echo "[baseline] Exported MT5 seed cache from '$baseline_volume' to $seed_dir."
   return 0
 }
@@ -196,7 +203,7 @@ set -e
 if [ ! -d /from/.wine ]; then
   exit 8
 fi
-tar --warning=no-file-changed -C /from -czf \"/out/$snapshot_name\" .wine
+tar -C /from -czf \"/out/$snapshot_name\" .wine
 "; then
     echo "[baseline] warning: failed to export MT5 snapshot from '$baseline_volume'."
     return 1
@@ -265,40 +272,85 @@ list_available_profiles() {
   local dir
   for dir in "$ROOT_DIR"/bots/*; do
     [[ -d "$dir" ]] || continue
-    [[ -f "$dir/run_live.py" ]] || continue
+    if [[ ! -f "$dir/run_live.py" ]]; then
+      compgen -G "$dir"/*/run_live.py >/dev/null || continue
+    fi
     basename "$dir"
   done | LC_ALL=C sort
 }
 
 profile_exists() {
   local profile="$1"
-  [[ -f "$ROOT_DIR/bots/$profile/run_live.py" ]]
+  [[ -f "$ROOT_DIR/bots/$profile/run_live.py" ]] && return 0
+  compgen -G "$ROOT_DIR/bots/$profile"/*/run_live.py >/dev/null
 }
 
 resolve_bot_defaults_from_profile() {
   local profile="$1"
   local profile_dir="$ROOT_DIR/bots/$profile"
+  local selected_rel="$profile"
+  local selected_dir="$profile_dir"
   local req_live req_base
-  req_live="/bots/$profile/requirements-live.txt"
-  req_base="/bots/$profile/requirements.txt"
+  local version_tag_raw version_tag_sanitized version_tag_raw_safe
+  local candidate_rel candidate_dir
 
-  if [[ ! -f "$profile_dir/run_live.py" ]]; then
+  if [[ ! -d "$profile_dir" ]]; then
     echo "Error: bot profile '$profile' not found at $profile_dir/run_live.py"
     echo "Available profiles:"
     list_available_profiles | sed 's/^/  /'
     exit 1
   fi
 
-  BOT_SCRIPT_DEFAULT="$profile/run_live.py"
-  if [[ -f "$profile_dir/requirements-live.txt" ]]; then
+  version_tag_raw="$(trim_outer_whitespace "${BOT_VERSION_TAG:-}")"
+  if [[ -n "$version_tag_raw" ]]; then
+    version_tag_sanitized="$(sanitize_version_token "$version_tag_raw")"
+    version_tag_raw_safe=""
+    if [[ "$version_tag_raw" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      version_tag_raw_safe="$version_tag_raw"
+    fi
+    for candidate_rel in "$profile/$version_tag_raw_safe" "$profile/$version_tag_sanitized"; do
+      [[ -n "$candidate_rel" ]] || continue
+      candidate_dir="$ROOT_DIR/bots/$candidate_rel"
+      if [[ -f "$candidate_dir/run_live.py" ]]; then
+        selected_rel="$candidate_rel"
+        selected_dir="$candidate_dir"
+        break
+      fi
+    done
+    if [[ "$selected_rel" == "$profile" ]]; then
+      echo "warning: BOT_VERSION_TAG='$version_tag_raw' not found under '$profile'; fallback to base profile."
+    fi
+  fi
+
+  if [[ ! -f "$selected_dir/run_live.py" ]]; then
+    if [[ -f "$profile_dir/run_live.py" ]]; then
+      selected_rel="$profile"
+      selected_dir="$profile_dir"
+    else
+      echo "Error: bot profile '$profile' has no run_live.py"
+      exit 1
+    fi
+  fi
+
+  BOT_SCRIPT_DEFAULT="$selected_rel/run_live.py"
+  req_live="/bots/$selected_rel/requirements-live.txt"
+  req_base="/bots/$selected_rel/requirements.txt"
+
+  if [[ -f "$selected_dir/requirements-live.txt" ]]; then
     BOT_REQUIREMENTS_DEFAULT="$req_live"
-  elif [[ -f "$profile_dir/requirements.txt" ]]; then
+  elif [[ -f "$selected_dir/requirements.txt" ]]; then
     BOT_REQUIREMENTS_DEFAULT="$req_base"
+  elif [[ "$selected_rel" != "$profile" && -f "$profile_dir/requirements-live.txt" ]]; then
+    BOT_REQUIREMENTS_DEFAULT="/bots/$profile/requirements-live.txt"
+    echo "warning: versioned profile '$selected_rel' has no requirements file; using /bots/$profile/requirements-live.txt"
+  elif [[ "$selected_rel" != "$profile" && -f "$profile_dir/requirements.txt" ]]; then
+    BOT_REQUIREMENTS_DEFAULT="/bots/$profile/requirements.txt"
+    echo "warning: versioned profile '$selected_rel' has no requirements file; using /bots/$profile/requirements.txt"
   else
-    echo "Error: requirements file not found for profile '$profile'"
+    echo "Error: requirements file not found for profile '$selected_rel'"
     echo "  expected one of:"
-    echo "    $profile_dir/requirements-live.txt"
-    echo "    $profile_dir/requirements.txt"
+    echo "    $selected_dir/requirements-live.txt"
+    echo "    $selected_dir/requirements.txt"
     exit 1
   fi
 }
@@ -520,6 +572,23 @@ else
 fi
 mkdir -p "$SNAPSHOT_HOST_DIR_ABS"
 
+SEED_HOST_DIR_RAW="${MT5_SEED_HOST_DIR:-$(read_dotenv_value MT5_SEED_HOST_DIR)}"
+if [[ -z "$SEED_HOST_DIR_RAW" ]]; then
+  SEED_HOST_DIR_RAW="./mt5-seed"
+fi
+if [[ "$SEED_HOST_DIR_RAW" == /* ]]; then
+  MT5_SEED_HOST_DIR_ABS="$SEED_HOST_DIR_RAW"
+else
+  MT5_SEED_HOST_DIR_ABS="$ROOT_DIR/${SEED_HOST_DIR_RAW#./}"
+fi
+mkdir -p "$MT5_SEED_HOST_DIR_ABS"
+
+MT5_SEED_CONFIG_DIR_VAL="${MT5_SEED_CONFIG_DIR:-$(read_dotenv_value MT5_SEED_CONFIG_DIR)}"
+MT5_SEED_CONFIG_DIR_VAL="$(trim_outer_whitespace "$MT5_SEED_CONFIG_DIR_VAL")"
+if [[ -z "$MT5_SEED_CONFIG_DIR_VAL" ]]; then
+  MT5_SEED_CONFIG_DIR_VAL="/mt5-seed"
+fi
+
 BASELINE_INSTANCE_NAME="$(resolve_baseline_instance_name)"
 if [[ -n "$BASELINE_INSTANCE_NAME" ]]; then
   if is_truthy "${MT5_AUTO_EXPORT_BASELINE_SEED:-1}"; then
@@ -536,6 +605,8 @@ export COMPOSE_PROJECT_NAME
 export MT5_WEB_PORT
 export MT5_SNAPSHOT_HOST_DIR="$SNAPSHOT_HOST_DIR_ABS"
 export MT5_INSTANCE_HOST_DIR="$STATE_DIR"
+export MT5_SEED_HOST_DIR="$MT5_SEED_HOST_DIR_ABS"
+export MT5_SEED_CONFIG_DIR="$MT5_SEED_CONFIG_DIR_VAL"
 export MT5_LOGIN="$MT5_LOGIN_VAL"
 export MT5_PASSWORD="$MT5_PASSWORD_VAL"
 export MT5_SERVER="$MT5_SERVER_VAL"
@@ -564,8 +635,14 @@ if [[ -z "${MT5_SNAPSHOT_PATH:-}" ]]; then
   export MT5_SNAPSHOT_PATH="/snapshots/mt5-config-snapshot.tgz"
 fi
 
+resolved_bot_dir="${BOT_SCRIPT_DEFAULT%/run_live.py}"
+if [[ -z "$resolved_bot_dir" || "$resolved_bot_dir" == "$BOT_SCRIPT_DEFAULT" ]]; then
+  resolved_bot_dir="$(dirname "$BOT_SCRIPT_DEFAULT")"
+fi
+resolved_bot_dir="$(printf '%s' "$resolved_bot_dir" | sed -E 's#^/+##')"
+
 if [[ -z "${LIVE_MODELS_DIR:-}" ]]; then
-  export LIVE_MODELS_DIR="/bots/${PROFILE}/models"
+  export LIVE_MODELS_DIR="/bots/${resolved_bot_dir}/models"
 fi
 if [[ -z "${LIVE_LLM_SEMANTIC_CACHE_FILE:-}" ]]; then
   export LIVE_LLM_SEMANTIC_CACHE_FILE="${LIVE_MODELS_DIR}/time_to_embedding_llm_cls.joblib"
@@ -589,7 +666,7 @@ if [[ -z "${LIVE_CATCHUP_MAX_BARS:-}" ]]; then
   export LIVE_CATCHUP_MAX_BARS="24"
 fi
 if [[ -z "${LIVE_SEMANTIC_ALIAS_HOURS:-}" ]]; then
-  export LIVE_SEMANTIC_ALIAS_HOURS="0,1,-1,2,-2,3,-3,4,-4,5,-5,6,-6,7,-7,8,-8,9,-9,10,-10,11,-11,12,-12"
+  export LIVE_SEMANTIC_ALIAS_HOURS="0"
 fi
 if [[ -z "${LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS:-}" ]]; then
   export LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS="180"
@@ -640,6 +717,8 @@ echo "Web: http://localhost:$MT5_WEB_PORT"
 echo "MT5_LOGIN: $MT5_LOGIN"
 echo "MT5_SERVER: $MT5_SERVER"
 echo "Bot: $BOT_SCRIPT"
+echo "BOT_VERSION_TAG: ${BOT_VERSION_TAG:-base}"
+echo "METATRADER_IMAGE: ${METATRADER_IMAGE:-auto}"
 echo "BOT_CONFIG_ID: $BOT_CONFIG_ID"
 echo "BOT_WS_URL: $BOT_WS_URL"
 echo "VISION_LLM_API_URL: $VISION_LLM_API_URL"

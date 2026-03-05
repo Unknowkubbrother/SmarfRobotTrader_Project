@@ -431,22 +431,41 @@ class LiveTradingBot:
 
         self._load_llm_semantic_cache()
         llm_cache_rows = 0
-        # Strict real-only semantic for live:
-        # do not keep any non-LLM preloaded map in runtime.
-        self.semantic_runtime.global_time_to_vec = {}
+        base_cache_rows = 0
+        merged_cache_rows = 0
+        # Use static CLS map as baseline, then overlay live LLM cache.
+        base_map = {}
+        if isinstance(self.semantic_runtime.global_time_to_vec, dict):
+            for key, vec in self.semantic_runtime.global_time_to_vec.items():
+                if not isinstance(key, str):
+                    continue
+                arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+                if arr.size == 0:
+                    continue
+                base_map[key] = arr
+        base_cache_rows = int(len(base_map))
+
+        self.semantic_runtime.global_time_to_vec = dict(base_map)
         self.semantic_runtime.cache = {}
         self.semantic_runtime.quality_cache = {}
         if self.llm_semantic_cache:
-            self.semantic_runtime.global_time_to_vec = {
-                key: np.asarray(vec, dtype=np.float32)
-                for key, vec in self.llm_semantic_cache.items()
-            }
-            llm_cache_rows = int(len(self.semantic_runtime.global_time_to_vec))
+            llm_applied = 0
+            for key, vec in self.llm_semantic_cache.items():
+                if not isinstance(key, str):
+                    continue
+                arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+                if arr.size == 0:
+                    continue
+                self.semantic_runtime.global_time_to_vec[key] = arr
+                llm_applied += 1
+            llm_cache_rows = int(llm_applied)
+        merged_cache_rows = int(len(self.semantic_runtime.global_time_to_vec))
 
         print(
             " [MODEL] "
             f"ready features={len(self.feature_columns)} sem_dim={self.semantic_runtime.semantic_feature_count} "
-            f"llm_cache_rows={llm_cache_rows}"
+            f"base_cache_rows={base_cache_rows} llm_cache_rows={llm_cache_rows} "
+            f"merged_cache_rows={merged_cache_rows}"
         )
         self._add_log(
             "success",
@@ -456,7 +475,9 @@ class LiveTradingBot:
             meta={
                 "features": int(len(self.feature_columns)),
                 "semantic_dim": int(self.semantic_runtime.semantic_feature_count),
+                "base_cache_rows": int(base_cache_rows),
                 "llm_cache_rows": int(llm_cache_rows),
+                "merged_cache_rows": int(merged_cache_rows),
             },
         )
 

@@ -118,15 +118,45 @@ def _connect_mt5() -> tuple[MetaTrader5, str, int]:
     )
 
 
-def generate_image(date_time: datetime, symbol: str = "EURUSD") -> str:
-    """Return a base64-encoded PNG candlestick chart for one 1-hour bar.
+_TF_SECONDS = {
+    "M1": 60,
+    "M2": 120,
+    "M3": 180,
+    "M4": 240,
+    "M5": 300,
+    "M6": 360,
+    "M10": 600,
+    "M12": 720,
+    "M15": 900,
+    "M20": 1200,
+    "M30": 1800,
+    "H1": 3600,
+    "H2": 7200,
+    "H3": 10800,
+    "H4": 14400,
+    "H6": 21600,
+    "H8": 28800,
+    "H12": 43200,
+    "D1": 86400,
+}
+
+
+def _timeframe_seconds(timeframe: str) -> int:
+    tf = str(timeframe or "H1").strip().upper()
+    return int(_TF_SECONDS.get(tf, 3600))
+
+
+def generate_image(date_time: datetime, symbol: str = "EURUSD", timeframe: str = "H1") -> str:
+    """Return a base64-encoded PNG candlestick chart for one bar window.
 
     Parameters
     ----------
     date_time : datetime
-        The target hour (minutes/seconds are ignored).
+        Target bar timestamp. It will be aligned to timeframe boundary.
     symbol : str
         MT5 symbol name.
+    timeframe : str
+        Target timeframe name (e.g. H1, M15). Used to define chart window length.
 
     Returns
     -------
@@ -136,13 +166,18 @@ def generate_image(date_time: datetime, symbol: str = "EURUSD") -> str:
     mt5, _connected_host, _connected_port = _connect_mt5()
 
     try:
-        start = date_time.replace(minute=0, second=0, microsecond=0)
+        tf_secs = _timeframe_seconds(timeframe)
+        epoch = int(date_time.replace(tzinfo=timezone.utc).timestamp()) if date_time.tzinfo is None else int(
+            date_time.astimezone(timezone.utc).timestamp()
+        )
+        aligned_epoch = epoch - (epoch % tf_secs)
+        start = datetime.fromtimestamp(aligned_epoch, tz=timezone.utc)
         start_utc = (
             start.replace(tzinfo=timezone.utc)
             if start.tzinfo is None
             else start.astimezone(timezone.utc)
         )
-        end_utc = start_utc + timedelta(hours=1)
+        end_utc = start_utc + timedelta(seconds=tf_secs)
 
         rates = mt5.copy_rates_range(
             symbol, mt5.TIMEFRAME_M1, start_utc, end_utc,

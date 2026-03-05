@@ -45,6 +45,58 @@ class BotRunnerError(RuntimeError):
         self.stderr = stderr
 
 
+def _is_truthy(raw: str | None, default: bool = False) -> bool:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return default
+    return text in {"1", "true", "yes", "on"}
+
+
+def _sanitize_docker_tag(raw: str | None) -> str:
+    tag = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(raw or "").strip())
+    tag = tag.strip(".-")
+    if not tag:
+        return ""
+    if len(tag) > 120:
+        tag = tag[:120]
+    return tag
+
+
+def _resolve_image_ref_with_version(
+    image_ref: str | None,
+    version_tag: str | None,
+) -> str | None:
+    image = str(image_ref or "").strip()
+    if not image:
+        return None
+
+    use_versioned_tag = _is_truthy(
+        os.getenv("BOT_RUNNER_USE_VERSIONED_IMAGE_TAG"),
+        default=True,
+    )
+    if not use_versioned_tag:
+        return image
+
+    # Keep digest-pinned images untouched.
+    if "@sha256:" in image:
+        return image
+
+    tag = _sanitize_docker_tag(version_tag)
+    if not tag:
+        return image
+
+    last_slash = image.rfind("/")
+    last_colon = image.rfind(":")
+    has_tag = last_colon > last_slash
+    if has_tag:
+        repository = image[:last_colon]
+        current_tag = image[last_colon + 1 :]
+        if current_tag and current_tag.lower() not in {"latest"}:
+            return image
+        return f"{repository}:{tag}"
+    return f"{image}:{tag}"
+
+
 def decrypt_mt5_password(encrypted_password: str) -> str:
     key = base64.urlsafe_b64encode(
         hashlib.sha256(os.getenv("SECRET_KEY", "UknownmeInLove").encode()).digest()
@@ -74,6 +126,7 @@ def build_bot_runtime_env(
     live_symbol: str,
     live_timeframe: str,
     docker_image_id: str | None = None,
+    bot_version_tag: str | None = None,
     magic_number: int | None = None,
 ) -> dict[str, str]:
     ws_url = (
@@ -197,8 +250,12 @@ def build_bot_runtime_env(
     if magic_number is not None:
         env["LIVE_MAGIC_NUMBER"] = str(int(magic_number))
 
-    if docker_image_id and str(docker_image_id).strip():
-        env["METATRADER_IMAGE"] = str(docker_image_id).strip()
+    resolved_image_ref = _resolve_image_ref_with_version(docker_image_id, bot_version_tag)
+    if resolved_image_ref:
+        env["METATRADER_IMAGE"] = resolved_image_ref
+
+    if bot_version_tag and str(bot_version_tag).strip():
+        env["BOT_VERSION_TAG"] = str(bot_version_tag).strip()
 
     return env
 
@@ -465,9 +522,14 @@ try:
 
     payload["trade_allowed"] = bool(getattr(info, "trade_allowed", False))
     payload["tradeapi_disabled"] = bool(getattr(info, "tradeapi_disabled", False))
-    payload["detail"] = "ok"
+    if payload["trade_allowed"] and not payload["tradeapi_disabled"]:
+        payload["detail"] = "ok"
+    elif payload["tradeapi_disabled"]:
+        payload["detail"] = "tradeapi_disabled"
+    else:
+        payload["detail"] = "trade_allowed_off"
     print(json.dumps(payload))
-    sys.exit(0 if payload["trade_allowed"] else 1)
+    sys.exit(0 if payload["trade_allowed"] and not payload["tradeapi_disabled"] else 1)
 except Exception as exc:
     payload["detail"] = f"exception:{exc}"
     print(json.dumps(payload))
@@ -536,6 +598,8 @@ except Exception as exc:
     tradeapi_disabled_raw = payload.get("tradeapi_disabled", None)
     trade_allowed = bool(trade_allowed_raw) if isinstance(trade_allowed_raw, bool) else None
     tradeapi_disabled = bool(tradeapi_disabled_raw) if isinstance(tradeapi_disabled_raw, bool) else None
+    if trade_allowed is True and tradeapi_disabled is True:
+        trade_allowed = False
 
     return BotRuntimeHealthResult(
         project_name=project_name,

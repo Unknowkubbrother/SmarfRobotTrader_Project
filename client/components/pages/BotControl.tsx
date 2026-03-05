@@ -114,8 +114,9 @@ const normalizeTradingSchedule = (value: unknown): Record<string, boolean> => {
 const mapLifecycleActionTitle = (action: string): string => {
   switch (String(action || "").toLowerCase()) {
     case "start":
-    case "restart":
       return "Starting Bot";
+    case "restart":
+      return "Restarting Bot";
     case "stop":
       return "Stopping Bot";
     case "emergency_stop":
@@ -647,6 +648,34 @@ export default function BotControl() {
     setStopConfirmOpen(false);
   };
 
+  const performBotRestart = async () => {
+    if (isBusy) return;
+    if (!selectedBot) return;
+    const actionTitle = "Restarting Bot";
+    startUiAction(
+      actionTitle,
+      "Stopping old process and booting bot runtime again...",
+      `${actionTitle} for ${selectedBot.bot_version?.label || "bot"}`,
+      {
+        botId: selectedBot.id,
+        expectedStatus: "running",
+        kind: "starting",
+      }
+    );
+    const result = await updateBotStatus(selectedBot.id, "running");
+    if (result.success) {
+      appendActionLog("success", `${actionTitle} completed`, selectedBot.id);
+      toast.success("Bot restarted successfully");
+      finishUiAction();
+    } else if (result.pending) {
+      appendActionLog("info", `${actionTitle} request accepted. Waiting for backend sync...`, selectedBot.id);
+      toast.info("Restart is in progress. Tracking status from backend...");
+    } else {
+      appendActionLog("error", `${actionTitle} failed`, selectedBot.id);
+      finishUiAction();
+    }
+  };
+
   const handlePanicClick = () => {
     if (isBusy) return;
     setPanicConfirmOpen(true);
@@ -1034,6 +1063,12 @@ export default function BotControl() {
                         </>
                       )}
                     </Button>
+                    {botStatus === "running" && (
+                      <Button variant="outline" className="gap-2" onClick={performBotRestart} disabled={isBusy}>
+                        <RefreshCw className="w-4 h-4" />
+                        Restart
+                      </Button>
+                    )}
                     <Button variant="destructive" onClick={handlePanicClick} className="gap-2" disabled={isBusy}>
                       <AlertOctagon className="w-4 h-4" />
                       Emergency Stop

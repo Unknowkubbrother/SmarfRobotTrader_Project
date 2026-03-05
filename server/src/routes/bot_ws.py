@@ -31,8 +31,19 @@ _CACHE_TTL = 3900  # 65 minutes
 _BOT_CONTEXT: dict[str, dict] = {}
 _BOT_OPEN_POSITIONS: dict[str, dict[int, dict]] = {}
 _BOT_ACCOUNT_SYNC_CACHE: dict[str, dict] = {}
+_BOT_INSUFFICIENT_FUNDS_ALERT_CACHE: dict[str, dict[str, float]] = {}
 _ACCOUNT_SYNC_MIN_INTERVAL_SEC = 5.0
 _ACCOUNT_SYNC_FORCE_INTERVAL_SEC = 60.0
+_INSUFFICIENT_FUNDS_ALERT_TTL_SEC = 60.0 * 60.0 * 6.0
+_INSUFFICIENT_FUNDS_ALERT_CACHE_MAX = 300
+_INSUFFICIENT_FUNDS_HINTS = (
+    "no money",
+    "not enough money",
+    "insufficient funds",
+    "insufficient margin",
+    "margin",
+    "funds",
+)
 
 
 def _cache_key(symbol: str, timeframe: str, dt_str: str) -> str:
@@ -55,6 +66,41 @@ def _safe_int(value, default: int = 0) -> int:
         return int(value)
     except Exception:
         return int(default)
+
+
+def _trim_text(value) -> str:
+    return str(value or "").strip()
+
+
+def _contains_insufficient_funds_hint(text: str) -> bool:
+    raw = _trim_text(text).lower()
+    if not raw:
+        return False
+    return any(hint in raw for hint in _INSUFFICIENT_FUNDS_HINTS)
+
+
+def _remember_insufficient_funds_alert(bot_config_id: str, dedup_key: str) -> bool:
+    if not bot_config_id or not dedup_key:
+        return False
+    now_epoch = time.time()
+    bucket = _BOT_INSUFFICIENT_FUNDS_ALERT_CACHE.setdefault(bot_config_id, {})
+    expired = [
+        key
+        for key, ts in bucket.items()
+        if (now_epoch - float(ts)) >= _INSUFFICIENT_FUNDS_ALERT_TTL_SEC
+    ]
+    for key in expired:
+        bucket.pop(key, None)
+
+    if dedup_key in bucket:
+        return False
+
+    bucket[dedup_key] = now_epoch
+    if len(bucket) > _INSUFFICIENT_FUNDS_ALERT_CACHE_MAX:
+        oldest_keys = sorted(bucket.items(), key=lambda item: float(item[1]))[: max(1, _INSUFFICIENT_FUNDS_ALERT_CACHE_MAX // 2)]
+        for key, _ in oldest_keys:
+            bucket.pop(key, None)
+    return True
 
 
 def _normalize_order_side(value) -> str | None:
@@ -109,7 +155,7 @@ async def _get_bot_context(bot_config_id: str) -> dict | None:
             "recordStatus": "active",
             "account": {"recordStatus": "active"},
         },
-        include={"account": True},
+        include={"account": True, "botVersion": True},
     )
     if not config:
         return None
@@ -118,9 +164,72 @@ async def _get_bot_context(bot_config_id: str) -> dict | None:
         "account_id": str(config.accountId),
         "bot_instance_id": _safe_int(getattr(config, "botInstanceId", 0), 0),
         "magic_number": _safe_int(getattr(config, "magicNumber", 0), 0),
+        "owner_user_id": str(getattr(getattr(config, "account", None), "userId", "") or ""),
+        "broker_name": str(getattr(getattr(config, "account", None), "brokerName", "") or ""),
+        "server_name": str(getattr(getattr(config, "account", None), "serverName", "") or ""),
+        "mt5_login_id": str(getattr(getattr(config, "account", None), "mt5LoginId", "") or ""),
+        "bot_label": str(getattr(getattr(config, "botVersion", None), "label", "") or ""),
     }
     _BOT_CONTEXT[bot_config_id] = context
     return context
+
+
+async def _emit_insufficient_funds_notification(bot_config_id: str, state: dict) -> None:
+    recent_logs = state.get("recent_logs")
+    if not isinstance(recent_logs, list) or len(recent_logs) == 0:
+        return
+
+    context = await _get_bot_context(bot_config_id)
+    if not isinstance(context, dict):
+        return
+    user_id = _trim_text(context.get("owner_user_id"))
+    if not user_id:
+        return
+
+    bot_label = _trim_text(context.get("bot_label")) or "Trading Bot"
+    symbol = _trim_text(state.get("symbol")).upper() or "-"
+    broker_name = _trim_text(context.get("broker_name"))
+    server_name = _trim_text(context.get("server_name"))
+    mt5_login_id = _trim_text(context.get("mt5_login_id"))
+    account_label_parts = [part for part in [broker_name, server_name] if part]
+    account_label = " / ".join(account_label_parts)
+    if mt5_login_id:
+        account_label = f"{account_label} ({mt5_login_id})" if account_label else f"MT5 {mt5_login_id}"
+
+    for entry in recent_logs:
+        if not isinstance(entry, dict):
+            continue
+        phase = _trim_text(entry.get("phase")).upper()
+        event = _trim_text(entry.get("event")).lower()
+        message = _trim_text(entry.get("message"))
+        meta = entry.get("meta") if isinstance(entry.get("meta"), dict) else {}
+        reason = _trim_text(meta.get("reason")) or message
+        side = _trim_text(meta.get("side")).upper() or "ORDER"
+
+        is_alert = event in {"open_blocked_insufficient_funds", "open_failed_insufficient_funds"}
+        if not is_alert and phase == "ORDER" and event == "open_failed":
+            is_alert = _contains_insufficient_funds_hint(f"{message} {reason}")
+        if not is_alert:
+            continue
+
+        timestamp_key = _trim_text(entry.get("timestamp_utc")) or _trim_text(entry.get("timestamp"))
+        dedup_key = f"{timestamp_key}|{event}|{side}|{reason[:200]}"
+        if not _remember_insufficient_funds_alert(bot_config_id, dedup_key):
+            continue
+
+        reason_text = reason or "Insufficient funds or margin"
+        title = "Order blocked: insufficient funds"
+        body = f"{bot_label} cannot open {side} on {symbol}: {reason_text}"
+        if account_label:
+            body = f"{body} | Account: {account_label}"
+        await db.notification.create(
+            data={
+                "userId": user_id,
+                "title": title[:100],
+                "message": body,
+                "relatedLink": "/bot-control",
+            }
+        )
 
 
 def _resolve_allowed_magic_set(context: dict | None = None) -> set[int]:
@@ -677,7 +786,7 @@ async def bot_websocket(websocket: WebSocket):
                             "recordStatus": "active",
                             "account": {"recordStatus": "active"},
                         },
-                        include={"account": True},
+                        include={"account": True, "botVersion": True},
                     )
                     if not config:
                         await websocket.send_text(json.dumps({
@@ -697,6 +806,11 @@ async def bot_websocket(websocket: WebSocket):
                             "account_id": str(config.accountId),
                             "bot_instance_id": _safe_int(getattr(config, "botInstanceId", 0), 0),
                             "magic_number": _safe_int(getattr(config, "magicNumber", 0), 0),
+                            "owner_user_id": str(getattr(getattr(config, "account", None), "userId", "") or ""),
+                            "broker_name": str(getattr(getattr(config, "account", None), "brokerName", "") or ""),
+                            "server_name": str(getattr(getattr(config, "account", None), "serverName", "") or ""),
+                            "mt5_login_id": str(getattr(getattr(config, "account", None), "mt5LoginId", "") or ""),
+                            "bot_label": str(getattr(getattr(config, "botVersion", None), "label", "") or ""),
                         }
                         raw_schedule = getattr(config, "tradingSchedule", None)
                         schedule = normalize_trading_schedule(raw_schedule)
@@ -717,6 +831,10 @@ async def bot_websocket(websocket: WebSocket):
                     await _persist_bot_state(bot_config_id, state)
                 except Exception as exc:
                     logger.warning("bot state db sync failed for %s: %s", bot_config_id, exc)
+                try:
+                    await _emit_insufficient_funds_notification(bot_config_id, state)
+                except Exception as exc:
+                    logger.warning("bot insufficient-funds notification failed for %s: %s", bot_config_id, exc)
             elif msg_type == "bot_command_ack" and bot_config_id:
                 try:
                     await bot_hub.receive_bot_command_ack(bot_config_id, msg)
@@ -735,6 +853,7 @@ async def bot_websocket(websocket: WebSocket):
             bot_hub.disconnect_bot(bot_config_id)
             _BOT_OPEN_POSITIONS.pop(bot_config_id, None)
             _BOT_ACCOUNT_SYNC_CACHE.pop(bot_config_id, None)
+            _BOT_INSUFFICIENT_FUNDS_ALERT_CACHE.pop(bot_config_id, None)
 
 
 # ── WS /ws/dashboard — Dashboard connection ──────────────────────────
@@ -792,7 +911,7 @@ async def bot_ws_cron(data: VisionLLMRequest):
         try:
             start = time.perf_counter()
             result, cls_vec = await asyncio.to_thread(
-                generate_llm_cls_for_bar, data.date_time, data.symbol,
+                generate_llm_cls_for_bar, data.date_time, data.symbol, timeframe,
             )
             elapsed = time.perf_counter() - start
             result_data = {

@@ -24,11 +24,13 @@ MT5_TRADE_CHECK_TIMEOUT_SECONDS="${MT5_TRADE_CHECK_TIMEOUT_SECONDS:-45}"
 MT5_DIALOG_SEARCH_WAIT_SECONDS="${MT5_DIALOG_SEARCH_WAIT_SECONDS:-6}"
 MT5_COMPANY_DISCOVERY_BEFORE_LOGIN="${MT5_COMPANY_DISCOVERY_BEFORE_LOGIN:-1}"
 MT5_COMPANY_DIALOG_CLEANUP_AFTER_LOGIN="${MT5_COMPANY_DIALOG_CLEANUP_AFTER_LOGIN:-1}"
+MT5_REFRESH_COMPANY_CACHE_AFTER_START="${MT5_REFRESH_COMPANY_CACHE_AFTER_START:-0}"
 MT5_COMPANY_SEARCH_QUERY="${MT5_COMPANY_SEARCH_QUERY:-}"
 MT5_SKIP_PRECHECKS="${MT5_SKIP_PRECHECKS:-0}"
 MT5_ALLOW_PARTIAL_START="${MT5_ALLOW_PARTIAL_START:-0}"
 BOT_WAIT_FOR_WS_REGISTER="${BOT_WAIT_FOR_WS_REGISTER:-1}"
 BOT_WS_READY_TIMEOUT_SECONDS="${BOT_WS_READY_TIMEOUT_SECONDS:-120}"
+MT5_ALGO_STABILIZE_SECONDS="${MT5_ALGO_STABILIZE_SECONDS:-20}"
 
 trim_outer_whitespace() {
   local raw="$1"
@@ -250,21 +252,13 @@ import os
 import sys
 
 try:
-    login_text = os.getenv("MT5_LOGIN", "").strip()
-    password = os.getenv("MT5_PASSWORD", "").strip()
-    server = os.getenv("MT5_SERVER", "").strip()
     timeout_ms = int(os.getenv("MT5_RPC_TIMEOUT_MS", "180000"))
     rpyc.core.protocol.DEFAULT_CONFIG["sync_request_timeout"] = max(60.0, float(timeout_ms) / 1000.0)
     mt5 = MetaTrader5(host="localhost", port=8001)
 
-    init_kwargs = {"timeout": timeout_ms}
-    if login_text and password:
-        init_kwargs["login"] = int(login_text)
-        init_kwargs["password"] = password
-        if server:
-            init_kwargs["server"] = server
-
-    if not mt5.initialize(**init_kwargs):
+    # Read-only probe: avoid credentialed re-login side effects that can
+    # flip MT5 AutoTrading state while probing.
+    if not mt5.initialize(timeout=timeout_ms):
         print("trade_allowed=0 tradeapi_disabled=unknown (initialize failed)")
         sys.exit(2)
 
@@ -275,7 +269,11 @@ try:
     trade_allowed = bool(getattr(info, "trade_allowed", False))
     tradeapi_disabled = bool(getattr(info, "tradeapi_disabled", False))
     print(f"trade_allowed={int(trade_allowed)} tradeapi_disabled={int(tradeapi_disabled)}")
-    sys.exit(0 if trade_allowed else 1)
+    if trade_allowed and not tradeapi_disabled:
+        sys.exit(0)
+    if tradeapi_disabled:
+        sys.exit(5)
+    sys.exit(1)
 except Exception as exc:
     print(f"trade_allowed=0 check_exception={exc}")
     sys.exit(3)
@@ -400,12 +398,16 @@ def probe_login(server_name: str, login_id: int, pwd: str, rpc_timeout: int, res
     }
     mt5 = None
     try:
+        # Keep each login attempt bounded by the per-attempt watchdog, even if
+        # global MT5 RPC timeout is configured higher.
+        attempt_timeout_ms = max(5000, int(attempt_timeout_sec) * 1000)
+        effective_timeout_ms = max(5000, min(int(rpc_timeout), attempt_timeout_ms))
         try:
-            rpyc.core.protocol.DEFAULT_CONFIG["sync_request_timeout"] = max(60.0, float(rpc_timeout) / 1000.0)
+            rpyc.core.protocol.DEFAULT_CONFIG["sync_request_timeout"] = max(10.0, float(effective_timeout_ms) / 1000.0)
         except Exception:
             pass
         mt5 = MetaTrader5(host="localhost", port=8001)
-        init_kwargs = {"timeout": rpc_timeout, "login": login_id, "password": pwd}
+        init_kwargs = {"timeout": effective_timeout_ms, "login": login_id, "password": pwd}
         if server_name:
             init_kwargs["server"] = server_name
         init_ok = bool(mt5.initialize(**init_kwargs))
@@ -556,6 +558,31 @@ for pattern in "Select a company" "Open an account" "Find your company"; do
     DISPLAY="$display" xdotool windowactivate --sync "$wid" >/dev/null 2>&1 || true
     DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Escape >/dev/null 2>&1 || true
     DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Alt+c >/dev/null 2>&1 || true
+    DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Alt+F4 >/dev/null 2>&1 || true
+  done
+done
+
+# Handle first-run updater popup that can block AutoTrading toggles.
+for pattern in "LiveUpdate" "Welcome to LiveUpdate"; do
+  for wid in $(DISPLAY="$display" xdotool search --onlyvisible --name "$pattern" 2>/dev/null | head -n 5); do
+    DISPLAY="$display" xdotool windowactivate --sync "$wid" >/dev/null 2>&1 || true
+    sleep 0.2
+
+    WIDTH=""
+    HEIGHT=""
+    eval "$(DISPLAY="$display" xdotool getwindowgeometry --shell "$wid" 2>/dev/null | grep -E "^(WIDTH|HEIGHT)=")" || true
+    WIDTH="${WIDTH:-640}"
+    HEIGHT="${HEIGHT:-380}"
+
+    # Prefer clicking "Later" (right button on this popup layout).
+    later_x=$(( WIDTH - 95 ))
+    later_y=$(( HEIGHT - 36 ))
+    [ "$later_x" -lt 200 ] && later_x=200
+    [ "$later_y" -lt 120 ] && later_y=120
+
+    DISPLAY="$display" xdotool mousemove --window "$wid" "$later_x" "$later_y" click 1 >/dev/null 2>&1 || true
+    DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Alt+l >/dev/null 2>&1 || true
+    DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Escape >/dev/null 2>&1 || true
     DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers Alt+F4 >/dev/null 2>&1 || true
   done
 done
@@ -871,6 +898,25 @@ wait_for_mt5_main_window() {
   return 1
 }
 
+restart_mt5_terminal_for_experts_config() {
+  compose exec -T -u abc "$SERVICE_NAME" sh -lc '
+display=":1"
+mt5exe="/config/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+
+pkill -f "terminal64.exe" >/dev/null 2>&1 || true
+sleep 2
+
+if [ ! -f "$mt5exe" ]; then
+  exit 1
+fi
+
+nohup env DISPLAY="$display" WINEPREFIX="/config/.wine" wine "$mt5exe" >/tmp/mt5-restart.log 2>&1 &
+' >/dev/null 2>&1 || return 1
+
+  sleep 3
+  wait_for_mt5_main_window
+}
+
 force_enable_algo_via_options_dialog() {
   if ! ensure_xdotool; then
     return 1
@@ -920,6 +966,8 @@ DISPLAY="$display" xdotool key --window "$opt_wid" --clearmodifiers Return >/dev
 enable_algo_trading_if_needed() {
   echo "[2.5/6] Ensuring MT5 Algo Trading is enabled..."
   append_runner_progress "[2.5/6] Ensuring MT5 Algo Trading is enabled..."
+  local probe_rc=0
+  local actionable_rc=0
   for probe_attempt in $(seq 1 15); do
     if check_trade_allowed; then
       echo "  trade_allowed already enabled."
@@ -927,7 +975,14 @@ enable_algo_trading_if_needed() {
       return 0
     fi
     probe_rc=$?
+    if [[ "$probe_rc" -eq 5 ]]; then
+      actionable_rc=5
+      echo "  detected tradeapi_disabled=1 (external Python API blocked)."
+      append_runner_progress "detected tradeapi_disabled=1 (external Python API blocked)."
+      break
+    fi
     if [[ "$probe_rc" -eq 1 ]]; then
+      actionable_rc=1
       break
     fi
     echo "  MT5 trade API not ready yet (rc=${probe_rc}), retry probe ${probe_attempt}/15..."
@@ -935,8 +990,31 @@ enable_algo_trading_if_needed() {
     sleep 2
   done
 
-  echo "  trade_allowed is OFF. Trying automatic Ctrl+E toggle..."
-  append_runner_progress "trade_allowed is OFF. Trying automatic Ctrl+E toggle..."
+  if [[ "$actionable_rc" -eq 5 ]]; then
+    echo "  restarting MT5 terminal once to apply Experts config..."
+    append_runner_progress "restarting MT5 terminal once to apply Experts config..."
+    if restart_mt5_terminal_for_experts_config; then
+      dismiss_mt5_dialogs_retry 3 1 || true
+      for retry_attempt in $(seq 1 10); do
+        if check_trade_allowed; then
+          echo "  Algo Trading enabled after MT5 restart."
+          append_runner_progress "Algo Trading enabled after MT5 restart."
+          return 0
+        fi
+        probe_rc=$?
+        if [[ "$probe_rc" -ne 2 && "$probe_rc" -ne 3 ]]; then
+          break
+        fi
+        sleep 2
+      done
+    else
+      echo "  warning: MT5 restart attempt failed, fallback to UI toggle."
+      append_runner_progress "warning: MT5 restart attempt failed, fallback to UI toggle."
+    fi
+  fi
+
+  echo "  MT5 trading gate still blocked. Trying automatic Ctrl+E toggle..."
+  append_runner_progress "MT5 trading gate still blocked. Trying automatic Ctrl+E toggle..."
   if ! ensure_xdotool; then
     echo "  warning: cannot install/find xdotool, auto-toggle skipped."
     append_runner_progress "warning: cannot install/find xdotool, auto-toggle skipped."
@@ -988,6 +1066,100 @@ DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers ctrl+e >/dev/nul
 
   echo "  warning: auto-toggle failed. MT5 may have a modal dialog open in VNC."
   append_runner_progress "warning: auto-toggle failed. MT5 may have a modal dialog open in VNC."
+  return 1
+}
+
+stabilize_algo_trading_after_start() {
+  local stabilize_seconds_raw="${MT5_ALGO_STABILIZE_SECONDS:-20}"
+  local stabilize_seconds
+  local interval_seconds=2
+  local elapsed=0
+  local rc=0
+
+  stabilize_seconds="$(printf '%s' "$stabilize_seconds_raw" | tr -dc '0-9')"
+  if [[ -z "$stabilize_seconds" ]]; then
+    stabilize_seconds=20
+  fi
+  if (( stabilize_seconds <= 0 )); then
+    return 0
+  fi
+
+  echo "[6.65/6] Stabilizing MT5 Algo Trading for ${stabilize_seconds}s..."
+  append_runner_progress "[6.65/6] Stabilizing MT5 Algo Trading for ${stabilize_seconds}s..."
+
+  while (( elapsed < stabilize_seconds )); do
+    if check_trade_allowed; then
+      :
+    else
+      rc=$?
+      if [[ "$rc" -eq 1 || "$rc" -eq 5 ]]; then
+        echo "  trade gate dropped during stabilization (rc=${rc}), re-enabling..."
+        append_runner_progress "trade gate dropped during stabilization (rc=${rc}), re-enabling..."
+        if ! enable_algo_trading_if_needed; then
+          return 1
+        fi
+      fi
+    fi
+    sleep "$interval_seconds"
+    elapsed=$((elapsed + interval_seconds))
+  done
+
+  return 0
+}
+
+trade_allowed_confirmed() {
+  local confirm_round
+  for confirm_round in 1 2; do
+    if ! check_trade_allowed; then
+      return 1
+    fi
+    sleep 1
+  done
+  return 0
+}
+
+force_set_algo_trading_on() {
+  local cycle=0
+
+  if ! ensure_xdotool; then
+    return 1
+  fi
+  if ! wait_for_mt5_main_window; then
+    return 1
+  fi
+
+  for cycle in 1 2 3; do
+    if trade_allowed_confirmed; then
+      return 0
+    fi
+
+    compose exec -T -u abc "$SERVICE_NAME" sh -lc '
+display=":1"
+wid="$(DISPLAY="$display" xdotool search --onlyvisible --name "MetaTrader|MetaQuotes" | head -n1 || true)"
+if [ -z "$wid" ]; then
+  exit 1
+fi
+DISPLAY="$display" xdotool windowactivate --sync "$wid" >/dev/null 2>&1 || true
+DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers ctrl+e >/dev/null 2>&1 || true
+' || true
+    sleep 1
+
+    if trade_allowed_confirmed; then
+      return 0
+    fi
+
+    compose exec -T -u abc "$SERVICE_NAME" sh -lc '
+display=":1"
+wid="$(DISPLAY="$display" xdotool search --onlyvisible --name "MetaTrader|MetaQuotes" | head -n1 || true)"
+if [ -z "$wid" ]; then
+  exit 1
+fi
+DISPLAY="$display" xdotool windowactivate --sync "$wid" >/dev/null 2>&1 || true
+DISPLAY="$display" xdotool key --window "$wid" --clearmodifiers ctrl+e >/dev/null 2>&1 || true
+' || true
+    sleep 1
+  done
+
   return 1
 }
 
@@ -1199,6 +1371,49 @@ append_runner_progress() {
   append_bot_log_marker "[RUNNER] ${message}"
 }
 
+record_bot_runtime_version_state() {
+  local current_tag current_script
+  local state_file state_dir
+  local prev_tag="" prev_script=""
+
+  current_tag="$(trim_outer_whitespace "${BOT_VERSION_TAG:-}")"
+  if [[ -z "$current_tag" ]]; then
+    current_tag="base"
+  fi
+  current_script="/bots/${BOT_SCRIPT}"
+
+  state_file="${BOT_RUNTIME_VERSION_STATE_FILE:-}"
+  if [[ -z "$state_file" ]]; then
+    state_file="${LIVE_STATE_FILE:-/instances/runtime_state.json}"
+    state_dir="$(dirname "$state_file")"
+    state_file="${state_dir}/runner_version_state.env"
+  else
+    state_dir="$(dirname "$state_file")"
+  fi
+
+  if [[ -f "$state_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$state_file" || true
+    prev_tag="${RUNNER_BOT_VERSION_TAG:-}"
+    prev_script="${RUNNER_BOT_SCRIPT_PATH:-}"
+  fi
+
+  append_runner_progress "bot_runtime_version current_tag=${current_tag} current_script=${current_script} image=${METATRADER_IMAGE}"
+  if [[ -z "$prev_tag" && -z "$prev_script" ]]; then
+    append_bot_log_marker "[RUNNER] bot_version_initialized tag=${current_tag} script=${current_script}"
+  elif [[ "$prev_tag" != "$current_tag" || "$prev_script" != "$current_script" ]]; then
+    append_bot_log_marker "[RUNNER] bot_version_changed from_tag=${prev_tag:-unknown} to_tag=${current_tag} from_script=${prev_script:-unknown} to_script=${current_script}"
+  else
+    append_bot_log_marker "[RUNNER] bot_version_unchanged tag=${current_tag} script=${current_script}"
+  fi
+
+  mkdir -p "$state_dir" >/dev/null 2>&1 || true
+  {
+    printf "RUNNER_BOT_VERSION_TAG=%q\n" "$current_tag"
+    printf "RUNNER_BOT_SCRIPT_PATH=%q\n" "$current_script"
+  } > "$state_file" 2>/dev/null || true
+}
+
 ensure_image_ready
 
 echo "[1/6] Starting MT5 container..."
@@ -1207,6 +1422,7 @@ if ! enable_bot_log_stream_if_needed; then
   echo "  warning: failed to enable runner progress stream to Docker logs."
 fi
 append_runner_progress "[1/6] Starting MT5 container..."
+append_runner_progress "runtime_image=${METATRADER_IMAGE} bot_version_tag=${BOT_VERSION_TAG:-base}"
 
 echo "[2/6] Waiting for mt5linux server (port 8001)..."
 echo "  note: first startup can take 10-30 minutes while Wine Python packages are installed."
@@ -1457,6 +1673,7 @@ fi
 
 echo "[5/6] Starting bot..."
 append_runner_progress "[5/6] Starting bot..."
+record_bot_runtime_version_state
 bot_python_cmd="python3"
 require_shared_python="0"
 use_shared_pydeps_lc_host="$(printf '%s' "$USE_SHARED_PYDEPS" | tr '[:upper:]' '[:lower:]')"
@@ -1563,13 +1780,57 @@ if bot_process_is_running; then
         fi
 	      fi
 	    fi
+      if ! stabilize_algo_trading_after_start; then
+        if is_truthy "$MT5_ALLOW_PARTIAL_START"; then
+          echo "  warning: MT5 Algo stabilization failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+          append_runner_progress "warning: MT5 Algo stabilization failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+          append_bot_log_marker "[RUNNER] start_warn reason=algo_stabilization_failed"
+        else
+          echo "Error: MT5 Algo Trading became unstable after startup."
+          append_runner_progress "Error: MT5 Algo Trading became unstable after startup."
+          append_bot_log_marker "[RUNNER] start_failed reason=algo_stabilization_failed"
+          exit 1
+        fi
+      fi
+      echo "[6.66/6] Forcing deterministic MT5 Algo ON state..."
+      append_runner_progress "[6.66/6] Forcing deterministic MT5 Algo ON state..."
+      if ! force_set_algo_trading_on; then
+        if is_truthy "$MT5_ALLOW_PARTIAL_START"; then
+          echo "  warning: deterministic MT5 Algo ON enforcement failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+          append_runner_progress "warning: deterministic MT5 Algo ON enforcement failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+          append_bot_log_marker "[RUNNER] start_warn reason=algo_force_on_failed"
+        else
+          echo "Error: unable to force MT5 Algo Trading ON state."
+          append_runner_progress "Error: unable to force MT5 Algo Trading ON state."
+          append_bot_log_marker "[RUNNER] start_failed reason=algo_force_on_failed"
+          exit 1
+        fi
+      fi
 	  fi
-	  if is_truthy "$MT5_COMPANY_DISCOVERY_BEFORE_LOGIN" && [[ -n "$MT5_SERVER_VAL" ]]; then
+	  if is_truthy "$MT5_REFRESH_COMPANY_CACHE_AFTER_START" && [[ -n "$MT5_SERVER_VAL" ]]; then
 	    echo "[6.7/6] Refreshing MT5 company cache after startup..."
 	    append_runner_progress "[6.7/6] Refreshing MT5 company cache after startup..."
 	    search_company_dialog_by_server "$MT5_SERVER_VAL" "1" || true
+      dismiss_mt5_dialogs_retry 3 1 || true
+      if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
+        echo "[6.8/6] Re-checking MT5 Algo Trading after company refresh..."
+        append_runner_progress "[6.8/6] Re-checking MT5 Algo Trading after company refresh..."
+        if ! enable_algo_trading_if_needed; then
+          if is_truthy "$MT5_ALLOW_PARTIAL_START"; then
+            echo "  warning: post-refresh MT5 Algo check failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+            append_runner_progress "warning: post-refresh MT5 Algo check failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
+            append_bot_log_marker "[RUNNER] start_warn reason=post_refresh_algo_check_failed"
+          else
+            echo "Error: MT5 Algo Trading check failed after company refresh."
+            append_runner_progress "Error: MT5 Algo Trading check failed after company refresh."
+            append_bot_log_marker "[RUNNER] start_failed reason=post_refresh_algo_check_failed"
+            exit 1
+          fi
+        fi
+      fi
 	  fi
 	  dismiss_mt5_dialogs_retry 3 1 || true
+	  append_bot_log_marker "[RUNNER] bot_version_active tag=${BOT_VERSION_TAG:-base} script=/bots/${BOT_SCRIPT} image=${METATRADER_IMAGE}"
 	  append_bot_log_marker "[RUNNER] start_ok"
 	  append_runner_progress "Bot started successfully."
 	  echo "Bot started successfully."

@@ -257,13 +257,21 @@ export function AdminUserManagement() {
     }
   };
 
-  const updateBotStatus = async (botConfigId: string, status: "running" | "stopped") => {
+  const updateBotStatus = async (
+    botConfigId: string,
+    status: "running" | "stopped",
+    mode: "run" | "stop" | "restart" = status === "running" ? "run" : "stop"
+  ) => {
     if (!selectedUser) return;
 
     setUpdatingBotId(botConfigId);
     try {
       await api.patch(`/admin/users/${selectedUser.id}/bot-configurations/${botConfigId}/status`, { status });
-      toast.success(`Bot status updated to ${status}`);
+      if (mode === "restart") {
+        toast.success("Bot restart requested");
+      } else {
+        toast.success(`Bot status updated to ${status}`);
+      }
       await fetchUserDetail(selectedUser.id);
     } catch (error: any) {
       console.error("Error updating bot status:", error);
@@ -708,6 +716,17 @@ export function AdminUserManagement() {
                                       <Badge variant="outline" className={`capitalize ${badgeClass || ""}`}>
                                         {botStatus}
                                       </Badge>
+                                      {isBotRunning && (
+                                        <Button
+                                          size="sm"
+                                          variant="outline"
+                                          disabled={updatingBotId === bot.id || isBotStarting}
+                                          onClick={() => updateBotStatus(bot.id, "running", "restart")}
+                                        >
+                                          <RefreshCw className="mr-1 w-3 h-3" />
+                                          Restart
+                                        </Button>
+                                      )}
                                       <Button
                                         size="sm"
                                         variant="outline"

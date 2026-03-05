@@ -122,10 +122,11 @@ async def _cron_worker(symbol: str, timeframe: str):
         await asyncio.sleep(seconds_to_next)
 
         now = datetime.now(timezone.utc)
-        # Align to candle boundary
+        # Align to current boundary, then use the just-closed candle open time.
         epoch = int(now.timestamp())
         aligned = epoch - (epoch % interval)
-        candle_dt = datetime.fromtimestamp(aligned, tz=timezone.utc)
+        candle_open_epoch = aligned - interval
+        candle_dt = datetime.fromtimestamp(candle_open_epoch, tz=timezone.utc)
         dt_str = candle_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         try:
@@ -136,7 +137,7 @@ async def _cron_worker(symbol: str, timeframe: str):
             else:
                 start = _time.perf_counter()
                 result, cls_vec = await asyncio.to_thread(
-                    generate_llm_cls_for_bar, candle_dt, symbol,
+                    generate_llm_cls_for_bar, candle_dt, symbol, timeframe,
                 )
                 elapsed = _time.perf_counter() - start
                 result_data = {

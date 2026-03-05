@@ -93,6 +93,7 @@ async def _extract_runtime_context(
     config,
     image_override: str | None = None,
     bot_version_override=None,
+    version_tag_override: str | None = None,
 ) -> dict[str, object | None]:
     account = getattr(config, "account", None)
     if not account:
@@ -124,11 +125,28 @@ async def _extract_runtime_context(
     except BotRunnerError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    image_ref = (
-        str(image_override).strip()
-        if image_override and str(image_override).strip()
-        else str(getattr(bot_version, "dockerImageId", "") or "").strip() or None
-    )
+    installed_image_ref = str(getattr(config, "installedDockerImageId", "") or "").strip() or None
+    installed_version_tag = str(getattr(config, "installedVersionTag", "") or "").strip() or None
+    latest_image_ref = str(getattr(bot_version, "dockerImageId", "") or "").strip() or None
+    latest_version_tag = str(getattr(bot_version, "versionTag", "") or "").strip() or None
+
+    image_ref = None
+    if image_override and str(image_override).strip():
+        image_ref = str(image_override).strip()
+    elif bot_version_override is not None:
+        image_ref = latest_image_ref
+    else:
+        # Keep runtime pinned to installed image until apply_update/change_model modifies it.
+        image_ref = installed_image_ref or latest_image_ref
+
+    effective_version_tag = None
+    if version_tag_override and str(version_tag_override).strip():
+        effective_version_tag = str(version_tag_override).strip()
+    elif bot_version_override is not None:
+        effective_version_tag = latest_version_tag
+    else:
+        # Keep runtime pinned to installed version until apply_update/change_model modifies it.
+        effective_version_tag = installed_version_tag or latest_version_tag
 
     try:
         profile_name = build_profile_name(live_symbol, live_timeframe)
@@ -146,6 +164,7 @@ async def _extract_runtime_context(
         live_symbol=live_symbol,
         live_timeframe=live_timeframe,
         docker_image_id=image_ref,
+        bot_version_tag=effective_version_tag,
         magic_number=magic_number,
     )
 
@@ -397,9 +416,11 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
             "dockerContainerId": runner_result.container_id,
         }
         current_version_tag = str(getattr(config.botVersion, "versionTag", "") or "").strip()
-        if current_version_tag:
+        installed_version_tag = str(getattr(config, "installedVersionTag", "") or "").strip()
+        if current_version_tag and not installed_version_tag:
             update_payload["installedVersionTag"] = current_version_tag
-        if runtime.get("docker_image_id"):
+        installed_image_id = str(getattr(config, "installedDockerImageId", "") or "").strip()
+        if runtime.get("docker_image_id") and not installed_image_id:
             update_payload["installedDockerImageId"] = runtime["docker_image_id"]
         await db.botconfiguration.update(
             where={"id": data.botConfigId},
@@ -516,9 +537,7 @@ async def get_bot_runtime_health(request: Request, botConfigId: str):
     if live_hub_connected:
         # Live WS heartbeat from bot runtime is already active; avoid expensive MT5 RPC probing
         # on every polling request.
-        health_detail = "ok"
-        trade_allowed = True
-        tradeapi_disabled = False
+        health_detail = "live_hub_connected"
     if should_probe_runtime:
         try:
             probe = await asyncio.to_thread(
@@ -995,7 +1014,11 @@ async def apply_bot_update(request: Request, data: Apply_Bot_Update):
     runner_result = None
     operation = "metadata_only"
     if was_running:
-        runtime = await _extract_runtime_context(config, image_override=latest_image_id)
+        runtime = await _extract_runtime_context(
+            config,
+            image_override=latest_image_id,
+            version_tag_override=latest_version_tag,
+        )
         operation = "restart"
         try:
             runner_result = await asyncio.to_thread(

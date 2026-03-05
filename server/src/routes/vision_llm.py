@@ -140,7 +140,7 @@ async def vision_llm(request: Request, data: VisionLLMRequest):
         try:
             start = time.perf_counter()
             result, cls_vec = await asyncio.to_thread(
-                generate_llm_cls_for_bar, data.date_time, symbol,
+                generate_llm_cls_for_bar, data.date_time, symbol, timeframe,
             )
             elapsed = time.perf_counter() - start
 

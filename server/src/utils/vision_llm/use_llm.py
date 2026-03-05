@@ -26,11 +26,12 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 def generate_llm_text_for_bar(
     date_time: datetime,
     symbol: str = "EURUSD",
+    timeframe: str = "H1",
     dataset_json: Optional[str] = None,
 ) -> str:
     """Generate a full RAG-based analysis text for one chart bar."""
     runtime = get_runtime(dataset_json)
-    base64_image = generate_image(date_time, symbol=symbol)
+    base64_image = generate_image(date_time, symbol=symbol, timeframe=timeframe)
     answer = run_rag_pipeline(
         chart_db=runtime["chart_db"],
         text_db=runtime["text_db"],
@@ -44,12 +45,14 @@ def generate_llm_text_for_bar(
 def generate_llm_cls_for_bar(
     date_time: datetime,
     symbol: str = "EURUSD",
+    timeframe: str = "H1",
     dataset_json: Optional[str] = None,
 ) -> Tuple[str, np.ndarray]:
     """Generate analysis text *and* its CLS embedding vector."""
     llm_text = generate_llm_text_for_bar(
         date_time=date_time,
         symbol=symbol,
+        timeframe=timeframe,
         dataset_json=dataset_json,
     )
     cls_vec = text_to_cls_embedding(llm_text)

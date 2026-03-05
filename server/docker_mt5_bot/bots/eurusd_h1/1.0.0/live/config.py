@@ -222,7 +222,7 @@ LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS = max(
     _env_float(180.0, "LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS"),
 )
 LIVE_SEMANTIC_ALIAS_HOURS = _env_int_tuple(
-    (0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8, 9, -9, 10, -10, 11, -11, 12, -12),
+    (0,),
     "LIVE_SEMANTIC_ALIAS_HOURS",
 )
 
