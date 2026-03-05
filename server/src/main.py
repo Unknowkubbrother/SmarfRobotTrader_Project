@@ -86,6 +86,10 @@ from datetime import datetime, timezone
 from .routes.bot_ws import _get_cached, _set_cached
 from .utils.vision_llm.use_llm import generate_llm_cls_for_bar
 from .utils.vision_llm.chart import MT5ConnectionError, NoMarketDataError
+from .utils.vision_llm.llm_client import (
+    VisionLLMConfigError,
+    VisionLLMServiceUnavailableError,
+)
 from .utils.ws_manager import bot_hub
 
 logger = logging.getLogger(__name__)
@@ -163,6 +167,14 @@ async def _cron_worker(symbol: str, timeframe: str):
         except MT5ConnectionError as exc:
             logger.warning(
                 "cron mt5 unavailable %s/%s at %s: %s",
+                symbol,
+                timeframe,
+                dt_str,
+                exc,
+            )
+        except (VisionLLMConfigError, VisionLLMServiceUnavailableError) as exc:
+            logger.warning(
+                "cron llm unavailable %s/%s at %s: %s",
                 symbol,
                 timeframe,
                 dt_str,

@@ -14,6 +14,10 @@ from fastapi import APIRouter, HTTPException, Request
 
 from ..models.vision_llm_model import VisionLLMRequest, VisionLLMTextEmbeddingRequest
 from ..utils.vision_llm.chart import MT5ConnectionError
+from ..utils.vision_llm.llm_client import (
+    VisionLLMConfigError,
+    VisionLLMServiceUnavailableError,
+)
 from ..utils.vision_llm.embedding import text_to_cls_embedding
 from ..utils.vision_llm.use_llm import generate_llm_cls_for_bar
 from ..database.client import r_cache
@@ -155,6 +159,8 @@ async def vision_llm(request: Request, data: VisionLLMRequest):
             _set_cached(symbol, timeframe, dt_str, result_data)
 
         except MT5ConnectionError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        except (VisionLLMConfigError, VisionLLMServiceUnavailableError) as exc:
             raise HTTPException(status_code=503, detail=str(exc))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))

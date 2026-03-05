@@ -4,8 +4,10 @@ orchestrates the multi-step retrieval-augmented generation workflow.
 """
 
 import os
+from urllib.parse import urlparse
 from typing import Optional
 
+import httpx
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage
@@ -38,6 +40,36 @@ _DEFAULT_DATASET_JSON = os.getenv(
 _runtime_cache: dict = {}
 
 
+# ── Errors ───────────────────────────────────────────────────────────
+
+class VisionLLMConfigError(RuntimeError):
+    """Raised when LLM configuration is invalid."""
+
+
+class VisionLLMServiceUnavailableError(RuntimeError):
+    """Raised when the LLM service cannot be reached."""
+
+
+def _normalize_llm_base_url(raw_value: Optional[str]) -> str:
+    """Normalize and validate LLM base URL from environment."""
+    base_url = str(raw_value or "").strip().strip('"').strip("'")
+    if not base_url:
+        base_url = "http://localhost:11434"
+
+    # Common typo recovery: "http:/host:port" -> "http://host:port"
+    if base_url.startswith("http:/") and not base_url.startswith("http://"):
+        base_url = "http://" + base_url[len("http:/"):].lstrip("/")
+    elif base_url.startswith("https:/") and not base_url.startswith("https://"):
+        base_url = "https://" + base_url[len("https:/"):].lstrip("/")
+
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise VisionLLMConfigError(
+            f"Invalid LLM_BASE_URL={raw_value!r}. Expected format: http://host:port"
+        )
+    return base_url.rstrip("/")
+
+
 # ── VisionLLMClient ──────────────────────────────────────────────────
 
 class VisionLLMClient:
@@ -45,10 +77,13 @@ class VisionLLMClient:
 
     def __init__(self) -> None:
         load_dotenv()
+        self.base_url = _normalize_llm_base_url(
+            os.getenv("LLM_BASE_URL", "http://localhost:11434")
+        )
         self.llm = init_chat_model(
             model=os.getenv("LLM_MODEL", "ministral-3:14b"),
             model_provider=os.getenv("LLM_MODEL_PROVIDER", "ollama"),
-            base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434"),
+            base_url=self.base_url,
         )
 
     def invoke(self, text: str, image_base64: str) -> str:
@@ -64,7 +99,13 @@ class VisionLLMClient:
                 ]
             )
         ]
-        response = self.llm.invoke(messages)
+        try:
+            response = self.llm.invoke(messages)
+        except httpx.ConnectError as exc:
+            raise VisionLLMServiceUnavailableError(
+                f"Cannot connect to LLM service at {self.base_url}. "
+                "Ensure Ollama is running and LLM_BASE_URL is correct."
+            ) from exc
         return strip_markdown(response.content)
 
 

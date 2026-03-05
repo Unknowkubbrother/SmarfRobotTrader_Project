@@ -17,7 +17,7 @@ from ..utils.turnstile import verify_turnstile
 
 SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 120
+ACCESS_TOKEN_EXPIRE_MINUTES = 300
 COOKIE_NAME = "access_token"
 
 cred = credentials.Certificate("smarfrobottrade-firebase.json")
