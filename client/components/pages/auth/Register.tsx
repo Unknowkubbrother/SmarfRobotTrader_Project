@@ -73,7 +73,7 @@ export default function Register() {
     });
 
     useEffect(() => {
-        if (user) router.push("/");
+        if (user) router.push("/dashboard");
     }, [user, router]);
 
     useEffect(() => {
@@ -107,7 +107,7 @@ export default function Register() {
                 router.push("/auth/login");
             } else {
                 toast.success("Welcome!");
-                router.push("/");
+                router.push("/dashboard");
             }
         } finally {
             setIsLoading(false);
@@ -204,7 +204,7 @@ export default function Register() {
 
             if (regData.isGoogle) {
                 toast.success("Registration complete!");
-                router.push("/");
+                router.push("/dashboard");
             } else {
                 toast.success("Registration complete! Please login.");
                 router.push("/auth/login");

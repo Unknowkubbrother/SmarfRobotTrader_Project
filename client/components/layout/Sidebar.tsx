@@ -19,7 +19,7 @@ import {
 import { useAuth } from "@/contexts/AuthContext";
 
 const navItems = [
-  { icon: LayoutDashboard, label: "Dashboard", path: "/" },
+  { icon: LayoutDashboard, label: "Dashboard", path: "/dashboard" },
   { icon: Bot, label: "Bot Control", path: "/bot-control" },
   { icon: Calendar, label: "Profit Calendar", path: "/calendar" },
   { icon: BookOpen, label: "Trading Journal", path: "/journal" },

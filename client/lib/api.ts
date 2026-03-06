@@ -20,8 +20,10 @@ export const api = axios.create({
 api.interceptors.response.use(
     (response) => response,
     (error) => {
-        if (error.response?.status === 401) {
-            // Redirect to login if 401 Unauthorized
+        const requestUrl = String(error.config?.url || "");
+        const isAuthRequest = requestUrl === "/auth" || requestUrl.startsWith("/auth/");
+
+        if (error.response?.status === 401 && !isAuthRequest) {
             if (typeof window !== "undefined") {
                 window.location.href = "/auth/login";
             }

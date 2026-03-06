@@ -35,11 +35,11 @@ export default function Login() {
     const [cfToken, setCfToken] = useState<string>("");
 
     const router = useRouter();
-    const { user, signIn, signInWithGoogle, loginVerify, checkUser, loginOtpInit, setPassword: setAuthPassword } = useAuth();
+    const { user, loading, signIn, signInWithGoogle, loginVerify, checkUser, loginOtpInit, setPassword: setAuthPassword } = useAuth();
 
     useEffect(() => {
-        if (user) router.push("/");
-    }, [user, router]);
+        if (!loading && user) router.push("/dashboard");
+    }, [loading, user, router]);
 
     useEffect(() => {
         if (countdown > 0) {
@@ -70,7 +70,7 @@ export default function Login() {
                 router.push(`/auth/register?${params.toString()}`);
             } else {
                 toast.success("Welcome!");
-                router.push("/");
+                router.push("/dashboard");
             }
         } finally {
             setIsLoading(false);
@@ -153,7 +153,7 @@ export default function Login() {
             } else {
                 toast.success("Welcome back!");
                 setCfToken(""); // Reset token
-                router.push("/");
+                router.push("/dashboard");
             }
         } finally {
             setIsLoading(false);
@@ -179,7 +179,7 @@ export default function Login() {
                 toast.success("Login verified!");
             } else {
                 toast.success("Login verified!");
-                router.push("/");
+                router.push("/dashboard");
             }
         } finally {
             setIsLoading(false);
@@ -201,7 +201,7 @@ export default function Login() {
                 return;
             }
             toast.success("Password set successfully! Welcome.");
-            router.push("/");
+            router.push("/dashboard");
         } finally {
             setIsLoading(false);
         }
@@ -306,7 +306,7 @@ export default function Login() {
                                 </form>
 
                                 <p className="mt-6 text-center text-sm text-muted-foreground">
-                                    Don't have an account?{" "}
+                                    Don&apos;t have an account?{" "}
                                     <Link href="/auth/register" className="text-foreground font-medium hover:underline">Sign Up</Link>
                                 </p>
                             </>
@@ -406,7 +406,7 @@ export default function Login() {
                                         {isLoading ? "Setting Password..." : "Set Password & Continue"}
                                     </Button>
                                     <div className="text-center">
-                                        <Link href="/" className="text-sm text-muted-foreground hover:underline">Skip (Not Recommended)</Link>
+                                        <Link href="/dashboard" className="text-sm text-muted-foreground hover:underline">Skip (Not Recommended)</Link>
                                     </div>
                                 </form>
                             </>

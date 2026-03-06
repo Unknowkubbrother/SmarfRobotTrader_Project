@@ -124,7 +124,7 @@ export default function NotificationsPage() {
                             </div>
                             <h3 className="text-xl font-semibold mb-2">No notifications yet</h3>
                             <p className="text-muted-foreground max-w-sm">
-                                We'll notify you here when there are updates about your bots, performance, or security.
+                                We&apos;ll notify you here when there are updates about your bots, performance, or security.
                             </p>
                         </div>
                     ) : (

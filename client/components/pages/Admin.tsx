@@ -30,7 +30,7 @@ export default function Admin() {
   useEffect(() => {
     if (!loading && !isAdmin) {
       toast.error("Access denied. Admin privileges required.");
-      router.push("/");
+      router.push("/dashboard");
     }
   }, [isAdmin, loading, router]);
 

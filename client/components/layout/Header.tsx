@@ -186,7 +186,7 @@ export function Header() {
                   ))
                 ) : (
                   <div className="p-4 text-center text-sm text-muted-foreground">
-                    No results found for "{query}"
+                    No results found for &quot;{query}&quot;
                   </div>
                 )}
               </div>
