@@ -647,7 +647,6 @@ async def get_admin_users(
             role=_enum_value(user.role) or "user",
             status=_enum_value(user.status) or "active",
             created_at=_to_datetime_string(user.createdAt) or "",
-            is_onboarding_completed=bool(user.isOnboardingCompleted),
         )
         for user in users
     ]
@@ -795,7 +794,6 @@ async def get_admin_user_detail(
         role=_enum_value(target_user.role) or "user",
         status=_enum_value(target_user.status) or "active",
         created_at=_to_datetime_string(target_user.createdAt) or "",
-        is_onboarding_completed=bool(target_user.isOnboardingCompleted),
         total_accounts=len(mapped_accounts),
         total_balance=round(total_balance, 2),
         pending_bills=pending_count,

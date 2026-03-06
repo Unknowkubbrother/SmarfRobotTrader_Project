@@ -20,7 +20,6 @@ class AdminUserItemResponse(BaseModel):
     role: str
     status: str
     created_at: str
-    is_onboarding_completed: bool
 
 
 class UpdateAdminUserStatusRequest(BaseModel):
@@ -118,7 +117,6 @@ class AdminUserDetailResponse(BaseModel):
     role: str
     status: str
     created_at: str
-    is_onboarding_completed: bool
     total_accounts: int = 0
     total_balance: float = 0.0
     pending_bills: int = 0

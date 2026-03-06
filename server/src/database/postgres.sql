@@ -31,7 +31,6 @@ CREATE TABLE "users" (
   "stripe_customer_id" VARCHAR(100),
   "role" role_enum DEFAULT 'user',
   "status" status_enum DEFAULT 'active',
-  "is_onboarding_completed" BOOLEAN DEFAULT FALSE,
   "created_at" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
   "updated_at" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );

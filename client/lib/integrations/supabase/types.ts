@@ -366,7 +366,6 @@ export type Database = {
           email: string
           google_auth_id: string | null
           id: string
-          is_onboarding_completed: boolean | null
           recovery_email: string | null
           status: string | null
           stripe_customer_id: string | null
@@ -377,7 +376,6 @@ export type Database = {
           email: string
           google_auth_id?: string | null
           id: string
-          is_onboarding_completed?: boolean | null
           recovery_email?: string | null
           status?: string | null
           stripe_customer_id?: string | null
@@ -388,7 +386,6 @@ export type Database = {
           email?: string
           google_auth_id?: string | null
           id?: string
-          is_onboarding_completed?: boolean | null
           recovery_email?: string | null
           status?: string | null
           stripe_customer_id?: string | null

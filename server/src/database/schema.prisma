@@ -117,7 +117,6 @@ model User {
   stripeCustomerId      String?   @map("stripe_customer_id") @db.VarChar(100)
   role                  Role      @default(user)
   status                Status    @default(active)
-  isOnboardingCompleted Boolean   @default(false) @map("is_onboarding_completed")
   createdAt             DateTime  @default(now()) @map("created_at") @db.Timestamptz
   updatedAt             DateTime? @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 

@@ -44,7 +44,6 @@ interface AdminUser {
   role: "user" | "admin";
   status: "active" | "banned" | "pending";
   created_at: string;
-  is_onboarding_completed: boolean;
 }
 
 interface AdminUserBot {
@@ -107,7 +106,6 @@ interface AdminUserDetail {
   role: "user" | "admin";
   status: "active" | "banned" | "pending";
   created_at: string;
-  is_onboarding_completed: boolean;
   total_accounts: number;
   total_balance: number;
   pending_bills: number;
@@ -629,12 +627,6 @@ export function AdminUserManagement() {
                         <p className="text-xs uppercase tracking-wide text-muted-foreground">Profile</p>
                         <p className="mt-2 text-sm">
                           Joined: <span className="font-semibold">{formatDate(userDetail.created_at)}</span>
-                        </p>
-                        <p className="mt-1 text-sm">
-                          Onboarding:{" "}
-                          <span className="font-semibold">
-                            {userDetail.is_onboarding_completed ? "Completed" : "Pending"}
-                          </span>
                         </p>
                       </div>
                     </div>
