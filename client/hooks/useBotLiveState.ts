@@ -28,6 +28,26 @@ export interface BotLiveLogEntry {
     meta?: Record<string, unknown>;
 }
 
+export interface BotLiveIntrabarReview {
+    review_id?: string;
+    ticket?: number;
+    side?: string;
+    triggered_at_utc?: string;
+    bar_end_utc?: string;
+    reviewed_at_bar_end_utc?: string;
+    actual_change_pct?: number;
+    actual_pnl_pips?: number;
+    actual_pnl_money?: number;
+    hold_to_close_change_pct?: number;
+    hold_to_close_pnl_pips?: number;
+    hold_to_close_pnl_money?: number;
+    delta_vs_hold_money?: number;
+    delta_vs_hold_pips?: number;
+    review_outcome?: "intrabar_better" | "hold_better" | "flat" | string;
+    bar_close_exit_source?: string;
+    trigger_reasons?: string[];
+}
+
 export interface BotLiveState {
     bot_config_id: string;
     symbol?: string;
@@ -65,6 +85,8 @@ export interface BotLiveState {
     // Logs
     llm_text?: string;
     recent_logs?: BotLiveLogEntry[];
+    pending_intrabar_review_count?: number;
+    recent_intrabar_reviews?: BotLiveIntrabarReview[];
 }
 
 export interface BotLifecycleEvent {

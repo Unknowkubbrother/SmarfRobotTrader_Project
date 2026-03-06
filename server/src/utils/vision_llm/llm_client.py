@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from typing import Optional
 
 import httpx
+import ollama
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage
@@ -50,6 +51,15 @@ class VisionLLMServiceUnavailableError(RuntimeError):
     """Raised when the LLM service cannot be reached."""
 
 
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    raw = str(os.getenv(name, default) or "").strip()
+    try:
+        value = float(raw)
+    except Exception:
+        value = float(default)
+    return max(float(minimum), value)
+
+
 def _normalize_llm_base_url(raw_value: Optional[str]) -> str:
     """Normalize and validate LLM base URL from environment."""
     base_url = str(raw_value or "").strip().strip('"').strip("'")
@@ -80,10 +90,20 @@ class VisionLLMClient:
         self.base_url = _normalize_llm_base_url(
             os.getenv("LLM_BASE_URL", "http://localhost:11434")
         )
+        self.connect_timeout_sec = _env_float("LLM_CONNECT_TIMEOUT_SEC", 10.0, minimum=0.5)
+        self.request_timeout_sec = _env_float("LLM_REQUEST_TIMEOUT_SEC", 300.0, minimum=1.0)
+        timeout = httpx.Timeout(
+            connect=self.connect_timeout_sec,
+            read=self.request_timeout_sec,
+            write=self.request_timeout_sec,
+            pool=self.connect_timeout_sec,
+        )
         self.llm = init_chat_model(
             model=os.getenv("LLM_MODEL", "ministral-3:14b"),
             model_provider=os.getenv("LLM_MODEL_PROVIDER", "ollama"),
             base_url=self.base_url,
+            sync_client_kwargs={"timeout": timeout},
+            async_client_kwargs={"timeout": timeout},
         )
 
     def invoke(self, text: str, image_base64: str) -> str:
@@ -101,10 +121,32 @@ class VisionLLMClient:
         ]
         try:
             response = self.llm.invoke(messages)
+        except httpx.ConnectTimeout as exc:
+            raise VisionLLMServiceUnavailableError(
+                f"Timed out connecting to LLM service at {self.base_url} "
+                f"after {self.connect_timeout_sec:.1f}s."
+            ) from exc
+        except httpx.ReadTimeout as exc:
+            raise VisionLLMServiceUnavailableError(
+                f"Timed out waiting for LLM response from {self.base_url} "
+                f"after {self.request_timeout_sec:.1f}s."
+            ) from exc
         except httpx.ConnectError as exc:
             raise VisionLLMServiceUnavailableError(
                 f"Cannot connect to LLM service at {self.base_url}. "
                 "Ensure Ollama is running and LLM_BASE_URL is correct."
+            ) from exc
+        except httpx.RequestError as exc:
+            raise VisionLLMServiceUnavailableError(
+                f"LLM request failed at {self.base_url}: {exc}"
+            ) from exc
+        except ollama.RequestError as exc:
+            raise VisionLLMServiceUnavailableError(
+                f"Ollama request failed at {self.base_url}: {exc}"
+            ) from exc
+        except ollama.ResponseError as exc:
+            raise VisionLLMServiceUnavailableError(
+                f"Ollama returned an error at {self.base_url}: {exc}"
             ) from exc
         return strip_markdown(response.content)
 

@@ -27,6 +27,7 @@ langchain
 langchain-community
 langchain-chroma
 langchain-ollama
+ollama
 
 # Vector Database
 chromadb

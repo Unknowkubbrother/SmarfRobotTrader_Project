@@ -46,6 +46,63 @@ def _env_bool(default: bool, *names: str) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _env_int_set(default_values: set[int], *names: str) -> set[int]:
+    raw = _env_first(*names)
+    if not raw:
+        return set(int(v) for v in default_values)
+
+    out: set[int] = set()
+    for chunk in str(raw).replace(";", ",").split(","):
+        text = str(chunk or "").strip()
+        if not text:
+            continue
+        try:
+            out.add(int(float(text)))
+        except Exception:
+            continue
+    if len(out) == 0:
+        return set(int(v) for v in default_values)
+    return out
+
+
+def _env_int_tuple(default_values: tuple[int, ...], *names: str) -> tuple[int, ...]:
+    raw = _env_first(*names)
+    if not raw:
+        return tuple(int(v) for v in default_values)
+
+    out: list[int] = []
+    seen: set[int] = set()
+    for chunk in str(raw).replace(";", ",").split(","):
+        text = str(chunk or "").strip()
+        if not text:
+            continue
+        try:
+            value = int(float(text))
+        except Exception:
+            continue
+        if value in seen:
+            continue
+        out.append(value)
+        seen.add(value)
+    if len(out) == 0:
+        return tuple(int(v) for v in default_values)
+    return tuple(out)
+
+
+def _safe_token(raw: str, fallback: str = "default") -> str:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return fallback
+    out = []
+    for ch in text:
+        if ch.isalnum() or ch in {"_", "-"}:
+            out.append(ch)
+        else:
+            out.append("_")
+    token = "".join(out).strip("_")
+    return token or fallback
+
+
 def _parse_risk_profile(raw: str) -> dict[str, float]:
     profile = {"low": 0.5, "medium": 1.0, "high": 1.5}
     if not raw:
@@ -133,6 +190,18 @@ TRADING_SCHEDULE_DEFAULT = _parse_trading_schedule(_env_first("LIVE_TRADING_SCHE
 # ---- MT5 / bot runtime
 MT5_HOST = _env_first("MT5_HOST") or "localhost"
 MT5_PORT = _env_int(8001, "MT5_PORT")
+MT5_LOGIN = _env_first("MT5_LOGIN")
+MT5_PASSWORD = _env_first("MT5_PASSWORD")
+MT5_SERVER = _env_first("MT5_SERVER")
+MT5_SERVER_FALLBACKS = [
+    chunk.strip()
+    for chunk in _env_first("MT5_SERVER_FALLBACKS").replace(";", ",").split(",")
+    if chunk.strip()
+]
+MT5_STRICT_SERVER_MATCH = _env_bool(False, "MT5_STRICT_SERVER_MATCH")
+MT5_RPC_TIMEOUT_MS = max(30000, _env_int(60000, "MT5_RPC_TIMEOUT_MS"))
+MT5_LOGIN_RETRIES = max(1, _env_int(20, "MT5_LOGIN_RETRIES"))
+MT5_RETRY_SECONDS = max(1.0, _env_float(5.0, "MT5_RETRY_SECONDS"))
 SYMBOL = _env_first("LIVE_SYMBOL") or "EURUSD"
 TIMEFRAME_NAME = (_env_first("LIVE_TIMEFRAME") or "H1").upper()
 MAGIC_NUMBER = _env_int(123456, "LIVE_MAGIC_NUMBER")
@@ -143,13 +212,22 @@ ORDER_TICK_RETRY_SEC = _env_float(0.25, "LIVE_ORDER_TICK_RETRY_SEC")
 SYNC_EXTERNAL_LOT = _env_bool(True, "LIVE_SYNC_EXTERNAL_LOT")
 EVAL_ON_START = _env_bool(True, "LIVE_EVAL_ON_START")
 ENABLE_CATCHUP_REPLAY = _env_bool(True, "LIVE_ENABLE_CATCHUP_REPLAY")
-MAX_CATCHUP_BARS = _env_int(0, "LIVE_CATCHUP_MAX_BARS")
+MAX_CATCHUP_BARS = _env_int(24, "LIVE_CATCHUP_MAX_BARS")
 EXECUTE_STALE_REPLAY_ORDERS = _env_bool(False, "LIVE_CATCHUP_EXECUTE_STALE")
 LIVE_SYNC_ACCOUNT_STATE = _env_bool(True, "LIVE_SYNC_ACCOUNT_STATE")
 LIVE_DYNAMIC_LOT = _env_bool(True, "LIVE_DYNAMIC_LOT")
+LIVE_MANAGE_MANUAL_POSITIONS = _env_bool(False, "LIVE_MANAGE_MANUAL_POSITIONS")
+LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS = max(
+    10.0,
+    _env_float(180.0, "LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS"),
+)
+LIVE_SEMANTIC_ALIAS_HOURS = _env_int_tuple(
+    (0,),
+    "LIVE_SEMANTIC_ALIAS_HOURS",
+)
 
 BOT_WS_URL = _env_first("BOT_WS_URL") or "ws://localhost:8000/bot/ws"
-BOT_CONFIG_ID = _env_first("BOT_CONFIG_ID") or "182bdab8-9274-4a4e-922f-700645086705"
+BOT_CONFIG_ID = _env_first("BOT_CONFIG_ID") or ""
 
 
 def _derive_vision_llm_api_url(bot_ws_url: str) -> str:
@@ -167,8 +245,62 @@ def _derive_vision_llm_api_url(bot_ws_url: str) -> str:
     return "http://localhost:8000/vision_llm/"
 
 
+def _derive_vision_llm_embed_text_api_url(vision_llm_api_url: str) -> str:
+    explicit = _env_first("VISION_LLM_EMBED_TEXT_API_URL")
+    if explicit:
+        return explicit
+
+    base = str(vision_llm_api_url or "").strip()
+    if not base:
+        return "http://localhost:8000/vision_llm/embed_text"
+    if base.endswith("/"):
+        return f"{base}embed_text"
+    return f"{base}/embed_text"
+
+
 VISION_LLM_API_URL = _derive_vision_llm_api_url(BOT_WS_URL)
+VISION_LLM_EMBED_TEXT_API_URL = _derive_vision_llm_embed_text_api_url(VISION_LLM_API_URL)
 VISION_LLM_TIMEOUT_SEC = _env_float(420.00, "VISION_LLM_TIMEOUT_SEC")
+LIVE_PERFORMANCE_SYNC_INTERVAL_SEC = max(
+    5.0,
+    _env_float(120.0, "LIVE_PERFORMANCE_SYNC_INTERVAL_SEC"),
+)
+LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS = max(
+    30,
+    _env_int(3650, "LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS"),
+)
+LIVE_MT5_HISTORY_END_AHEAD_HOURS = min(
+    24.0,
+    max(0.0, _env_float(2.0, "LIVE_MT5_HISTORY_END_AHEAD_HOURS")),
+)
+LIVE_PERFORMANCE_SCOPE = (_env_first("LIVE_PERFORMANCE_SCOPE") or "symbol").strip().lower()
+if LIVE_PERFORMANCE_SCOPE not in {"managed", "symbol", "account"}:
+    LIVE_PERFORMANCE_SCOPE = "symbol"
+LIVE_MANAGED_MAGIC_SET = _env_int_set(
+    {int(MAGIC_NUMBER), 123456, 12345, 0},
+    "LIVE_MANAGED_MAGIC_SET",
+    "LIVE_MANAGED_MAGIC_NUMBERS",
+    "LIVE_MAGIC_SET",
+    "LIVE_MAGIC_NUMBERS",
+)
+LIVE_PERFORMANCE_MAGIC_SET = _env_int_set(
+    set(LIVE_MANAGED_MAGIC_SET),
+    "LIVE_PERFORMANCE_MAGIC_SET",
+    "LIVE_PERFORMANCE_MAGIC_NUMBERS",
+)
+LIVE_PREWARM_SEMANTIC_ON_START = _env_bool(True, "LIVE_PREWARM_SEMANTIC_ON_START")
+LIVE_PREWARM_SEMANTIC_MAX_SECONDS = max(
+    0.0,
+    _env_float(45.0, "LIVE_PREWARM_SEMANTIC_MAX_SECONDS"),
+)
+LIVE_PREWARM_SEMANTIC_MAX_MISSING = max(
+    1,
+    _env_int(8, "LIVE_PREWARM_SEMANTIC_MAX_MISSING"),
+)
+LIVE_PREWARM_REQUEST_TIMEOUT_SEC = max(
+    5.0,
+    _env_float(20.0, "LIVE_PREWARM_REQUEST_TIMEOUT_SEC"),
+)
 
 
 # ---- Live feature / gate / bridge parameters (owned by live config)
@@ -180,6 +312,18 @@ PIP_VALUE = _env_float(10.0, "LIVE_PIP_VALUE", "PIP_VALUE")
 RISK_PIPS = _env_int(50, "LIVE_RISK_PIPS", "RISK_PIPS")
 SPREAD_PIPS = _env_float(2.0, "LIVE_SPREAD_PIPS", "SPREAD_PIPS")
 MAX_HOLD_STEPS = _env_int(16, "LIVE_MAX_HOLD_STEPS", "MAX_HOLD_STEPS")
+INTRABAR_TAKE_PROFIT_PIPS = max(
+    0.0,
+    _env_float(0.0, "LIVE_INTRABAR_TAKE_PROFIT_PIPS"),
+)
+INTRABAR_TAKE_PROFIT_MONEY = max(
+    0.0,
+    _env_float(0.0, "LIVE_INTRABAR_TAKE_PROFIT_MONEY"),
+)
+INTRABAR_TAKE_PROFIT_CHANGE_PCT = max(
+    0.0,
+    _env_float(0.0, "LIVE_INTRABAR_TAKE_PROFIT_CHANGE_PCT"),
+)
 EMBED_SOURCE_MODE = (_env_first("LIVE_EMBED_SOURCE_MODE", "EMBED_SOURCE_MODE") or "cls").strip().lower()
 
 OPEN_PROB_THRESHOLD = _env_float(0.75, "LIVE_OPEN_PROB_THRESHOLD", "OPEN_PROB_THRESHOLD")
@@ -258,7 +402,16 @@ LLM_TEXT_LOG_FILE = (
     or os.path.join(MODELS_DIR, "time_to_llm_text.jsonl")
 )
 LLM_SEMANTIC_CACHE_SCHEMA = "utc_v2"
-STATE_FILE = _env_first("LIVE_STATE_FILE") or os.path.join(MODELS_DIR, "run_live_state.json")
+STATE_FILE = _env_first("LIVE_STATE_FILE")
+if not STATE_FILE:
+    state_identity = (
+        _safe_token(BOT_CONFIG_ID)
+        if BOT_CONFIG_ID
+        else _safe_token(_env_first("MT5_LOGIN"), fallback="")
+    )
+    if not state_identity:
+        state_identity = _safe_token(f"{SYMBOL}_{TIMEFRAME_NAME}")
+    STATE_FILE = os.path.join(MODELS_DIR, f"run_live_state_{state_identity}.json")
 MODEL_PATH = os.path.join(MODELS_DIR, "ppo_trading.zip")
 VEC_NORM_PATH = os.path.join(MODELS_DIR, "vec_normalize.pkl")
 

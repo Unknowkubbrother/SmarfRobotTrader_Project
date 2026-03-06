@@ -4,6 +4,7 @@ import shutil
 import sys
 import time
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from urllib import error as urlerror
@@ -16,6 +17,11 @@ from mt5linux import MetaTrader5
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
+try:
+    import fcntl
+except Exception:  # pragma: no cover - non-POSIX runtime
+    fcntl = None
+
 from .config import (
     BAR_HISTORY,
     CORE_DIR,
@@ -23,6 +29,9 @@ from .config import (
     ENABLE_CATCHUP_REPLAY,
     EVAL_ON_START,
     EXECUTE_STALE_REPLAY_ORDERS,
+    INTRABAR_TAKE_PROFIT_CHANGE_PCT,
+    INTRABAR_TAKE_PROFIT_MONEY,
+    INTRABAR_TAKE_PROFIT_PIPS,
     LIVE_DYNAMIC_LOT,
     LIVE_SYNC_ACCOUNT_STATE,
     LLM_SEMANTIC_CACHE_FILE,
@@ -32,8 +41,28 @@ from .config import (
     MAX_CATCHUP_BARS,
     MODEL_PATH,
     MODELS_DIR,
+    LIVE_PREWARM_REQUEST_TIMEOUT_SEC,
+    LIVE_PREWARM_SEMANTIC_MAX_MISSING,
+    LIVE_PREWARM_SEMANTIC_MAX_SECONDS,
+    LIVE_PREWARM_SEMANTIC_ON_START,
+    LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS,
+    LIVE_MANAGED_MAGIC_SET,
+    LIVE_MT5_HISTORY_END_AHEAD_HOURS,
+    LIVE_SEMANTIC_ALIAS_HOURS,
+    LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS,
+    LIVE_PERFORMANCE_MAGIC_SET,
+    LIVE_PERFORMANCE_SCOPE,
+    LIVE_PERFORMANCE_SYNC_INTERVAL_SEC,
     MT5_HOST,
+    MT5_LOGIN,
+    MT5_LOGIN_RETRIES,
+    MT5_PASSWORD,
     MT5_PORT,
+    MT5_RETRY_SECONDS,
+    MT5_RPC_TIMEOUT_MS,
+    MT5_SERVER,
+    MT5_SERVER_FALLBACKS,
+    MT5_STRICT_SERVER_MATCH,
     ORDER_TICK_RETRIES,
     ORDER_TICK_RETRY_SEC,
     PIP_VALUE,
@@ -50,6 +79,7 @@ from .config import (
     TIMEFRAME_SECONDS_MAP,
     VEC_NORM_PATH,
     VISION_LLM_API_URL,
+    VISION_LLM_EMBED_TEXT_API_URL,
     VISION_LLM_TIMEOUT_SEC,
     BOT_WS_URL,
     BOT_CONFIG_ID,
@@ -90,11 +120,25 @@ class LiveTradingBot:
         self.llm_semantic_cache_file = LLM_SEMANTIC_CACHE_FILE
         self.llm_text_log_file = LLM_TEXT_LOG_FILE
         self.llm_semantic_cache = {}
+        self.llm_text_cache = {}
         self._ws_connected = False
         self._ws_send_lock = threading.Lock()
         self._ws_state_lock = threading.Lock()
         self._ws_pending_state_payload = None
         self._ws_last_enqueued_at = 0.0
+        self._open_position_tickets = set()
+        self._closed_deal_cursor_msc = 0
+        self._last_closed_deal_poll_at = 0.0
+        self._last_closed_deal_reconcile_at = 0.0
+        self._closed_deal_retry_payload = []
+        self._closed_deal_retry_until = 0.0
+        self._perf_last_sync_at = 0.0
+        self._perf_cursor_msc = 0
+        self._perf_seeded = False
+        self._perf_deal_seen = set()
+        self._perf_ticket_net = {}
+        self.pending_intrabar_reviews = []
+        self.recent_intrabar_reviews = []
         self._sem_retry_not_before = {}  # ts_key -> epoch seconds
         self.last_action = "HOLD"
         self._last_status_tick = None  # {"bid": float, "ask": float, "time": int}
@@ -109,7 +153,11 @@ class LiveTradingBot:
             20.0,
             float(max(1, int(ORDER_TICK_RETRIES)) * max(0.05, float(ORDER_TICK_RETRY_SEC))),
         )
+        self.intrabar_take_profit_change_pct = float(INTRABAR_TAKE_PROFIT_CHANGE_PCT)
+        self.intrabar_take_profit_pips = float(INTRABAR_TAKE_PROFIT_PIPS)
+        self.intrabar_take_profit_money = float(INTRABAR_TAKE_PROFIT_MONEY)
         self.vision_llm_api_url = str(VISION_LLM_API_URL or "").strip()
+        self.vision_llm_embed_text_api_url = str(VISION_LLM_EMBED_TEXT_API_URL or "").strip()
         # Live real-only semantic can take long on model warmup; avoid false timeout loops.
         self.vision_llm_timeout_sec = max(420.0, float(VISION_LLM_TIMEOUT_SEC or 420.0))
         self.risk_profile_map = dict(RISK_PROFILE_MAP or {"low": 0.5, "medium": 1.0, "high": 1.5})
@@ -120,18 +168,221 @@ class LiveTradingBot:
         self.trading_schedule = dict(TRADING_SCHEDULE_DEFAULT)
         self._mt5_reconnect_lock = threading.Lock()
         self._mt5_last_reconnect_at = 0.0
+        self.mt5_login_text = str(MT5_LOGIN or "").strip()
+        self.mt5_password = str(MT5_PASSWORD or "").strip()
+        self.mt5_server = str(MT5_SERVER or "").strip()
+        self.mt5_server_fallbacks = tuple(
+            str(item or "").strip()
+            for item in (MT5_SERVER_FALLBACKS or [])
+            if str(item or "").strip()
+        )
+        self.mt5_strict_server_match = bool(MT5_STRICT_SERVER_MATCH)
+        self.mt5_rpc_timeout_ms = max(30000, int(MT5_RPC_TIMEOUT_MS or 180000))
+        self.mt5_login_retries = max(1, int(MT5_LOGIN_RETRIES or 20))
+        self.mt5_retry_seconds = max(1.0, float(MT5_RETRY_SECONDS or 5.0))
+        self.mt5_history_end_ahead_hours = max(0.0, float(LIVE_MT5_HISTORY_END_AHEAD_HOURS or 0.0))
+        def _env_float_runtime(name: str, default: float) -> float:
+            raw = str(os.getenv(name, "") or "").strip()
+            if not raw:
+                return float(default)
+            try:
+                return float(raw)
+            except Exception:
+                return float(default)
+
+        self.trade_allowed_wait_timeout_sec = max(
+            0.0,
+            _env_float_runtime("LIVE_TRADE_ALLOWED_WAIT_TIMEOUT_SEC", 20.0),
+        )
+        self.trade_allowed_probe_interval_sec = max(
+            0.1,
+            _env_float_runtime("LIVE_TRADE_ALLOWED_PROBE_INTERVAL_SEC", 1.0),
+        )
+        self.trade_allowed_warn_cooldown_sec = max(
+            1.0,
+            _env_float_runtime("LIVE_TRADE_ALLOWED_WARN_COOLDOWN_SEC", 10.0),
+        )
+        self._last_trade_allowed_blocked_log_at = 0.0
+        self.semantic_alias_hours = tuple(int(v) for v in (LIVE_SEMANTIC_ALIAS_HOURS or (0,)))
+        if 0 not in self.semantic_alias_hours:
+            self.semantic_alias_hours = (0,) + self.semantic_alias_hours
+        self.semantic_no_data_retry_seconds = max(10.0, float(LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS or 180.0))
+        try:
+            self.mt5_login_id = int(self.mt5_login_text) if self.mt5_login_text else None
+        except ValueError:
+            self.mt5_login_id = None
+            print(f" [MT5] invalid MT5_LOGIN value: {self.mt5_login_text!r}")
 
         tf_attr = f"TIMEFRAME_{TIMEFRAME_NAME}"
         self.timeframe = getattr(mt5, tf_attr, mt5.TIMEFRAME_H1)
         self.timeframe_seconds = int(TIMEFRAME_SECONDS_MAP.get(TIMEFRAME_NAME, 3600))
 
-    def connect(self):
-        if not mt5.initialize():
-            raise RuntimeError("initialize() failed")
+    def _server_candidates(self) -> list[str]:
+        candidates: list[str] = []
 
-        account_info = mt5.account_info()
+        def add(value: str) -> None:
+            normalized = " ".join(str(value or "").split()).strip()
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+
+        primary = str(self.mt5_server or "").strip()
+        add(primary)
+
+        for fallback in self.mt5_server_fallbacks:
+            add(fallback)
+
+        if self.mt5_strict_server_match:
+            if len(candidates) == 0:
+                return [""]
+            return candidates
+
+        if primary:
+            if primary.lower().startswith("mt5 "):
+                add(primary[4:])
+            else:
+                add(f"MT5 {primary}")
+
+        if len(candidates) == 0:
+            return [""]
+        return candidates
+
+    def _build_mt5_initialize_kwargs(
+        self,
+        server_name: str | None = None,
+        include_credentials: bool = True,
+    ) -> dict:
+        kwargs = {"timeout": int(self.mt5_rpc_timeout_ms)}
+        if server_name:
+            kwargs["server"] = str(server_name).strip()
+        if include_credentials and self.mt5_login_id is not None and self.mt5_password:
+            kwargs["login"] = int(self.mt5_login_id)
+            kwargs["password"] = self.mt5_password
+        return kwargs
+
+    def _build_mt5_login_kwargs(self, server_name: str | None = None) -> dict | None:
+        if self.mt5_login_id is None or not self.mt5_password:
+            return None
+        kwargs = {"login": int(self.mt5_login_id), "password": self.mt5_password}
+        if server_name:
+            kwargs["server"] = str(server_name).strip()
+        return kwargs
+
+    def _account_matches_expected_login(self, account_info) -> bool:
         if account_info is None:
-            raise RuntimeError("Failed to get account info")
+            return False
+        if self.mt5_login_id is None:
+            return True
+        try:
+            return int(account_info.login) == int(self.mt5_login_id)
+        except Exception:
+            return False
+
+    def _remember_mt5_server(self, account_info=None, fallback_server: str | None = None) -> None:
+        resolved_server = ""
+        if account_info is not None:
+            resolved_server = str(getattr(account_info, "server", "") or "").strip()
+        if resolved_server:
+            self.mt5_server = resolved_server
+        elif fallback_server:
+            self.mt5_server = str(fallback_server).strip()
+
+    def _initialize_mt5_session(self, prefer_session_reuse: bool = False) -> bool:
+        if prefer_session_reuse:
+            reuse_candidates: list[str | None] = [None]
+            for candidate in self._server_candidates():
+                normalized = str(candidate or "").strip()
+                if normalized and normalized not in reuse_candidates:
+                    reuse_candidates.append(normalized)
+
+            # Reconnect path: avoid credentialed login because some MT5 builds
+            # can flip AutoTrading off when login() is called repeatedly.
+            for server_name in reuse_candidates:
+                try:
+                    if not bool(
+                        mt5.initialize(
+                            **self._build_mt5_initialize_kwargs(
+                                server_name=server_name,
+                                include_credentials=False,
+                            )
+                        )
+                    ):
+                        continue
+                except Exception:
+                    continue
+
+                try:
+                    account_info = mt5.account_info()
+                except Exception:
+                    account_info = None
+
+                if self._account_matches_expected_login(account_info):
+                    self._remember_mt5_server(account_info, server_name)
+                    return True
+            return False
+
+        for server_name in self._server_candidates():
+            try:
+                if not bool(
+                    mt5.initialize(
+                        **self._build_mt5_initialize_kwargs(
+                            server_name=server_name,
+                            include_credentials=True,
+                        )
+                    )
+                ):
+                    continue
+            except Exception:
+                continue
+
+            login_kwargs = self._build_mt5_login_kwargs(server_name)
+            if not login_kwargs:
+                if server_name:
+                    self.mt5_server = str(server_name).strip()
+                return True
+
+            try:
+                login_ok = bool(mt5.login(**login_kwargs))
+            except Exception:
+                login_ok = False
+
+            if login_ok:
+                if server_name:
+                    self.mt5_server = str(server_name).strip()
+                return True
+
+            # Some MT5 builds can return login=False while account session is still active.
+            try:
+                account_info = mt5.account_info()
+            except Exception:
+                account_info = None
+            if account_info is None:
+                continue
+            if self._account_matches_expected_login(account_info):
+                self._remember_mt5_server(account_info, server_name)
+                return True
+
+        return False
+
+    def connect(self):
+        account_info = None
+        last_err = None
+        for attempt in range(1, self.mt5_login_retries + 1):
+            if self._initialize_mt5_session(prefer_session_reuse=True) or self._initialize_mt5_session():
+                account_info = mt5.account_info()
+                if account_info is not None:
+                    break
+
+            last_err = self._safe_last_error()
+            if attempt < self.mt5_login_retries:
+                time.sleep(min(self.mt5_retry_seconds, 10.0))
+
+        if account_info is None:
+            raise RuntimeError(f"Failed to get account info after login retries. last_error={last_err}")
+
+        if self.mt5_login_id is not None and int(account_info.login) != int(self.mt5_login_id):
+            raise RuntimeError(
+                f"Connected to unexpected account {account_info.login}, expected {self.mt5_login_id}"
+            )
 
         symbol_info = mt5.symbol_info(SYMBOL)
         if symbol_info is None:
@@ -212,7 +463,7 @@ class LiveTradingBot:
                 meta={"reason": str(reason)},
             )
 
-            max_attempts = 3
+            max_attempts = max(3, min(12, self.mt5_login_retries))
             last_err = None
             for attempt in range(1, max_attempts + 1):
                 try:
@@ -221,14 +472,10 @@ class LiveTradingBot:
                     pass
                 time.sleep(0.05)
 
-                ok = False
-                try:
-                    ok = bool(mt5.initialize())
-                except Exception:
-                    ok = False
+                ok = self._initialize_mt5_session(prefer_session_reuse=True)
                 if not ok:
                     last_err = self._safe_last_error()
-                    time.sleep(min(0.25 * attempt, 0.8))
+                    time.sleep(min(self.mt5_retry_seconds, 5.0))
                     continue
 
                 try:
@@ -238,6 +485,10 @@ class LiveTradingBot:
 
                 account_info = mt5.account_info()
                 if account_info is not None:
+                    if self.mt5_login_id is not None and int(account_info.login) != int(self.mt5_login_id):
+                        last_err = f"unexpected_account:{account_info.login}"
+                        time.sleep(min(self.mt5_retry_seconds, 5.0))
+                        continue
                     symbol_info = mt5.symbol_info(SYMBOL)
                     if symbol_info is not None:
                         self.point = float(symbol_info.point)
@@ -249,12 +500,16 @@ class LiveTradingBot:
                         f"MT5 reconnected on attempt {attempt}",
                         phase="mt5",
                         event="reconnect_ok",
-                        meta={"attempt": int(attempt), "account": int(account_info.login)},
+                        meta={
+                            "attempt": int(attempt),
+                            "account": int(account_info.login),
+                            "session_reuse": bool(attempt == 1),
+                        },
                     )
                     return True
 
                 last_err = self._safe_last_error()
-                time.sleep(min(0.25 * attempt, 0.8))
+                time.sleep(min(self.mt5_retry_seconds, 5.0))
 
             err_text = str(last_err) if last_err is not None else "unknown"
             print(f"\n [MT5] reconnect failed ({reason}) | last_error={err_text}")
@@ -273,6 +528,30 @@ class LiveTradingBot:
         res = mt5.order_send(req)
         retried = False
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            return res, retried
+
+        retcode = getattr(res, "retcode", None) if res is not None else None
+        comment = str(getattr(res, "comment", "") or "").strip() if res is not None else ""
+        if self._is_autotrading_disabled_result(retcode, comment):
+            if not self._ensure_trade_allowed_before_order(
+                reason=f"order_send:{reason}",
+                action_label="Order retry",
+                force_log=True,
+            ):
+                return res, retried
+            retried = True
+            if callable(refresh_price_fn):
+                try:
+                    next_price = refresh_price_fn()
+                except Exception:
+                    next_price = None
+                if next_price is None:
+                    return res, retried
+                req["price"] = float(next_price)
+            try:
+                res = mt5.order_send(req)
+            except Exception:
+                res = None
             return res, retried
 
         last_err = self._safe_last_error()
@@ -306,6 +585,274 @@ class LiveTradingBot:
         except Exception:
             res = None
         return res, retried
+
+    def _trade_retcode_name(self, retcode) -> str:
+        try:
+            code = int(retcode)
+        except Exception:
+            return str(retcode or "")
+        for attr in dir(mt5):
+            if not attr.startswith("TRADE_RETCODE_"):
+                continue
+            try:
+                if int(getattr(mt5, attr)) == code:
+                    return attr
+            except Exception:
+                continue
+        return str(code)
+
+    def _is_autotrading_disabled_result(self, retcode=None, text: str = "") -> bool:
+        try:
+            code = int(retcode) if retcode is not None else None
+        except Exception:
+            code = None
+
+        client_disabled_code = getattr(mt5, "TRADE_RETCODE_CLIENT_DISABLES_AT", 10027)
+        try:
+            if code is not None and int(code) == int(client_disabled_code):
+                return True
+        except Exception:
+            pass
+
+        haystack = str(text or "").strip().lower()
+        if not haystack:
+            return False
+        keywords = (
+            "autotrading disabled by client",
+            "auto trading disabled by client",
+            "client disables autotrading",
+            "client disables auto trading",
+            "disabled by client",
+        )
+        return any(word in haystack for word in keywords)
+
+    def _probe_trade_allowed_state(self) -> tuple[bool | None, str]:
+        try:
+            info = mt5.terminal_info()
+        except Exception as exc:
+            return None, f"terminal_info_exception={exc}"
+
+        if info is None:
+            return None, "terminal_info_none"
+
+        trade_allowed = bool(getattr(info, "trade_allowed", False))
+        tradeapi_disabled = bool(getattr(info, "tradeapi_disabled", False))
+        effective_allowed = bool(trade_allowed and not tradeapi_disabled)
+        detail = (
+            f"trade_allowed={int(trade_allowed)}"
+            f" tradeapi_disabled={int(tradeapi_disabled)}"
+            f" effective_allowed={int(effective_allowed)}"
+        )
+        return effective_allowed, detail
+
+    def _ensure_trade_allowed_before_order(
+        self,
+        reason: str,
+        action_label: str = "Order",
+        force_log: bool = False,
+    ) -> bool:
+        timeout_sec = max(0.0, float(self.trade_allowed_wait_timeout_sec))
+        probe_interval = max(0.1, float(self.trade_allowed_probe_interval_sec))
+        deadline = time.time() + timeout_sec
+        attempt = 0
+        last_detail = "trade_allowed_probe_unavailable"
+        wait_logged = False
+
+        while True:
+            attempt += 1
+            trade_allowed, detail = self._probe_trade_allowed_state()
+            last_detail = str(detail or last_detail)
+            if trade_allowed is True:
+                if attempt > 1:
+                    print(f" [MT5] AutoTrading recovered ({reason}) | {last_detail}")
+                    self._add_log(
+                        "info",
+                        f"MT5 AutoTrading recovered ({reason})",
+                        phase="order",
+                        event="autotrading_recovered",
+                        meta={
+                            "reason": str(reason),
+                            "attempt": int(attempt),
+                            "detail": last_detail,
+                        },
+                    )
+                return True
+
+            if not wait_logged and timeout_sec > 0:
+                wait_logged = True
+                self._add_log(
+                    "warning",
+                    "Waiting for MT5 AutoTrading to be enabled",
+                    phase="order",
+                    event="autotrading_wait",
+                    meta={
+                        "reason": str(reason),
+                        "timeout_sec": float(timeout_sec),
+                    },
+                )
+
+            if trade_allowed is None:
+                last_err = self._safe_last_error()
+                if self._is_mt5_ipc_error(last_err):
+                    self._try_reconnect_mt5(reason=f"trade_allowed_probe:{reason}")
+
+            if time.time() >= deadline:
+                break
+            time.sleep(probe_interval)
+
+        now_epoch = time.time()
+        should_log = bool(force_log) or (
+            (now_epoch - float(self._last_trade_allowed_blocked_log_at))
+            >= float(self.trade_allowed_warn_cooldown_sec)
+        )
+        if should_log:
+            msg = f"{action_label} blocked: AutoTrading disabled by client"
+            print(f" {msg} | {last_detail}")
+            self._add_log(
+                "warning",
+                msg,
+                phase="order",
+                event="autotrading_disabled",
+                meta={
+                    "reason": str(reason),
+                    "detail": last_detail,
+                    "timeout_sec": float(timeout_sec),
+                },
+            )
+            self._last_trade_allowed_blocked_log_at = now_epoch
+        return False
+
+    def _is_insufficient_funds_result(self, retcode=None, text: str = "") -> bool:
+        try:
+            code = int(retcode) if retcode is not None else None
+        except Exception:
+            code = None
+        no_money_code = getattr(mt5, "TRADE_RETCODE_NO_MONEY", 10019)
+        try:
+            if code is not None and int(code) == int(no_money_code):
+                return True
+        except Exception:
+            pass
+
+        haystack = str(text or "").strip().lower()
+        if not haystack:
+            return False
+        keywords = (
+            "no money",
+            "not enough money",
+            "insufficient",
+            "insufficient funds",
+            "insufficient margin",
+            "margin",
+            "funds",
+        )
+        return any(word in haystack for word in keywords)
+
+    def _precheck_open_order_funds(self, req: dict, side: str) -> tuple[bool, dict]:
+        side_text = str(side or "").strip().upper() or "ORDER"
+        account = None
+        try:
+            account = mt5.account_info()
+        except Exception:
+            account = None
+        balance = float(getattr(account, "balance", 0.0) or 0.0) if account is not None else 0.0
+        free_margin = float(getattr(account, "margin_free", 0.0) or 0.0) if account is not None else 0.0
+        if account is not None and free_margin <= 0.0:
+            return False, {
+                "reason": f"{side_text} blocked: free margin is {free_margin:.2f}",
+                "retcode": getattr(mt5, "TRADE_RETCODE_NO_MONEY", 10019),
+                "retcode_name": "TRADE_RETCODE_NO_MONEY",
+                "balance": balance,
+                "free_margin": free_margin,
+                "required_margin": 0.0,
+            }
+
+        try:
+            check = mt5.order_check(req)
+        except Exception:
+            check = None
+
+        if check is None:
+            last_err = self._safe_last_error()
+            err_text = str(last_err)
+            if self._is_insufficient_funds_result(None, err_text):
+                return False, {
+                    "reason": f"{side_text} blocked: {err_text}",
+                    "retcode": getattr(mt5, "TRADE_RETCODE_NO_MONEY", 10019),
+                    "retcode_name": "TRADE_RETCODE_NO_MONEY",
+                    "balance": balance,
+                    "free_margin": free_margin,
+                    "required_margin": 0.0,
+                }
+            return True, {
+                "reason": "",
+                "retcode": None,
+                "retcode_name": "",
+                "balance": balance,
+                "free_margin": free_margin,
+                "required_margin": 0.0,
+            }
+
+        retcode = getattr(check, "retcode", None)
+        comment = str(getattr(check, "comment", "") or "").strip()
+        required_margin = float(getattr(check, "margin", 0.0) or 0.0)
+        done_code = getattr(mt5, "TRADE_RETCODE_DONE", None)
+        try:
+            if done_code is not None and int(retcode) == int(done_code):
+                return True, {
+                    "reason": "",
+                    "retcode": retcode,
+                    "retcode_name": self._trade_retcode_name(retcode),
+                    "balance": balance,
+                    "free_margin": free_margin,
+                    "required_margin": required_margin,
+                }
+        except Exception:
+            pass
+
+        detail = comment or self._trade_retcode_name(retcode)
+        if self._is_insufficient_funds_result(retcode, detail):
+            return False, {
+                "reason": f"{side_text} blocked: {detail}",
+                "retcode": retcode,
+                "retcode_name": self._trade_retcode_name(retcode),
+                "balance": balance,
+                "free_margin": free_margin,
+                "required_margin": required_margin,
+            }
+
+        return True, {
+            "reason": "",
+            "retcode": retcode,
+            "retcode_name": self._trade_retcode_name(retcode),
+            "balance": balance,
+            "free_margin": free_margin,
+            "required_margin": required_margin,
+        }
+
+    @contextmanager
+    def _exclusive_file_lock(self, target_path: str):
+        lock_path = f"{target_path}.lock"
+        lock_dir = os.path.dirname(lock_path)
+        lock_fh = None
+        try:
+            if lock_dir:
+                os.makedirs(lock_dir, exist_ok=True)
+            lock_fh = open(lock_path, "a+", encoding="utf-8")
+            if fcntl is not None:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            if lock_fh is not None:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+                try:
+                    lock_fh.close()
+                except Exception:
+                    pass
 
     def _load_llm_semantic_cache(self):
         self.llm_semantic_cache = {}
@@ -342,6 +889,32 @@ class LiveTradingBot:
             restored[key] = arr
         self.llm_semantic_cache = restored
 
+    def _load_llm_text_log_cache(self):
+        self.llm_text_cache = {}
+        log_file = self.llm_text_log_file
+        if not log_file or not os.path.exists(log_file):
+            return
+        try:
+            with self._exclusive_file_lock(log_file):
+                with open(log_file, "r", encoding="utf-8") as fh:
+                    for raw_line in fh:
+                        line = str(raw_line or "").strip()
+                        if not line:
+                            continue
+                        try:
+                            payload = json.loads(line)
+                        except Exception:
+                            continue
+                        if not isinstance(payload, dict):
+                            continue
+                        ts_key = str(payload.get("time", "") or "").strip()
+                        llm_text = str(payload.get("text", "") or "").strip()
+                        if not ts_key or not llm_text:
+                            continue
+                        self.llm_text_cache[ts_key] = llm_text
+        except Exception as exc:
+            print(f" LLM text cache skipped (invalid file): {exc}")
+
     def _save_llm_semantic_cache(self, reason: str = "periodic"):
         if not self.llm_semantic_cache:
             return
@@ -350,34 +923,236 @@ class LiveTradingBot:
             cache_dir = os.path.dirname(cache_file)
             if cache_dir:
                 os.makedirs(cache_dir, exist_ok=True)
-            tmp_path = f"{cache_file}.tmp"
-            serializable = {k: np.asarray(v, dtype=np.float32) for k, v in self.llm_semantic_cache.items()}
-            payload = {
-                "schema": LLM_SEMANTIC_CACHE_SCHEMA,
-                "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                "rows": serializable,
-            }
-            joblib.dump(payload, tmp_path)
-            os.replace(tmp_path, cache_file)
+            with self._exclusive_file_lock(cache_file):
+                merged_rows = {}
+                if os.path.exists(cache_file):
+                    try:
+                        existing_payload = joblib.load(cache_file)
+                    except Exception:
+                        existing_payload = None
+                    existing_rows = None
+                    if isinstance(existing_payload, dict):
+                        if (
+                            existing_payload.get("schema") == LLM_SEMANTIC_CACHE_SCHEMA
+                            and isinstance(existing_payload.get("rows"), dict)
+                        ):
+                            existing_rows = existing_payload.get("rows")
+                        elif existing_payload and all(isinstance(k, str) for k in existing_payload.keys()):
+                            existing_rows = existing_payload
+                    if isinstance(existing_rows, dict):
+                        for key, vec in existing_rows.items():
+                            if not isinstance(key, str):
+                                continue
+                            arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+                            if arr.size == 0:
+                                continue
+                            merged_rows[key] = arr
+
+                for key, vec in self.llm_semantic_cache.items():
+                    if not isinstance(key, str):
+                        continue
+                    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+                    if arr.size == 0:
+                        continue
+                    merged_rows[key] = arr
+
+                if not merged_rows:
+                    return
+
+                serializable = {k: np.asarray(v, dtype=np.float32) for k, v in merged_rows.items()}
+                payload = {
+                    "schema": LLM_SEMANTIC_CACHE_SCHEMA,
+                    "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "rows": serializable,
+                }
+                tmp_path = f"{cache_file}.tmp.{os.getpid()}.{int(time.time() * 1000000)}"
+                try:
+                    joblib.dump(payload, tmp_path)
+                    os.replace(tmp_path, cache_file)
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                self.llm_semantic_cache = merged_rows
         except Exception as exc:
             print(f" LLM semantic cache save failed ({reason}): {exc}")
+
+    def _resolve_cached_semantic_alias(self, ts_key: str):
+        if not ts_key:
+            return None, None
+
+        # 1) Exact lookup first.
+        vec = self.llm_semantic_cache.get(ts_key)
+        if vec is not None:
+            return ts_key, np.asarray(vec, dtype=np.float32).reshape(-1)
+
+        # 2) Broker server time can be offset by whole hours.
+        try:
+            base_dt = datetime.strptime(str(ts_key), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None, None
+
+        for hour_offset in self.semantic_alias_hours:
+            try:
+                offset = int(hour_offset)
+            except Exception:
+                continue
+            if offset == 0:
+                continue
+            candidate_key = (base_dt + timedelta(hours=offset)).strftime("%Y-%m-%d %H:%M:%S")
+            vec = self.llm_semantic_cache.get(candidate_key)
+            if vec is not None:
+                return candidate_key, np.asarray(vec, dtype=np.float32).reshape(-1)
+
+        return None, None
+
+    def _adopt_semantic_alias(self, ts_key: str, alias_key: str, alias_vec: np.ndarray):
+        vec = np.asarray(alias_vec, dtype=np.float32).reshape(-1)
+        if vec.size == 0:
+            return False
+        self.llm_semantic_cache[ts_key] = vec
+        if self.semantic_runtime is not None:
+            self.semantic_runtime.global_time_to_vec[ts_key] = vec
+        self._sem_retry_not_before.pop(ts_key, None)
+        self._save_llm_semantic_cache(reason="cache_alias")
+        print(f"\n [SEM] ready (cache_alias) ts={ts_key} <- {alias_key} dim={vec.size}")
+        self._add_log(
+            "analysis",
+            f"Semantic alias hit for {ts_key}",
+            phase="sem",
+            event="cache_alias_hit",
+            meta={"ts": ts_key, "alias_ts": alias_key, "dim": int(vec.size)},
+        )
+        return True
+
+    def _resolve_cached_llm_text_alias(self, ts_key: str):
+        if not ts_key:
+            return None, None
+
+        llm_text = str(self.llm_text_cache.get(ts_key, "") or "").strip()
+        if llm_text:
+            return ts_key, llm_text
+
+        try:
+            base_dt = datetime.strptime(str(ts_key), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None, None
+
+        for hour_offset in self.semantic_alias_hours:
+            try:
+                offset = int(hour_offset)
+            except Exception:
+                continue
+            if offset == 0:
+                continue
+            candidate_key = (base_dt + timedelta(hours=offset)).strftime("%Y-%m-%d %H:%M:%S")
+            llm_text = str(self.llm_text_cache.get(candidate_key, "") or "").strip()
+            if llm_text:
+                return candidate_key, llm_text
+
+        return None, None
+
+    def _request_llm_text_embedding_from_server(self, llm_text: str, timeout_sec: float | None = None):
+        if not self.vision_llm_embed_text_api_url:
+            raise RuntimeError("VISION_LLM_EMBED_TEXT_API_URL is empty")
+
+        payload = {"text": str(llm_text or "")}
+        body = json.dumps(payload).encode("utf-8")
+        req = urlrequest.Request(
+            self.vision_llm_embed_text_api_url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        timeout = float(timeout_sec or 0.0)
+        if timeout <= 0:
+            timeout = max(10.0, min(float(self.vision_llm_timeout_sec), 120.0))
+        try:
+            with urlrequest.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except urlerror.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8")
+            except Exception:
+                detail = ""
+            raise RuntimeError(
+                f"text-embed server returned HTTP {exc.code}"
+                + (f" | {detail}" if detail else "")
+            ) from exc
+        except urlerror.URLError as exc:
+            raise RuntimeError(f"text-embed server unavailable: {exc}") from exc
+
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception as exc:
+            raise RuntimeError(f"text-embed invalid server JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("text-embed invalid server payload type")
+        cls_raw = data.get("cls_vec")
+        if cls_raw is None:
+            raise RuntimeError("text-embed server payload missing cls_vec")
+        return np.asarray(cls_raw, dtype=np.float32).reshape(-1)
+
+    def _try_resolve_semantic_from_text_log(self, ts_key: str, timeout_sec: float | None = None) -> bool:
+        text_key, llm_text = self._resolve_cached_llm_text_alias(ts_key)
+        if not llm_text:
+            return False
+
+        source = "text_log_embed" if text_key == ts_key else "text_log_alias_embed"
+        try:
+            cls_vec = self._request_llm_text_embedding_from_server(llm_text, timeout_sec=timeout_sec)
+            self._save_llm_semantic_entry(ts_key, cls_vec, llm_text, source=source)
+            self._add_log(
+                "analysis",
+                f"Semantic restored from text log for {ts_key}",
+                phase="sem",
+                event="text_log_embed_ready",
+                meta={
+                    "ts": ts_key,
+                    "text_ts": text_key,
+                    "source": source,
+                    "text_len": int(len(llm_text)),
+                },
+            )
+            return True
+        except Exception as exc:
+            self._add_log(
+                "warning",
+                f"Text-log semantic restore failed for {ts_key}",
+                phase="sem",
+                event="text_log_embed_failed",
+                meta={"ts": ts_key, "text_ts": text_key, "error": str(exc)},
+            )
+            return False
+
+    def _semantic_retry_delay(self, exc: Exception) -> float:
+        err_text = str(exc or "")
+        if "No M1 data" in err_text:
+            return max(10.0, float(self.semantic_no_data_retry_seconds))
+        return max(2.0, min(float(POLL_SECONDS) * 4.0, 12.0))
 
     def _append_llm_text_log(self, ts_key: str, llm_text: str):
         if not self.llm_text_log_file:
             return
+        ts_val = str(ts_key or "").strip()
+        text_val = str(llm_text or "").strip()
         try:
             log_dir = os.path.dirname(self.llm_text_log_file)
             if log_dir:
                 os.makedirs(log_dir, exist_ok=True)
             record = {
-                "time": ts_key,
+                "time": ts_val,
                 "symbol": SYMBOL,
                 "timeframe": TIMEFRAME_NAME,
-                "text": str(llm_text or "").strip(),
+                "text": text_val,
                 "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             }
-            with open(self.llm_text_log_file, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            with self._exclusive_file_lock(self.llm_text_log_file):
+                with open(self.llm_text_log_file, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception as exc:
             print(f" LLM text log failed: {exc}")
 
@@ -430,9 +1205,12 @@ class LiveTradingBot:
         )
 
         self._load_llm_semantic_cache()
+        # Keep time_to_llm_text as append-only log; do not load it for semantic restore.
         llm_cache_rows = 0
+        llm_text_rows = 0
         base_cache_rows = 0
         merged_cache_rows = 0
+
         # Use static CLS map as baseline, then overlay live LLM cache.
         base_map = {}
         if isinstance(self.semantic_runtime.global_time_to_vec, dict):
@@ -456,6 +1234,7 @@ class LiveTradingBot:
                 arr = np.asarray(vec, dtype=np.float32).reshape(-1)
                 if arr.size == 0:
                     continue
+                # LLM vector overrides baseline CLS when timestamps collide.
                 self.semantic_runtime.global_time_to_vec[key] = arr
                 llm_applied += 1
             llm_cache_rows = int(llm_applied)
@@ -465,7 +1244,7 @@ class LiveTradingBot:
             " [MODEL] "
             f"ready features={len(self.feature_columns)} sem_dim={self.semantic_runtime.semantic_feature_count} "
             f"base_cache_rows={base_cache_rows} llm_cache_rows={llm_cache_rows} "
-            f"merged_cache_rows={merged_cache_rows}"
+            f"merged_cache_rows={merged_cache_rows} llm_text_rows={llm_text_rows}"
         )
         self._add_log(
             "success",
@@ -478,6 +1257,7 @@ class LiveTradingBot:
                 "base_cache_rows": int(base_cache_rows),
                 "llm_cache_rows": int(llm_cache_rows),
                 "merged_cache_rows": int(merged_cache_rows),
+                "llm_text_rows": int(llm_text_rows),
             },
         )
 
@@ -543,6 +1323,8 @@ class LiveTradingBot:
                                 pass
                             elif msg_type == "bot_config":
                                 self._apply_runtime_config(msg, source="ws")
+                            elif msg_type == "bot_command":
+                                self._handle_runtime_command(msg)
                             self._flush_pending_state_to_server()
                 except Exception as exc:
                     self._ws = None
@@ -694,6 +1476,101 @@ class LiveTradingBot:
                 meta={"source": source, "risk_level": self.risk_level, "risk_percent": float(self.risk_percent)},
             )
 
+    def _send_ws_payload(self, payload: dict) -> bool:
+        if not self._ws_connected or not hasattr(self, "_ws") or self._ws is None:
+            return False
+        try:
+            body = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            return False
+        try:
+            with self._ws_send_lock:
+                self._ws.send(body)
+            return True
+        except Exception:
+            return False
+
+    def _send_bot_command_ack(
+        self,
+        command: str,
+        command_id: str,
+        ok: bool,
+        detail: str,
+        meta: dict | None = None,
+    ):
+        payload = {
+            "type": "bot_command_ack",
+            "bot_config_id": BOT_CONFIG_ID,
+            "command": str(command or "").strip().lower(),
+            "command_id": str(command_id or "").strip(),
+            "ok": bool(ok),
+            "detail": str(detail or "").strip(),
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        clean_meta = self._sanitize_log_meta(meta)
+        if clean_meta:
+            payload["meta"] = clean_meta
+        self._send_ws_payload(payload)
+
+    def _handle_runtime_command(self, payload: dict):
+        if not isinstance(payload, dict):
+            return
+
+        command = str(payload.get("command", "")).strip().lower()
+        command_id = str(payload.get("command_id", "")).strip()
+        if not command:
+            return
+        if not command_id:
+            command_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+        if command in {"emergency_close_all", "close_all_positions", "close_all"}:
+            started_at = time.time()
+            self._add_log(
+                "warning",
+                "Emergency command received: close managed positions",
+                phase="order",
+                event="emergency_close_requested",
+            )
+            ok = False
+            detail = ""
+            try:
+                ok = bool(self.close_all())
+                detail = "All managed positions were closed" if ok else "Some managed positions could not be closed"
+            except Exception as exc:
+                detail = f"Emergency close failed: {exc}"
+                ok = False
+
+            try:
+                self._sync_bridge_from_mt5()
+                self._push_state_to_server(action_name=self.last_action or "HOLD")
+                self._flush_pending_state_to_server()
+            except Exception:
+                pass
+
+            elapsed_sec = round(max(0.0, time.time() - started_at), 2)
+            self._add_log(
+                "success" if ok else "warning",
+                detail,
+                phase="order",
+                event="emergency_close_done" if ok else "emergency_close_partial",
+                meta={"elapsed_sec": elapsed_sec},
+            )
+            self._send_bot_command_ack(
+                command=command,
+                command_id=command_id,
+                ok=ok,
+                detail=detail,
+                meta={"elapsed_sec": elapsed_sec},
+            )
+            return
+
+        self._send_bot_command_ack(
+            command=command,
+            command_id=command_id,
+            ok=False,
+            detail=f"Unsupported command: {command}",
+        )
+
     def _flush_pending_state_to_server(self):
         """Flush queued state payload from WS thread."""
         if not self._ws_connected or not hasattr(self, "_ws") or self._ws is None:
@@ -764,13 +1641,10 @@ class LiveTradingBot:
 
         # ── MT5 Active positions ──
         positions_data = []
-        all_positions = None
-        try:
-            all_positions = mt5.positions_get()
-        except Exception:
-            all_positions = None
-        if all_positions:
-            for p in all_positions:
+        managed_positions = self._get_symbol_positions_safe()
+        if managed_positions:
+            for p in managed_positions:
+                commission_value = 0.0
                 opened_at_utc = datetime.fromtimestamp(p.time, tz=timezone.utc)
                 positions_data.append({
                     "ticket": int(p.ticket),
@@ -781,6 +1655,7 @@ class LiveTradingBot:
                     "price_current": float(p.price_current),
                     "profit": float(p.profit),
                     "swap": float(p.swap),
+                    "commission": commission_value,
                     "sl": float(p.sl),
                     "tp": float(p.tp),
                     "opened_at": opened_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
@@ -789,7 +1664,74 @@ class LiveTradingBot:
                         p.time, tz=timezone.utc
                     ).strftime("%H:%M:%S"),
                     "comment": str(p.comment) if p.comment else "",
+                    "magic": int(getattr(p, "magic", 0) or 0),
                 })
+
+        current_open_tickets = {
+            int(item.get("ticket", 0) or 0)
+            for item in positions_data
+            if int(item.get("ticket", 0) or 0) > 0
+        }
+        previous_open_tickets = set(getattr(self, "_open_position_tickets", set()) or set())
+        closed_ticket_candidates = previous_open_tickets - current_open_tickets
+        self._open_position_tickets = current_open_tickets
+
+        closed_deals = []
+        is_reconcile_due = (
+            now - float(getattr(self, "_last_closed_deal_reconcile_at", 0.0) or 0.0)
+        ) >= 900.0
+        should_poll_closed_deals = bool(closed_ticket_candidates) or is_reconcile_due
+        if not should_poll_closed_deals:
+            should_poll_closed_deals = (now - float(getattr(self, "_last_closed_deal_poll_at", 0.0) or 0.0)) >= 60.0
+        if should_poll_closed_deals:
+            self._last_closed_deal_poll_at = now
+            try:
+                if is_reconcile_due:
+                    self._last_closed_deal_reconcile_at = now
+                    closed_deals = self._collect_recent_closed_deals(force_lookback_sec=3 * 24 * 60 * 60)
+                else:
+                    closed_deals = self._collect_recent_closed_deals(
+                        expected_tickets=closed_ticket_candidates if closed_ticket_candidates else None
+                    )
+            except Exception as exc:
+                print(f" WS state: closed deals fetch failed: {exc}")
+                closed_deals = []
+
+        # Keep recently discovered closed deals in outgoing state for a short window.
+        # This gives server-side persistence a few retries if one WS frame is dropped.
+        if closed_deals:
+            latest_by_ticket = {}
+            for row in list(getattr(self, "_closed_deal_retry_payload", []) or []) + list(closed_deals):
+                if not isinstance(row, dict):
+                    continue
+                ticket = int(row.get("ticket", 0) or 0)
+                if ticket <= 0:
+                    continue
+                close_msc = int(row.get("closeTimeMsc", 0) or 0)
+                prev = latest_by_ticket.get(ticket)
+                prev_msc = int((prev or {}).get("closeTimeMsc", 0) or 0)
+                if prev is None or close_msc >= prev_msc:
+                    latest_by_ticket[ticket] = row
+            retry_rows = sorted(
+                list(latest_by_ticket.values()),
+                key=lambda row: int(row.get("closeTimeMsc", 0) or 0),
+                reverse=True,
+            )
+            self._closed_deal_retry_payload = retry_rows[:200]
+            self._closed_deal_retry_until = now + 20.0
+        else:
+            retry_rows = list(getattr(self, "_closed_deal_retry_payload", []) or [])
+            retry_until = float(getattr(self, "_closed_deal_retry_until", 0.0) or 0.0)
+            if retry_rows and now < retry_until:
+                closed_deals = retry_rows
+            elif retry_rows and now >= retry_until:
+                self._closed_deal_retry_payload = []
+        if closed_deals:
+            self._sync_performance_from_mt5_history(
+                force=True,
+                full_resync=False,
+                reason="closed_deals_snapshot",
+            )
 
         last_err = self._safe_last_error()
         if self._is_mt5_ipc_error(last_err):
@@ -804,6 +1746,8 @@ class LiveTradingBot:
             "bot_config_id": BOT_CONFIG_ID,
             "symbol": SYMBOL,
             "timeframe": TIMEFRAME_NAME,
+            "magic_number": int(MAGIC_NUMBER),
+            "manage_manual_positions": bool(0 in set(int(v) for v in (LIVE_MANAGED_MAGIC_SET or set()))),
             # Bot model state
             "position": int(current_pos),
             "entry_price": float(self.bridge.entry_price) if self.bridge else 0.0,
@@ -825,9 +1769,12 @@ class LiveTradingBot:
             **account_data,
             # MT5 Positions
             "positions": positions_data,
+            "closed_deals": closed_deals,
             # Logs
             "llm_text": llm_text,
             "recent_logs": list(getattr(self, "recent_logs", [])[-40:]),
+            "pending_intrabar_review_count": int(len(getattr(self, "pending_intrabar_reviews", []) or [])),
+            "recent_intrabar_reviews": list(getattr(self, "recent_intrabar_reviews", [])[-20:]),
             "ws_connected": bool(self._ws_connected),
         }
         try:
@@ -869,9 +1816,11 @@ class LiveTradingBot:
         """Add a log entry to be sent to the dashboard Activity Log."""
         if not hasattr(self, "recent_logs"):
             self.recent_logs = []
-        now_str = datetime.now().strftime("%H:%M:%S")
+        now_utc = datetime.now(timezone.utc)
+        now_str = now_utc.strftime("%H:%M:%S")
         entry = {
             "timestamp": now_str,
+            "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
             "type": str(log_type or "info"),
             "message": str(message or "").strip(),
         }
@@ -1010,22 +1959,29 @@ class LiveTradingBot:
         if ts_key in self.semantic_runtime.global_time_to_vec:
             return
 
-        now_epoch = time.time()
-        retry_not_before = float(self._sem_retry_not_before.get(ts_key, 0.0) or 0.0)
-        if now_epoch < retry_not_before:
-            return
-
         # 1. Check local disk cache
-        cached_vec = self.llm_semantic_cache.get(ts_key)
-        if cached_vec is not None:
-            self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(cached_vec, dtype=np.float32)
+        alias_key, alias_vec = self._resolve_cached_semantic_alias(ts_key)
+        if alias_vec is not None:
+            if alias_key == ts_key:
+                self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(alias_vec, dtype=np.float32)
+            else:
+                self._adopt_semantic_alias(ts_key, alias_key, alias_vec)
             self._add_log(
                 "analysis",
                 f"Semantic cache hit for {ts_key}",
                 phase="sem",
-                event="cache_hit",
-                meta={"ts": ts_key, "source": "disk_cache"},
+                event="cache_hit" if alias_key == ts_key else "cache_alias_hit",
+                meta={
+                    "ts": ts_key,
+                    "source": "disk_cache" if alias_key == ts_key else "cache_alias",
+                    "alias_ts": alias_key if alias_key != ts_key else None,
+                },
             )
+            return
+
+        now_epoch = time.time()
+        retry_not_before = float(self._sem_retry_not_before.get(ts_key, 0.0) or 0.0)
+        if now_epoch < retry_not_before:
             return
 
         # 2. Request from server HTTP endpoint
@@ -1042,7 +1998,7 @@ class LiveTradingBot:
             self._save_llm_semantic_entry(ts_key, cls_vec, llm_text, source="server_post")
         except Exception as exc:
             # Avoid hammering the endpoint immediately after a timeout/failure.
-            self._sem_retry_not_before[ts_key] = time.time() + max(2.0, min(float(POLL_SECONDS) * 4.0, 12.0))
+            self._sem_retry_not_before[ts_key] = time.time() + self._semantic_retry_delay(exc)
             print(f"\n [SEM] request failed ts={ts_key}: {exc} | fallback=blocked_real_only")
             self._add_log(
                 "warning",
@@ -1051,6 +2007,119 @@ class LiveTradingBot:
                 event="server_request_failed",
                 meta={"ts": ts_key, "error": str(exc)},
             )
+
+    def _resolve_live_llm_semantic_quick(self, ts_key: str, timeout_sec: float):
+        if self.semantic_runtime is None:
+            return False
+        if ts_key in self.semantic_runtime.global_time_to_vec:
+            return True
+
+        alias_key, alias_vec = self._resolve_cached_semantic_alias(ts_key)
+        if alias_vec is not None:
+            if alias_key == ts_key:
+                self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(alias_vec, dtype=np.float32)
+            else:
+                self._adopt_semantic_alias(ts_key, alias_key, alias_vec)
+            return True
+
+        quick_timeout = max(5.0, float(timeout_sec))
+
+        prev_timeout = float(self.vision_llm_timeout_sec)
+        self.vision_llm_timeout_sec = min(prev_timeout, quick_timeout)
+        try:
+            llm_text, cls_vec = self._request_llm_semantic_from_server(ts_key)
+            self._save_llm_semantic_entry(ts_key, cls_vec, llm_text, source="startup_prewarm")
+            return True
+        except Exception as exc:
+            self._sem_retry_not_before[ts_key] = time.time() + self._semantic_retry_delay(exc)
+            self._add_log(
+                "warning",
+                f"Startup prewarm failed for {ts_key}",
+                phase="sem",
+                event="startup_prewarm_failed",
+                meta={"ts": ts_key, "error": str(exc)},
+            )
+            return False
+        finally:
+            self.vision_llm_timeout_sec = prev_timeout
+
+    def _prewarm_semantic_on_start(self):
+        if not bool(LIVE_PREWARM_SEMANTIC_ON_START):
+            return
+        if self.semantic_runtime is None:
+            return
+
+        max_seconds = max(0.0, float(LIVE_PREWARM_SEMANTIC_MAX_SECONDS))
+        if max_seconds <= 0.0:
+            return
+
+        current_bar_time = self._current_bar_time()
+        if current_bar_time <= 0:
+            return
+        window_df = self._fetch_window(current_bar_time)
+        if window_df is None:
+            return
+
+        ts_keys = pd.to_datetime(window_df["time"]).dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+        missing = [ts for ts in ts_keys if ts not in self.semantic_runtime.global_time_to_vec]
+        if not missing:
+            self._add_log(
+                "info",
+                "Startup prewarm skipped: semantic cache already warm",
+                phase="sem",
+                event="startup_prewarm_skip_full",
+            )
+            return
+
+        max_missing = max(1, int(LIVE_PREWARM_SEMANTIC_MAX_MISSING))
+        target_keys = missing[-max_missing:]
+        started_at = time.time()
+        deadline = time.time() + max_seconds
+        timeout_per_request = max(5.0, float(LIVE_PREWARM_REQUEST_TIMEOUT_SEC))
+        resolved_count = 0
+        attempted_count = 0
+
+        print(
+            "\n [SEM] startup prewarm "
+            f"targets={len(target_keys)} missing={len(missing)} budget={max_seconds:.1f}s"
+        )
+        self._add_log(
+            "info",
+            f"Startup semantic prewarm targets={len(target_keys)}",
+            phase="sem",
+            event="startup_prewarm_start",
+            meta={
+                "missing_total": int(len(missing)),
+                "targets": int(len(target_keys)),
+                "budget_sec": float(max_seconds),
+            },
+        )
+
+        for ts_key in target_keys:
+            if time.time() >= deadline:
+                break
+            attempted_count += 1
+            if self._resolve_live_llm_semantic_quick(ts_key, timeout_sec=timeout_per_request):
+                resolved_count += 1
+
+        elapsed = max(0.0, float(time.time() - started_at))
+        pending_after = len([ts for ts in target_keys if ts not in self.semantic_runtime.global_time_to_vec])
+        print(
+            "\n [SEM] startup prewarm done "
+            f"resolved={resolved_count}/{attempted_count} pending={pending_after} elapsed={elapsed:.1f}s"
+        )
+        self._add_log(
+            "success" if pending_after == 0 else "info",
+            f"Startup semantic prewarm resolved={resolved_count}/{attempted_count}",
+            phase="sem",
+            event="startup_prewarm_done",
+            meta={
+                "resolved": int(resolved_count),
+                "attempted": int(attempted_count),
+                "pending_after": int(pending_after),
+                "elapsed_sec": float(round(elapsed, 2)),
+            },
+        )
 
     def _ensure_window_real_semantic(self, window_df: pd.DataFrame):
         if self.semantic_runtime is None:
@@ -1199,6 +2268,10 @@ class LiveTradingBot:
                 "recent_trade_pips": [float(x) for x in list(self.bridge.recent_trade_pips)],
                 "gate_stats": {k: float(v) for k, v in dict(self.bridge.gate_stats or {}).items()},
             },
+            "intrabar": {
+                "pending_reviews": list(getattr(self, "pending_intrabar_reviews", [])[-50:]),
+                "recent_reviews": list(getattr(self, "recent_intrabar_reviews", [])[-50:]),
+            },
             "gate_history": self.gate_provider.to_records(max_rows=max(BAR_HISTORY * 2, 400)),
         }
 
@@ -1272,6 +2345,18 @@ class LiveTradingBot:
         self.last_bar_time = int(max(0, payload.get("last_bar_time", self.last_bar_time)))
         self.last_known_ticket = int(max(0, payload.get("last_known_ticket", self.last_known_ticket)))
         self.gate_provider.load_records(payload.get("gate_history", []))
+        intrabar_state = payload.get("intrabar", {})
+        if isinstance(intrabar_state, dict):
+            pending_reviews = intrabar_state.get("pending_reviews", [])
+            recent_reviews = intrabar_state.get("recent_reviews", [])
+            if isinstance(pending_reviews, list):
+                self.pending_intrabar_reviews = [
+                    dict(row) for row in pending_reviews[-50:] if isinstance(row, dict)
+                ]
+            if isinstance(recent_reviews, list):
+                self.recent_intrabar_reviews = [
+                    dict(row) for row in recent_reviews[-50:] if isinstance(row, dict)
+                ]
 
         runtime_cfg = payload.get("runtime_config", {})
         if isinstance(runtime_cfg, dict):
@@ -1291,6 +2376,39 @@ class LiveTradingBot:
             return mt5.ORDER_FILLING_IOC
         return mt5.ORDER_FILLING_RETURNAL
 
+    def _is_managed_magic(self, raw_magic) -> bool:
+        try:
+            magic = int(raw_magic or 0)
+        except Exception:
+            magic = 0
+        allowed = set(int(v) for v in (LIVE_MANAGED_MAGIC_SET or set()))
+        if len(allowed) == 0:
+            return True
+        return int(magic) in allowed
+
+    def _is_performance_magic(self, raw_magic) -> bool:
+        try:
+            magic = int(raw_magic or 0)
+        except Exception:
+            magic = 0
+        allowed = set(int(v) for v in (LIVE_PERFORMANCE_MAGIC_SET or set()))
+        if len(allowed) == 0:
+            return True
+        return int(magic) in allowed
+
+    def _filter_managed_symbol_positions(self, positions):
+        if not positions:
+            return []
+        out = []
+        symbol_upper = str(SYMBOL or "").upper()
+        for p in positions:
+            if str(getattr(p, "symbol", "")).upper() != symbol_upper:
+                continue
+            if not self._is_managed_magic(getattr(p, "magic", 0)):
+                continue
+            out.append(p)
+        return out
+
     def _get_symbol_positions_safe(self):
         retries = 2
         for attempt in range(retries + 1):
@@ -1299,31 +2417,344 @@ class LiveTradingBot:
                 if attempt < retries:
                     time.sleep(0.05)
                 continue
-            if len(positions) == 0 and self.last_known_ticket != 0 and attempt < retries:
+
+            managed = self._filter_managed_symbol_positions(list(positions))
+            if len(managed) == 0 and self.last_known_ticket != 0 and attempt < retries:
                 time.sleep(0.05)
                 continue
-            return list(positions)
+            return managed
+
         last_err = self._safe_last_error()
         if self._is_mt5_ipc_error(last_err):
             self._try_reconnect_mt5(reason="positions_get")
             try:
                 positions = mt5.positions_get(symbol=SYMBOL)
                 if positions is not None:
-                    return list(positions)
+                    return self._filter_managed_symbol_positions(list(positions))
             except Exception:
                 pass
         try:
             all_positions = mt5.positions_get()
             if all_positions:
-                filtered = [
-                    p
-                    for p in all_positions
-                    if str(getattr(p, "symbol", "")).upper() == SYMBOL.upper()
-                ]
-                return list(filtered)
+                return self._filter_managed_symbol_positions(list(all_positions))
         except Exception:
             pass
         return []
+
+    def _collect_recent_closed_deals(self, expected_tickets=None, force_lookback_sec: int | None = None):
+        now_utc = datetime.now(timezone.utc)
+        history_end_utc = self._history_deals_end_utc(now_utc)
+        cursor_msc = int(getattr(self, "_closed_deal_cursor_msc", 0) or 0)
+        use_cursor = True
+        if isinstance(force_lookback_sec, int) and force_lookback_sec > 0:
+            use_cursor = False
+            start_utc = now_utc - timedelta(seconds=int(force_lookback_sec))
+        elif cursor_msc > 0:
+            start_utc = datetime.fromtimestamp(max(0, cursor_msc - 5000) / 1000.0, tz=timezone.utc)
+        else:
+            start_utc = now_utc - timedelta(days=3)
+
+        try:
+            deals = mt5.history_deals_get(start_utc, history_end_utc)
+        except Exception as exc:
+            print(f" WS state: history_deals_get failed: {exc}")
+            deals = None
+
+        if deals is None:
+            last_err = self._safe_last_error()
+            if self._is_mt5_ipc_error(last_err):
+                self._try_reconnect_mt5(reason="history_deals_get")
+            return []
+
+        expected = set()
+        if expected_tickets:
+            for raw_ticket in expected_tickets:
+                try:
+                    ticket = int(raw_ticket or 0)
+                except Exception:
+                    ticket = 0
+                if ticket > 0:
+                    expected.add(ticket)
+
+        entry_out_values = set()
+        for name in ("DEAL_ENTRY_OUT", "DEAL_ENTRY_OUT_BY", "DEAL_ENTRY_INOUT"):
+            value = getattr(mt5, name, None)
+            if value is not None:
+                entry_out_values.add(int(value))
+
+        latest_by_ticket = {}
+        max_seen_msc = cursor_msc
+        symbol_upper = str(SYMBOL or "").upper()
+
+        for deal in deals:
+            deal_symbol = str(getattr(deal, "symbol", "") or "").upper()
+            if deal_symbol != symbol_upper:
+                continue
+            if not self._is_performance_magic(getattr(deal, "magic", 0)):
+                continue
+
+            entry = int(getattr(deal, "entry", -999) or -999)
+            if entry_out_values and entry not in entry_out_values:
+                continue
+
+            ticket = int(getattr(deal, "position_id", 0) or 0)
+            if ticket <= 0:
+                ticket = int(getattr(deal, "order", 0) or 0)
+            if ticket <= 0:
+                ticket = int(getattr(deal, "ticket", 0) or 0)
+            if ticket <= 0:
+                continue
+
+            if expected and ticket not in expected:
+                continue
+
+            close_time_msc = int(getattr(deal, "time_msc", 0) or 0)
+            if close_time_msc <= 0:
+                close_time_msc = int(getattr(deal, "time", 0) or 0) * 1000
+            if close_time_msc <= 0:
+                continue
+            if use_cursor and cursor_msc > 0 and close_time_msc < cursor_msc:
+                continue
+
+            close_dt = datetime.fromtimestamp(close_time_msc / 1000.0, tz=timezone.utc)
+            payload = {
+                "ticket": ticket,
+                "symbol": deal_symbol or symbol_upper,
+                "magic": int(getattr(deal, "magic", 0) or 0),
+                "volume": float(getattr(deal, "volume", 0.0) or 0.0),
+                "closePrice": float(getattr(deal, "price", 0.0) or 0.0),
+                "profit": float(getattr(deal, "profit", 0.0) or 0.0),
+                "swap": float(getattr(deal, "swap", 0.0) or 0.0),
+                "commission": float(getattr(deal, "commission", 0.0) or 0.0),
+                "closeTime": close_dt.isoformat(),
+                "closeTimeMsc": close_time_msc,
+            }
+
+            previous = latest_by_ticket.get(ticket)
+            if not previous or int(previous.get("closeTimeMsc", 0) or 0) <= close_time_msc:
+                latest_by_ticket[ticket] = payload
+
+            if close_time_msc > max_seen_msc:
+                max_seen_msc = close_time_msc
+
+        if use_cursor and max_seen_msc > cursor_msc:
+            self._closed_deal_cursor_msc = max_seen_msc + 1
+
+        rows = sorted(
+            list(latest_by_ticket.values()),
+            key=lambda row: int(row.get("closeTimeMsc", 0) or 0),
+            reverse=True,
+        )
+        if len(rows) > 200:
+            rows = rows[:200]
+        return rows
+
+    def _deal_entry_out_values(self):
+        values = set()
+        for name in ("DEAL_ENTRY_OUT", "DEAL_ENTRY_OUT_BY", "DEAL_ENTRY_INOUT"):
+            value = getattr(mt5, name, None)
+            if value is not None:
+                values.add(int(value))
+        return values
+
+    def _resolve_deal_ticket(self, deal) -> int:
+        ticket = int(getattr(deal, "position_id", 0) or 0)
+        if ticket <= 0:
+            ticket = int(getattr(deal, "order", 0) or 0)
+        if ticket <= 0:
+            ticket = int(getattr(deal, "ticket", 0) or 0)
+        return int(ticket)
+
+    def _history_deals_end_utc(self, now_utc: datetime | None = None) -> datetime:
+        end_utc = now_utc if isinstance(now_utc, datetime) else datetime.now(timezone.utc)
+        if end_utc.tzinfo is None:
+            end_utc = end_utc.replace(tzinfo=timezone.utc)
+        ahead_hours = max(0.0, float(getattr(self, "mt5_history_end_ahead_hours", 0.0) or 0.0))
+        if ahead_hours <= 0.0:
+            return end_utc
+        return end_utc + timedelta(hours=ahead_hours)
+
+    def _fetch_managed_closed_deal_events(self, start_utc: datetime, end_utc: datetime):
+        try:
+            deals = mt5.history_deals_get(start_utc, end_utc)
+        except Exception as exc:
+            print(f" Performance sync: history_deals_get failed: {exc}")
+            deals = None
+
+        if deals is None:
+            last_err = self._safe_last_error()
+            if self._is_mt5_ipc_error(last_err):
+                self._try_reconnect_mt5(reason="history_perf_sync")
+            return None
+
+        entry_out_values = self._deal_entry_out_values()
+        symbol_upper = str(SYMBOL or "").upper()
+        scope = str(LIVE_PERFORMANCE_SCOPE or "symbol").strip().lower()
+        include_all_symbols = scope == "account"
+        events = []
+
+        for deal in deals:
+            if not include_all_symbols and str(getattr(deal, "symbol", "") or "").upper() != symbol_upper:
+                continue
+            if not self._is_performance_magic(getattr(deal, "magic", 0)):
+                continue
+
+            entry = int(getattr(deal, "entry", -999) or -999)
+            if entry_out_values and entry not in entry_out_values:
+                continue
+
+            deal_id = int(getattr(deal, "ticket", 0) or 0)
+            if deal_id <= 0:
+                continue
+
+            ticket = self._resolve_deal_ticket(deal)
+            if ticket <= 0:
+                continue
+
+            close_time_msc = int(getattr(deal, "time_msc", 0) or 0)
+            if close_time_msc <= 0:
+                close_time_msc = int(getattr(deal, "time", 0) or 0) * 1000
+            if close_time_msc <= 0:
+                continue
+
+            net_pnl = (
+                float(getattr(deal, "profit", 0.0) or 0.0)
+                + float(getattr(deal, "commission", 0.0) or 0.0)
+                + float(getattr(deal, "swap", 0.0) or 0.0)
+            )
+            events.append(
+                {
+                    "deal_id": int(deal_id),
+                    "ticket": int(ticket),
+                    "close_time_msc": int(close_time_msc),
+                    "net_pnl": float(net_pnl),
+                }
+            )
+
+        return events
+
+    def _apply_mt5_performance_stats(self):
+        if self.bridge is None:
+            return
+        trade_nets = [float(value) for value in dict(self._perf_ticket_net or {}).values()]
+        self.bridge.trades = int(len(trade_nets))
+        self.bridge.wins = int(sum(1 for value in trade_nets if value > 1e-9))
+        self.bridge.total_pnl = float(sum(trade_nets))
+
+    def _sync_performance_from_mt5_history(
+        self,
+        force: bool = False,
+        full_resync: bool = False,
+        reason: str = "periodic",
+    ) -> bool:
+        if self.bridge is None:
+            return False
+
+        now_epoch = time.time()
+        interval_sec = max(5.0, float(LIVE_PERFORMANCE_SYNC_INTERVAL_SEC))
+        if (
+            not force
+            and float(getattr(self, "_perf_last_sync_at", 0.0) or 0.0) > 0.0
+            and (now_epoch - float(self._perf_last_sync_at)) < interval_sec
+        ):
+            return False
+
+        prev_stats = (
+            int(getattr(self.bridge, "trades", 0) or 0),
+            int(getattr(self.bridge, "wins", 0) or 0),
+            float(getattr(self.bridge, "total_pnl", 0.0) or 0.0),
+        )
+
+        now_utc = datetime.now(timezone.utc)
+        history_end_utc = self._history_deals_end_utc(now_utc)
+        mode = "incremental"
+        updates = 0
+
+        if bool(full_resync) or not bool(getattr(self, "_perf_seeded", False)):
+            mode = "full"
+            lookback_days = max(30, int(LIVE_PERFORMANCE_BOOT_LOOKBACK_DAYS))
+            start_utc = now_utc - timedelta(days=int(lookback_days))
+            events = self._fetch_managed_closed_deal_events(start_utc, history_end_utc)
+            self._perf_last_sync_at = now_epoch
+            if events is None:
+                return False
+
+            events = sorted(events, key=lambda row: int(row.get("close_time_msc", 0) or 0))
+            next_seen = set()
+            next_ticket_net = {}
+            max_seen_msc = 0
+            for row in events:
+                deal_id = int(row.get("deal_id", 0) or 0)
+                ticket = int(row.get("ticket", 0) or 0)
+                close_time_msc = int(row.get("close_time_msc", 0) or 0)
+                net_pnl = float(row.get("net_pnl", 0.0) or 0.0)
+                if deal_id <= 0 or ticket <= 0:
+                    continue
+                next_seen.add(deal_id)
+                next_ticket_net[ticket] = float(next_ticket_net.get(ticket, 0.0) or 0.0) + net_pnl
+                if close_time_msc > max_seen_msc:
+                    max_seen_msc = close_time_msc
+                updates += 1
+
+            self._perf_deal_seen = next_seen
+            self._perf_ticket_net = next_ticket_net
+            self._perf_cursor_msc = int(max_seen_msc + 1) if max_seen_msc > 0 else int(now_utc.timestamp() * 1000) + 1
+            self._perf_seeded = True
+        else:
+            cursor_msc = int(getattr(self, "_perf_cursor_msc", 0) or 0)
+            if cursor_msc > 0:
+                start_utc = datetime.fromtimestamp(max(0, cursor_msc - 5000) / 1000.0, tz=timezone.utc)
+            else:
+                start_utc = now_utc - timedelta(days=1)
+            events = self._fetch_managed_closed_deal_events(start_utc, history_end_utc)
+            self._perf_last_sync_at = now_epoch
+            if events is None:
+                return False
+
+            events = sorted(events, key=lambda row: int(row.get("close_time_msc", 0) or 0))
+            max_seen_msc = int(cursor_msc)
+            for row in events:
+                deal_id = int(row.get("deal_id", 0) or 0)
+                ticket = int(row.get("ticket", 0) or 0)
+                close_time_msc = int(row.get("close_time_msc", 0) or 0)
+                net_pnl = float(row.get("net_pnl", 0.0) or 0.0)
+                if deal_id <= 0 or ticket <= 0:
+                    continue
+                if deal_id in self._perf_deal_seen:
+                    continue
+                self._perf_deal_seen.add(deal_id)
+                self._perf_ticket_net[ticket] = float(self._perf_ticket_net.get(ticket, 0.0) or 0.0) + net_pnl
+                if close_time_msc > max_seen_msc:
+                    max_seen_msc = close_time_msc
+                updates += 1
+
+            if max_seen_msc > cursor_msc:
+                self._perf_cursor_msc = int(max_seen_msc + 1)
+
+        self._apply_mt5_performance_stats()
+        next_stats = (
+            int(getattr(self.bridge, "trades", 0) or 0),
+            int(getattr(self.bridge, "wins", 0) or 0),
+            float(getattr(self.bridge, "total_pnl", 0.0) or 0.0),
+        )
+        changed = bool(prev_stats != next_stats)
+        if full_resync or changed or updates > 0:
+            self._add_log(
+                "info",
+                f"Performance sync ({mode}) trades={next_stats[0]} wins={next_stats[1]} pnl={next_stats[2]:+.2f}",
+                phase="mt5",
+                event="performance_sync",
+                meta={
+                    "mode": mode,
+                    "reason": str(reason),
+                    "scope": str(LIVE_PERFORMANCE_SCOPE),
+                    "magic_set": ",".join(str(int(v)) for v in sorted(set(LIVE_PERFORMANCE_MAGIC_SET or set()))),
+                    "updates": int(updates),
+                    "tickets": int(len(self._perf_ticket_net)),
+                    "deals_seen": int(len(self._perf_deal_seen)),
+                },
+            )
+        return changed or updates > 0
 
     def _get_mt5_position(self):
         positions = self._get_symbol_positions_safe()
@@ -1405,8 +2836,7 @@ class LiveTradingBot:
 
                 ticket = int(getattr(o, "ticket", 0) or 0)
                 magic = int(getattr(o, "magic", 0) or 0)
-                # Startup block should react only to this bot (or manual=0) orders.
-                if magic not in (0, int(MAGIC_NUMBER)):
+                if not self._is_managed_magic(magic):
                     foreign_order_count += 1
                     continue
                 if ticket > 0:
@@ -1448,7 +2878,6 @@ class LiveTradingBot:
         if self.sync_account_state and account is not None:
             self.bridge.balance = float(account.balance)
             self.bridge.equity = float(account.equity)
-            self.bridge.total_pnl = float(account.balance - self.initial_balance)
             self.bridge.max_equity = max(float(self.bridge.max_equity), float(self.bridge.equity))
         else:
             self.bridge.max_equity = max(float(self.bridge.max_equity), float(self.bridge.equity))
@@ -1472,6 +2901,7 @@ class LiveTradingBot:
 
         self.current_lot = self.bridge.lot_size
         self.last_known_ticket = current_ticket
+        self._sync_performance_from_mt5_history(force=False, full_resync=False, reason="bridge_heartbeat")
 
     def _fetch_window(self, bar_end_ts: int):
         rates = None
@@ -1894,13 +3324,13 @@ class LiveTradingBot:
             )
 
     def close_all(self):
-        positions = mt5.positions_get(symbol=SYMBOL)
-        if positions is None:
+        raw_positions = mt5.positions_get(symbol=SYMBOL)
+        if raw_positions is None:
             last_err = self._safe_last_error()
             if self._is_mt5_ipc_error(last_err):
                 self._try_reconnect_mt5(reason="close_all:positions_get")
-                positions = mt5.positions_get(symbol=SYMBOL)
-        if positions is None:
+                raw_positions = mt5.positions_get(symbol=SYMBOL)
+        if raw_positions is None:
             self._add_log(
                 "warning",
                 "Close skipped: positions_get returned None",
@@ -1908,6 +3338,8 @@ class LiveTradingBot:
                 event="close_skipped",
             )
             return False
+
+        positions = self._filter_managed_symbol_positions(list(raw_positions))
         if len(positions) == 0:
             self._add_log(
                 "info",
@@ -1916,6 +3348,9 @@ class LiveTradingBot:
                 event="close_no_positions",
             )
             return True
+
+        if not self._ensure_trade_allowed_before_order(reason="close_all", action_label="Close order"):
+            return False
 
         all_ok = True
         for pos in positions:
@@ -2078,7 +3513,352 @@ class LiveTradingBot:
             return self._last_status_tick, True
         return None, False
 
+    def _resolve_bar_close_exit_price(
+        self,
+        *,
+        bar_end_ts: int,
+        side: str,
+        fallback_close_price: float,
+    ) -> tuple[float, str, int]:
+        side_upper = str(side or "").upper()
+        close_price = float(fallback_close_price or 0.0)
+        tick_price_key = "bid" if side_upper == "LONG" else "ask"
+
+        try:
+            mt5.symbol_select(SYMBOL, True)
+        except Exception:
+            pass
+
+        ticks = None
+        try:
+            end_dt = datetime.fromtimestamp(int(bar_end_ts), tz=timezone.utc)
+            start_dt = end_dt - timedelta(seconds=5)
+            scan_end_dt = end_dt + timedelta(seconds=2)
+            ticks = mt5.copy_ticks_range(SYMBOL, start_dt, scan_end_dt, mt5.COPY_TICKS_ALL)
+        except Exception:
+            ticks = None
+
+        if ticks is not None and len(ticks) > 0:
+            try:
+                tdf = pd.DataFrame(ticks)
+                if "time_msc" in tdf.columns:
+                    tdf["tick_msc"] = pd.to_numeric(tdf["time_msc"], errors="coerce").fillna(0).astype("int64")
+                elif "time" in tdf.columns:
+                    tdf["tick_msc"] = (pd.to_numeric(tdf["time"], errors="coerce").fillna(0) * 1000).astype("int64")
+                else:
+                    tdf["tick_msc"] = 0
+                tdf = tdf.sort_values("tick_msc").reset_index(drop=True)
+                cutoff_msc = int(bar_end_ts) * 1000
+                usable = tdf[pd.to_numeric(tdf.get(tick_price_key), errors="coerce").fillna(0.0) > 0.0].copy()
+                if len(usable) > 0:
+                    at_or_before = usable[usable["tick_msc"] <= cutoff_msc]
+                    if len(at_or_before) > 0:
+                        row = at_or_before.iloc[-1]
+                        return float(row[tick_price_key]), f"tick_{tick_price_key}_at_or_before_close", int(row["tick_msc"])
+                    after = usable[usable["tick_msc"] > cutoff_msc]
+                    if len(after) > 0:
+                        row = after.iloc[0]
+                        return float(row[tick_price_key]), f"tick_{tick_price_key}_after_close", int(row["tick_msc"])
+            except Exception:
+                pass
+
+        if close_price > 0.0:
+            if side_upper == "SHORT":
+                return float(close_price + (self.pip_size * SPREAD_PIPS)), "bar_close_plus_spread_estimate", 0
+            return float(close_price), "bar_close_bid_fallback", 0
+
+        return 0.0, "unavailable", 0
+
+    def _queue_intrabar_review(
+        self,
+        *,
+        pos,
+        current_bar_time: int,
+        exit_time_ts: int,
+        side: str,
+        entry_price: float,
+        exit_price: float,
+        change_pct: float,
+        pnl_pips: float,
+        pnl_money: float,
+        trigger_reasons: list[str],
+    ) -> None:
+        review_bar_end_ts = int(current_bar_time + self.timeframe_seconds)
+        event_ts = int(exit_time_ts or time.time())
+        record = {
+            "review_id": f"{int(getattr(pos, 'ticket', 0) or 0)}:{review_bar_end_ts}:{event_ts}",
+            "ticket": int(getattr(pos, "ticket", 0) or 0),
+            "side": str(side),
+            "volume": float(getattr(pos, "volume", 0.0) or 0.0),
+            "bar_open_ts": int(current_bar_time),
+            "bar_open_utc": datetime.fromtimestamp(current_bar_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+            "bar_end_ts": int(review_bar_end_ts),
+            "bar_end_utc": datetime.fromtimestamp(review_bar_end_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+            "triggered_at_ts": int(event_ts),
+            "triggered_at_utc": datetime.fromtimestamp(event_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+            "entry_price": float(entry_price),
+            "actual_exit_price": float(exit_price),
+            "actual_change_pct": float(change_pct),
+            "actual_pnl_pips": float(pnl_pips),
+            "actual_pnl_money": float(pnl_money),
+            "trigger_reasons": [str(x) for x in list(trigger_reasons or []) if str(x).strip()],
+        }
+        pending = list(getattr(self, "pending_intrabar_reviews", []) or [])
+        pending.append(record)
+        self.pending_intrabar_reviews = pending[-50:]
+        self._add_log(
+            "info",
+            "Intrabar exit queued for candle-close review",
+            phase="intrabar",
+            event="review_pending",
+            meta={
+                "ticket": int(getattr(pos, "ticket", 0) or 0),
+                "side": str(side),
+                "bar_end_utc": str(record.get("bar_end_utc", "")),
+                "triggered_at_utc": str(record.get("triggered_at_utc", "")),
+                "actual_change_pct": float(change_pct),
+                "actual_pnl_pips": float(pnl_pips),
+                "actual_pnl_money": float(pnl_money),
+                "reasons": " | ".join(record["trigger_reasons"]),
+            },
+        )
+        self._save_runtime_state(reason="intrabar_review_pending")
+
+    def _review_intrabar_exits_at_bar_close(self, bar_end_ts: int, window_df: pd.DataFrame) -> None:
+        pending = list(getattr(self, "pending_intrabar_reviews", []) or [])
+        if not pending or window_df is None or len(window_df) <= 0:
+            return
+
+        try:
+            bar_close_price = float(window_df.iloc[-1]["close"])
+        except Exception:
+            return
+        if bar_close_price <= 0.0:
+            return
+
+        still_pending = []
+        completed = list(getattr(self, "recent_intrabar_reviews", []) or [])
+        bar_end_utc = datetime.fromtimestamp(int(bar_end_ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+        for row in pending:
+            if not isinstance(row, dict):
+                continue
+            target_bar_end_ts = int(row.get("bar_end_ts", 0) or 0)
+            if target_bar_end_ts <= 0:
+                continue
+            if target_bar_end_ts > int(bar_end_ts):
+                still_pending.append(dict(row))
+                continue
+
+            side = str(row.get("side", "")).upper()
+            direction = 1.0 if side == "LONG" else -1.0
+            entry_price = float(row.get("entry_price", 0.0) or 0.0)
+            if entry_price <= 0.0:
+                continue
+
+            volume = max(0.0, float(row.get("volume", 0.0) or 0.0))
+            hold_exit_price, hold_exit_source, hold_exit_tick_msc = self._resolve_bar_close_exit_price(
+                bar_end_ts=target_bar_end_ts,
+                side=side,
+                fallback_close_price=bar_close_price,
+            )
+            if hold_exit_price <= 0.0:
+                continue
+            hold_change_pct = float(
+                direction * (hold_exit_price - entry_price) / max(entry_price, 1e-10) * 100.0
+            )
+            hold_pnl_pips = float(direction * (hold_exit_price - entry_price) / max(self.pip_size, 1e-10))
+            hold_pnl_money = float(hold_pnl_pips * PIP_VALUE * volume)
+
+            actual_change_pct = float(row.get("actual_change_pct", 0.0) or 0.0)
+            actual_pnl_pips = float(row.get("actual_pnl_pips", 0.0) or 0.0)
+            actual_pnl_money = float(row.get("actual_pnl_money", 0.0) or 0.0)
+
+            delta_change_pct = float(hold_change_pct - actual_change_pct)
+            delta_pips = float(hold_pnl_pips - actual_pnl_pips)
+            delta_money = float(hold_pnl_money - actual_pnl_money)
+
+            if delta_money > 1e-9:
+                outcome = "hold_better"
+            elif delta_money < -1e-9:
+                outcome = "intrabar_better"
+            else:
+                outcome = "flat"
+
+            reviewed = dict(row)
+            reviewed.update(
+                {
+                    "reviewed_at_bar_end_ts": int(bar_end_ts),
+                    "reviewed_at_bar_end_utc": bar_end_utc,
+                    "review_late": bool(target_bar_end_ts < int(bar_end_ts)),
+                    "bar_close_price": float(bar_close_price),
+                    "bar_close_exit_price": float(hold_exit_price),
+                    "bar_close_exit_source": str(hold_exit_source),
+                    "bar_close_exit_tick_msc": int(hold_exit_tick_msc),
+                    "hold_to_close_change_pct": float(hold_change_pct),
+                    "hold_to_close_pnl_pips": float(hold_pnl_pips),
+                    "hold_to_close_pnl_money": float(hold_pnl_money),
+                    "delta_vs_hold_change_pct": float(delta_change_pct),
+                    "delta_vs_hold_pips": float(delta_pips),
+                    "delta_vs_hold_money": float(delta_money),
+                    "review_outcome": str(outcome),
+                }
+            )
+            completed.append(reviewed)
+
+            print(
+                "\n [INTRABAR][REVIEW] "
+                f"ticket={int(reviewed.get('ticket', 0) or 0)} "
+                f"source={hold_exit_source} "
+                f"actual={actual_change_pct:+.3f}%/{actual_pnl_money:+.2f} "
+                f"bar_close={hold_change_pct:+.3f}%/{hold_pnl_money:+.2f} "
+                f"delta={delta_money:+.2f} outcome={outcome}"
+            )
+            self._add_log(
+                "analysis",
+                f"Intrabar review {outcome}: actual={actual_pnl_money:+.2f} vs close={hold_pnl_money:+.2f}",
+                phase="intrabar",
+                event="review",
+                meta={
+                    "ticket": int(reviewed.get("ticket", 0) or 0),
+                    "bar_close_exit_source": str(hold_exit_source),
+                    "bar_close_exit_tick_msc": int(hold_exit_tick_msc),
+                    "actual_change_pct": float(actual_change_pct),
+                    "actual_pnl_money": float(actual_pnl_money),
+                    "hold_to_close_change_pct": float(hold_change_pct),
+                    "hold_to_close_pnl_money": float(hold_pnl_money),
+                    "delta_vs_hold_money": float(delta_money),
+                    "delta_vs_hold_pips": float(delta_pips),
+                    "outcome": str(outcome),
+                    "review_late": bool(reviewed.get("review_late", False)),
+                },
+            )
+
+        self.pending_intrabar_reviews = still_pending[-50:]
+        self.recent_intrabar_reviews = completed[-50:]
+
+    def _maybe_take_profit_intrabar(self, current_bar_time: int) -> bool:
+        if current_bar_time <= 0 or current_bar_time != self.last_bar_time:
+            return False
+        if (
+            self.intrabar_take_profit_change_pct <= 0.0
+            and self.intrabar_take_profit_pips <= 0.0
+            and self.intrabar_take_profit_money <= 0.0
+        ):
+            return False
+
+        current_pos, pos = self._get_mt5_position()
+        if current_pos == 0 or pos is None:
+            return False
+
+        tick_data, stale_tick = self._get_status_tick()
+        if tick_data is None:
+            return False
+
+        tick_time_ts = int(tick_data.get("time", 0) or 0)
+        now_epoch = int(time.time())
+        stale_age_sec = max(0, now_epoch - tick_time_ts) if tick_time_ts > 0 else 999999
+        max_stale_sec = max(5, int(round(float(POLL_SECONDS) * 3.0)))
+        if stale_tick and stale_age_sec > max_stale_sec:
+            return False
+
+        entry_price = float(getattr(pos, "price_open", 0.0) or 0.0)
+        if entry_price <= 0.0:
+            return False
+
+        exit_price = float(tick_data.get("bid", 0.0) if current_pos == 1 else tick_data.get("ask", 0.0))
+        if exit_price <= 0.0:
+            return False
+
+        change_pct = float(current_pos * (exit_price - entry_price) / max(entry_price, 1e-10) * 100.0)
+        pnl_pips = float(current_pos * (exit_price - entry_price) / max(self.pip_size, 1e-10))
+        pnl_money = float(getattr(pos, "profit", 0.0) or 0.0)
+
+        hit_reasons = []
+        if (
+            self.intrabar_take_profit_change_pct > 0.0
+            and change_pct >= self.intrabar_take_profit_change_pct
+        ):
+            hit_reasons.append(
+                f"change {change_pct:.3f}%>={self.intrabar_take_profit_change_pct:.3f}%"
+            )
+        if self.intrabar_take_profit_pips > 0.0 and pnl_pips >= self.intrabar_take_profit_pips:
+            hit_reasons.append(f"pips {pnl_pips:.1f}>={self.intrabar_take_profit_pips:.1f}")
+        if self.intrabar_take_profit_money > 0.0 and pnl_money >= self.intrabar_take_profit_money:
+            hit_reasons.append(f"money {pnl_money:.2f}>={self.intrabar_take_profit_money:.2f}")
+        if not hit_reasons:
+            return False
+
+        side = "LONG" if current_pos == 1 else "SHORT"
+        print(
+            "\n [INTRABAR] take-profit hit -> close "
+            f"| side={side} | price={exit_price:.{self.digits}f} "
+            f"| change={change_pct:+.3f}% | pips={pnl_pips:+.1f} | pnl={pnl_money:+.2f} "
+            f"| trigger={' ; '.join(hit_reasons)}"
+        )
+        self._add_log(
+            "action",
+            "Intrabar take-profit hit -> closing position",
+            phase="intrabar",
+            event="take_profit_hit",
+            meta={
+                "side": side,
+                "ticket": int(getattr(pos, "ticket", 0) or 0),
+                "price": float(exit_price),
+                "change_pct": float(change_pct),
+                "pnl_pips": float(pnl_pips),
+                "pnl_money": float(pnl_money),
+                "reasons": " | ".join(hit_reasons),
+            },
+        )
+        if not self.close_all():
+            return False
+
+        self._queue_intrabar_review(
+            pos=pos,
+            current_bar_time=int(current_bar_time),
+            exit_time_ts=int(tick_time_ts or now_epoch),
+            side=side,
+            entry_price=float(entry_price),
+            exit_price=float(exit_price),
+            change_pct=float(change_pct),
+            pnl_pips=float(pnl_pips),
+            pnl_money=float(pnl_money),
+            trigger_reasons=hit_reasons,
+        )
+        self.last_action = "CLOSE"
+        return True
+
+    def _reset_intrabar_cooldown_if_flattened(self, prev_bridge_pos: int, current_bar_time: int):
+        if self.bridge is None:
+            return
+        if prev_bridge_pos == 0 or int(self.bridge.position) != 0:
+            return
+        if current_bar_time <= 0 or current_bar_time != self.last_bar_time:
+            return
+
+        if int(self.bridge.trade_cooldown) != 0 or bool(self.bridge.first_bar):
+            print("\n [INTRABAR] flat before next candle -> reset cooldown for next prediction")
+            self._add_log(
+                "info",
+                "Intrabar exit detected -> reset cooldown for next candle",
+                phase="intrabar",
+                event="cooldown_reset",
+                meta={"bar_time": int(current_bar_time)},
+            )
+
+        self.bridge.trade_cooldown = 0
+        self.bridge.first_bar = False
+        self.last_action = "CLOSE"
+        self._save_runtime_state(reason="intrabar_flat")
+
     def send_order(self, order_type):
+        if not self._ensure_trade_allowed_before_order(
+            reason="open_buy" if order_type == mt5.ORDER_TYPE_BUY else "open_sell",
+            action_label="Open order",
+        ):
+            return False
+
         tick = self._get_trade_tick()
         if tick is None:
             print(" Order Skipped: no live tick (market closed or quote unavailable)")
@@ -2091,6 +3871,7 @@ class LiveTradingBot:
             )
             return False
 
+        side = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
         if self.dynamic_lot:
@@ -2119,6 +3900,30 @@ class LiveTradingBot:
             "type_filling": self._get_filling_mode(),
         }
 
+        funds_ok, funds_meta = self._precheck_open_order_funds(req, side=side)
+        if not funds_ok:
+            reason = str((funds_meta or {}).get("reason") or "Insufficient funds/margin").strip()
+            retcode_name = str((funds_meta or {}).get("retcode_name") or "").strip()
+            print(f" Order Blocked: {reason}")
+            self._add_log(
+                "warning",
+                reason,
+                phase="order",
+                event="open_blocked_insufficient_funds",
+                meta={
+                    "side": side,
+                    "lot": float(self.current_lot),
+                    "price": float(price),
+                    "retcode": str((funds_meta or {}).get("retcode") or ""),
+                    "retcode_name": retcode_name,
+                    "balance": float((funds_meta or {}).get("balance") or 0.0),
+                    "free_margin": float((funds_meta or {}).get("free_margin") or 0.0),
+                    "required_margin": float((funds_meta or {}).get("required_margin") or 0.0),
+                    "reason": reason,
+                },
+            )
+            return False
+
         def _refresh_open_price():
             retry_tick = self._get_trade_tick()
             if retry_tick is None:
@@ -2131,7 +3936,6 @@ class LiveTradingBot:
             refresh_price_fn=_refresh_open_price,
         )
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-            side = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
             price = float(req.get("price", price))
             if self.bridge is not None:
                 self.bridge.lot_size = float(self.current_lot)
@@ -2155,12 +3959,29 @@ class LiveTradingBot:
                 if isinstance(last_err, tuple) and len(last_err) >= 2:
                     comment = f"{comment} | mt5_error={last_err[0]}:{last_err[1]}"
             print(f" Order Failed: {comment}")
+            retcode = getattr(res, "retcode", None) if res is not None else None
+            retcode_name = self._trade_retcode_name(retcode)
+            is_no_money = self._is_insufficient_funds_result(retcode, comment)
+            is_autotrading_disabled = self._is_autotrading_disabled_result(retcode, comment)
+            if is_no_money:
+                event_name = "open_failed_insufficient_funds"
+            elif is_autotrading_disabled:
+                event_name = "open_failed_autotrading_disabled"
+            else:
+                event_name = "open_failed"
             self._add_log(
                 "warning",
                 f"Order failed: {comment}",
                 phase="order",
-                event="open_failed",
-                meta={"reason": str(comment)},
+                event=event_name,
+                meta={
+                    "side": side,
+                    "lot": float(self.current_lot),
+                    "price": float(price),
+                    "retcode": str(retcode or ""),
+                    "retcode_name": retcode_name,
+                    "reason": str(comment),
+                },
             )
             return False
 
@@ -2342,6 +4163,7 @@ class LiveTradingBot:
             )
             return
 
+        self._review_intrabar_exits_at_bar_close(bar_end_ts, window_df)
         self._wait_until_real_semantic_ready(window_df)
 
         delta_tick, delta_price, delta_note = self._calc_delta_for_closed_bar(bar_end_ts, window_df=window_df)
@@ -2548,7 +4370,9 @@ class LiveTradingBot:
         self.connect()
         self._load_model()
         self._load_runtime_state()
+        self._sync_performance_from_mt5_history(force=True, full_resync=True, reason="startup")
         self._sync_bridge_from_mt5()
+        self._prewarm_semantic_on_start()
         if self.bridge is not None:
             print(
                 " [READY] "
@@ -2565,6 +4389,30 @@ class LiveTradingBot:
                     "equity": float(self.bridge.equity),
                     "lot": float(self.bridge.lot_size),
                     "last_bar_time": int(self.last_bar_time),
+                },
+            )
+        if (
+            self.intrabar_take_profit_change_pct > 0.0
+            or self.intrabar_take_profit_pips > 0.0
+            or self.intrabar_take_profit_money > 0.0
+        ):
+            intrabar_parts = []
+            if self.intrabar_take_profit_change_pct > 0.0:
+                intrabar_parts.append(f"change={self.intrabar_take_profit_change_pct:.3f}%")
+            if self.intrabar_take_profit_pips > 0.0:
+                intrabar_parts.append(f"pips={self.intrabar_take_profit_pips:.1f}")
+            if self.intrabar_take_profit_money > 0.0:
+                intrabar_parts.append(f"money={self.intrabar_take_profit_money:.2f}")
+            print(f" [INTRABAR] realtime close active | {' | '.join(intrabar_parts)}")
+            self._add_log(
+                "info",
+                "Intrabar take-profit monitoring active",
+                phase="intrabar",
+                event="enabled",
+                meta={
+                    "take_profit_change_pct": float(self.intrabar_take_profit_change_pct),
+                    "take_profit_pips": float(self.intrabar_take_profit_pips),
+                    "take_profit_money": float(self.intrabar_take_profit_money),
                 },
             )
         self._start_ws_listener()
@@ -2690,8 +4538,12 @@ class LiveTradingBot:
                     if self.last_bar_time != current_bar_time:
                         self.last_bar_time = current_bar_time
                         self._process_closed_bar(current_bar_time, mode="New Candle", execute_orders=True)
+                else:
+                    self._maybe_take_profit_intrabar(current_bar_time)
 
+                prev_bridge_pos = int(self.bridge.position) if self.bridge is not None else 0
                 self._sync_bridge_from_mt5()
+                self._reset_intrabar_cooldown_if_flattened(prev_bridge_pos, current_bar_time)
                 self._push_state_to_server()
                 self._print_status_line(current_bar_time=current_bar_time)
                 time.sleep(POLL_SECONDS)

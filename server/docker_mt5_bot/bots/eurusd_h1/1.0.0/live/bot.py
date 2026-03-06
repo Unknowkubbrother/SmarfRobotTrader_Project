@@ -29,6 +29,9 @@ from .config import (
     ENABLE_CATCHUP_REPLAY,
     EVAL_ON_START,
     EXECUTE_STALE_REPLAY_ORDERS,
+    INTRABAR_TAKE_PROFIT_CHANGE_PCT,
+    INTRABAR_TAKE_PROFIT_MONEY,
+    INTRABAR_TAKE_PROFIT_PIPS,
     LIVE_DYNAMIC_LOT,
     LIVE_SYNC_ACCOUNT_STATE,
     LLM_SEMANTIC_CACHE_FILE,
@@ -134,6 +137,8 @@ class LiveTradingBot:
         self._perf_seeded = False
         self._perf_deal_seen = set()
         self._perf_ticket_net = {}
+        self.pending_intrabar_reviews = []
+        self.recent_intrabar_reviews = []
         self._sem_retry_not_before = {}  # ts_key -> epoch seconds
         self.last_action = "HOLD"
         self._last_status_tick = None  # {"bid": float, "ask": float, "time": int}
@@ -148,6 +153,9 @@ class LiveTradingBot:
             20.0,
             float(max(1, int(ORDER_TICK_RETRIES)) * max(0.05, float(ORDER_TICK_RETRY_SEC))),
         )
+        self.intrabar_take_profit_change_pct = float(INTRABAR_TAKE_PROFIT_CHANGE_PCT)
+        self.intrabar_take_profit_pips = float(INTRABAR_TAKE_PROFIT_PIPS)
+        self.intrabar_take_profit_money = float(INTRABAR_TAKE_PROFIT_MONEY)
         self.vision_llm_api_url = str(VISION_LLM_API_URL or "").strip()
         self.vision_llm_embed_text_api_url = str(VISION_LLM_EMBED_TEXT_API_URL or "").strip()
         # Live real-only semantic can take long on model warmup; avoid false timeout loops.
@@ -1765,6 +1773,8 @@ class LiveTradingBot:
             # Logs
             "llm_text": llm_text,
             "recent_logs": list(getattr(self, "recent_logs", [])[-40:]),
+            "pending_intrabar_review_count": int(len(getattr(self, "pending_intrabar_reviews", []) or [])),
+            "recent_intrabar_reviews": list(getattr(self, "recent_intrabar_reviews", [])[-20:]),
             "ws_connected": bool(self._ws_connected),
         }
         try:
@@ -2258,6 +2268,10 @@ class LiveTradingBot:
                 "recent_trade_pips": [float(x) for x in list(self.bridge.recent_trade_pips)],
                 "gate_stats": {k: float(v) for k, v in dict(self.bridge.gate_stats or {}).items()},
             },
+            "intrabar": {
+                "pending_reviews": list(getattr(self, "pending_intrabar_reviews", [])[-50:]),
+                "recent_reviews": list(getattr(self, "recent_intrabar_reviews", [])[-50:]),
+            },
             "gate_history": self.gate_provider.to_records(max_rows=max(BAR_HISTORY * 2, 400)),
         }
 
@@ -2331,6 +2345,18 @@ class LiveTradingBot:
         self.last_bar_time = int(max(0, payload.get("last_bar_time", self.last_bar_time)))
         self.last_known_ticket = int(max(0, payload.get("last_known_ticket", self.last_known_ticket)))
         self.gate_provider.load_records(payload.get("gate_history", []))
+        intrabar_state = payload.get("intrabar", {})
+        if isinstance(intrabar_state, dict):
+            pending_reviews = intrabar_state.get("pending_reviews", [])
+            recent_reviews = intrabar_state.get("recent_reviews", [])
+            if isinstance(pending_reviews, list):
+                self.pending_intrabar_reviews = [
+                    dict(row) for row in pending_reviews[-50:] if isinstance(row, dict)
+                ]
+            if isinstance(recent_reviews, list):
+                self.recent_intrabar_reviews = [
+                    dict(row) for row in recent_reviews[-50:] if isinstance(row, dict)
+                ]
 
         runtime_cfg = payload.get("runtime_config", {})
         if isinstance(runtime_cfg, dict):
@@ -3487,6 +3513,345 @@ class LiveTradingBot:
             return self._last_status_tick, True
         return None, False
 
+    def _resolve_bar_close_exit_price(
+        self,
+        *,
+        bar_end_ts: int,
+        side: str,
+        fallback_close_price: float,
+    ) -> tuple[float, str, int]:
+        side_upper = str(side or "").upper()
+        close_price = float(fallback_close_price or 0.0)
+        tick_price_key = "bid" if side_upper == "LONG" else "ask"
+
+        try:
+            mt5.symbol_select(SYMBOL, True)
+        except Exception:
+            pass
+
+        ticks = None
+        try:
+            end_dt = datetime.fromtimestamp(int(bar_end_ts), tz=timezone.utc)
+            start_dt = end_dt - timedelta(seconds=5)
+            scan_end_dt = end_dt + timedelta(seconds=2)
+            ticks = mt5.copy_ticks_range(SYMBOL, start_dt, scan_end_dt, mt5.COPY_TICKS_ALL)
+        except Exception:
+            ticks = None
+
+        if ticks is not None and len(ticks) > 0:
+            try:
+                tdf = pd.DataFrame(ticks)
+                if "time_msc" in tdf.columns:
+                    tdf["tick_msc"] = pd.to_numeric(tdf["time_msc"], errors="coerce").fillna(0).astype("int64")
+                elif "time" in tdf.columns:
+                    tdf["tick_msc"] = (pd.to_numeric(tdf["time"], errors="coerce").fillna(0) * 1000).astype("int64")
+                else:
+                    tdf["tick_msc"] = 0
+                tdf = tdf.sort_values("tick_msc").reset_index(drop=True)
+                cutoff_msc = int(bar_end_ts) * 1000
+                usable = tdf[pd.to_numeric(tdf.get(tick_price_key), errors="coerce").fillna(0.0) > 0.0].copy()
+                if len(usable) > 0:
+                    at_or_before = usable[usable["tick_msc"] <= cutoff_msc]
+                    if len(at_or_before) > 0:
+                        row = at_or_before.iloc[-1]
+                        return float(row[tick_price_key]), f"tick_{tick_price_key}_at_or_before_close", int(row["tick_msc"])
+                    after = usable[usable["tick_msc"] > cutoff_msc]
+                    if len(after) > 0:
+                        row = after.iloc[0]
+                        return float(row[tick_price_key]), f"tick_{tick_price_key}_after_close", int(row["tick_msc"])
+            except Exception:
+                pass
+
+        if close_price > 0.0:
+            if side_upper == "SHORT":
+                return float(close_price + (self.pip_size * SPREAD_PIPS)), "bar_close_plus_spread_estimate", 0
+            return float(close_price), "bar_close_bid_fallback", 0
+
+        return 0.0, "unavailable", 0
+
+    def _queue_intrabar_review(
+        self,
+        *,
+        pos,
+        current_bar_time: int,
+        exit_time_ts: int,
+        side: str,
+        entry_price: float,
+        exit_price: float,
+        change_pct: float,
+        pnl_pips: float,
+        pnl_money: float,
+        trigger_reasons: list[str],
+    ) -> None:
+        review_bar_end_ts = int(current_bar_time + self.timeframe_seconds)
+        event_ts = int(exit_time_ts or time.time())
+        record = {
+            "review_id": f"{int(getattr(pos, 'ticket', 0) or 0)}:{review_bar_end_ts}:{event_ts}",
+            "ticket": int(getattr(pos, "ticket", 0) or 0),
+            "side": str(side),
+            "volume": float(getattr(pos, "volume", 0.0) or 0.0),
+            "bar_open_ts": int(current_bar_time),
+            "bar_open_utc": datetime.fromtimestamp(current_bar_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+            "bar_end_ts": int(review_bar_end_ts),
+            "bar_end_utc": datetime.fromtimestamp(review_bar_end_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+            "triggered_at_ts": int(event_ts),
+            "triggered_at_utc": datetime.fromtimestamp(event_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+            "entry_price": float(entry_price),
+            "actual_exit_price": float(exit_price),
+            "actual_change_pct": float(change_pct),
+            "actual_pnl_pips": float(pnl_pips),
+            "actual_pnl_money": float(pnl_money),
+            "trigger_reasons": [str(x) for x in list(trigger_reasons or []) if str(x).strip()],
+        }
+        pending = list(getattr(self, "pending_intrabar_reviews", []) or [])
+        pending.append(record)
+        self.pending_intrabar_reviews = pending[-50:]
+        self._add_log(
+            "info",
+            "Intrabar exit queued for candle-close review",
+            phase="intrabar",
+            event="review_pending",
+            meta={
+                "ticket": int(getattr(pos, "ticket", 0) or 0),
+                "side": str(side),
+                "bar_end_utc": str(record.get("bar_end_utc", "")),
+                "triggered_at_utc": str(record.get("triggered_at_utc", "")),
+                "actual_change_pct": float(change_pct),
+                "actual_pnl_pips": float(pnl_pips),
+                "actual_pnl_money": float(pnl_money),
+                "reasons": " | ".join(record["trigger_reasons"]),
+            },
+        )
+        self._save_runtime_state(reason="intrabar_review_pending")
+
+    def _review_intrabar_exits_at_bar_close(self, bar_end_ts: int, window_df: pd.DataFrame) -> None:
+        pending = list(getattr(self, "pending_intrabar_reviews", []) or [])
+        if not pending or window_df is None or len(window_df) <= 0:
+            return
+
+        try:
+            bar_close_price = float(window_df.iloc[-1]["close"])
+        except Exception:
+            return
+        if bar_close_price <= 0.0:
+            return
+
+        still_pending = []
+        completed = list(getattr(self, "recent_intrabar_reviews", []) or [])
+        bar_end_utc = datetime.fromtimestamp(int(bar_end_ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+        for row in pending:
+            if not isinstance(row, dict):
+                continue
+            target_bar_end_ts = int(row.get("bar_end_ts", 0) or 0)
+            if target_bar_end_ts <= 0:
+                continue
+            if target_bar_end_ts > int(bar_end_ts):
+                still_pending.append(dict(row))
+                continue
+
+            side = str(row.get("side", "")).upper()
+            direction = 1.0 if side == "LONG" else -1.0
+            entry_price = float(row.get("entry_price", 0.0) or 0.0)
+            if entry_price <= 0.0:
+                continue
+
+            volume = max(0.0, float(row.get("volume", 0.0) or 0.0))
+            hold_exit_price, hold_exit_source, hold_exit_tick_msc = self._resolve_bar_close_exit_price(
+                bar_end_ts=target_bar_end_ts,
+                side=side,
+                fallback_close_price=bar_close_price,
+            )
+            if hold_exit_price <= 0.0:
+                continue
+            hold_change_pct = float(
+                direction * (hold_exit_price - entry_price) / max(entry_price, 1e-10) * 100.0
+            )
+            hold_pnl_pips = float(direction * (hold_exit_price - entry_price) / max(self.pip_size, 1e-10))
+            hold_pnl_money = float(hold_pnl_pips * PIP_VALUE * volume)
+
+            actual_change_pct = float(row.get("actual_change_pct", 0.0) or 0.0)
+            actual_pnl_pips = float(row.get("actual_pnl_pips", 0.0) or 0.0)
+            actual_pnl_money = float(row.get("actual_pnl_money", 0.0) or 0.0)
+
+            delta_change_pct = float(hold_change_pct - actual_change_pct)
+            delta_pips = float(hold_pnl_pips - actual_pnl_pips)
+            delta_money = float(hold_pnl_money - actual_pnl_money)
+
+            if delta_money > 1e-9:
+                outcome = "hold_better"
+            elif delta_money < -1e-9:
+                outcome = "intrabar_better"
+            else:
+                outcome = "flat"
+
+            reviewed = dict(row)
+            reviewed.update(
+                {
+                    "reviewed_at_bar_end_ts": int(bar_end_ts),
+                    "reviewed_at_bar_end_utc": bar_end_utc,
+                    "review_late": bool(target_bar_end_ts < int(bar_end_ts)),
+                    "bar_close_price": float(bar_close_price),
+                    "bar_close_exit_price": float(hold_exit_price),
+                    "bar_close_exit_source": str(hold_exit_source),
+                    "bar_close_exit_tick_msc": int(hold_exit_tick_msc),
+                    "hold_to_close_change_pct": float(hold_change_pct),
+                    "hold_to_close_pnl_pips": float(hold_pnl_pips),
+                    "hold_to_close_pnl_money": float(hold_pnl_money),
+                    "delta_vs_hold_change_pct": float(delta_change_pct),
+                    "delta_vs_hold_pips": float(delta_pips),
+                    "delta_vs_hold_money": float(delta_money),
+                    "review_outcome": str(outcome),
+                }
+            )
+            completed.append(reviewed)
+
+            print(
+                "\n [INTRABAR][REVIEW] "
+                f"ticket={int(reviewed.get('ticket', 0) or 0)} "
+                f"source={hold_exit_source} "
+                f"actual={actual_change_pct:+.3f}%/{actual_pnl_money:+.2f} "
+                f"bar_close={hold_change_pct:+.3f}%/{hold_pnl_money:+.2f} "
+                f"delta={delta_money:+.2f} outcome={outcome}"
+            )
+            self._add_log(
+                "analysis",
+                f"Intrabar review {outcome}: actual={actual_pnl_money:+.2f} vs close={hold_pnl_money:+.2f}",
+                phase="intrabar",
+                event="review",
+                meta={
+                    "ticket": int(reviewed.get("ticket", 0) or 0),
+                    "bar_close_exit_source": str(hold_exit_source),
+                    "bar_close_exit_tick_msc": int(hold_exit_tick_msc),
+                    "actual_change_pct": float(actual_change_pct),
+                    "actual_pnl_money": float(actual_pnl_money),
+                    "hold_to_close_change_pct": float(hold_change_pct),
+                    "hold_to_close_pnl_money": float(hold_pnl_money),
+                    "delta_vs_hold_money": float(delta_money),
+                    "delta_vs_hold_pips": float(delta_pips),
+                    "outcome": str(outcome),
+                    "review_late": bool(reviewed.get("review_late", False)),
+                },
+            )
+
+        self.pending_intrabar_reviews = still_pending[-50:]
+        self.recent_intrabar_reviews = completed[-50:]
+
+    def _maybe_take_profit_intrabar(self, current_bar_time: int) -> bool:
+        if current_bar_time <= 0 or current_bar_time != self.last_bar_time:
+            return False
+        if (
+            self.intrabar_take_profit_change_pct <= 0.0
+            and self.intrabar_take_profit_pips <= 0.0
+            and self.intrabar_take_profit_money <= 0.0
+        ):
+            return False
+
+        current_pos, pos = self._get_mt5_position()
+        if current_pos == 0 or pos is None:
+            return False
+
+        tick_data, stale_tick = self._get_status_tick()
+        if tick_data is None:
+            return False
+
+        tick_time_ts = int(tick_data.get("time", 0) or 0)
+        now_epoch = int(time.time())
+        stale_age_sec = max(0, now_epoch - tick_time_ts) if tick_time_ts > 0 else 999999
+        max_stale_sec = max(5, int(round(float(POLL_SECONDS) * 3.0)))
+        if stale_tick and stale_age_sec > max_stale_sec:
+            return False
+
+        entry_price = float(getattr(pos, "price_open", 0.0) or 0.0)
+        if entry_price <= 0.0:
+            return False
+
+        exit_price = float(tick_data.get("bid", 0.0) if current_pos == 1 else tick_data.get("ask", 0.0))
+        if exit_price <= 0.0:
+            return False
+
+        change_pct = float(current_pos * (exit_price - entry_price) / max(entry_price, 1e-10) * 100.0)
+        pnl_pips = float(current_pos * (exit_price - entry_price) / max(self.pip_size, 1e-10))
+        pnl_money = float(getattr(pos, "profit", 0.0) or 0.0)
+
+        hit_reasons = []
+        if (
+            self.intrabar_take_profit_change_pct > 0.0
+            and change_pct >= self.intrabar_take_profit_change_pct
+        ):
+            hit_reasons.append(
+                f"change {change_pct:.3f}%>={self.intrabar_take_profit_change_pct:.3f}%"
+            )
+        if self.intrabar_take_profit_pips > 0.0 and pnl_pips >= self.intrabar_take_profit_pips:
+            hit_reasons.append(f"pips {pnl_pips:.1f}>={self.intrabar_take_profit_pips:.1f}")
+        if self.intrabar_take_profit_money > 0.0 and pnl_money >= self.intrabar_take_profit_money:
+            hit_reasons.append(f"money {pnl_money:.2f}>={self.intrabar_take_profit_money:.2f}")
+        if not hit_reasons:
+            return False
+
+        side = "LONG" if current_pos == 1 else "SHORT"
+        print(
+            "\n [INTRABAR] take-profit hit -> close "
+            f"| side={side} | price={exit_price:.{self.digits}f} "
+            f"| change={change_pct:+.3f}% | pips={pnl_pips:+.1f} | pnl={pnl_money:+.2f} "
+            f"| trigger={' ; '.join(hit_reasons)}"
+        )
+        self._add_log(
+            "action",
+            "Intrabar take-profit hit -> closing position",
+            phase="intrabar",
+            event="take_profit_hit",
+            meta={
+                "side": side,
+                "ticket": int(getattr(pos, "ticket", 0) or 0),
+                "price": float(exit_price),
+                "change_pct": float(change_pct),
+                "pnl_pips": float(pnl_pips),
+                "pnl_money": float(pnl_money),
+                "reasons": " | ".join(hit_reasons),
+            },
+        )
+        if not self.close_all():
+            return False
+
+        self._queue_intrabar_review(
+            pos=pos,
+            current_bar_time=int(current_bar_time),
+            exit_time_ts=int(tick_time_ts or now_epoch),
+            side=side,
+            entry_price=float(entry_price),
+            exit_price=float(exit_price),
+            change_pct=float(change_pct),
+            pnl_pips=float(pnl_pips),
+            pnl_money=float(pnl_money),
+            trigger_reasons=hit_reasons,
+        )
+        self.last_action = "CLOSE"
+        return True
+
+    def _reset_intrabar_cooldown_if_flattened(self, prev_bridge_pos: int, current_bar_time: int):
+        if self.bridge is None:
+            return
+        if prev_bridge_pos == 0 or int(self.bridge.position) != 0:
+            return
+        if current_bar_time <= 0 or current_bar_time != self.last_bar_time:
+            return
+
+        if int(self.bridge.trade_cooldown) != 0 or bool(self.bridge.first_bar):
+            print("\n [INTRABAR] flat before next candle -> reset cooldown for next prediction")
+            self._add_log(
+                "info",
+                "Intrabar exit detected -> reset cooldown for next candle",
+                phase="intrabar",
+                event="cooldown_reset",
+                meta={"bar_time": int(current_bar_time)},
+            )
+
+        self.bridge.trade_cooldown = 0
+        self.bridge.first_bar = False
+        self.last_action = "CLOSE"
+        self._save_runtime_state(reason="intrabar_flat")
+
     def send_order(self, order_type):
         if not self._ensure_trade_allowed_before_order(
             reason="open_buy" if order_type == mt5.ORDER_TYPE_BUY else "open_sell",
@@ -3798,6 +4163,7 @@ class LiveTradingBot:
             )
             return
 
+        self._review_intrabar_exits_at_bar_close(bar_end_ts, window_df)
         self._wait_until_real_semantic_ready(window_df)
 
         delta_tick, delta_price, delta_note = self._calc_delta_for_closed_bar(bar_end_ts, window_df=window_df)
@@ -4025,6 +4391,30 @@ class LiveTradingBot:
                     "last_bar_time": int(self.last_bar_time),
                 },
             )
+        if (
+            self.intrabar_take_profit_change_pct > 0.0
+            or self.intrabar_take_profit_pips > 0.0
+            or self.intrabar_take_profit_money > 0.0
+        ):
+            intrabar_parts = []
+            if self.intrabar_take_profit_change_pct > 0.0:
+                intrabar_parts.append(f"change={self.intrabar_take_profit_change_pct:.3f}%")
+            if self.intrabar_take_profit_pips > 0.0:
+                intrabar_parts.append(f"pips={self.intrabar_take_profit_pips:.1f}")
+            if self.intrabar_take_profit_money > 0.0:
+                intrabar_parts.append(f"money={self.intrabar_take_profit_money:.2f}")
+            print(f" [INTRABAR] realtime close active | {' | '.join(intrabar_parts)}")
+            self._add_log(
+                "info",
+                "Intrabar take-profit monitoring active",
+                phase="intrabar",
+                event="enabled",
+                meta={
+                    "take_profit_change_pct": float(self.intrabar_take_profit_change_pct),
+                    "take_profit_pips": float(self.intrabar_take_profit_pips),
+                    "take_profit_money": float(self.intrabar_take_profit_money),
+                },
+            )
         self._start_ws_listener()
         startup_eval_pending = bool(EVAL_ON_START)
 
@@ -4148,8 +4538,12 @@ class LiveTradingBot:
                     if self.last_bar_time != current_bar_time:
                         self.last_bar_time = current_bar_time
                         self._process_closed_bar(current_bar_time, mode="New Candle", execute_orders=True)
+                else:
+                    self._maybe_take_profit_intrabar(current_bar_time)
 
+                prev_bridge_pos = int(self.bridge.position) if self.bridge is not None else 0
                 self._sync_bridge_from_mt5()
+                self._reset_intrabar_cooldown_if_flattened(prev_bridge_pos, current_bar_time)
                 self._push_state_to_server()
                 self._print_status_line(current_bar_time=current_bar_time)
                 time.sleep(POLL_SECONDS)
