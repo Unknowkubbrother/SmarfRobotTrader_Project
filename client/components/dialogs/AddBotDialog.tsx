@@ -5,6 +5,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 import { api } from "@/lib/api";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import type { BotConfigWithVersion } from "@/hooks/useTradingAccounts";
 
 interface BotVersion {
   id: string;
@@ -21,6 +22,7 @@ interface AddBotDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   accountId: string;
+  existingBots?: BotConfigWithVersion[];
   onBotAdded: () => void;
 }
 
@@ -30,17 +32,61 @@ const riskLevels = [
   { id: "high", label: "High", description: "Aggressive trading", color: "text-destructive" },
 ];
 
-export function AddBotDialog({ open, onOpenChange, accountId, onBotAdded }: AddBotDialogProps) {
+const normalizePairValue = (value: string | null | undefined): string =>
+  String(value || "").trim().toUpperCase();
+
+const getPairKey = (symbol: string | null | undefined, timeframe: string | null | undefined): string | null => {
+  const normalizedSymbol = normalizePairValue(symbol);
+  const normalizedTimeframe = normalizePairValue(timeframe);
+  if (!normalizedSymbol || !normalizedTimeframe) {
+    return null;
+  }
+  return `${normalizedSymbol}__${normalizedTimeframe}`;
+};
+
+export function AddBotDialog({ open, onOpenChange, accountId, existingBots = [], onBotAdded }: AddBotDialogProps) {
   const [botVersions, setBotVersions] = useState<BotVersion[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [selectedRisk, setSelectedRisk] = useState("medium");
   const [loading, setLoading] = useState(false);
+
+  const existingPairKeys = new Set(
+    existingBots
+      .map((bot) => getPairKey(bot.bot_version?.symbol, bot.bot_version?.timeframe))
+      .filter((value): value is string => Boolean(value))
+  );
+
+  const isModelAlreadyAdded = (model: BotVersion) => {
+    const pairKey = getPairKey(model.symbol, model.timeframe);
+    return Boolean(pairKey && existingPairKeys.has(pairKey));
+  };
 
   useEffect(() => {
     if (open) {
       fetchBotVersions();
     }
   }, [open]);
+
+  useEffect(() => {
+    if (!open) {
+      setSelectedModel(null);
+      setSelectedRisk("medium");
+      return;
+    }
+
+    setSelectedModel((current) => {
+      if (!current) return current;
+      const selectedVersion = botVersions.find((model) => model.id === current);
+      if (!selectedVersion) return null;
+      const pairKey = getPairKey(selectedVersion.symbol, selectedVersion.timeframe);
+      if (!pairKey) return current;
+      const pairAlreadyExists = existingBots.some((bot) => {
+        const existingPairKey = getPairKey(bot.bot_version?.symbol, bot.bot_version?.timeframe);
+        return existingPairKey === pairKey;
+      });
+      return pairAlreadyExists ? null : current;
+    });
+  }, [open, botVersions, existingBots]);
 
   const fetchBotVersions = async () => {
     try {
@@ -54,6 +100,12 @@ export function AddBotDialog({ open, onOpenChange, accountId, onBotAdded }: AddB
   const handleCreateBot = async () => {
     if (!selectedModel) {
       toast.error("Please select a model");
+      return;
+    }
+
+    const selectedVersion = botVersions.find((model) => model.id === selectedModel);
+    if (selectedVersion && isModelAlreadyAdded(selectedVersion)) {
+      toast.error("This symbol and timeframe is already added in this account");
       return;
     }
 
@@ -99,60 +151,71 @@ export function AddBotDialog({ open, onOpenChange, accountId, onBotAdded }: AddB
               Select Model
             </h3>
             <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {botVersions.map((model) => (
-                <div
-                  key={model.id}
-                  onClick={() => setSelectedModel(model.id)}
-                  className={cn(
-                    "rounded-xl border overflow-hidden cursor-pointer transition-all",
-                    selectedModel === model.id
-                      ? "border-primary ring-2 ring-primary/20"
-                      : "border-border hover:border-primary/50"
-                  )}
-                >
-                  <div className="bg-gradient-to-r from-[#0f3460] to-[#16537e] p-3 text-white">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <Activity className="w-4 h-4" />
-                        <span className="font-medium text-sm">{model.label}</span>
-                      </div>
-                      <span className="px-2 py-0.5 rounded-full bg-white/20 text-xs">
-                        {model.version_tag}
-                      </span>
-                    </div>
-                  </div>
-                  <div className="p-3 bg-card space-y-2">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="text-muted-foreground">Lastest update</span>
-                      <span className="font-mono">{model.release_date}</span>
-                    </div>
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="text-muted-foreground">Symbol</span>
-                      <span className="font-mono">{model.symbol}</span>
-                    </div>
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="text-muted-foreground">Timeframe</span>
-                      <span>{model.timeframe}</span>
-                    </div>
-                    <div className="flex flex-col gap-1.5 text-xs pt-2 border-t border-border/50">
-                      <span className="text-muted-foreground font-medium">Release Notes</span>
-                      <div className="max-h-20 overflow-y-auto flex flex-col gap-1 pr-1 scrollbar-thin scrollbar-thumb-muted-foreground/20 scrollbar-track-transparent">
-                        {model.release_notes.map((note, index) => (
-                          <div key={index} className="flex items-start gap-1.5">
-                            <span className="text-primary mt-1 shrink-0">•</span>
-                            <span className="text-muted-foreground/80">{note}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                    {selectedModel === model.id && (
-                      <div className="pt-2">
-                        <span className="text-xs text-primary font-medium">✓ Selected</span>
-                      </div>
+              {botVersions.map((model) => {
+                const alreadyAdded = isModelAlreadyAdded(model);
+                return (
+                  <div
+                    key={model.id}
+                    onClick={() => {
+                      if (alreadyAdded) return;
+                      setSelectedModel(model.id);
+                    }}
+                    className={cn(
+                      "rounded-xl border overflow-hidden cursor-pointer transition-all",
+                      alreadyAdded && "cursor-not-allowed border-dashed opacity-60",
+                      selectedModel === model.id
+                        ? "border-primary ring-2 ring-primary/20"
+                        : "border-border hover:border-primary/50"
                     )}
+                  >
+                    <div className="bg-gradient-to-r from-[#0f3460] to-[#16537e] p-3 text-white">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <Activity className="w-4 h-4" />
+                          <span className="font-medium text-sm">{model.label}</span>
+                        </div>
+                        <span className="px-2 py-0.5 rounded-full bg-white/20 text-xs">
+                          {model.version_tag}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="p-3 bg-card space-y-2">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-muted-foreground">Lastest update</span>
+                        <span className="font-mono">{model.release_date}</span>
+                      </div>
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-muted-foreground">Symbol</span>
+                        <span className="font-mono">{model.symbol}</span>
+                      </div>
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-muted-foreground">Timeframe</span>
+                        <span>{model.timeframe}</span>
+                      </div>
+                      <div className="flex flex-col gap-1.5 text-xs pt-2 border-t border-border/50">
+                        <span className="text-muted-foreground font-medium">Release Notes</span>
+                        <div className="max-h-20 overflow-y-auto flex flex-col gap-1 pr-1 scrollbar-thin scrollbar-thumb-muted-foreground/20 scrollbar-track-transparent">
+                          {model.release_notes.map((note, index) => (
+                            <div key={index} className="flex items-start gap-1.5">
+                              <span className="text-primary mt-1 shrink-0">•</span>
+                              <span className="text-muted-foreground/80">{note}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      {alreadyAdded ? (
+                        <div className="pt-2">
+                          <span className="text-xs text-muted-foreground font-medium">Already added to this account</span>
+                        </div>
+                      ) : selectedModel === model.id ? (
+                        <div className="pt-2">
+                          <span className="text-xs text-primary font-medium">✓ Selected</span>
+                        </div>
+                      ) : null}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
 

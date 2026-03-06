@@ -40,6 +40,44 @@ def _enum_value(value):
     return value.value if hasattr(value, "value") else value
 
 
+def _normalize_pair_value(value: str | None) -> str:
+    return str(value or "").strip().upper()
+
+
+async def _find_account_symbol_timeframe_conflict(
+    *,
+    account_id: str,
+    symbol: str | None,
+    timeframe: str | None,
+    exclude_config_id: str | None = None,
+):
+    normalized_symbol = _normalize_pair_value(symbol)
+    normalized_timeframe = _normalize_pair_value(timeframe)
+    if not normalized_symbol or not normalized_timeframe:
+        return None
+
+    where: dict = {
+        "accountId": str(account_id),
+        "recordStatus": ACTIVE_RECORD_STATUS,
+    }
+    if exclude_config_id:
+        where["id"] = {"not": str(exclude_config_id)}
+
+    configs = await db.botconfiguration.find_many(
+        where=where,
+        include={"botVersion": True},
+    )
+
+    for config in configs:
+        bot_version = getattr(config, "botVersion", None)
+        existing_symbol = _normalize_pair_value(getattr(bot_version, "symbol", None))
+        existing_timeframe = _normalize_pair_value(getattr(bot_version, "timeframe", None))
+        if existing_symbol == normalized_symbol and existing_timeframe == normalized_timeframe:
+            return config
+
+    return None
+
+
 async def _allocate_magic_number_for_account(
     *,
     account_id: str,
@@ -303,6 +341,19 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
         raise HTTPException(status_code=404, detail="Bot version not found")
     if not getattr(bot_version, "isActive", True):
         raise HTTPException(status_code=400, detail="This bot version is inactive")
+
+    conflict = await _find_account_symbol_timeframe_conflict(
+        account_id=str(data.accountId),
+        symbol=getattr(bot_version, "symbol", None),
+        timeframe=getattr(bot_version, "timeframe", None),
+    )
+    if conflict is not None:
+        symbol = _normalize_pair_value(getattr(bot_version, "symbol", None)) or "UNKNOWN"
+        timeframe = _normalize_pair_value(getattr(bot_version, "timeframe", None)) or "UNKNOWN"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Bot for {symbol} {timeframe} already exists in this account",
+        )
 
     bot_configuration_count = await db.botconfiguration.count(
         where={
@@ -841,6 +892,20 @@ async def change_bot_model(request: Request, data: Change_Bot_Model):
         raise HTTPException(status_code=400, detail="Selected bot version is inactive")
     if str(getattr(config, "modelId", "") or "") == str(data.newModelId):
         return {"status_code": 200, "message": "Bot already uses this model", "restarted": False}
+
+    conflict = await _find_account_symbol_timeframe_conflict(
+        account_id=str(getattr(config, "accountId", "") or ""),
+        symbol=getattr(new_version, "symbol", None),
+        timeframe=getattr(new_version, "timeframe", None),
+        exclude_config_id=str(getattr(config, "id", "") or ""),
+    )
+    if conflict is not None:
+        symbol = _normalize_pair_value(getattr(new_version, "symbol", None)) or "UNKNOWN"
+        timeframe = _normalize_pair_value(getattr(new_version, "timeframe", None)) or "UNKNOWN"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Another bot already uses {symbol} {timeframe} in this account",
+        )
 
     current_status = _enum_value(getattr(config, "containerStatus", None))
     was_running = current_status == "running" or bool(getattr(config, "isActive", False))

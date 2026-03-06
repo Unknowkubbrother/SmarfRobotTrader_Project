@@ -157,6 +157,7 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         accountId={accountId}
+        existingBots={bots}
         onBotAdded={() => {
           onBotAdded();
           setDialogOpen(false);

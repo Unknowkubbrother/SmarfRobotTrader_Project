@@ -530,6 +530,7 @@ export default function Dashboard() {
           open={addBotOpen}
           onOpenChange={setAddBotOpen}
           accountId={selectedAccount.id}
+          existingBots={selectedAccount.bot_configurations}
           onBotAdded={refetch}
         />
       )}

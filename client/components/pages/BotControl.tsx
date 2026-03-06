@@ -132,6 +132,18 @@ const mapLifecycleActionTitle = (action: string): string => {
   }
 };
 
+const normalizeBotPairValue = (value: string | null | undefined): string =>
+  String(value || "").trim().toUpperCase();
+
+const getBotPairKey = (symbol: string | null | undefined, timeframe: string | null | undefined): string | null => {
+  const normalizedSymbol = normalizeBotPairValue(symbol);
+  const normalizedTimeframe = normalizeBotPairValue(timeframe);
+  if (!normalizedSymbol || !normalizedTimeframe) {
+    return null;
+  }
+  return `${normalizedSymbol}__${normalizedTimeframe}`;
+};
+
 export default function BotControl() {
   const searchParams = useSearchParams();
   const queryBotId = searchParams.get("botId");
@@ -182,6 +194,12 @@ export default function BotControl() {
   const appliedQueryBotIdRef = useRef<string | null>(null);
 
   const [availableModels, setAvailableModels] = useState<BotVersion[]>([]);
+  const siblingPairKeys = new Set(
+    (selectedAccount?.bot_configurations || [])
+      .filter((bot) => bot.id !== selectedBot?.id)
+      .map((bot) => getBotPairKey(bot.bot_version?.symbol, bot.bot_version?.timeframe))
+      .filter((value): value is string => Boolean(value))
+  );
   const activeActionForSelectedBot =
     activeAction && selectedBot && activeAction.botId === selectedBot.id
       ? activeAction
@@ -789,6 +807,12 @@ export default function BotControl() {
   const handleModelSelect = (modelId: string) => {
     if (isBusy) return;
     if (modelId === selectedBot?.model_id) return;
+    const nextModel = availableModels.find((model) => model.model_id === modelId);
+    const nextPairKey = getBotPairKey(nextModel?.symbol, nextModel?.timeframe);
+    if (nextPairKey && siblingPairKeys.has(nextPairKey)) {
+      toast.error("This symbol and timeframe is already used by another bot in this account");
+      return;
+    }
     setPendingModelId(modelId);
     setModelConfirmOpen(true);
   };
@@ -1376,69 +1400,83 @@ export default function BotControl() {
             <p className="text-muted-foreground">Select your automated trading companion</p>
           </DialogHeader>
           <div className="grid md:grid-cols-3 gap-4 mt-4 max-h-[60vh] overflow-y-auto">
-            {availableModels.map((model) => (
-              <div
-                key={model.model_id}
-                className={cn(
-                  "rounded-2xl border border-border overflow-hidden hover:border-primary transition-colors cursor-pointer",
-                  isBusy && "pointer-events-none opacity-60",
-                  selectedBot?.model_id === model.model_id && "ring-2 ring-primary border-primary"
-                )}
-                onClick={() => handleModelSelect(model.model_id)}
-              >
-                <div className="bg-gradient-to-r from-[#0f3460] to-[#16537e] p-4 text-white">
-                  <div className="flex items-center justify-between mb-1">
-                    <div className="flex items-center gap-2">
-                      <Activity className="w-5 h-5" />
-                      <span className="font-semibold truncate">{model.label}</span>
+            {availableModels.map((model) => {
+              const isCurrentModel = selectedBot?.model_id === model.model_id;
+              const pairKey = getBotPairKey(model.symbol, model.timeframe);
+              const isDuplicatePair = Boolean(!isCurrentModel && pairKey && siblingPairKeys.has(pairKey));
+
+              return (
+                <div
+                  key={model.model_id}
+                  className={cn(
+                    "rounded-2xl border border-border overflow-hidden hover:border-primary transition-colors cursor-pointer",
+                    isBusy && "pointer-events-none opacity-60",
+                    isDuplicatePair && "opacity-60 border-dashed cursor-not-allowed",
+                    isCurrentModel && "ring-2 ring-primary border-primary"
+                  )}
+                  onClick={() => {
+                    if (isDuplicatePair) return;
+                    handleModelSelect(model.model_id);
+                  }}
+                >
+                  <div className="bg-gradient-to-r from-[#0f3460] to-[#16537e] p-4 text-white">
+                    <div className="flex items-center justify-between mb-1">
+                      <div className="flex items-center gap-2">
+                        <Activity className="w-5 h-5" />
+                        <span className="font-semibold truncate">{model.label}</span>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <span className="text-xs">{model.timeframe}</span>
+                        <span className="px-2 py-0.5 rounded-full bg-white/20 text-xs">{model.version_tag}</span>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-1">
-                      <span className="text-xs">{model.timeframe}</span>
-                      <span className="px-2 py-0.5 rounded-full bg-white/20 text-xs">{model.version_tag}</span>
+                  </div>
+                  <div className="p-4 bg-card space-y-3">
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-muted-foreground flex items-center gap-2">
+                        <Clock className="w-4 h-4" /> Latest update
+                      </span>
+                      <span>30 Dec 2568</span>
                     </div>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-muted-foreground">Symbol</span>
+                      <span className="font-mono">{model.symbol}</span>
+                    </div>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-muted-foreground">Timeframe</span>
+                      <span>{model.timeframe}</span>
+                    </div>
+                    <div className="bg-primary/10 rounded-lg p-3 mt-3">
+                      <p className="text-xs font-medium text-primary mb-2">Release Notes</p>
+                      <ul className="space-y-1">
+                        {model.release_notes.map((note, i) => (
+                          <li key={i} className="text-xs text-muted-foreground flex items-start gap-2">
+                            <span className="w-1 h-1 rounded-full bg-primary mt-1.5 shrink-0" />
+                            {note}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                    {isDuplicatePair && (
+                      <div className="text-xs text-muted-foreground">Already used by another bot in this account</div>
+                    )}
+                    <Button
+                      className="w-full gap-2"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (isDuplicatePair) return;
+                        handleModelSelect(model.model_id);
+                      }}
+                      variant={isCurrentModel ? "secondary" : "default"}
+                      disabled={isCurrentModel || isBusy || isDuplicatePair}
+                    >
+                      <Activity className="w-4 h-4" />
+                      {isCurrentModel ? "Current Model" : isDuplicatePair ? "Unavailable" : "Select Model"}
+                    </Button>
                   </div>
                 </div>
-                <div className="p-4 bg-card space-y-3">
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-muted-foreground flex items-center gap-2">
-                      <Clock className="w-4 h-4" /> Latest update
-                    </span>
-                    <span>30 Dec 2568</span>
-                  </div>
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-muted-foreground">Symbol</span>
-                    <span className="font-mono">{model.symbol}</span>
-                  </div>
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-muted-foreground">Timeframe</span>
-                    <span>{model.timeframe}</span>
-                  </div>
-                  <div className="bg-primary/10 rounded-lg p-3 mt-3">
-                    <p className="text-xs font-medium text-primary mb-2">Release Notes</p>
-                    <ul className="space-y-1">
-                      {model.release_notes.map((note, i) => (
-                        <li key={i} className="text-xs text-muted-foreground flex items-start gap-2">
-                          <span className="w-1 h-1 rounded-full bg-primary mt-1.5 shrink-0" />
-                          {note}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                  <Button
-                    className="w-full gap-2"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleModelSelect(model.model_id);
-                    }}
-                    variant={selectedBot?.model_id === model.model_id ? "secondary" : "default"}
-                    disabled={selectedBot?.model_id === model.model_id || isBusy}
-                  >
-                    <Activity className="w-4 h-4" />
-                    {selectedBot?.model_id === model.model_id ? "Current Model" : "Select Model"}
-                  </Button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
             {availableModels.length === 0 && (
               <div className="col-span-3 text-center py-10 text-muted-foreground">
                 No trading models available.
@@ -1454,6 +1492,7 @@ export default function BotControl() {
           open={addBotOpen}
           onOpenChange={setAddBotOpen}
           accountId={selectedAccount.id}
+          existingBots={selectedAccount.bot_configurations}
           onBotAdded={refetch}
         />
       )}
@@ -1464,7 +1503,7 @@ export default function BotControl() {
           <AlertDialogHeader>
             <AlertDialogTitle>Delete Bot</AlertDialogTitle>
             <AlertDialogDescription>
-              Are you sure you want to delete "{botLabel}"? This action cannot be undone.
+              Are you sure you want to delete <strong>{botLabel}</strong>? This action cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1559,7 +1598,7 @@ export default function BotControl() {
             <AlertDialogDescription>
               Are you sure you want to switch to <strong>{pendingModelLabel}</strong>?
               <br />
-              The bot will be updated with the new model's logic and parameters.
+              The bot will be updated with the new model logic and parameters.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
