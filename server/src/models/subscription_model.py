@@ -103,3 +103,12 @@ class AdminSubscriptionStatsResponse(BaseModel):
     total_bot_versions: int
     pending_tickets: int
     monthly_revenue: float
+
+
+class ProcessDueBillingResponse(BaseModel):
+    processed_subscriptions: int = 0
+    created_invoices: int = 0
+    paid_invoices: int = 0
+    pending_invoices: int = 0
+    skipped_invoices: int = 0
+    failed_invoices: int = 0

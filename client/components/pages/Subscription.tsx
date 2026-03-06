@@ -294,6 +294,8 @@ export default function Subscription() {
   const [setAsDefault, setSetAsDefault] = useState(false);
   const [submittingCard, setSubmittingCard] = useState(false);
   const [methodActionId, setMethodActionId] = useState<string | null>(null);
+  const [invoiceActionId, setInvoiceActionId] = useState<string | null>(null);
+  const [invoiceActionType, setInvoiceActionType] = useState<"download" | "pay" | null>(null);
   const setupIntentRequestedRef = useRef(false);
 
   const {
@@ -306,6 +308,8 @@ export default function Subscription() {
     addPaymentMethod,
     setDefaultPaymentMethod,
     removePaymentMethod,
+    downloadInvoice,
+    payInvoice,
   } = useSubscription();
 
   const weeklyProfit = weeklyPreview?.net_profit ?? 0;
@@ -381,6 +385,22 @@ export default function Subscription() {
     setMethodActionId(methodId);
     await removePaymentMethod(methodId);
     setMethodActionId(null);
+  };
+
+  const onDownloadInvoice = async (invoiceId: string) => {
+    setInvoiceActionId(invoiceId);
+    setInvoiceActionType("download");
+    await downloadInvoice(invoiceId);
+    setInvoiceActionId(null);
+    setInvoiceActionType(null);
+  };
+
+  const onPayInvoice = async (invoiceId: string) => {
+    setInvoiceActionId(invoiceId);
+    setInvoiceActionType("pay");
+    await payInvoice(invoiceId);
+    setInvoiceActionId(null);
+    setInvoiceActionType(null);
   };
 
   if (loading) {
@@ -537,7 +557,8 @@ export default function Subscription() {
         <div className="glass-card p-6 animate-slide-up">
           {invoices.length === 0 ? (
             <div className="text-center text-sm text-muted-foreground py-12">
-              No invoices yet. Your billing history will appear here.
+              No invoices yet.
+              {nextBillingLabel !== "-" ? ` Your next billing date is ${nextBillingLabel}.` : " Your billing history will appear here."}
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -548,13 +569,15 @@ export default function Subscription() {
                     <th className="text-right text-xs font-medium text-muted-foreground py-3 px-2">Net Profit</th>
                     <th className="text-right text-xs font-medium text-muted-foreground py-3 px-2">Fee</th>
                     <th className="text-center text-xs font-medium text-muted-foreground py-3 px-2">Status</th>
-                    <th className="text-right text-xs font-medium text-muted-foreground py-3 px-2">Invoice</th>
+                    <th className="text-right text-xs font-medium text-muted-foreground py-3 px-2">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {invoices.map((invoice) => {
                     const profit = invoice.total_period_profit ?? 0;
                     const status = (invoice.status ?? "pending").toLowerCase();
+                    const isActionLoading = invoiceActionId === invoice.id;
+                    const canPayNow = status === "pending" || status === "failed";
 
                     return (
                       <tr key={invoice.id} className="border-b border-border/50 hover:bg-secondary/30 transition-colors">
@@ -582,13 +605,30 @@ export default function Subscription() {
                           </span>
                         </td>
                         <td className="py-4 px-2 text-right">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => toast.info("Invoice download is not available yet")}
-                          >
-                            <Download className="w-4 h-4" />
-                          </Button>
+                          <div className="flex items-center justify-end gap-2">
+                            {canPayNow && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={isActionLoading}
+                                onClick={() => onPayInvoice(invoice.id)}
+                              >
+                                {isActionLoading && invoiceActionType === "pay" ? "Paying..." : "Pay now"}
+                              </Button>
+                            )}
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              disabled={isActionLoading}
+                              onClick={() => onDownloadInvoice(invoice.id)}
+                            >
+                              {isActionLoading && invoiceActionType === "download" ? (
+                                "Downloading..."
+                              ) : (
+                                <Download className="w-4 h-4" />
+                              )}
+                            </Button>
+                          </div>
                         </td>
                       </tr>
                     );

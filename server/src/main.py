@@ -12,6 +12,12 @@ from .database.client import db
 
 SECRET_KEY = os.getenv("JWT_SECRET", "UknownmeInLove")
 ALGORITHM = "HS256"
+_DEFAULT_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+]
 
 PUBLIC_PATHS = [
     "/",
@@ -79,6 +85,33 @@ class AuthMiddleware(BaseHTTPMiddleware):
         
         return await call_next(request)
 
+
+def _normalize_origin(value: str | None) -> str | None:
+    text = str(value or "").strip().strip("'\"").rstrip("/")
+    if not text:
+        return None
+    return text
+
+
+def _resolve_cors_origins() -> list[str]:
+    origins: list[str] = []
+
+    def add(value: str | None):
+        origin = _normalize_origin(value)
+        if origin and origin not in origins:
+            origins.append(origin)
+
+    for raw_origin in str(os.getenv("CORS_ALLOWED_ORIGINS", "") or "").split(","):
+        add(raw_origin)
+
+    for env_name in ("FRONTEND_URL", "APP_URL", "NEXT_PUBLIC_APP_URL"):
+        add(os.getenv(env_name))
+
+    for default_origin in _DEFAULT_CORS_ORIGINS:
+        add(default_origin)
+
+    return origins
+
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -94,6 +127,7 @@ from .utils.notification_runtime import (
     run_summary_notification_worker,
     run_threshold_notification_worker,
 )
+from .utils.subscription_billing import run_subscription_billing_worker
 from .utils.ws_manager import bot_hub
 
 logger = logging.getLogger(__name__)
@@ -202,6 +236,7 @@ async def lifespan(app: FastAPI):
 
     background_tasks.append(asyncio.create_task(run_threshold_notification_worker()))
     background_tasks.append(asyncio.create_task(run_summary_notification_worker()))
+    background_tasks.append(asyncio.create_task(run_subscription_billing_worker()))
 
     yield
 
@@ -220,12 +255,7 @@ UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
 app.mount("/static", StaticFiles(directory=UPLOADS_DIR), name="static")
 
 
-_cors_origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:3001",
-    "http://127.0.0.1:3001",
-]
+_cors_origins = _resolve_cors_origins()
 
 app.add_middleware(
     CORSMiddleware,

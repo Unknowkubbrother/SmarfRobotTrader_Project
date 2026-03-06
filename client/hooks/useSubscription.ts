@@ -61,6 +61,12 @@ interface AttachPaymentMethodPayload {
   setAsDefault?: boolean;
 }
 
+function getDownloadFilename(headerValue: string | undefined, fallback: string) {
+  if (!headerValue) return fallback;
+  const match = headerValue.match(/filename="?([^"]+)"?/i);
+  return match?.[1] || fallback;
+}
+
 export function useSubscription() {
   const { user, loading: authLoading } = useAuth();
 
@@ -159,6 +165,51 @@ export function useSubscription() {
     }
   };
 
+  const downloadInvoice = async (invoiceId: string) => {
+    if (!user || typeof window === "undefined") return false;
+
+    try {
+      const response = await api.get(`/subscription/invoices/${invoiceId}/download`, {
+        responseType: "blob",
+      });
+      const filename = getDownloadFilename(
+        response.headers["content-disposition"],
+        `invoice-${invoiceId.slice(0, 8)}.html`
+      );
+      const blob = new Blob([response.data], {
+        type: response.headers["content-type"] || "text/html;charset=utf-8",
+      });
+      const objectUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(objectUrl);
+      return true;
+    } catch (error: any) {
+      console.error("Error downloading invoice:", error);
+      toast.error(error?.message || "Failed to download invoice");
+      return false;
+    }
+  };
+
+  const payInvoice = async (invoiceId: string) => {
+    if (!user) return false;
+
+    try {
+      await api.post(`/subscription/invoices/${invoiceId}/pay`);
+      toast.success("Invoice paid successfully");
+      await fetchData();
+      return true;
+    } catch (error: any) {
+      console.error("Error paying invoice:", error);
+      toast.error(error?.message || "Failed to pay invoice");
+      return false;
+    }
+  };
+
   return {
     subscription,
     invoices,
@@ -170,5 +221,7 @@ export function useSubscription() {
     addPaymentMethod,
     setDefaultPaymentMethod,
     removePaymentMethod,
+    downloadInvoice,
+    payInvoice,
   };
 }

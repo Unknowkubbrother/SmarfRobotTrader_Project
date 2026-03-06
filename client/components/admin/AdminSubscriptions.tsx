@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { DollarSign, Percent, Settings, Save } from "lucide-react";
+import { DollarSign, Percent, Settings, Save, PlayCircle } from "lucide-react";
 import { toast } from "sonner";
 
 import { api } from "@/lib/api";
@@ -36,14 +36,31 @@ interface AdminSubscriptionManagementResponse {
   subscriptions: AdminSubscriptionItem[];
 }
 
+interface ProcessDueBillingResponse {
+  processed_subscriptions: number;
+  created_invoices: number;
+  paid_invoices: number;
+  pending_invoices: number;
+  skipped_invoices: number;
+  failed_invoices: number;
+}
+
+interface SubscriptionDraft {
+  fee_type: "percentage" | "fixed";
+  fee_value: string;
+  min_profit_threshold: string;
+  next_billing_date: string;
+}
+
 export function AdminSubscriptions() {
   const [subscriptions, setSubscriptions] = useState<AdminSubscriptionItem[]>([]);
   const [billingConfig, setBillingConfig] = useState<AdminBillingConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [savingConfig, setSavingConfig] = useState(false);
   const [updatingSubId, setUpdatingSubId] = useState<string | null>(null);
-  const [savingNextBillingSubId, setSavingNextBillingSubId] = useState<string | null>(null);
-  const [nextBillingDrafts, setNextBillingDrafts] = useState<Record<string, string>>({});
+  const [savingBillingSubId, setSavingBillingSubId] = useState<string | null>(null);
+  const [runningDueBilling, setRunningDueBilling] = useState(false);
+  const [subscriptionDrafts, setSubscriptionDrafts] = useState<Record<string, SubscriptionDraft>>({});
   const [configForm, setConfigForm] = useState({
     fee_type: "percentage" as "percentage" | "fixed",
     fee_value: 20,
@@ -61,9 +78,14 @@ export function AdminSubscriptions() {
       const { data } = await api.get<AdminSubscriptionManagementResponse>("/subscription/admin/management");
       const rows = data.subscriptions || [];
       setSubscriptions(rows);
-      setNextBillingDrafts(
-        rows.reduce<Record<string, string>>((acc, row) => {
-          acc[row.id] = row.next_billing_date ?? "";
+      setSubscriptionDrafts(
+        rows.reduce<Record<string, SubscriptionDraft>>((acc, row) => {
+          acc[row.id] = {
+            fee_type: row.fee_type,
+            fee_value: String(row.fee_value ?? 0),
+            min_profit_threshold: String(row.min_profit_threshold ?? 0),
+            next_billing_date: row.next_billing_date ?? "",
+          };
           return acc;
         }, {})
       );
@@ -119,22 +141,63 @@ export function AdminSubscriptions() {
     }
   };
 
-  const updateSubscriptionNextBilling = async (sub: AdminSubscriptionItem) => {
-    setSavingNextBillingSubId(sub.id);
+  const updateSubscriptionDraft = (
+    subscriptionId: string,
+    key: keyof SubscriptionDraft,
+    value: string
+  ) => {
+    setSubscriptionDrafts((prev) => {
+      const current = prev[subscriptionId] || {
+        fee_type: "percentage",
+        fee_value: "0",
+        min_profit_threshold: "0",
+        next_billing_date: "",
+      };
+      return {
+        ...prev,
+        [subscriptionId]: {
+          ...current,
+          [key]: value,
+        },
+      };
+    });
+  };
+
+  const saveSubscriptionBilling = async (sub: AdminSubscriptionItem) => {
+    const draft = subscriptionDrafts[sub.id];
+    if (!draft) return;
+
+    setSavingBillingSubId(sub.id);
     try {
       await api.patch(`/admin/users/${sub.user_id}/subscriptions/${sub.id}/billing`, {
-        fee_type: sub.fee_type,
-        fee_value: sub.fee_value,
-        min_profit_threshold: sub.min_profit_threshold,
-        next_billing_date: nextBillingDrafts[sub.id] || null,
+        fee_type: draft.fee_type,
+        fee_value: parseFloat(draft.fee_value) || 0,
+        min_profit_threshold: parseFloat(draft.min_profit_threshold) || 0,
+        next_billing_date: draft.next_billing_date || null,
       });
-      toast.success("Next billing updated");
+      toast.success("Subscription billing updated");
       await fetchData();
     } catch (error: any) {
-      console.error("Error updating next billing date:", error);
-      toast.error(error?.message || "Failed to update next billing date");
+      console.error("Error updating subscription billing:", error);
+      toast.error(error?.message || "Failed to update subscription billing");
     } finally {
-      setSavingNextBillingSubId(null);
+      setSavingBillingSubId(null);
+    }
+  };
+
+  const runDueBillingNow = async () => {
+    setRunningDueBilling(true);
+    try {
+      const { data } = await api.post<ProcessDueBillingResponse>("/subscription/admin/process-due");
+      toast.success(
+        `Processed ${data.processed_subscriptions} subscriptions, created ${data.created_invoices} invoices`
+      );
+      await fetchData();
+    } catch (error: any) {
+      console.error("Error processing due billing:", error);
+      toast.error(error?.message || "Failed to process due billing");
+    } finally {
+      setRunningDueBilling(false);
     }
   };
 
@@ -162,9 +225,15 @@ export function AdminSubscriptions() {
   return (
     <div className="space-y-6">
       <div className="glass-card p-6">
-        <div className="flex items-center gap-2 mb-4">
-          <Settings className="w-5 h-5 text-primary" />
-          <h3 className="font-semibold">Default Billing Configuration</h3>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Settings className="w-5 h-5 text-primary" />
+            <h3 className="font-semibold">Default Billing Configuration</h3>
+          </div>
+          <Button variant="outline" onClick={runDueBillingNow} disabled={runningDueBilling}>
+            <PlayCircle className="mr-2 h-4 w-4" />
+            {runningDueBilling ? "Running..." : "Run Due Billing Now"}
+          </Button>
         </div>
 
         <div className="grid md:grid-cols-4 gap-6">
@@ -252,75 +321,133 @@ export function AdminSubscriptions() {
         <div className="p-4 border-b border-border">
           <h3 className="font-semibold">User Subscriptions</h3>
         </div>
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>User</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>Fee</TableHead>
-              <TableHead>Threshold</TableHead>
-              <TableHead>Next Billing</TableHead>
-              <TableHead>Actions</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {subscriptions.map((sub) => (
-              <TableRow key={sub.id}>
-                <TableCell>{sub.user_email || "Unknown"}</TableCell>
-                <TableCell>{getStatusBadge(sub.status)}</TableCell>
-                <TableCell>
-                  {sub.fee_type === "percentage" ? `${sub.fee_value}%` : `$${sub.fee_value}`}
-                </TableCell>
-                <TableCell>${sub.min_profit_threshold}</TableCell>
-                <TableCell>
-                  <Input
-                    type="date"
-                    value={nextBillingDrafts[sub.id] ?? ""}
-                    onChange={(event) =>
-                      setNextBillingDrafts((prev) => ({ ...prev, [sub.id]: event.target.value }))
-                    }
-                    className="h-8 w-[155px]"
-                  />
-                </TableCell>
-                <TableCell>
-                  <div className="flex gap-2">
-                    <Button
-                      size="sm"
-                      disabled={savingNextBillingSubId === sub.id}
-                      onClick={() => updateSubscriptionNextBilling(sub)}
-                    >
-                      {savingNextBillingSubId === sub.id ? "Saving..." : "Save Billing Date"}
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={updatingSubId === sub.id || sub.status === "active"}
-                      onClick={() => updateSubscriptionStatus(sub.id, "active")}
-                    >
-                      Activate
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={updatingSubId === sub.id || sub.status === "past_due"}
-                      onClick={() => updateSubscriptionStatus(sub.id, "past_due")}
-                    >
-                      Mark Past Due
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={updatingSubId === sub.id || sub.status === "canceled"}
-                      onClick={() => updateSubscriptionStatus(sub.id, "canceled")}
-                    >
-                      Cancel
-                    </Button>
-                  </div>
-                </TableCell>
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>User</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>Fee Type</TableHead>
+                <TableHead>Fee Value</TableHead>
+                <TableHead>Threshold</TableHead>
+                <TableHead>Next Billing</TableHead>
+                <TableHead>Actions</TableHead>
               </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+            </TableHeader>
+            <TableBody>
+              {subscriptions.map((sub) => {
+                const draft = subscriptionDrafts[sub.id] || {
+                  fee_type: sub.fee_type,
+                  fee_value: String(sub.fee_value ?? 0),
+                  min_profit_threshold: String(sub.min_profit_threshold ?? 0),
+                  next_billing_date: sub.next_billing_date ?? "",
+                };
+
+                return (
+                  <TableRow key={sub.id} className="align-top">
+                    <TableCell className="min-w-[260px] py-5">
+                      <div className="space-y-1">
+                        <p className="font-medium leading-6">{sub.user_email || "Unknown"}</p>
+                        <p className="text-xs text-muted-foreground">
+                          Subscription {sub.id.slice(0, 8)}
+                        </p>
+                      </div>
+                    </TableCell>
+                    <TableCell className="py-5">{getStatusBadge(sub.status)}</TableCell>
+                    <TableCell className="min-w-[150px] py-5">
+                      <select
+                        className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+                        value={draft.fee_type}
+                        onChange={(event) =>
+                          updateSubscriptionDraft(
+                            sub.id,
+                            "fee_type",
+                            event.target.value
+                          )
+                        }
+                      >
+                        <option value="percentage">Percentage</option>
+                        <option value="fixed">Fixed</option>
+                      </select>
+                    </TableCell>
+                    <TableCell className="min-w-[140px] py-5">
+                      <Input
+                        type="number"
+                        min={0}
+                        value={draft.fee_value}
+                        onChange={(event) =>
+                          updateSubscriptionDraft(sub.id, "fee_value", event.target.value)
+                        }
+                        className="h-9"
+                      />
+                    </TableCell>
+                    <TableCell className="min-w-[140px] py-5">
+                      <Input
+                        type="number"
+                        min={0}
+                        value={draft.min_profit_threshold}
+                        onChange={(event) =>
+                          updateSubscriptionDraft(sub.id, "min_profit_threshold", event.target.value)
+                        }
+                        className="h-9"
+                      />
+                    </TableCell>
+                    <TableCell className="min-w-[170px] py-5">
+                      <Input
+                        type="date"
+                        value={draft.next_billing_date}
+                        onChange={(event) =>
+                          updateSubscriptionDraft(sub.id, "next_billing_date", event.target.value)
+                        }
+                        className="h-9"
+                      />
+                    </TableCell>
+                    <TableCell className="min-w-[360px] py-5">
+                      <div className="grid grid-cols-3 gap-2">
+                        <Button
+                          size="sm"
+                          className="col-span-3"
+                          disabled={savingBillingSubId === sub.id}
+                          onClick={() => saveSubscriptionBilling(sub)}
+                        >
+                          <Save className="mr-2 h-4 w-4" />
+                          {savingBillingSubId === sub.id ? "Saving..." : "Save Billing"}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="w-full"
+                          disabled={updatingSubId === sub.id || sub.status === "active"}
+                          onClick={() => updateSubscriptionStatus(sub.id, "active")}
+                        >
+                          Activate
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="w-full"
+                          disabled={updatingSubId === sub.id || sub.status === "past_due"}
+                          onClick={() => updateSubscriptionStatus(sub.id, "past_due")}
+                        >
+                          Mark Past Due
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="w-full"
+                          disabled={updatingSubId === sub.id || sub.status === "canceled"}
+                          onClick={() => updateSubscriptionStatus(sub.id, "canceled")}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </div>
       </div>
     </div>
   );

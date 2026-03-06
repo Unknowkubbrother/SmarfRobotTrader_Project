@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import Response
 
 from ..database.client import db
 from ..models.subscription_model import (
@@ -16,11 +17,17 @@ from ..models.subscription_model import (
     CreateSetupIntentResponse,
     InvoiceResponse,
     PaymentMethodResponse,
+    ProcessDueBillingResponse,
     SubscriptionResponse,
     SubscriptionSummaryResponse,
     UpdateBillingConfigRequest,
     UpdateSubscriptionStatusRequest,
     WeeklyPreviewResponse,
+)
+from ..utils.subscription_billing import (
+    build_invoice_html,
+    pay_invoice_now,
+    process_all_due_billing,
 )
 from .authentication import get_current_active_user
 
@@ -369,6 +376,8 @@ async def get_subscription_summary(
         except Exception:
             pass
 
+    await process_all_due_billing(today=today, user_id=user_id)
+
     payment_methods = await db.userpaymentmethod.find_many(
         where={"userId": user_id, "isActive": True}
     )
@@ -609,6 +618,67 @@ async def remove_payment_method(
     return {"message": "Payment method removed"}
 
 
+@subscription_router.get("/invoices/{invoice_id}/download")
+async def download_invoice(
+    invoice_id: str,
+    current_user: Annotated[any, Depends(get_current_active_user)],
+):
+    invoice = await db.invoice.find_unique(
+        where={"id": invoice_id},
+        include={"subscription": True},
+    )
+    if not invoice or str(invoice.subscription.userId) != str(current_user.id):
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    payment_method = None
+    payment_method_id = str(invoice.paymentMethodUsed or "").strip()
+    if payment_method_id:
+        payment_method = await db.userpaymentmethod.find_unique(where={"id": payment_method_id})
+    if not payment_method and invoice.subscription.defaultPaymentMethodId:
+        payment_method = await db.userpaymentmethod.find_unique(
+            where={"id": str(invoice.subscription.defaultPaymentMethodId)}
+        )
+
+    html_content = build_invoice_html(
+        invoice,
+        user=current_user,
+        subscription=invoice.subscription,
+        payment_method=payment_method,
+    )
+    filename = f"invoice-{str(invoice.id)[:8]}.html"
+    return Response(
+        content=html_content,
+        media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@subscription_router.post("/invoices/{invoice_id}/pay")
+async def pay_invoice(
+    invoice_id: str,
+    current_user: Annotated[any, Depends(get_current_active_user)],
+):
+    invoice = await db.invoice.find_unique(
+        where={"id": invoice_id},
+        include={"subscription": True},
+    )
+    if not invoice or str(invoice.subscription.userId) != str(current_user.id):
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    invoice_status = (_enum_value(invoice.status) or "").lower()
+    if invoice_status == "paid":
+        return {"message": "Invoice already paid"}
+    if invoice_status == "skipped":
+        raise HTTPException(status_code=400, detail="Skipped invoice cannot be paid")
+
+    try:
+        await pay_invoice_now(invoice, user=current_user)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    return {"message": "Invoice paid successfully"}
+
+
 def _map_billing_config(config) -> AdminBillingConfigResponse:
     return AdminBillingConfigResponse(
         config_id=int(config.configId) if config else None,
@@ -777,4 +847,21 @@ async def get_admin_subscription_stats(
         total_bot_versions=total_bot_versions,
         pending_tickets=pending_tickets,
         monthly_revenue=monthly_revenue,
+    )
+
+
+@subscription_router.post("/admin/process-due", response_model=ProcessDueBillingResponse)
+async def process_due_billing_now(
+    current_user: Annotated[any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    summary = await process_all_due_billing(today=date.today())
+    return ProcessDueBillingResponse(
+        processed_subscriptions=summary.processed_subscriptions,
+        created_invoices=summary.created_invoices,
+        paid_invoices=summary.paid_invoices,
+        pending_invoices=summary.pending_invoices,
+        skipped_invoices=summary.skipped_invoices,
+        failed_invoices=summary.failed_invoices,
     )

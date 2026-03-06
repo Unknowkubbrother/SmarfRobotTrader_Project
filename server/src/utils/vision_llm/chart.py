@@ -147,22 +147,6 @@ def _timeframe_seconds(timeframe: str) -> int:
 
 
 def generate_image(date_time: datetime, symbol: str = "EURUSD", timeframe: str = "H1") -> str:
-    """Return a base64-encoded PNG candlestick chart for one bar window.
-
-    Parameters
-    ----------
-    date_time : datetime
-        Target bar timestamp. It will be aligned to timeframe boundary.
-    symbol : str
-        MT5 symbol name.
-    timeframe : str
-        Target timeframe name (e.g. H1, M15). Used to define chart window length.
-
-    Returns
-    -------
-    str
-        Base64-encoded PNG image.
-    """
     mt5, _connected_host, _connected_port = _connect_mt5()
 
     try:
