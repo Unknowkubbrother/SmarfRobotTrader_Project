@@ -21,11 +21,17 @@ from ..constants.mt5_server_catalog import (
     validate_mt5_broker_server_pair,
 )
 from ..utils.mt5_bot_runner import BotRunnerError, build_profile_name, run_bot_instance_action
+from ..utils.notification_delivery import (
+    build_generic_notification_email_html,
+    claim_notification_dedupe,
+    dispatch_notification_to_user_id,
+)
 from ..utils.subscription_access import assert_user_subscription_allows_bot_usage
 from ..utils.trading_schedule import normalize_trading_schedule
 
 trading_router = APIRouter()
 ACTIVE_RECORD_STATUS = "active"
+_TRADING_NOTIFICATION_RELATED_LINK = "/dashboard"
 
 
 def _as_date(value) -> date:
@@ -94,6 +100,88 @@ def _encrypt_mt5_password(raw_password: str) -> str:
     )
     fernet = Fernet(key)
     return fernet.encrypt(raw_password.encode()).decode()
+
+
+def _format_trading_account_label(account) -> str:
+    broker_name = str(getattr(account, "brokerName", "") or "").strip()
+    server_name = str(getattr(account, "serverName", "") or "").strip()
+    login_id = str(getattr(account, "mt5LoginId", "") or "").strip()
+    label_parts = [part for part in [broker_name, server_name] if part]
+    label = " / ".join(label_parts)
+    if login_id:
+        label = f"{label} ({login_id})" if label else f"MT5 {login_id}"
+    return label or "MT5 account"
+
+
+async def _notify_trading_account_event(
+    *,
+    user_id: str,
+    event_type: str,
+    account,
+    linked_bots: int = 0,
+    stopped_instances: int = 0,
+) -> None:
+    try:
+        account_id = str(getattr(account, "id", "") or "").strip()
+        if not user_id or not account_id:
+            return
+
+        account_label = _format_trading_account_label(account)
+        title = "Trading account updated"
+        subject = "Trading account updated - SmarfRobotTrade"
+        message = f"{account_label} was updated."
+        email_message = f"{account_label} was updated in your SmarfRobotTrade profile."
+
+        if event_type == "created":
+            title = "Trading account connected"
+            subject = "Trading account connected - SmarfRobotTrade"
+            message = f"{account_label} was added to your profile."
+            email_message = (
+                f"{account_label} was connected to your SmarfRobotTrade profile. "
+                "You can now configure bots for this account."
+            )
+        elif event_type == "deleted":
+            title = "Trading account archived"
+            subject = "Trading account archived - SmarfRobotTrade"
+            message = f"{account_label} was archived."
+            email_message = f"{account_label} was archived from your SmarfRobotTrade profile."
+
+        if linked_bots > 0:
+            bot_note = f" {linked_bots} linked bot(s) were affected."
+            message = f"{message}{bot_note}"
+            email_message = f"{email_message}{bot_note}"
+        if stopped_instances > 0:
+            stop_note = f" {stopped_instances} running bot instance(s) were stopped."
+            message = f"{message}{stop_note}"
+            email_message = f"{email_message}{stop_note}"
+
+        dedupe_basis = f"{event_type}|{account_id}|{getattr(account, 'brokerName', '')}|{getattr(account, 'serverName', '')}|{getattr(account, 'mt5LoginId', '')}|{linked_bots}|{stopped_instances}"
+        if not claim_notification_dedupe(
+            key=f"trading_account_notify:{user_id}:{dedupe_basis}",
+            ttl_seconds=90,
+        ):
+            return
+
+        email_html = build_generic_notification_email_html(
+            title=title,
+            greeting="Hi Trader,",
+            message=email_message,
+            related_link=_TRADING_NOTIFICATION_RELATED_LINK,
+            action_label="Open dashboard",
+        )
+
+        await dispatch_notification_to_user_id(
+            user_id,
+            title=title,
+            message=message,
+            related_link=_TRADING_NOTIFICATION_RELATED_LINK,
+            email_subject=subject,
+            email_html=email_html,
+            action_label="Open dashboard",
+            send_discord_channel=False,
+        )
+    except Exception:
+        return
 
 
 async def _stop_account_bot_instances(account_id: str) -> int:
@@ -1025,6 +1113,12 @@ async def create_account(request: Request, data: Create_Trading_Account):
         }
     )
 
+    await _notify_trading_account_event(
+        user_id=str(userId),
+        event_type="created",
+        account=trading_account,
+    )
+
     return {
         "status_code": 200,
         "message": "Trading account created successfully"
@@ -1096,6 +1190,8 @@ async def update_account(request: Request, data: Update_Trading_Account):
         data=update_payload,
     )
 
+    updated_account = await db.tradingaccount.find_unique(where={"id": data.accountId})
+
     if linked_bots > 0:
         await db.botconfiguration.update_many(
             where={"accountId": data.accountId, "recordStatus": ACTIVE_RECORD_STATUS},
@@ -1103,6 +1199,15 @@ async def update_account(request: Request, data: Update_Trading_Account):
                 "containerStatus": "stopped",
                 "isActive": False,
             },
+        )
+
+    if updated_account:
+        await _notify_trading_account_event(
+            user_id=str(request.state.user_id),
+            event_type="updated",
+            account=updated_account,
+            linked_bots=int(linked_bots),
+            stopped_instances=int(stopped_instances),
         )
 
     return {
@@ -1153,6 +1258,14 @@ async def delete_account(request: Request, data: Delete_Trading_Account):
             "recordStatus": "deleted",
             "deletedAt": datetime.utcnow(),
         },
+    )
+
+    await _notify_trading_account_event(
+        user_id=str(request.state.user_id),
+        event_type="deleted",
+        account=account,
+        linked_bots=int(linked_bots),
+        stopped_instances=int(stopped_instances),
     )
 
     return {
