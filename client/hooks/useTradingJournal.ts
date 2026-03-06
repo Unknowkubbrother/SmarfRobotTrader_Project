@@ -8,6 +8,10 @@ export interface TradingJournalRow {
   journalId: string | null;
   ticketId: number;
   accountId: string;
+  accountLabel: string;
+  accountBrokerName: string | null;
+  accountServerName: string | null;
+  accountLoginId: string | null;
   symbol: string;
   type: string;
   status: string;
@@ -25,6 +29,14 @@ export interface TradingJournalRow {
   attachmentUrls: string[];
   journalCreatedAt: string | null;
   journalUpdatedAt: string | null;
+}
+
+export interface TradingJournalAccount {
+  id: string;
+  label: string;
+  brokerName: string | null;
+  serverName: string | null;
+  mt5LoginId: string | null;
 }
 
 export interface TradingJournalSummary {
@@ -49,6 +61,7 @@ export function useTradingJournal(options: UseTradingJournalOptions = {}) {
   const includeArchived = options.includeArchived ?? true;
   const { user, loading: authLoading } = useAuth();
   const [rows, setRows] = useState<TradingJournalRow[]>([]);
+  const [accounts, setAccounts] = useState<TradingJournalAccount[]>([]);
   const [summary, setSummary] = useState<TradingJournalSummary>({
     totalRows: 0,
     withJournal: 0,
@@ -62,6 +75,7 @@ export function useTradingJournal(options: UseTradingJournalOptions = {}) {
       if (authLoading) return;
       if (!user) {
         setRows([]);
+        setAccounts([]);
         setSummary({ totalRows: 0, withJournal: 0, withoutJournal: 0 });
         setLoading(false);
         return;
@@ -78,8 +92,10 @@ export function useTradingJournal(options: UseTradingJournalOptions = {}) {
           },
         });
         const data = Array.isArray(res.data?.data) ? res.data.data : [];
+        const accountRows = Array.isArray(res.data?.accounts) ? res.data.accounts : [];
         const s = res.data?.summary || {};
         setRows(data as TradingJournalRow[]);
+        setAccounts(accountRows as TradingJournalAccount[]);
         setSummary({
           totalRows: Number(s.totalRows || data.length || 0),
           withJournal: Number(s.withJournal || 0),
@@ -144,6 +160,7 @@ export function useTradingJournal(options: UseTradingJournalOptions = {}) {
 
   return {
     rows,
+    accounts,
     summary,
     stats,
     loading,

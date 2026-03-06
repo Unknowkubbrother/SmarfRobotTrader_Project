@@ -28,6 +28,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_TAGS = [
@@ -41,6 +42,7 @@ const DEFAULT_TAGS = [
   "WinnerTrade",
 ];
 const INCLUDE_ARCHIVED_STORAGE_KEY = "trading-journal-include-archived";
+const ALL_ACCOUNTS_FILTER = "__all_accounts__";
 
 function fmtDate(value: string | null): string {
   if (!value) return "-";
@@ -73,6 +75,33 @@ function displayTag(value: string): string {
   return text ? `#${text}` : "";
 }
 
+type TradingJournalAccountLike = Pick<
+  TradingJournalRow,
+  "accountId" | "accountLabel" | "accountBrokerName" | "accountServerName" | "accountLoginId"
+>;
+
+function fallbackAccountLabel(accountId: string | null | undefined): string {
+  const safeId = String(accountId || "").trim();
+  return safeId ? `Account ${safeId.slice(0, 8)}` : "Unknown account";
+}
+
+function formatAccountLabel(row: TradingJournalAccountLike | null | undefined): string {
+  if (!row) return "Unknown account";
+
+  const explicitLabel = String(row.accountLabel || "").trim();
+  if (explicitLabel) return explicitLabel;
+
+  const broker = String(row.accountBrokerName || "").trim();
+  const server = String(row.accountServerName || "").trim();
+  const login = String(row.accountLoginId || "").trim();
+  const left = [broker, server].filter(Boolean).join(" / ");
+
+  if (left && login) return `${left} (${login})`;
+  if (left) return left;
+  if (login) return `MT5 ${login}`;
+  return fallbackAccountLabel(row.accountId);
+}
+
 export default function TradingJournal() {
   const [includeArchived, setIncludeArchived] = useState<boolean>(() => {
     if (typeof window === "undefined") return true;
@@ -83,6 +112,7 @@ export default function TradingJournal() {
   });
   const {
     rows,
+    accounts,
     loading,
     query,
     setQuery,
@@ -101,6 +131,7 @@ export default function TradingJournal() {
   const [screenshotFilter, setScreenshotFilter] = useState<"all" | "yes" | "no">("all");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerSearchText, setPickerSearchText] = useState("");
+  const [pickerAccountFilter, setPickerAccountFilter] = useState<string>(ALL_ACCOUNTS_FILTER);
   const [editing, setEditing] = useState<TradingJournalRow | null>(null);
   const [rationale, setRationale] = useState("");
   const [lesson, setLesson] = useState("");
@@ -135,6 +166,26 @@ export default function TradingJournal() {
     return Array.from(map.entries()).map(([key, label]) => ({ key, label }));
   }, [rows]);
 
+  const pickerAccountOptions = useMemo(
+    () =>
+      accounts
+        .filter((account) => Boolean(account.id))
+        .map((account) => ({
+          id: account.id,
+          label: String(account.label || "").trim() || fallbackAccountLabel(account.id),
+        }))
+        .sort((a, b) => a.label.localeCompare(b.label)),
+    [accounts]
+  );
+
+  useEffect(() => {
+    if (pickerAccountFilter === ALL_ACCOUNTS_FILTER) return;
+    const exists = pickerAccountOptions.some((option) => option.id === pickerAccountFilter);
+    if (!exists) {
+      setPickerAccountFilter(ALL_ACCOUNTS_FILTER);
+    }
+  }, [pickerAccountFilter, pickerAccountOptions]);
+
   const visibleRows = useMemo(() => {
     const journalRows = rows.filter((row) => Boolean(row.journalId));
     const selected = new Set(selectedTags);
@@ -166,22 +217,30 @@ export default function TradingJournal() {
 
   const pickerRows = useMemo(() => {
     const noJournalRows = rows.filter((r) => !r.journalId);
+    const selectedAccountId =
+      pickerAccountFilter === ALL_ACCOUNTS_FILTER ? null : pickerAccountFilter;
     const baseRows = noJournalRows;
     const q = String(pickerSearchText || "").trim().toLowerCase();
-    if (!q) return baseRows;
     return baseRows.filter((r) => {
+      if (selectedAccountId && String(r.accountId || "").trim() !== selectedAccountId) {
+        return false;
+      }
+      if (!q) return true;
       const text = [
         String(r.ticketId),
         String(r.symbol || ""),
         String(r.type || ""),
         String(r.status || ""),
         fmtDate(r.closeTime),
+        formatAccountLabel(r),
+        String(r.accountId || ""),
+        String(r.accountLoginId || ""),
       ]
         .join(" ")
         .toLowerCase();
       return text.includes(q);
     });
-  }, [pickerSearchText, rows]);
+  }, [pickerAccountFilter, pickerSearchText, rows]);
 
   const toggleTag = (tagKey: string) => {
     setSelectedTags((prev) =>
@@ -352,19 +411,22 @@ export default function TradingJournal() {
             const profit = Number(row.profit || 0);
             return (
               <div key={row.ticketId} className="rounded-xl border border-border bg-card p-5">
-                <div className="mb-4 flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-3">
-                    <p className="text-lg font-semibold tracking-tight">{row.symbol || "-"}</p>
-                    <Badge
-                      className={cn(
-                        "font-mono uppercase",
-                        side === "BUY" ? "bg-emerald-100 text-emerald-700" : "",
-                        side === "SELL" ? "bg-rose-100 text-rose-700" : ""
-                      )}
-                    >
-                      {side || "-"}
-                    </Badge>
-                    <span className="text-sm text-muted-foreground">{fmtDate(row.closeTime)}</span>
+                <div className="mb-4 flex items-start justify-between gap-3">
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <p className="text-lg font-semibold tracking-tight">{row.symbol || "-"}</p>
+                      <Badge
+                        className={cn(
+                          "font-mono uppercase",
+                          side === "BUY" ? "bg-emerald-100 text-emerald-700" : "",
+                          side === "SELL" ? "bg-rose-100 text-rose-700" : ""
+                        )}
+                      >
+                        {side || "-"}
+                      </Badge>
+                      <span className="text-sm text-muted-foreground">{fmtDate(row.closeTime)}</span>
+                    </div>
+                    <p className="truncate text-xs text-muted-foreground">{formatAccountLabel(row)}</p>
                   </div>
                   <p
                     className={cn(
@@ -462,14 +524,32 @@ export default function TradingJournal() {
           </DialogHeader>
 
           <div className="space-y-3">
-            <div className="relative">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={pickerSearchText}
-                onChange={(e) => setPickerSearchText(e.target.value)}
-                placeholder="Search by ticket, symbol, type..."
-                className="pl-9"
-              />
+            <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_240px]">
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={pickerSearchText}
+                  onChange={(e) => setPickerSearchText(e.target.value)}
+                  placeholder="Search by ticket, symbol, type, account..."
+                  className="pl-9"
+                />
+              </div>
+              <div className="space-y-1">
+                <p className="text-xs text-muted-foreground">Trading account</p>
+                <Select value={pickerAccountFilter} onValueChange={setPickerAccountFilter}>
+                  <SelectTrigger className="h-10">
+                    <SelectValue placeholder="All accounts" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={ALL_ACCOUNTS_FILTER}>All accounts</SelectItem>
+                    {pickerAccountOptions.map((option) => (
+                      <SelectItem key={option.id} value={option.id}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
 
             <div className="max-h-[360px] space-y-2 overflow-y-auto pr-1">
@@ -486,25 +566,30 @@ export default function TradingJournal() {
                       key={`pick-${row.ticketId}`}
                       className="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2"
                     >
-                      <div className="flex items-center gap-3">
-                        <span className="font-mono text-sm">#{row.ticketId}</span>
-                        <span className="font-semibold">{row.symbol || "-"}</span>
-                        <Badge
-                          variant="outline"
-                          className={cn(
-                            "font-mono uppercase",
-                            side === "BUY" ? "bg-emerald-100 text-emerald-700" : "",
-                            side === "SELL" ? "bg-rose-100 text-rose-700" : ""
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-3">
+                          <span className="font-mono text-sm">#{row.ticketId}</span>
+                          <span className="font-semibold">{row.symbol || "-"}</span>
+                          <Badge
+                            variant="outline"
+                            className={cn(
+                              "font-mono uppercase",
+                              side === "BUY" ? "bg-emerald-100 text-emerald-700" : "",
+                              side === "SELL" ? "bg-rose-100 text-rose-700" : ""
+                            )}
+                          >
+                            {side || "-"}
+                          </Badge>
+                          <span className="text-xs text-muted-foreground">{fmtDate(row.closeTime)}</span>
+                          {row.journalId ? (
+                            <Badge variant="secondary">Has Journal</Badge>
+                          ) : (
+                            <Badge className="bg-blue-100 text-blue-700 hover:bg-blue-100">New</Badge>
                           )}
-                        >
-                          {side || "-"}
-                        </Badge>
-                        <span className="text-xs text-muted-foreground">{fmtDate(row.closeTime)}</span>
-                        {row.journalId ? (
-                          <Badge variant="secondary">Has Journal</Badge>
-                        ) : (
-                          <Badge className="bg-blue-100 text-blue-700 hover:bg-blue-100">New</Badge>
-                        )}
+                        </div>
+                        <p className="mt-1 truncate text-xs text-muted-foreground">
+                          {formatAccountLabel(row)}
+                        </p>
                       </div>
                       <div className="flex items-center gap-3">
                         <span
@@ -620,7 +705,7 @@ export default function TradingJournal() {
           <DialogHeader>
             <DialogTitle>Journal Entry #{editing?.ticketId}</DialogTitle>
             <DialogDescription>
-              {editing?.symbol || "-"} {editing?.type || "-"} | Profit{" "}
+              {editing?.symbol || "-"} {editing?.type || "-"} | {formatAccountLabel(editing)} | Profit{" "}
               {editing ? `${editing.profit >= 0 ? "+" : ""}${fmtNum(editing.profit)}` : "0.00"}
             </DialogDescription>
           </DialogHeader>

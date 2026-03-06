@@ -113,6 +113,25 @@ def _format_trading_account_label(account) -> str:
     return label or "MT5 account"
 
 
+def _fallback_trading_account_label(account_id: str | None) -> str:
+    safe_id = str(account_id or "").strip()
+    return f"Account {safe_id[:8]}" if safe_id else "Unknown account"
+
+
+def _serialize_trading_account_source(account) -> dict:
+    account_id = str(getattr(account, "id", "") or "").strip()
+    broker_name = str(getattr(account, "brokerName", "") or "").strip() or None
+    server_name = str(getattr(account, "serverName", "") or "").strip() or None
+    mt5_login_id = str(getattr(account, "mt5LoginId", "") or "").strip() or None
+    return {
+        "id": account_id,
+        "label": _format_trading_account_label(account),
+        "brokerName": broker_name,
+        "serverName": server_name,
+        "mt5LoginId": mt5_login_id,
+    }
+
+
 async def _notify_trading_account_event(
     *,
     user_id: str,
@@ -682,12 +701,27 @@ async def get_trading_journal_feed(
         return {
             "status_code": 200,
             "data": [],
+            "accounts": [],
             "summary": {
                 "totalRows": 0,
                 "withJournal": 0,
                 "withoutJournal": 0,
             },
         }
+
+    trading_accounts = await db.tradingaccount.find_many(
+        where={"id": {"in": account_ids}},
+    )
+    account_by_id = {
+        str(getattr(account, "id", "") or "").strip(): account
+        for account in trading_accounts
+        if str(getattr(account, "id", "") or "").strip()
+    }
+    account_sources = [
+        _serialize_trading_account_source(account)
+        for account in trading_accounts
+        if str(getattr(account, "id", "") or "").strip()
+    ]
 
     fetch_size = max(safe_limit * 3, 400)
     where_scope = {
@@ -703,6 +737,7 @@ async def get_trading_journal_feed(
         return {
             "status_code": 200,
             "data": [],
+            "accounts": account_sources,
             "summary": {
                 "totalRows": 0,
                 "withJournal": 0,
@@ -727,6 +762,28 @@ async def get_trading_journal_feed(
     for order in orders:
         ticket_id = int(getattr(order, "ticketId", 0) or 0)
         journal = journal_by_ticket.get(ticket_id)
+        account_id = str(getattr(order, "accountId", "") or "").strip()
+        account = account_by_id.get(account_id)
+        account_label = (
+            _format_trading_account_label(account)
+            if account
+            else _fallback_trading_account_label(account_id)
+        )
+        account_broker_name = (
+            str(getattr(account, "brokerName", "") or "").strip() or None
+            if account
+            else None
+        )
+        account_server_name = (
+            str(getattr(account, "serverName", "") or "").strip() or None
+            if account
+            else None
+        )
+        account_login_id = (
+            str(getattr(account, "mt5LoginId", "") or "").strip() or None
+            if account
+            else None
+        )
 
         tags = _normalize_string_list(getattr(journal, "tags", [])) if journal else []
         attachment_urls = _normalize_string_list(getattr(journal, "attachmentUrls", [])) if journal else []
@@ -739,7 +796,11 @@ async def get_trading_journal_feed(
         row = {
             "journalId": str(getattr(journal, "id", "") or "") if journal else None,
             "ticketId": int(ticket_id),
-            "accountId": str(getattr(order, "accountId", "") or ""),
+            "accountId": account_id,
+            "accountLabel": account_label,
+            "accountBrokerName": account_broker_name,
+            "accountServerName": account_server_name,
+            "accountLoginId": account_login_id,
             "magicNumber": int(getattr(order, "magicNumber", 0) or 0) or None,
             "symbol": str(getattr(order, "symbol", "") or ""),
             "type": order_type,
@@ -765,6 +826,11 @@ async def get_trading_journal_feed(
                 str(row["ticketId"]),
                 str(row["symbol"]),
                 str(row["type"]),
+                str(row["accountId"]),
+                str(row["accountLabel"]),
+                str(row["accountBrokerName"] or ""),
+                str(row["accountServerName"] or ""),
+                str(row["accountLoginId"] or ""),
                 str(row["tradeRationale"] or ""),
                 str(row["mistakeLesson"] or ""),
                 " ".join(tags),
@@ -781,6 +847,7 @@ async def get_trading_journal_feed(
     return {
         "status_code": 200,
         "data": rows,
+        "accounts": account_sources,
         "summary": {
             "totalRows": int(len(rows)),
             "withJournal": int(with_journal),
