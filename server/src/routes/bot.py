@@ -28,6 +28,7 @@ from ..utils.mt5_bot_runner import (
 )
 from ..utils.bot_operation_events import emit_and_store_bot_operation_event
 from ..utils.bot_magic import derive_magic_number, normalize_magic_number
+from ..utils.notification_delivery import dispatch_notification_to_user_id
 from ..utils.ws_manager import bot_hub
 
 bot_router = APIRouter()
@@ -1173,13 +1174,13 @@ async def apply_bot_update(request: Request, data: Apply_Bot_Update):
 
     bot_label = bot_version.label or "Trading Bot"
     version_tag = latest_version_tag
-    await db.notification.create(
-        data={
-            "userId": request.state.user_id,
-            "title": f"Bot updated: {bot_label}",
-            "message": f"{bot_label} is now on {version_tag}.",
-            "relatedLink": "/bot-control",
-        }
+    await dispatch_notification_to_user_id(
+        request.state.user_id,
+        title=f"Bot updated: {bot_label}",
+        message=f"{bot_label} is now on {version_tag}.",
+        related_link="/bot-control",
+        email_subject=f"Bot updated to {version_tag} - SmarfRobotTrade",
+        action_label="Open bot control",
     )
 
     try:

@@ -4,6 +4,7 @@ import bcrypt
 import os
 import shutil
 import time
+from urllib.parse import urlparse
 
 from ..database.client import db, r_cache
 from lib.untils import random_with_N_digits, send_otp_email
@@ -23,6 +24,35 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 settings_router = APIRouter()
 
+
+def _mask_discord_webhook_url(value: Optional[str]) -> Optional[str]:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+
+    parsed = urlparse(normalized)
+    host = parsed.netloc or "discord"
+    suffix = normalized[-4:] if len(normalized) >= 4 else normalized
+    return f"{host} ••••{suffix}"
+
+
+def _build_notification_config_response(notify_config) -> NotificationConfigResponse:
+    if not notify_config:
+        return NotificationConfigResponse()
+
+    webhook_url = str(getattr(notify_config, "discordWebhookUrl", None) or "").strip()
+    return NotificationConfigResponse(
+        emailNotificationEnable=notify_config.emailNotificationEnable,
+        alertMarginLevelThreshold=notify_config.alertMarginLevelThreshold,
+        alertProfitTarget=notify_config.alertProfitTarget,
+        alertLossLimit=notify_config.alertLossLimit,
+        enableWeeklySummary=notify_config.enableWeeklySummary,
+        enableMonthlySummary=notify_config.enableMonthlySummary,
+        discordWebhookUrl=None,
+        discordWebhookDisplay=_mask_discord_webhook_url(webhook_url),
+        hasDiscordWebhook=bool(webhook_url),
+    )
+
 @settings_router.get("/profile", response_model=UserProfileResponse)
 async def get_profile(
     current_user: Annotated[any, Depends(get_current_active_user)]
@@ -32,21 +62,7 @@ async def get_profile(
         where={"userId": str(current_user.id)}
     )
     
-    notify_response = None
-    if notify_config:
-        notify_response = NotificationConfigResponse(
-            emailNotificationEnable=notify_config.emailNotificationEnable,
-            alertMarginLevelThreshold=notify_config.alertMarginLevelThreshold,
-            alertProfitTarget=notify_config.alertProfitTarget,
-            alertLossLimit=notify_config.alertLossLimit,
-            enableWeeklySummary=notify_config.enableWeeklySummary,
-            enableMonthlySummary=notify_config.enableMonthlySummary,
-            lineNotifyToken=notify_config.lineNotifyToken,
-            discordWebhookUrl=notify_config.discordWebhookUrl
-        )
-    else:
-        # Return defaults if no config exists
-        notify_response = NotificationConfigResponse()
+    notify_response = _build_notification_config_response(notify_config)
 
     return UserProfileResponse(
         id=str(current_user.id),
@@ -184,16 +200,29 @@ async def update_password(
     
     return {"message": "Password updated successfully"}
 
-@settings_router.patch("/notifications")
+@settings_router.patch("/notifications", response_model=NotificationConfigResponse)
 async def update_notifications(
     data: UpdateNotificationsRequest,
     current_user: Annotated[any, Depends(get_current_active_user)]
 ):
     # Prepare update data types, filtering None
     update_dict = data.dict(exclude_unset=True)
-    
+
     if not update_dict:
-        return {"message": "No changes provided"}
+        return (await get_profile(current_user)).notificationConfig
+
+    if "alertProfitTarget" in update_dict and update_dict["alertProfitTarget"] is not None:
+        update_dict["alertProfitTarget"] = abs(update_dict["alertProfitTarget"])
+
+    if "alertLossLimit" in update_dict and update_dict["alertLossLimit"] is not None:
+        update_dict["alertLossLimit"] = -abs(update_dict["alertLossLimit"])
+
+    if "alertMarginLevelThreshold" in update_dict and update_dict["alertMarginLevelThreshold"] is not None:
+        update_dict["alertMarginLevelThreshold"] = abs(update_dict["alertMarginLevelThreshold"])
+
+    if "discordWebhookUrl" in update_dict and update_dict["discordWebhookUrl"] is not None:
+        normalized_url = str(update_dict["discordWebhookUrl"]).strip()
+        update_dict["discordWebhookUrl"] = normalized_url or None
 
     # Check if config exists
     config = await db.notificationconfig.find_unique(where={"userId": str(current_user.id)})
@@ -210,8 +239,9 @@ async def update_notifications(
             **update_dict
         }
         await db.notificationconfig.create(data=create_data)
-        
-    return {"message": "Notification settings updated"}
+
+    refreshed_config = await db.notificationconfig.find_unique(where={"userId": str(current_user.id)})
+    return _build_notification_config_response(refreshed_config)
 
 @settings_router.get("/activity-logs", response_model=List[ActivityLogResponse])
 async def get_activity_logs(

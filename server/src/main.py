@@ -90,6 +90,10 @@ from .utils.vision_llm.llm_client import (
     VisionLLMConfigError,
     VisionLLMServiceUnavailableError,
 )
+from .utils.notification_runtime import (
+    run_summary_notification_worker,
+    run_threshold_notification_worker,
+)
 from .utils.ws_manager import bot_hub
 
 logger = logging.getLogger(__name__)
@@ -190,14 +194,20 @@ async def lifespan(app: FastAPI):
 
     # Start one cron worker per symbol:timeframe pair
     cron_tasks = []
+    background_tasks = []
     if CRON_ENABLED and CRON_PAIRS:
         for symbol, timeframe in CRON_PAIRS:
             task = asyncio.create_task(_cron_worker(symbol, timeframe))
             cron_tasks.append(task)
 
+    background_tasks.append(asyncio.create_task(run_threshold_notification_worker()))
+    background_tasks.append(asyncio.create_task(run_summary_notification_worker()))
+
     yield
 
     for task in cron_tasks:
+        task.cancel()
+    for task in background_tasks:
         task.cancel()
     await db.disconnect()
 

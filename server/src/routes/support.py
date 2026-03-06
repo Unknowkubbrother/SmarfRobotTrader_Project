@@ -3,7 +3,6 @@ from datetime import datetime
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from lib.untils import send_email
 
 from ..database.client import db
 from ..models.support_model import (
@@ -14,6 +13,7 @@ from ..models.support_model import (
     UserReplySupportTicketRequest,
 )
 from .authentication import get_current_active_user
+from ..utils.notification_delivery import dispatch_notification_to_user
 
 support_router = APIRouter(tags=["Support"])
 
@@ -35,15 +35,6 @@ def _enum_value(value):
 def _is_admin(current_user: Any) -> bool:
     role = _enum_value(getattr(current_user, "role", None))
     return role == "admin"
-
-
-def _is_notification_allowed(notification_config) -> bool:
-    if not notification_config:
-        return True
-    value = getattr(notification_config, "emailNotificationEnable", None)
-    if value is None:
-        return True
-    return bool(value)
 
 
 def _normalize_status(raw_status: Optional[str], default: str = "open") -> str:
@@ -330,35 +321,23 @@ async def _notify_admins_new_ticket(ticket, current_user: Any, category: str, us
 
     for admin in admins:
         try:
-            await db.notification.create(
-                data={
-                    "userId": str(admin.id),
-                    "title": notification_title,
-                    "message": notification_message,
-                    "relatedLink": "/admin",
-                }
-            )
-        except Exception:
-            pass
-
-        if not getattr(admin, "email", None):
-            continue
-        if not _is_notification_allowed(getattr(admin, "notificationConfig", None)):
-            continue
-        try:
-            send_email(
-                to_email=str(admin.email),
-                subject=f"[Support] {subject_text}",
-                html_content=_build_admin_new_ticket_email_html(
+            await dispatch_notification_to_user(
+                admin,
+                title=notification_title,
+                message=notification_message,
+                related_link="/admin",
+                email_subject=f"[Support] {subject_text}",
+                email_html=_build_admin_new_ticket_email_html(
                     reporter_name=reporter_name,
                     reporter_email=reporter_email,
                     subject_text=subject_text,
                     category=category,
                     message_text=user_message,
                 ),
+                action_label="Open admin panel",
             )
         except Exception as exc:
-            print(f"[support] failed to send admin ticket email to {getattr(admin, 'email', None)}: {exc}")
+            print(f"[support] failed to notify admin {getattr(admin, 'email', None)}: {exc}")
 
 
 async def _notify_admins_user_reply(ticket, current_user: Any, reply_text: str):
@@ -377,34 +356,22 @@ async def _notify_admins_user_reply(ticket, current_user: Any, reply_text: str):
 
     for admin in admins:
         try:
-            await db.notification.create(
-                data={
-                    "userId": str(admin.id),
-                    "title": notification_title,
-                    "message": notification_message,
-                    "relatedLink": "/admin",
-                }
-            )
-        except Exception:
-            pass
-
-        if not getattr(admin, "email", None):
-            continue
-        if not _is_notification_allowed(getattr(admin, "notificationConfig", None)):
-            continue
-        try:
-            send_email(
-                to_email=str(admin.email),
-                subject=f"[Support Update] {subject_text}",
-                html_content=_build_admin_ticket_update_email_html(
+            await dispatch_notification_to_user(
+                admin,
+                title=notification_title,
+                message=notification_message,
+                related_link="/admin",
+                email_subject=f"[Support Update] {subject_text}",
+                email_html=_build_admin_ticket_update_email_html(
                     reporter_name=reporter_name,
                     reporter_email=reporter_email,
                     subject_text=subject_text,
                     message_text=reply_text,
                 ),
+                action_label="Open admin panel",
             )
         except Exception as exc:
-            print(f"[support] failed to send admin update email to {getattr(admin, 'email', None)}: {exc}")
+            print(f"[support] failed to notify admin update {getattr(admin, 'email', None)}: {exc}")
 
 
 async def _notify_user_ticket_reply(ticket, reply_text: str):
@@ -417,33 +384,21 @@ async def _notify_user_ticket_reply(ticket, reply_text: str):
 
     subject_text = str(getattr(ticket, "subject", "") or "").strip() or "(No subject)"
     try:
-        await db.notification.create(
-            data={
-                "userId": str(user.id),
-                "title": "Support replied to your ticket",
-                "message": subject_text,
-                "relatedLink": "/support",
-            }
-        )
-    except Exception:
-        pass
-
-    if not getattr(user, "email", None):
-        return
-    if not _is_notification_allowed(getattr(user, "notificationConfig", None)):
-        return
-    try:
-        send_email(
-            to_email=str(user.email),
-            subject=f"[Support Reply] {subject_text}",
-            html_content=_build_user_ticket_reply_email_html(
+        await dispatch_notification_to_user(
+            user,
+            title="Support replied to your ticket",
+            message=subject_text,
+            related_link="/support",
+            email_subject=f"[Support Reply] {subject_text}",
+            email_html=_build_user_ticket_reply_email_html(
                 user_name=str(getattr(user, "username", "") or "Trader"),
                 subject_text=subject_text,
                 reply_text=reply_text,
             ),
+            action_label="Open support",
         )
     except Exception as exc:
-        print(f"[support] failed to send ticket reply email to {getattr(user, 'email', None)}: {exc}")
+        print(f"[support] failed to notify ticket reply for {getattr(user, 'email', None)}: {exc}")
 
 
 @support_router.get("/tickets", response_model=list[SupportTicketItemResponse])

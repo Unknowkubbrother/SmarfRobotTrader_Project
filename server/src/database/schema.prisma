@@ -156,7 +156,6 @@ model ActivityLog {
 // ==========================================
 model NotificationConfig {
   userId                  String  @id @map("user_id") @db.Uuid
-  lineNotifyToken         String? @map("line_notify_token") @db.VarChar(255)
   discordWebhookUrl       String? @map("discord_webhook_url") @db.VarChar(255)
   emailNotificationEnable Boolean @default(true) @map("email_notification_enable")
 

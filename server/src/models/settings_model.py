@@ -18,8 +18,9 @@ class NotificationConfigResponse(BaseModel):
     alertLossLimit: Optional[Decimal] = None
     enableWeeklySummary: bool = True
     enableMonthlySummary: bool = True
-    lineNotifyToken: Optional[str] = None
     discordWebhookUrl: Optional[str] = None
+    discordWebhookDisplay: Optional[str] = None
+    hasDiscordWebhook: bool = False
 
 class UserProfileResponse(BaseModel):
     id: str
@@ -48,5 +49,4 @@ class UpdateNotificationsRequest(BaseModel):
     alertLossLimit: Optional[Decimal] = None
     enableWeeklySummary: Optional[bool] = None
     enableMonthlySummary: Optional[bool] = None
-    lineNotifyToken: Optional[str] = None
     discordWebhookUrl: Optional[str] = None

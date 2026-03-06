@@ -241,7 +241,6 @@ export type Database = {
           email_notification_enable: boolean | null
           enable_monthly_summary: boolean | null
           enable_weekly_summary: boolean | null
-          line_notify_token: string | null
           updated_at: string | null
           user_id: string
         }
@@ -253,7 +252,6 @@ export type Database = {
           email_notification_enable?: boolean | null
           enable_monthly_summary?: boolean | null
           enable_weekly_summary?: boolean | null
-          line_notify_token?: string | null
           updated_at?: string | null
           user_id: string
         }
@@ -265,7 +263,6 @@ export type Database = {
           email_notification_enable?: boolean | null
           enable_monthly_summary?: boolean | null
           enable_weekly_summary?: boolean | null
-          line_notify_token?: string | null
           updated_at?: string | null
           user_id?: string
         }

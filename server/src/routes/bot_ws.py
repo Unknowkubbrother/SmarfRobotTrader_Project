@@ -26,6 +26,7 @@ from ..utils.trading_schedule import normalize_trading_schedule
 from ..utils.vision_llm.use_llm import generate_llm_cls_for_bar
 from ..utils.ws_manager import bot_hub
 from ..database.client import db, r_cache
+from ..utils.notification_delivery import dispatch_notification_to_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -226,13 +227,13 @@ async def _emit_insufficient_funds_notification(bot_config_id: str, state: dict)
         body = f"{bot_label} cannot open {side} on {symbol}: {reason_text}"
         if account_label:
             body = f"{body} | Account: {account_label}"
-        await db.notification.create(
-            data={
-                "userId": user_id,
-                "title": title[:100],
-                "message": body,
-                "relatedLink": "/bot-control",
-            }
+        await dispatch_notification_to_user_id(
+            user_id,
+            title=title[:100],
+            message=body,
+            related_link="/bot-control",
+            email_subject="[Alert] Order blocked: insufficient funds",
+            action_label="Open bot control",
         )
 
 

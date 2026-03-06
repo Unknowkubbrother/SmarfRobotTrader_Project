@@ -64,7 +64,6 @@ CREATE TABLE "activities_logs" (
 -- ==============================================================
 CREATE TABLE "notification_configs" (
   "user_id" UUID PRIMARY KEY REFERENCES "users" ("user_id") ON DELETE CASCADE,
-  "line_notify_token" VARCHAR(255),
   "discord_webhook_url" VARCHAR(255),
   "email_notification_enable" BOOLEAN DEFAULT TRUE,
   

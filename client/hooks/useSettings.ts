@@ -9,8 +9,9 @@ export interface NotificationConfig {
     alertLossLimit: number | null;
     enableWeeklySummary: boolean;
     enableMonthlySummary: boolean;
-    lineNotifyToken: string | null;
-    discordWebhookUrl: string | null;
+    discordWebhookUrl?: string | null;
+    discordWebhookDisplay: string | null;
+    hasDiscordWebhook: boolean;
 }
 
 export interface UserProfile {
@@ -113,16 +114,13 @@ export function useSettings() {
     const updateNotifications = async (data: Partial<NotificationConfig>) => {
         try {
             setLoading(true);
-            await api.patch("/settings/notifications", data);
+            const response = await api.patch<NotificationConfig>("/settings/notifications", data);
 
             // Update local state
             if (profile) {
                 setProfile({
                     ...profile,
-                    notificationConfig: {
-                        ...profile.notificationConfig,
-                        ...data
-                    }
+                    notificationConfig: response.data
                 });
             }
 

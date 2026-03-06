@@ -5,7 +5,6 @@ from decimal import Decimal
 from typing import Annotated, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from lib.untils import send_email
 
 from ..database.client import db
 from ..models.admin_model import (
@@ -36,6 +35,7 @@ from ..utils.mt5_bot_runner import (
 )
 from ..utils.bot_magic import derive_magic_number, normalize_magic_number
 from ..utils.bot_operation_events import emit_and_store_bot_operation_event
+from ..utils.notification_delivery import dispatch_notification_to_user
 from .authentication import get_current_active_user
 
 admin_router = APIRouter(tags=["Admin"])
@@ -184,15 +184,6 @@ def _safe_runner_profile(symbol: Optional[str], timeframe: Optional[str]) -> str
         return build_profile_name(symbol, timeframe)
     except Exception:
         return "-"
-
-
-def _is_notification_allowed(notification_config) -> bool:
-    if not notification_config:
-        return True
-    value = getattr(notification_config, "emailNotificationEnable", None)
-    if value is None:
-        return True
-    return bool(value)
 
 
 def _runner_error_message(prefix: str, exc: BotRunnerError) -> str:
@@ -486,8 +477,6 @@ async def _notify_users_for_bot_update(
         user_status = _enum_value(getattr(user, "status", None))
         if user_status == "banned":
             continue
-        if not _is_notification_allowed(getattr(user, "notificationConfig", None)):
-            continue
         user_map[str(user.id)] = user
 
     if not user_map:
@@ -504,30 +493,25 @@ async def _notify_users_for_bot_update(
 
     emails_sent = 0
     for user in user_map.values():
-        await db.notification.create(
-            data={
-                "userId": str(user.id),
-                "title": notification_title,
-                "message": notification_message,
-                "relatedLink": "/bot-control",
-            }
-        )
-
         try:
-            if getattr(user, "email", None):
-                send_email(
-                    to_email=user.email,
-                    subject=f"Bot update available ({version_tag}) - SmarfRobotTrade",
-                    html_content=_build_bot_update_email_html(
-                        bot_label=bot_label,
-                        version_tag=version_tag,
-                        runner_profile=_safe_runner_profile(version.symbol, version.timeframe),
-                        release_notes=release_notes,
-                    ),
-                )
+            delivery = await dispatch_notification_to_user(
+                user,
+                title=notification_title,
+                message=notification_message,
+                related_link="/bot-control",
+                email_subject=f"Bot update available ({version_tag}) - SmarfRobotTrade",
+                email_html=_build_bot_update_email_html(
+                    bot_label=bot_label,
+                    version_tag=version_tag,
+                    runner_profile=_safe_runner_profile(version.symbol, version.timeframe),
+                    release_notes=release_notes,
+                ),
+                action_label="Open bot control",
+            )
+            if delivery.get("email"):
                 emails_sent += 1
         except Exception as exc:
-            print(f"[admin] failed to send bot update email to {getattr(user, 'email', None)}: {exc}")
+            print(f"[admin] failed to notify bot update for {getattr(user, 'email', None)}: {exc}")
 
     return len(user_map), emails_sent
 

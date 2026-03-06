@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from "react";
-import { User, Shield, Bell, Monitor, Globe, Key, Loader2, MessageSquare, Gamepad2, Camera } from "lucide-react";
+import { User, Shield, Bell, Monitor, Key, Loader2, Gamepad2, Camera } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { useSettings, UserProfile, NotificationConfig } from "@/hooks/useSettings";
+import { useSettings, NotificationConfig } from "@/hooks/useSettings";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
@@ -48,7 +48,6 @@ export default function Settings() {
   const [otp, setOtp] = useState("");
 
   const [tokenForm, setTokenForm] = useState({
-    lineNotifyToken: "",
     discordWebhookUrl: ""
   });
 
@@ -88,8 +87,7 @@ export default function Settings() {
 
       if (profile.notificationConfig) {
         setTokenForm({
-          lineNotifyToken: profile.notificationConfig.lineNotifyToken || "",
-          discordWebhookUrl: profile.notificationConfig.discordWebhookUrl || ""
+          discordWebhookUrl: ""
         });
         setThresholds(prev => ({
           alertProfitTarget: profile.notificationConfig.alertProfitTarget?.toString() ?? prev.alertProfitTarget,
@@ -144,10 +142,38 @@ export default function Settings() {
   };
 
   const handleTokenSave = async () => {
-    await updateNotifications({
-      lineNotifyToken: tokenForm.lineNotifyToken || null,
-      discordWebhookUrl: tokenForm.discordWebhookUrl || null
+    const normalizedUrl = tokenForm.discordWebhookUrl.trim();
+    if (!normalizedUrl) {
+      toast.error(
+        profile?.notificationConfig.hasDiscordWebhook
+          ? "Enter a new Discord webhook URL or remove the current one"
+          : "Enter a Discord webhook URL"
+      );
+      return;
+    }
+
+    const success = await updateNotifications({
+      discordWebhookUrl: normalizedUrl
     });
+
+    if (success) {
+      setTokenForm({ discordWebhookUrl: "" });
+    }
+  };
+
+  const handleDiscordWebhookRemove = async () => {
+    if (!profile?.notificationConfig.hasDiscordWebhook) {
+      toast.error("No Discord webhook configured");
+      return;
+    }
+
+    const success = await updateNotifications({
+      discordWebhookUrl: null
+    });
+
+    if (success) {
+      setTokenForm({ discordWebhookUrl: "" });
+    }
   };
 
   const handleThresholdChange = (key: string, value: string) => {
@@ -494,7 +520,7 @@ export default function Settings() {
               {[
                 { id: "alertProfitTarget", label: "Profit Alerts", desc: "Get notified when daily profit exceeds threshold", unit: "USD" },
                 { id: "alertLossLimit", label: "Loss Alerts", desc: "Get notified when losses exceed threshold", unit: "USD" },
-                { id: "alertMarginLevelThreshold", label: "Margin Level Alerts", desc: "Get notified when margin level exceeds threshold", unit: "%" },
+                { id: "alertMarginLevelThreshold", label: "Margin Level Alerts", desc: "Get notified when margin level falls below threshold", unit: "%" },
               ].map(item => {
                 const configKey = item.id as keyof NotificationConfig;
                 const isEnabled = profile.notificationConfig[configKey] !== null;
@@ -538,38 +564,46 @@ export default function Settings() {
 
           <div className="glass-card p-6 animate-slide-up" style={{ animationDelay: "100ms" }}>
             <h3 className="text-lg font-semibold mb-6">Notification Token Preferences</h3>
-            <div className="grid md:grid-cols-2 gap-6">
-              <div>
-                <div className="flex items-center gap-2 mb-2">
-                  <MessageSquare className="w-4 h-4 text-[#00B900]" />
-                  <label className="text-sm font-medium">Line Notify Token</label>
-                </div>
-                <input
-                  type="text"
-                  value={tokenForm.lineNotifyToken}
-                  onChange={(e) => setTokenForm({ ...tokenForm, lineNotifyToken: e.target.value })}
-                  className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
-                  placeholder="Enter Line Notify Token"
-                />
-              </div>
+            <div className="grid md:grid-cols-1 gap-6">
               <div>
                 <div className="flex items-center gap-2 mb-2">
                   <Gamepad2 className="w-4 h-4 text-[#5865F2]" />
                   <label className="text-sm font-medium">Discord Webhook</label>
                 </div>
+                {profile.notificationConfig.hasDiscordWebhook ? (
+                  <p className="mb-2 text-xs text-muted-foreground">
+                    Saved webhook: {profile.notificationConfig.discordWebhookDisplay || "Configured"}
+                  </p>
+                ) : (
+                  <p className="mb-2 text-xs text-muted-foreground">
+                    No Discord webhook configured yet.
+                  </p>
+                )}
                 <input
-                  type="text"
+                  type="password"
                   value={tokenForm.discordWebhookUrl}
                   onChange={(e) => setTokenForm({ ...tokenForm, discordWebhookUrl: e.target.value })}
                   className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50"
-                  placeholder="Enter Discord Webhook URL"
+                  placeholder={
+                    profile.notificationConfig.hasDiscordWebhook
+                      ? "Paste a new Discord webhook URL to replace the saved one"
+                      : "Enter Discord Webhook URL"
+                  }
+                  autoComplete="new-password"
                 />
               </div>
             </div>
-            <Button onClick={handleTokenSave} className="mt-6">
-              {loading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
-              Save Preferences
-            </Button>
+            <div className="mt-6 flex flex-wrap gap-3">
+              <Button onClick={handleTokenSave}>
+                {loading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
+                Save Preferences
+              </Button>
+              {profile.notificationConfig.hasDiscordWebhook && (
+                <Button variant="outline" onClick={handleDiscordWebhookRemove} disabled={loading}>
+                  Remove Webhook
+                </Button>
+              )}
+            </div>
           </div>
         </div>
       )}
