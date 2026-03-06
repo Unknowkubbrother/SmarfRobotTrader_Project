@@ -29,6 +29,7 @@ from ..utils.mt5_bot_runner import (
 from ..utils.bot_operation_events import emit_and_store_bot_operation_event
 from ..utils.bot_magic import derive_magic_number, normalize_magic_number
 from ..utils.notification_delivery import dispatch_notification_to_user_id
+from ..utils.subscription_access import assert_user_subscription_allows_bot_usage
 from ..utils.ws_manager import bot_hub
 
 bot_router = APIRouter()
@@ -375,6 +376,10 @@ async def get_bot_versions(request: Request):
 async def create_bot_configuration(request: Request, data: Create_Bot_Configuration):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
+    await assert_user_subscription_allows_bot_usage(
+        request.state.user_id,
+        action_label="create new bots",
+    )
 
     trading_account = await db.tradingaccount.find_first(
         where={
@@ -466,6 +471,11 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
     requested_status = str(data.status or "").strip().lower()
     if requested_status not in ("running", "stopped"):
         raise HTTPException(status_code=400, detail="Status must be 'running' or 'stopped'")
+    if requested_status == "running":
+        await assert_user_subscription_allows_bot_usage(
+            request.state.user_id,
+            action_label="start bots",
+        )
     if requested_status == "running" and config.botVersion and not getattr(config.botVersion, "isActive", True):
         raise HTTPException(status_code=400, detail="Cannot run bot. Its version is inactive.")
 

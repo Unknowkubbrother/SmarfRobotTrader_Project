@@ -12,12 +12,19 @@ interface User {
   role: string;
   status: string;
   avatar_url?: string;
+  subscription_status?: string | null;
+  subscription_blocked?: boolean;
+  subscription_block_message?: string | null;
+  subscription_unpaid_invoice_id?: string | null;
+  subscription_unpaid_invoice_status?: string | null;
+  subscription_has_active_payment_method?: boolean;
 }
 
 interface AuthContextType {
   user: User | null;
   loading: boolean;
   isAdmin: boolean;
+  refreshUser: () => Promise<void>;
   signIn: (email: string, password: string, cfToken?: string) => Promise<{ error: Error | null; requireOtp?: boolean; recoveryEmailHint?: string }>;
   loginVerify: (email: string, otp: string) => Promise<{ error: Error | null }>;
   signInWithGoogle: () => Promise<{ error: Error | null; requireOtp?: boolean; requireRegister?: boolean; recoveryEmailHint?: string; googleInfo?: any; email?: string }>;
@@ -248,6 +255,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user,
       loading,
       isAdmin,
+      refreshUser: fetchCurrentUser,
       signIn,
       loginVerify,
       signInWithGoogle,

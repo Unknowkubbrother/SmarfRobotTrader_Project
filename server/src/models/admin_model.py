@@ -36,6 +36,7 @@ class UpdateAdminBotConfigurationStatusRequest(BaseModel):
 
 
 class UpdateAdminUserSubscriptionBillingRequest(BaseModel):
+    collection_mode: str = "automatic"
     fee_type: str
     fee_value: float
     min_profit_threshold: float
@@ -83,6 +84,7 @@ class AdminUserTradingAccountItemResponse(BaseModel):
 class AdminUserSubscriptionItemResponse(BaseModel):
     id: str
     status: str
+    collection_mode: str = "automatic"
     fee_type: str
     fee_value: float = 0.0
     min_profit_threshold: float = 0.0

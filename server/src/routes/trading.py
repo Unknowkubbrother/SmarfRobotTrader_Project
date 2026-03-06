@@ -21,6 +21,7 @@ from ..constants.mt5_server_catalog import (
     validate_mt5_broker_server_pair,
 )
 from ..utils.mt5_bot_runner import BotRunnerError, build_profile_name, run_bot_instance_action
+from ..utils.subscription_access import assert_user_subscription_allows_bot_usage
 from ..utils.trading_schedule import normalize_trading_schedule
 
 trading_router = APIRouter()
@@ -974,6 +975,10 @@ async def get_mt5_server_catalog(request: Request):
 async def create_account(request: Request, data: Create_Trading_Account):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
+    await assert_user_subscription_allows_bot_usage(
+        request.state.user_id,
+        action_label="connect trading accounts",
+    )
 
     broker_name = str(data.brokerName or "").strip()
     server_name = str(data.serverName or "").strip()

@@ -1,7 +1,9 @@
 import { useState, useEffect } from "react";
-import { Activity, Clock, Shield, Sparkles } from "lucide-react";
+import { Activity, AlertTriangle, Shield, Sparkles } from "lucide-react";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import { useAuth } from "@/contexts/AuthContext";
 import { api } from "@/lib/api";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -24,6 +26,7 @@ interface AddBotDialogProps {
   accountId: string;
   existingBots?: BotConfigWithVersion[];
   onBotAdded: () => void;
+  blockedReason?: string | null;
 }
 
 const riskLevels = [
@@ -44,11 +47,24 @@ const getPairKey = (symbol: string | null | undefined, timeframe: string | null 
   return `${normalizedSymbol}__${normalizedTimeframe}`;
 };
 
-export function AddBotDialog({ open, onOpenChange, accountId, existingBots = [], onBotAdded }: AddBotDialogProps) {
+export function AddBotDialog({
+  open,
+  onOpenChange,
+  accountId,
+  existingBots = [],
+  onBotAdded,
+  blockedReason = null,
+}: AddBotDialogProps) {
+  const { user } = useAuth();
   const [botVersions, setBotVersions] = useState<BotVersion[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [selectedRisk, setSelectedRisk] = useState("medium");
   const [loading, setLoading] = useState(false);
+  const subscriptionBlocked = Boolean(blockedReason ?? user?.subscription_blocked);
+  const subscriptionBlockedReason =
+    blockedReason ??
+    user?.subscription_block_message ??
+    "Complete billing setup before creating new bots.";
 
   const existingPairKeys = new Set(
     existingBots
@@ -98,6 +114,11 @@ export function AddBotDialog({ open, onOpenChange, accountId, existingBots = [],
   };
 
   const handleCreateBot = async () => {
+    if (subscriptionBlocked) {
+      toast.error(subscriptionBlockedReason);
+      return;
+    }
+
     if (!selectedModel) {
       toast.error("Please select a model");
       return;
@@ -144,6 +165,14 @@ export function AddBotDialog({ open, onOpenChange, accountId, existingBots = [],
         </DialogHeader>
 
         <div className="space-y-6 mt-4">
+          {subscriptionBlocked && (
+            <Alert className="border-warning/30 bg-warning/5 text-foreground [&>svg]:text-warning">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>Bot creation is blocked</AlertTitle>
+              <AlertDescription>{subscriptionBlockedReason}</AlertDescription>
+            </Alert>
+          )}
+
           {/* Model Selection */}
           <div>
             <h3 className="text-sm font-medium mb-3 flex items-center gap-2">
@@ -157,12 +186,12 @@ export function AddBotDialog({ open, onOpenChange, accountId, existingBots = [],
                   <div
                     key={model.id}
                     onClick={() => {
-                      if (alreadyAdded) return;
+                      if (alreadyAdded || subscriptionBlocked) return;
                       setSelectedModel(model.id);
                     }}
                     className={cn(
                       "rounded-xl border overflow-hidden cursor-pointer transition-all",
-                      alreadyAdded && "cursor-not-allowed border-dashed opacity-60",
+                      (alreadyAdded || subscriptionBlocked) && "cursor-not-allowed border-dashed opacity-60",
                       selectedModel === model.id
                         ? "border-primary ring-2 ring-primary/20"
                         : "border-border hover:border-primary/50"
@@ -207,6 +236,10 @@ export function AddBotDialog({ open, onOpenChange, accountId, existingBots = [],
                         <div className="pt-2">
                           <span className="text-xs text-muted-foreground font-medium">Already added to this account</span>
                         </div>
+                      ) : subscriptionBlocked ? (
+                        <div className="pt-2">
+                          <span className="text-xs text-warning font-medium">Resolve billing before adding new bots</span>
+                        </div>
                       ) : selectedModel === model.id ? (
                         <div className="pt-2">
                           <span className="text-xs text-primary font-medium">✓ Selected</span>
@@ -230,6 +263,7 @@ export function AddBotDialog({ open, onOpenChange, accountId, existingBots = [],
                 <button
                   key={level.id}
                   onClick={() => setSelectedRisk(level.id)}
+                  disabled={subscriptionBlocked}
                   className={cn(
                     "p-3 rounded-xl border text-left transition-all",
                     selectedRisk === level.id
@@ -253,7 +287,7 @@ export function AddBotDialog({ open, onOpenChange, accountId, existingBots = [],
             <Button variant="outline" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button onClick={handleCreateBot} disabled={loading || !selectedModel}>
+            <Button onClick={handleCreateBot} disabled={loading || !selectedModel || subscriptionBlocked}>
               {loading ? "Adding..." : "Add Bot"}
             </Button>
           </div>

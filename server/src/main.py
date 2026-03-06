@@ -150,13 +150,11 @@ _TF_SECS = {
 
 
 async def _cron_worker(symbol: str, timeframe: str):
-    """Background loop: compute + broadcast vision_llm for one symbol/timeframe."""
     import time as _time
     interval = _TF_SECS.get(timeframe, 3600)
     logger.info("cron_worker started  | %s/%s  interval=%ds", symbol, timeframe, interval)
 
     while True:
-        # Sleep until next candle close + 5s buffer
         now = datetime.now(timezone.utc)
         epoch = int(now.timestamp())
         seconds_to_next = interval - (epoch % interval) + 5
@@ -164,7 +162,6 @@ async def _cron_worker(symbol: str, timeframe: str):
         await asyncio.sleep(seconds_to_next)
 
         now = datetime.now(timezone.utc)
-        # Align to current boundary, then use the just-closed candle open time.
         epoch = int(now.timestamp())
         aligned = epoch - (epoch % interval)
         candle_open_epoch = aligned - interval
@@ -226,7 +223,6 @@ async def _cron_worker(symbol: str, timeframe: str):
 async def lifespan(app: FastAPI):
     await db.connect()
 
-    # Start one cron worker per symbol:timeframe pair
     cron_tasks = []
     background_tasks = []
     if CRON_ENABLED and CRON_PAIRS:

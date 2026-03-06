@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -10,6 +10,10 @@ class CreateSetupIntentResponse(BaseModel):
 class AttachPaymentMethodRequest(BaseModel):
     paymentMethodId: str
     setAsDefault: bool = False
+
+
+class PayInvoiceRequest(BaseModel):
+    payment_method_id: Optional[str] = None
 
 
 class PaymentMethodResponse(BaseModel):
@@ -37,6 +41,7 @@ class InvoiceResponse(BaseModel):
 class SubscriptionResponse(BaseModel):
     id: str
     status: str
+    collection_mode: str = "automatic"
     fee_type: str
     fee_value: float
     min_profit_threshold: float
@@ -63,6 +68,7 @@ class SubscriptionSummaryResponse(BaseModel):
 class AdminBillingConfigResponse(BaseModel):
     config_id: Optional[int] = None
     default_fee_type: str = "percentage"
+    default_collection_mode: str = "automatic"
     default_fee_value: float = 20.0
     default_min_threshold: float = 0.0
     default_next_billing_date: Optional[str] = None
@@ -74,6 +80,7 @@ class AdminSubscriptionItemResponse(BaseModel):
     user_id: str
     user_email: Optional[str] = None
     status: str
+    collection_mode: str = "automatic"
     fee_type: str
     fee_value: float
     min_profit_threshold: float
@@ -86,11 +93,42 @@ class AdminSubscriptionManagementResponse(BaseModel):
     subscriptions: List[AdminSubscriptionItemResponse]
 
 
+class AdminInvoiceDetailResponse(BaseModel):
+    id: str
+    billing_start_date: Optional[str] = None
+    billing_end_date: Optional[str] = None
+    total_period_profit: float = 0.0
+    calculated_fee: float = 0.0
+    status: Optional[str] = None
+    payment_method_used: Optional[str] = None
+    stripe_payment_intent_id: Optional[str] = None
+    stripe_charge_id: Optional[str] = None
+    stripe_balance_txn_id: Optional[str] = None
+    processor_request_id: Optional[str] = None
+    payment_breakdown: Optional[Dict[str, Any]] = None
+    payment_method_details: Optional[Dict[str, Any]] = None
+    payment_error_details: Optional[Dict[str, Any]] = None
+    paid_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class AdminSubscriptionInvoiceListResponse(BaseModel):
+    subscription_id: str
+    user_id: str
+    user_email: Optional[str] = None
+    invoices: List[AdminInvoiceDetailResponse]
+
+
 class UpdateBillingConfigRequest(BaseModel):
     default_fee_type: str
+    default_collection_mode: str = "automatic"
     default_fee_value: float
     default_min_threshold: float
     default_next_billing_date: Optional[str] = None
+
+
+class UpdateCollectionModeRequest(BaseModel):
+    collection_mode: str = "automatic"
 
 
 class UpdateSubscriptionStatusRequest(BaseModel):

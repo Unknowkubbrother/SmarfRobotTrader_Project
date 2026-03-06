@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { TrendingUp, TrendingDown, Activity, Wallet, Target, BarChart3, Plus, BellRing, DownloadCloud } from "lucide-react";
+import { TrendingUp, TrendingDown, Activity, Wallet, Target, BarChart3, Plus, BellRing, DownloadCloud, AlertTriangle } from "lucide-react";
 import { PerformanceChart } from "@/components/dashboard/PerformanceChart";
 import { StatusPanel } from "@/components/dashboard/StatusPanel";
 import { ActivePositions } from "@/components/dashboard/ActivePositions";
@@ -9,7 +9,9 @@ import { BotCard } from "@/components/dashboard/BotCard";
 import TradingViewWidget from "@/components/dashboard/TradingViewWidget";
 import { AddBotDialog } from "@/components/dialogs/AddBotDialog";
 import { AddAccountDialog } from "@/components/dialogs/AddAccountDialog";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { useAuth } from "@/contexts/AuthContext";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { useTradingAccounts } from "@/hooks/useTradingAccounts";
@@ -24,6 +26,7 @@ import {
 } from "@/lib/botOperationStore";
 
 export default function Dashboard() {
+  const { user } = useAuth();
   const { accounts, loading, updateBotStatus, deleteBot, updateAccount, deleteAccount, refetch, getPendingUpdatesCount } = useTradingAccounts();
   const [selectedAccount, setSelectedAccount] = useState<AccountWithBots | null>(null);
   const [selectedBotId, setSelectedBotId] = useState<string | null>(null);
@@ -192,6 +195,10 @@ export default function Dashboard() {
 
   const handleToggleBotStatus = async (botId: string, newStatus: "running" | "stopped") => {
     if (botActionState) return;
+    if (newStatus === "running" && subscriptionBlocked) {
+      toast.error(subscriptionBlockedReason);
+      return;
+    }
     if (newStatus === "running") {
       const targetBot = accounts
         .flatMap((account) => account.bot_configurations || [])
@@ -327,6 +334,18 @@ export default function Dashboard() {
   const currentSymbol = currentBot?.bot_version?.symbol || "XAUUSD";
   const selectedAccountPendingUpdates = selectedAccount ? getPendingUpdatesCount(selectedAccount) : 0;
   const totalPendingUpdates = accounts.reduce((sum, account) => sum + getPendingUpdatesCount(account), 0);
+  const subscriptionBlocked = Boolean(user?.subscription_blocked);
+  const billingSetupRequired = user?.subscription_has_active_payment_method === false;
+  const subscriptionBlockedReason =
+    user?.subscription_block_message || "Complete billing setup before connecting trading accounts or using bots.";
+
+  const openAddBotDialog = () => {
+    if (subscriptionBlocked) {
+      toast.error(subscriptionBlockedReason);
+      return;
+    }
+    setAddBotOpen(true);
+  };
 
   return (
     <div className="space-y-6">
@@ -365,10 +384,25 @@ export default function Dashboard() {
               onBotSelect={setSelectedBotId}
               accountId={selectedAccount.id}
               onBotAdded={refetch}
+              addBotDisabled={subscriptionBlocked}
+              addBotDisabledReason={subscriptionBlockedReason}
             />
           )}
         </div>
       </div>
+
+      {subscriptionBlocked && (
+        <Alert className="border-warning/30 bg-warning/5 text-foreground [&>svg]:text-warning">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>{billingSetupRequired ? "Billing setup required" : "Bot access is paused"}</AlertTitle>
+          <AlertDescription className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <span>{subscriptionBlockedReason}</span>
+            <Button asChild size="sm" variant="outline" className="w-full md:w-auto">
+              <Link href="/subscription">Open Subscription & Billing</Link>
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
 
       {selectedAccountPendingUpdates > 0 && (
         <div className="rounded-xl border border-primary/30 bg-primary/5 px-4 py-3">
@@ -400,7 +434,12 @@ export default function Dashboard() {
           <p className="text-muted-foreground max-w-md mx-auto mb-8">
             Link your MT5 broker account to start trading with our AI-powered bots.
           </p>
-          <Button onClick={() => setAddAccountOpen(true)} className="gap-2">
+          <Button
+            onClick={() => setAddAccountOpen(true)}
+            className="gap-2"
+            disabled={subscriptionBlocked}
+            title={subscriptionBlocked ? subscriptionBlockedReason : undefined}
+          >
             <Plus className="w-4 h-4" />
             Add Trading Account
           </Button>
@@ -411,7 +450,12 @@ export default function Dashboard() {
             <h2 className="text-lg font-semibold text-foreground">
               Select a Bot to View Dashboard
             </h2>
-            <Button onClick={() => setAddBotOpen(true)} className="gap-2">
+            <Button
+              onClick={openAddBotDialog}
+              className="gap-2"
+              disabled={subscriptionBlocked}
+              title={subscriptionBlocked ? subscriptionBlockedReason : undefined}
+            >
               <Plus className="w-4 h-4" />
               Create New Bot
             </Button>
@@ -426,7 +470,12 @@ export default function Dashboard() {
               <p className="text-muted-foreground mb-6">
                 Create a bot to start automated trading and view performance analytics.
               </p>
-              <Button onClick={() => setAddBotOpen(true)} className="gap-2">
+              <Button
+                onClick={openAddBotDialog}
+                className="gap-2"
+                disabled={subscriptionBlocked}
+                title={subscriptionBlocked ? subscriptionBlockedReason : undefined}
+              >
                 <Plus className="w-4 h-4" />
                 Create Your First Bot
               </Button>
@@ -446,6 +495,7 @@ export default function Dashboard() {
                     onSelect={setSelectedBotId}
                     showDelete={true}
                     isBusy={botActionState?.botId === bot.id}
+                    startBlockedReason={subscriptionBlocked ? subscriptionBlockedReason : null}
                   />
                 </div>
               ))}
@@ -533,6 +583,7 @@ export default function Dashboard() {
           accountId={selectedAccount.id}
           existingBots={selectedAccount.bot_configurations}
           onBotAdded={refetch}
+          blockedReason={subscriptionBlocked ? subscriptionBlockedReason : null}
         />
       )}
 

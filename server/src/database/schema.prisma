@@ -69,6 +69,13 @@ enum FeeType {
   @@map("fee_type_enum")
 }
 
+enum CollectionMode {
+  automatic
+  manual
+
+  @@map("collection_mode_enum")
+}
+
 enum SubStatus {
   active
   past_due
@@ -84,6 +91,16 @@ enum InvoiceStatus {
   failed
 
   @@map("invoice_status_enum")
+}
+
+enum DailyAggregateBillingStatus {
+  unbilled
+  pending
+  paid
+  skipped
+  failed
+
+  @@map("daily_aggregate_billing_status_enum")
 }
 
 // ==========================================
@@ -272,11 +289,15 @@ model DailyAggregate {
   date           DateTime @db.Date
   dailyNetProfit Decimal? @map("daily_net_profit") @db.Decimal(15, 2)
   totalTrades    Int?     @map("total_trades")
+  billingInvoiceId String? @map("billing_invoice_id") @db.Uuid
+  billingStatus    DailyAggregateBillingStatus @default(unbilled) @map("billing_status")
 
   // Relations
   account TradingAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
 
   @@unique([accountId, date])
+  @@index([billingInvoiceId])
+  @@index([billingStatus, date])
   @@map("daily_aggregates")
 }
 
@@ -376,6 +397,7 @@ model BotOperationLog {
 model SystemBillingConfig {
   configId               Int       @id @default(autoincrement()) @map("config_id")
   defaultFeeType         FeeType?  @map("default_fee_type")
+  defaultCollectionMode  CollectionMode? @default(automatic) @map("default_collection_mode")
   defaultFeeValue        Decimal?  @map("default_fee_value") @db.Decimal(10, 2)
   defaultMinThreshold    Decimal?  @map("default_min_threshold") @db.Decimal(10, 2)
   defaultNextBillingDate DateTime? @map("default_next_billing_date") @db.Date
@@ -390,6 +412,7 @@ model Subscription {
   defaultPaymentMethodId String? @map("default_payment_method_id") @db.Uuid
 
   status             SubStatus?
+  collectionMode     CollectionMode? @default(automatic) @map("collection_mode")
   feeType            FeeType?   @default(percentage) @map("fee_type")
   feeValue           Decimal?   @default(20.00) @map("fee_value") @db.Decimal(10, 2)
   minProfitThreshold Decimal?   @map("min_profit_threshold") @db.Decimal(10, 2)
@@ -414,11 +437,18 @@ model Invoice {
   status                InvoiceStatus?
   paymentMethodUsed     String?        @map("payment_method_used") @db.VarChar(50)
   stripePaymentIntentId String?        @map("stripe_payment_intent_id") @db.VarChar(100)
+  stripeChargeId        String?        @map("stripe_charge_id") @db.VarChar(100)
+  stripeBalanceTxnId    String?        @map("stripe_balance_txn_id") @db.VarChar(100)
+  processorRequestId    String?        @map("processor_request_id") @db.VarChar(100)
+  paymentBreakdown      Json?          @map("payment_breakdown")
+  paymentMethodDetails  Json?          @map("payment_method_details")
+  paymentErrorDetails   Json?          @map("payment_error_details")
   paidAt                DateTime?      @map("paid_at") @db.Timestamptz
   createdAt             DateTime       @default(now()) @map("created_at") @db.Timestamptz
 
   // Relations
   subscription Subscription @relation(fields: [subId], references: [id], onDelete: Cascade)
 
+  @@unique([subId, billingStartDate, billingEndDate], map: "invoices_sub_period_unique")
   @@map("invoices")
 }

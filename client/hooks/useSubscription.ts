@@ -7,6 +7,7 @@ import { api } from "@/lib/api";
 export interface SubscriptionData {
   id: string;
   status: string;
+  collection_mode: string;
   fee_type: string;
   fee_value: number;
   min_profit_threshold: number;
@@ -68,7 +69,7 @@ function getDownloadFilename(headerValue: string | undefined, fallback: string) 
 }
 
 export function useSubscription() {
-  const { user, loading: authLoading } = useAuth();
+  const { user, loading: authLoading, refreshUser } = useAuth();
 
   const [subscription, setSubscription] = useState<SubscriptionData | null>(null);
   const [invoices, setInvoices] = useState<InvoiceData[]>([]);
@@ -126,6 +127,7 @@ export function useSubscription() {
     try {
       const { data } = await api.post<PaymentMethodData>("/subscription/payment-methods", payload);
       toast.success("Payment method added");
+      await refreshUser();
       await fetchData();
       return data;
     } catch (error: any) {
@@ -156,6 +158,7 @@ export function useSubscription() {
     try {
       await api.delete(`/subscription/payment-methods/${methodId}`);
       toast.success("Payment method removed");
+      await refreshUser();
       await fetchData();
       return true;
     } catch (error: any) {
@@ -174,10 +177,10 @@ export function useSubscription() {
       });
       const filename = getDownloadFilename(
         response.headers["content-disposition"],
-        `invoice-${invoiceId.slice(0, 8)}.html`
+        `invoice-${invoiceId.slice(0, 8)}.pdf`
       );
       const blob = new Blob([response.data], {
-        type: response.headers["content-type"] || "text/html;charset=utf-8",
+        type: response.headers["content-type"] || "application/pdf",
       });
       const objectUrl = window.URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -195,17 +198,39 @@ export function useSubscription() {
     }
   };
 
-  const payInvoice = async (invoiceId: string) => {
+  const payInvoice = async (invoiceId: string, paymentMethodId?: string | null) => {
     if (!user) return false;
 
     try {
-      await api.post(`/subscription/invoices/${invoiceId}/pay`);
+      await api.post(`/subscription/invoices/${invoiceId}/pay`, {
+        payment_method_id: paymentMethodId || undefined,
+      });
       toast.success("Invoice paid successfully");
+      await refreshUser();
       await fetchData();
       return true;
     } catch (error: any) {
       console.error("Error paying invoice:", error);
       toast.error(error?.message || "Failed to pay invoice");
+      return false;
+    }
+  };
+
+  const updateCollectionMode = async (collectionMode: "automatic" | "manual") => {
+    if (!user) return false;
+
+    try {
+      const { data } = await api.patch<SubscriptionData>("/subscription/collection-mode", {
+        collection_mode: collectionMode,
+      });
+      setSubscription(data ?? null);
+      toast.success("Collection mode updated");
+      await refreshUser();
+      await fetchData();
+      return true;
+    } catch (error: any) {
+      console.error("Error updating collection mode:", error);
+      toast.error(error?.message || "Failed to update collection mode");
       return false;
     }
   };
@@ -223,5 +248,6 @@ export function useSubscription() {
     removePaymentMethod,
     downloadInvoice,
     payInvoice,
+    updateCollectionMode,
   };
 }

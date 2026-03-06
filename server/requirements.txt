@@ -21,6 +21,7 @@ pandas
 
 # Image Processing
 pillow
+reportlab
 
 # LangChain Ecosystem
 langchain

@@ -10,24 +10,34 @@ from fastapi.responses import Response
 from ..database.client import db
 from ..models.subscription_model import (
     AdminBillingConfigResponse,
+    AdminInvoiceDetailResponse,
     AdminSubscriptionItemResponse,
+    AdminSubscriptionInvoiceListResponse,
     AdminSubscriptionManagementResponse,
     AdminSubscriptionStatsResponse,
     AttachPaymentMethodRequest,
     CreateSetupIntentResponse,
     InvoiceResponse,
+    PayInvoiceRequest,
     PaymentMethodResponse,
     ProcessDueBillingResponse,
     SubscriptionResponse,
     SubscriptionSummaryResponse,
     UpdateBillingConfigRequest,
+    UpdateCollectionModeRequest,
     UpdateSubscriptionStatusRequest,
     WeeklyPreviewResponse,
 )
 from ..utils.subscription_billing import (
-    build_invoice_html,
+    billing_period_for_due_date,
+    build_invoice_pdf,
     pay_invoice_now,
     process_all_due_billing,
+)
+from ..utils.subscription_access import (
+    get_user_subscription_access_state,
+    suspend_user_bot_runtime,
+    sync_subscription_status_from_invoices,
 )
 from .authentication import get_current_active_user
 
@@ -43,6 +53,7 @@ if stripe is not None and STRIPE_SECRET_KEY:
 subscription_router = APIRouter(tags=["Subscription"])
 ADMIN_FEE_TYPES = {"percentage", "fixed"}
 ADMIN_SUB_STATUSES = {"active", "past_due", "canceled"}
+COLLECTION_MODES = {"automatic", "manual"}
 
 
 def _to_float(value: Optional[Decimal]) -> float:
@@ -162,6 +173,22 @@ async def _stripe_call(callable_obj, *args, **kwargs):
     return await asyncio.to_thread(callable_obj, *args, **kwargs)
 
 
+def _map_subscription_response(subscription, *, status_override: str | None = None, next_billing_date: str | None = None):
+    fee_type = _enum_value(subscription.feeType) or "percentage"
+    fee_value = _to_float(subscription.feeValue)
+    min_profit_threshold = _to_float(subscription.minProfitThreshold)
+    return SubscriptionResponse(
+        id=str(subscription.id),
+        status=status_override or _enum_value(subscription.status) or "active",
+        collection_mode=_enum_value(getattr(subscription, "collectionMode", None)) or "automatic",
+        fee_type=fee_type,
+        fee_value=round(fee_value, 2),
+        min_profit_threshold=round(min_profit_threshold, 2),
+        next_billing_date=next_billing_date if next_billing_date is not None else _to_date_string(subscription.nextBillingDate),
+        default_payment_method_id=subscription.defaultPaymentMethodId,
+    )
+
+
 async def _get_or_create_subscription(user_id: str):
     subscription = await db.subscription.find_first(where={"userId": user_id})
     if subscription:
@@ -171,6 +198,9 @@ async def _get_or_create_subscription(user_id: str):
     default_fee_type = _enum_value(config.defaultFeeType) if config else None
     if not default_fee_type:
         default_fee_type = "percentage"
+    default_collection_mode = _enum_value(getattr(config, "defaultCollectionMode", None)) if config else None
+    if default_collection_mode not in COLLECTION_MODES:
+        default_collection_mode = "automatic"
     default_fee_value = config.defaultFeeValue if config and config.defaultFeeValue is not None else Decimal("20.00")
     default_min_threshold = (
         config.defaultMinThreshold if config and config.defaultMinThreshold is not None else Decimal("0.00")
@@ -181,6 +211,7 @@ async def _get_or_create_subscription(user_id: str):
         data={
             "userId": user_id,
             "status": "active",
+            "collectionMode": default_collection_mode,
             "feeType": default_fee_type,
             "feeValue": default_fee_value,
             "minProfitThreshold": default_min_threshold,
@@ -358,18 +389,6 @@ async def get_subscription_summary(
     subscription = await _get_or_create_subscription(user_id)
     config = await db.systembillingconfig.find_first(order={"updatedAt": "desc"})
 
-    current_next_billing_date = _extract_date(subscription.nextBillingDate)
-    resolved_next_billing_date = _resolve_subscription_next_billing_date(
-        subscription.nextBillingDate,
-        config=config,
-        today=today,
-    )
-    if current_next_billing_date != resolved_next_billing_date:
-        subscription = await db.subscription.update(
-            where={"id": str(subscription.id)},
-            data={"nextBillingDate": datetime.combine(resolved_next_billing_date, datetime.min.time())},
-        )
-
     if _stripe_enabled() and current_user.stripeCustomerId:
         try:
             await _sync_customer_payment_methods(user_id, current_user.stripeCustomerId)
@@ -377,6 +396,21 @@ async def get_subscription_summary(
             pass
 
     await process_all_due_billing(today=today, user_id=user_id)
+    await sync_subscription_status_from_invoices(str(subscription.id), allow_reactivate=False)
+    subscription = await db.subscription.find_unique(where={"id": str(subscription.id)}) or subscription
+    current_next_billing_date = _extract_date(subscription.nextBillingDate)
+    resolved_next_billing_date = current_next_billing_date
+    if not resolved_next_billing_date:
+        resolved_next_billing_date = _resolve_subscription_next_billing_date(
+            subscription.nextBillingDate,
+            config=config,
+            today=today,
+        )
+        subscription = await db.subscription.update(
+            where={"id": str(subscription.id)},
+            data={"nextBillingDate": datetime.combine(resolved_next_billing_date, datetime.min.time())},
+        )
+    access_state = await get_user_subscription_access_state(user_id)
 
     payment_methods = await db.userpaymentmethod.find_many(
         where={"userId": user_id, "isActive": True}
@@ -392,13 +426,16 @@ async def get_subscription_summary(
         take=20,
     )
 
-    week_start = _start_of_week(today)
+    billing_period_start, billing_period_end = billing_period_for_due_date(resolved_next_billing_date)
     weekly_aggregates = await db.dailyaggregate.find_many(
         where={
-            "account": {"userId": user_id},
+            "account": {
+                "userId": user_id,
+                "recordStatus": "active",
+            },
             "date": {
-                "gte": datetime.combine(week_start, datetime.min.time()),
-                "lte": datetime.combine(today, datetime.max.time()),
+                "gte": datetime.combine(billing_period_start, datetime.min.time()),
+                "lte": datetime.combine(billing_period_end, datetime.max.time()),
             },
         }
     )
@@ -425,14 +462,10 @@ async def get_subscription_summary(
     )
     next_billing_date = resolved_next_billing_date.isoformat()
 
-    mapped_subscription = SubscriptionResponse(
-        id=str(subscription.id),
-        status=_enum_value(subscription.status) or "active",
-        fee_type=fee_type,
-        fee_value=round(fee_value, 2),
-        min_profit_threshold=round(min_profit_threshold, 2),
+    mapped_subscription = _map_subscription_response(
+        subscription,
+        status_override=access_state.subscription_status or _enum_value(subscription.status) or "active",
         next_billing_date=next_billing_date,
-        default_payment_method_id=subscription.defaultPaymentMethodId,
     )
 
     mapped_invoices = [
@@ -453,8 +486,8 @@ async def get_subscription_summary(
     mapped_payment_methods = [_map_payment_method(method) for method in payment_methods_sorted]
 
     weekly_preview = WeeklyPreviewResponse(
-        week_start=week_start.isoformat(),
-        week_end=today.isoformat(),
+        week_start=billing_period_start.isoformat(),
+        week_end=billing_period_end.isoformat(),
         gross_profit=round(gross_profit, 2),
         gross_loss=round(gross_loss, 2),
         net_profit=round(net_profit, 2),
@@ -466,6 +499,27 @@ async def get_subscription_summary(
         invoices=mapped_invoices,
         payment_methods=mapped_payment_methods,
         weekly_preview=weekly_preview,
+    )
+
+
+@subscription_router.patch("/collection-mode", response_model=SubscriptionResponse)
+async def update_subscription_collection_mode(
+    data: UpdateCollectionModeRequest,
+    current_user: Annotated[any, Depends(get_current_active_user)],
+):
+    next_collection_mode = str(data.collection_mode or "").strip().lower()
+    if next_collection_mode not in COLLECTION_MODES:
+        raise HTTPException(status_code=400, detail="collection_mode must be automatic or manual")
+
+    subscription = await _get_or_create_subscription(str(current_user.id))
+    updated_subscription = await db.subscription.update(
+        where={"id": str(subscription.id)},
+        data={"collectionMode": next_collection_mode},
+    )
+    access_state = await get_user_subscription_access_state(str(current_user.id))
+    return _map_subscription_response(
+        updated_subscription,
+        status_override=access_state.subscription_status or _enum_value(updated_subscription.status) or "active",
     )
 
 
@@ -629,6 +683,9 @@ async def download_invoice(
     )
     if not invoice or str(invoice.subscription.userId) != str(current_user.id):
         raise HTTPException(status_code=404, detail="Invoice not found")
+    invoice_status = (_enum_value(invoice.status) or "").lower()
+    if invoice_status != "paid":
+        raise HTTPException(status_code=400, detail="Only paid invoices can be downloaded")
 
     payment_method = None
     payment_method_id = str(invoice.paymentMethodUsed or "").strip()
@@ -639,16 +696,20 @@ async def download_invoice(
             where={"id": str(invoice.subscription.defaultPaymentMethodId)}
         )
 
-    html_content = build_invoice_html(
-        invoice,
-        user=current_user,
-        subscription=invoice.subscription,
-        payment_method=payment_method,
-    )
-    filename = f"invoice-{str(invoice.id)[:8]}.html"
+    try:
+        pdf_bytes = build_invoice_pdf(
+            invoice,
+            user=current_user,
+            subscription=invoice.subscription,
+            payment_method=payment_method,
+        )
+    except RuntimeError as error:
+        raise HTTPException(status_code=500, detail=str(error))
+
+    filename = f"invoice-{str(invoice.id)[:8]}.pdf"
     return Response(
-        content=html_content,
-        media_type="text/html; charset=utf-8",
+        content=pdf_bytes,
+        media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -657,6 +718,7 @@ async def download_invoice(
 async def pay_invoice(
     invoice_id: str,
     current_user: Annotated[any, Depends(get_current_active_user)],
+    data: PayInvoiceRequest | None = None,
 ):
     invoice = await db.invoice.find_unique(
         where={"id": invoice_id},
@@ -672,7 +734,11 @@ async def pay_invoice(
         raise HTTPException(status_code=400, detail="Skipped invoice cannot be paid")
 
     try:
-        await pay_invoice_now(invoice, user=current_user)
+        await pay_invoice_now(
+            invoice,
+            user=current_user,
+            selected_payment_method_id=(data.payment_method_id if data else None),
+        )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
 
@@ -683,10 +749,36 @@ def _map_billing_config(config) -> AdminBillingConfigResponse:
     return AdminBillingConfigResponse(
         config_id=int(config.configId) if config else None,
         default_fee_type=_enum_value(config.defaultFeeType) if config and config.defaultFeeType else "percentage",
+        default_collection_mode=(
+            _enum_value(getattr(config, "defaultCollectionMode", None))
+            if config and getattr(config, "defaultCollectionMode", None)
+            else "automatic"
+        ),
         default_fee_value=round(_to_float(config.defaultFeeValue), 2) if config else 20.0,
         default_min_threshold=round(_to_float(config.defaultMinThreshold), 2) if config else 0.0,
         default_next_billing_date=_to_date_string(getattr(config, "defaultNextBillingDate", None)) if config else None,
         updated_at=_to_datetime_string(config.updatedAt) if config else None,
+    )
+
+
+def _map_admin_invoice_detail(invoice) -> AdminInvoiceDetailResponse:
+    return AdminInvoiceDetailResponse(
+        id=str(invoice.id),
+        billing_start_date=_to_date_string(invoice.billingStartDate),
+        billing_end_date=_to_date_string(invoice.billingEndDate),
+        total_period_profit=round(_to_float(invoice.totalPeriodProfit), 2),
+        calculated_fee=round(_to_float(invoice.calculatedFee), 2),
+        status=_enum_value(invoice.status),
+        payment_method_used=invoice.paymentMethodUsed,
+        stripe_payment_intent_id=invoice.stripePaymentIntentId,
+        stripe_charge_id=getattr(invoice, "stripeChargeId", None),
+        stripe_balance_txn_id=getattr(invoice, "stripeBalanceTxnId", None),
+        processor_request_id=getattr(invoice, "processorRequestId", None),
+        payment_breakdown=getattr(invoice, "paymentBreakdown", None),
+        payment_method_details=getattr(invoice, "paymentMethodDetails", None),
+        payment_error_details=getattr(invoice, "paymentErrorDetails", None),
+        paid_at=_to_datetime_string(invoice.paidAt),
+        created_at=_to_datetime_string(invoice.createdAt),
     )
 
 
@@ -706,12 +798,12 @@ async def get_admin_subscription_management(
     normalized_subscriptions = []
     for sub in subscriptions:
         current_next_billing_date = _extract_date(sub.nextBillingDate)
-        resolved_next_billing_date = _resolve_subscription_next_billing_date(
-            sub.nextBillingDate,
-            config=config,
-            today=today,
-        )
-        if current_next_billing_date != resolved_next_billing_date:
+        if not current_next_billing_date:
+            resolved_next_billing_date = _resolve_subscription_next_billing_date(
+                sub.nextBillingDate,
+                config=config,
+                today=today,
+            )
             sub = await db.subscription.update(
                 where={"id": str(sub.id)},
                 data={"nextBillingDate": datetime.combine(resolved_next_billing_date, datetime.min.time())},
@@ -725,6 +817,7 @@ async def get_admin_subscription_management(
             user_id=str(sub.userId),
             user_email=sub.user.email if sub.user else None,
             status=_enum_value(sub.status) or "active",
+            collection_mode=_enum_value(getattr(sub, "collectionMode", None)) or "automatic",
             fee_type=_enum_value(sub.feeType) or "percentage",
             fee_value=round(_to_float(sub.feeValue), 2),
             min_profit_threshold=round(_to_float(sub.minProfitThreshold), 2),
@@ -740,6 +833,37 @@ async def get_admin_subscription_management(
     )
 
 
+@subscription_router.get(
+    "/admin/subscriptions/{subscription_id}/invoices",
+    response_model=AdminSubscriptionInvoiceListResponse,
+)
+async def get_admin_subscription_invoices(
+    subscription_id: str,
+    current_user: Annotated[any, Depends(get_current_active_user)],
+):
+    _require_admin(current_user)
+
+    subscription = await db.subscription.find_unique(
+        where={"id": subscription_id},
+        include={"user": True},
+    )
+    if not subscription:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    invoices = await db.invoice.find_many(
+        where={"subId": subscription_id},
+        order={"createdAt": "desc"},
+        take=12,
+    )
+
+    return AdminSubscriptionInvoiceListResponse(
+        subscription_id=str(subscription.id),
+        user_id=str(subscription.userId),
+        user_email=subscription.user.email if subscription.user else None,
+        invoices=[_map_admin_invoice_detail(invoice) for invoice in invoices],
+    )
+
+
 @subscription_router.put("/admin/config", response_model=AdminBillingConfigResponse)
 async def update_admin_billing_config(
     data: UpdateBillingConfigRequest,
@@ -750,6 +874,9 @@ async def update_admin_billing_config(
     fee_type = data.default_fee_type.strip().lower()
     if fee_type not in ADMIN_FEE_TYPES:
         raise HTTPException(status_code=400, detail="default_fee_type must be percentage or fixed")
+    collection_mode = data.default_collection_mode.strip().lower()
+    if collection_mode not in COLLECTION_MODES:
+        raise HTTPException(status_code=400, detail="default_collection_mode must be automatic or manual")
     if data.default_fee_value < 0:
         raise HTTPException(status_code=400, detail="default_fee_value must be greater than or equal to 0")
     if data.default_min_threshold < 0:
@@ -767,6 +894,7 @@ async def update_admin_billing_config(
     config = await db.systembillingconfig.find_first(order={"updatedAt": "desc"})
     payload = {
         "defaultFeeType": fee_type,
+        "defaultCollectionMode": collection_mode,
         "defaultFeeValue": Decimal(str(data.default_fee_value)),
         "defaultMinThreshold": Decimal(str(data.default_min_threshold)),
     }
@@ -808,6 +936,11 @@ async def update_admin_subscription_status(
         where={"id": subscription_id},
         data={"status": next_status},
     )
+    if next_status in {"past_due", "canceled"}:
+        await suspend_user_bot_runtime(
+            str(subscription.userId),
+            reason=f"admin_subscription_status_{next_status}",
+        )
     return {"message": f"Subscription updated to {next_status}"}
 
 

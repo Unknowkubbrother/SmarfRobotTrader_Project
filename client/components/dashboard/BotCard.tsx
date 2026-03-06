@@ -22,6 +22,7 @@ interface BotCardProps {
   isSelected?: boolean;
   showDelete?: boolean;
   isBusy?: boolean;
+  startBlockedReason?: string | null;
 }
 
 export function BotCard({
@@ -31,7 +32,8 @@ export function BotCard({
   onSelect,
   isSelected = false,
   showDelete = true,
-  isBusy = false
+  isBusy = false,
+  startBlockedReason = null,
 }: BotCardProps) {
   const [showStopConfirm, setShowStopConfirm] = useState(false);
   const status = String(bot.status || bot.container_status || "stopped").toLowerCase();
@@ -39,8 +41,9 @@ export function BotCard({
   const isRunning = status === "running";
   const isVersionInactive = bot.bot_version?.is_active === false;
   const isStartLockedByVersion = isVersionInactive && !isRunning && !isStarting;
+  const isStartBlockedBySubscription = Boolean(startBlockedReason) && !isRunning && !isStarting;
   const isActionLocked = isBusy || isStarting;
-  const isToggleDisabled = isActionLocked || isStartLockedByVersion;
+  const isToggleDisabled = isActionLocked || isStartLockedByVersion || isStartBlockedBySubscription;
   const symbol = bot.bot_version?.symbol || "N/A";
   const label = bot.bot_version?.label || "No Model";
   const riskLevel = bot.risk_level || "medium";
@@ -155,6 +158,12 @@ export function BotCard({
                     Locked
                   </span>
                 )}
+                {isStartBlockedBySubscription && (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-warning/10 text-warning">
+                    <AlertTriangle className="w-3 h-3" />
+                    Billing Hold
+                  </span>
+                )}
                 {bot.has_pending_update && (
                   <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-primary/10 text-primary">
                     <DownloadCloud className="w-3 h-3" />
@@ -192,10 +201,18 @@ export function BotCard({
               className="h-8 w-8 p-0"
               onClick={handleToggleClick}
               disabled={isToggleDisabled}
-              title={isStartLockedByVersion ? "This bot model is inactive. Change model to an active version first." : undefined}
+              title={
+                isStartLockedByVersion
+                  ? "This bot model is inactive. Change model to an active version first."
+                  : isStartBlockedBySubscription
+                  ? startBlockedReason ?? "Resolve subscription billing before starting bots."
+                  : undefined
+              }
             >
               {status === "running" ? (
                 <Power className="w-4 h-4 text-destructive" />
+              ) : isStartBlockedBySubscription ? (
+                <AlertTriangle className="w-4 h-4 text-warning" />
               ) : isStartLockedByVersion ? (
                 <AlertTriangle className="w-4 h-4 text-destructive" />
               ) : status === "starting" ? (

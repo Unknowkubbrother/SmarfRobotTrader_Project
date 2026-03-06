@@ -36,6 +36,8 @@ from ..utils.mt5_bot_runner import (
 from ..utils.bot_magic import derive_magic_number, normalize_magic_number
 from ..utils.bot_operation_events import emit_and_store_bot_operation_event
 from ..utils.notification_delivery import dispatch_notification_to_user
+from ..utils.subscription_access import sync_subscription_status_from_invoices
+from ..utils.subscription_billing import sync_daily_aggregate_status_for_invoice
 from .authentication import get_current_active_user
 
 admin_router = APIRouter(tags=["Admin"])
@@ -46,6 +48,7 @@ ALLOWED_USER_ROLES = {"user", "admin"}
 ALLOWED_BOT_STATUSES = {"running", "stopped"}
 ALLOWED_SUB_STATUSES = {"active", "past_due", "canceled"}
 ALLOWED_FEE_TYPES = {"percentage", "fixed"}
+ALLOWED_COLLECTION_MODES = {"automatic", "manual"}
 MAGIC_RESEED_LIMIT = 128
 SOFT_DELETED_LABEL_PREFIX = "[DELETED] "
 
@@ -141,6 +144,7 @@ def _map_user_subscription(subscription) -> AdminUserSubscriptionItemResponse:
     return AdminUserSubscriptionItemResponse(
         id=str(subscription.id),
         status=_enum_value(subscription.status) or "active",
+        collection_mode=_enum_value(getattr(subscription, "collectionMode", None)) or "automatic",
         fee_type=_enum_value(subscription.feeType) or "percentage",
         fee_value=round(_to_float(subscription.feeValue), 2),
         min_profit_threshold=round(_to_float(subscription.minProfitThreshold), 2),
@@ -731,12 +735,12 @@ async def get_admin_user_detail(
     normalized_subscriptions = []
     for sub in subscriptions:
         current_next_billing_date = _extract_date(sub.nextBillingDate)
-        resolved_next_billing_date = _resolve_subscription_next_billing_date(
-            sub.nextBillingDate,
-            config=billing_config,
-            today=today,
-        )
-        if current_next_billing_date != resolved_next_billing_date:
+        if not current_next_billing_date:
+            resolved_next_billing_date = _resolve_subscription_next_billing_date(
+                sub.nextBillingDate,
+                config=billing_config,
+                today=today,
+            )
             sub = await db.subscription.update(
                 where={"id": str(sub.id)},
                 data={"nextBillingDate": datetime.combine(resolved_next_billing_date, datetime.min.time())},
@@ -871,6 +875,12 @@ async def update_admin_user_subscription_billing(
 ):
     _require_admin(current_user)
 
+    collection_mode = data.collection_mode.strip().lower()
+    if collection_mode not in ALLOWED_COLLECTION_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="collection_mode must be automatic or manual",
+        )
     fee_type = data.fee_type.strip().lower()
     if fee_type not in ALLOWED_FEE_TYPES:
         raise HTTPException(
@@ -912,6 +922,7 @@ async def update_admin_user_subscription_billing(
         )
 
     update_payload = {
+        "collectionMode": collection_mode,
         "feeType": fee_type,
         "feeValue": Decimal(str(data.fee_value)),
         "minProfitThreshold": Decimal(str(data.min_profit_threshold)),
@@ -963,6 +974,8 @@ async def skip_admin_user_invoice(
         where={"id": invoice_id},
         data={"status": "skipped"},
     )
+    await sync_daily_aggregate_status_for_invoice(invoice_id, "skipped")
+    await sync_subscription_status_from_invoices(str(invoice.subId))
     return {"message": "Invoice skipped"}
 
 

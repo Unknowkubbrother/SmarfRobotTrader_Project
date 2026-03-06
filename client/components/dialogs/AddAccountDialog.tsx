@@ -1,5 +1,7 @@
 import { useState } from "react";
-import { Lock, User } from "lucide-react";
+import { CreditCard, Lock, User } from "lucide-react";
+import Link from "next/link";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -27,6 +29,9 @@ export function AddAccountDialog({ onAccountAdded, open, onOpenChange, trigger }
   const { user } = useAuth();
   const { createAccount } = useTradingAccounts();
   const { catalog, loading: catalogLoading } = useMt5ServerCatalog();
+  const setupBlocked = Boolean(user?.subscription_blocked);
+  const setupBlockedReason =
+    user?.subscription_block_message || "Add a payment method before connecting trading accounts.";
   const [formData, setFormData] = useState({
     broker_name: "",
     server_name: "",
@@ -37,6 +42,10 @@ export function AddAccountDialog({ onAccountAdded, open, onOpenChange, trigger }
   const handleSubmit = async () => {
     if (!user) {
       toast.error("Please sign in to add an account");
+      return;
+    }
+    if (setupBlocked) {
+      toast.error(setupBlockedReason);
       return;
     }
 
@@ -75,6 +84,18 @@ export function AddAccountDialog({ onAccountAdded, open, onOpenChange, trigger }
         </DialogDescription>
       </DialogHeader>
       <div className="space-y-4 py-4">
+        {setupBlocked && (
+          <Alert className="border-primary/30 bg-primary/5 text-foreground [&>svg]:text-primary">
+            <CreditCard className="h-4 w-4" />
+            <AlertTitle>Billing setup required</AlertTitle>
+            <AlertDescription className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <span>{setupBlockedReason}</span>
+              <Button asChild size="sm" variant="outline" className="w-full md:w-auto">
+                <Link href="/subscription">Open Subscription & Billing</Link>
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
         <div>
           <Label htmlFor="broker">Broker Name</Label>
           <Select
@@ -86,7 +107,7 @@ export function AddAccountDialog({ onAccountAdded, open, onOpenChange, trigger }
                 server_name: "",
               }))
             }
-            disabled={catalogLoading || catalog.brokers.length === 0}
+            disabled={setupBlocked || catalogLoading || catalog.brokers.length === 0}
           >
             <SelectTrigger id="broker" className="mt-1">
               <SelectValue
@@ -116,7 +137,7 @@ export function AddAccountDialog({ onAccountAdded, open, onOpenChange, trigger }
                 server_name: nextServer,
               }))
             }
-            disabled={!formData.broker_name}
+            disabled={setupBlocked || !formData.broker_name}
           >
             <SelectTrigger id="server" className="mt-1">
               <SelectValue
@@ -145,6 +166,7 @@ export function AddAccountDialog({ onAccountAdded, open, onOpenChange, trigger }
               placeholder="Your account number"
               className="pl-10"
               value={formData.mt5_login_id}
+              disabled={setupBlocked}
               onChange={(e) => setFormData({ ...formData, mt5_login_id: e.target.value })}
             />
           </div>
@@ -159,6 +181,7 @@ export function AddAccountDialog({ onAccountAdded, open, onOpenChange, trigger }
               placeholder="Your trading password"
               className="pl-10"
               value={formData.mt5_password}
+              disabled={setupBlocked}
               onChange={(e) => setFormData({ ...formData, mt5_password: e.target.value })}
             />
           </div>
@@ -171,7 +194,7 @@ export function AddAccountDialog({ onAccountAdded, open, onOpenChange, trigger }
         <Button variant="outline" onClick={() => setIsOpen(false)}>
           Cancel
         </Button>
-        <Button onClick={handleSubmit} disabled={loading}>
+        <Button onClick={handleSubmit} disabled={loading || setupBlocked}>
           {loading ? "Connecting..." : "Connect Account"}
         </Button>
       </DialogFooter>

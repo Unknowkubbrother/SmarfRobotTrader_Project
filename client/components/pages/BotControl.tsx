@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from "react";
-import { Power, AlertOctagon, Clock, Shield, Play, Activity, TrendingUp, RefreshCw, Sparkles, Plus, Trash2, AlertTriangle, DownloadCloud } from "lucide-react";
+import { Power, AlertOctagon, Clock, Shield, Play, Activity, TrendingUp, RefreshCw, Sparkles, Trash2, AlertTriangle, DownloadCloud } from "lucide-react";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { useAuth } from "@/contexts/AuthContext";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { AccountSelector, AccountWithBots } from "@/components/dashboard/AccountSelector";
@@ -38,6 +40,7 @@ import {
   type PersistedBotAction,
   type PersistedBotLog,
 } from "@/lib/botOperationStore";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
 const riskLevels = [
@@ -145,6 +148,7 @@ const getBotPairKey = (symbol: string | null | undefined, timeframe: string | nu
 };
 
 export default function BotControl() {
+  const { user } = useAuth();
   const searchParams = useSearchParams();
   const queryBotId = searchParams.get("botId");
 
@@ -164,6 +168,10 @@ export default function BotControl() {
     refetch,
     getBotVersions
   } = useTradingAccounts();
+  const subscriptionBlocked = Boolean(user?.subscription_blocked);
+  const billingSetupRequired = user?.subscription_has_active_payment_method === false;
+  const subscriptionBlockedReason =
+    user?.subscription_block_message || "Complete billing setup before starting or creating bots.";
 
   const [selectedAccount, setSelectedAccount] = useState<AccountWithBots | null>(null);
   const [selectedBot, setSelectedBot] = useState<BotConfigWithVersion | null>(null);
@@ -215,6 +223,12 @@ export default function BotControl() {
     Boolean(isSelectedBotVersionInactive) &&
     selectedBotStatusNormalized !== "running" &&
     selectedBotStatusNormalized !== "starting";
+  const isSelectedBotStartLockedBySubscription =
+    subscriptionBlocked &&
+    selectedBotStatusNormalized !== "running" &&
+    selectedBotStatusNormalized !== "starting";
+  const isSelectedBotStartLocked =
+    isSelectedBotStartLockedByVersion || isSelectedBotStartLockedBySubscription;
 
   const { getBotState, lifecycleEvents, isConnected: isBotWsConnected } = useBotLiveState();
   const liveState = selectedBot ? getBotState(selectedBot.id) : undefined;
@@ -628,6 +642,20 @@ export default function BotControl() {
     return true;
   };
 
+  const guardStartWhenSubscriptionBlocked = (actionLabel: string): boolean => {
+    if (!subscriptionBlocked) return false;
+    toast.error(`Cannot ${actionLabel}. ${subscriptionBlockedReason}`);
+    return true;
+  };
+
+  const openAddBotDialog = () => {
+    if (subscriptionBlocked) {
+      toast.error(subscriptionBlockedReason);
+      return;
+    }
+    setAddBotOpen(true);
+  };
+
   const handleToggleBotClick = () => {
     if (isBusy) return;
     if (!selectedBot) return;
@@ -635,6 +663,7 @@ export default function BotControl() {
     if (currentStatus === "running") {
       setStopConfirmOpen(true);
     } else {
+      if (guardStartWhenSubscriptionBlocked("start")) return;
       if (guardStartWhenVersionInactive("start")) return;
       performBotToggle("running");
     }
@@ -643,6 +672,7 @@ export default function BotControl() {
   const performBotToggle = async (newStatus: "running" | "stopped") => {
     if (isBusy) return;
     if (!selectedBot) return;
+    if (newStatus === "running" && guardStartWhenSubscriptionBlocked("start")) return;
     if (newStatus === "running" && guardStartWhenVersionInactive("start")) return;
     const actionTitle = newStatus === "running" ? "Starting Bot" : "Stopping Bot";
     startUiAction(
@@ -673,6 +703,7 @@ export default function BotControl() {
   const performBotRestart = async () => {
     if (isBusy) return;
     if (!selectedBot) return;
+    if (guardStartWhenSubscriptionBlocked("restart")) return;
     if (guardStartWhenVersionInactive("restart")) return;
     const actionTitle = "Restarting Bot";
     startUiAction(
@@ -975,10 +1006,25 @@ export default function BotControl() {
               }}
               accountId={selectedAccount.id}
               onBotAdded={refetch}
+              addBotDisabled={subscriptionBlocked}
+              addBotDisabledReason={subscriptionBlockedReason}
             />
           )}
         </div>
       </div>
+
+      {subscriptionBlocked && (
+        <Alert className="border-warning/30 bg-warning/5 text-foreground [&>svg]:text-warning">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>{billingSetupRequired ? "Billing setup required" : "Bot access is paused"}</AlertTitle>
+          <AlertDescription className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <span>{subscriptionBlockedReason}</span>
+            <Button asChild size="sm" variant="outline" className="w-full md:w-auto">
+              <Link href="/subscription">Open Subscription & Billing</Link>
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
 
       {activeActionForSelectedBot && (
         <div className="rounded-xl border border-warning/30 bg-warning/5 p-4">
@@ -1103,14 +1149,21 @@ export default function BotControl() {
                       variant="outline"
                       className="gap-2"
                       onClick={handleToggleBotClick}
-                      disabled={isBusy || isSelectedBotStartLockedByVersion}
+                      disabled={isBusy || isSelectedBotStartLocked}
                       title={
-                        isSelectedBotStartLockedByVersion
+                        isSelectedBotStartLockedBySubscription
+                          ? subscriptionBlockedReason
+                          : isSelectedBotStartLockedByVersion
                           ? "This bot model is inactive. Change model before starting."
                           : undefined
                       }
                     >
-                      {isSelectedBotStartLockedByVersion ? (
+                      {isSelectedBotStartLockedBySubscription ? (
+                        <>
+                          <AlertTriangle className="w-4 h-4 text-warning" />
+                          Billing Hold
+                        </>
+                      ) : isSelectedBotStartLockedByVersion ? (
                         <>
                           <AlertTriangle className="w-4 h-4 text-destructive" />
                           Locked
@@ -1137,9 +1190,11 @@ export default function BotControl() {
                         variant="outline"
                         className="gap-2"
                         onClick={performBotRestart}
-                        disabled={isBusy || Boolean(isSelectedBotVersionInactive)}
+                        disabled={isBusy || Boolean(isSelectedBotVersionInactive) || subscriptionBlocked}
                         title={
-                          isSelectedBotVersionInactive
+                          subscriptionBlocked
+                            ? subscriptionBlockedReason
+                            : isSelectedBotVersionInactive
                             ? "This bot model is inactive. Change model before restarting."
                             : undefined
                         }
@@ -1164,7 +1219,12 @@ export default function BotControl() {
                   </>
                 )}
                 {!selectedBot && (
-                  <Button className="gap-2 bg-warning text-warning-foreground hover:bg-warning/90" onClick={() => setAddBotOpen(true)}>
+                  <Button
+                    className="gap-2 bg-warning text-warning-foreground hover:bg-warning/90"
+                    onClick={openAddBotDialog}
+                    disabled={subscriptionBlocked}
+                    title={subscriptionBlocked ? subscriptionBlockedReason : undefined}
+                  >
                     <Sparkles className="w-4 h-4" />
                     Add First Bot
                   </Button>
@@ -1504,6 +1564,7 @@ export default function BotControl() {
           accountId={selectedAccount.id}
           existingBots={selectedAccount.bot_configurations}
           onBotAdded={refetch}
+          blockedReason={subscriptionBlocked ? subscriptionBlockedReason : null}
         />
       )}
 

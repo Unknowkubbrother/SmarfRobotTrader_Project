@@ -10,6 +10,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AddAccountDialog } from "@/components/dialogs/AddAccountDialog";
 import { EditAccountDialog } from "@/components/dialogs/EditAccountDialog";
+import { useAuth } from "@/contexts/AuthContext";
 import { AccountWithBots, Update_Trading_Account } from "@/hooks/useTradingAccounts";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -44,10 +45,14 @@ export function AccountSelector({
   onDeleteAccount,
   onAccountDeleted,
 }: AccountSelectorProps) {
+  const { user } = useAuth();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [deleteLoading, setDeleteLoading] = useState(false);
+  const addAccountDisabled = Boolean(user?.subscription_blocked);
+  const addAccountDisabledReason =
+    user?.subscription_block_message || "Add a payment method before connecting trading accounts.";
 
   const getRunningBotsCount = (account: AccountWithBots) => {
     return account.bot_configurations.filter(
@@ -166,8 +171,14 @@ export function AccountSelector({
           )}
           <DropdownMenuSeparator />
           <DropdownMenuItem
-            onClick={() => setDialogOpen(true)}
+            onClick={() => {
+              if (!addAccountDisabled) {
+                setDialogOpen(true);
+              }
+            }}
             className="flex items-center gap-3 p-3 cursor-pointer text-primary"
+            disabled={addAccountDisabled}
+            title={addAccountDisabled ? addAccountDisabledReason : undefined}
           >
             <Plus className="w-4 h-4" />
             <span className="text-sm font-medium">Add New Account</span>

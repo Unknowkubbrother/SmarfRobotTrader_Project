@@ -18,9 +18,19 @@ interface BotSelectorProps {
   onBotSelect: (botId: string) => void;
   accountId: string;
   onBotAdded: () => void;
+  addBotDisabled?: boolean;
+  addBotDisabledReason?: string | null;
 }
 
-export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBotAdded }: BotSelectorProps) {
+export function BotSelector({
+  bots,
+  selectedBotId,
+  onBotSelect,
+  accountId,
+  onBotAdded,
+  addBotDisabled = false,
+  addBotDisabledReason = null,
+}: BotSelectorProps) {
   const [dialogOpen, setDialogOpen] = useState(false);
 
   const selectedBot = bots.find(b => b.id === selectedBotId);
@@ -89,6 +99,8 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
                 size="sm"
                 onClick={() => setDialogOpen(true)}
                 className="w-full mt-2"
+                disabled={addBotDisabled}
+                title={addBotDisabled ? addBotDisabledReason ?? undefined : undefined}
               >
                 Create Your First Bot
               </Button>
@@ -153,8 +165,14 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
             <>
               <DropdownMenuSeparator />
               <DropdownMenuItem
-                onClick={() => setDialogOpen(true)}
+                onClick={() => {
+                  if (!addBotDisabled) {
+                    setDialogOpen(true);
+                  }
+                }}
                 className="flex items-center gap-3 p-3 cursor-pointer text-primary"
+                disabled={addBotDisabled}
+                title={addBotDisabled ? addBotDisabledReason ?? undefined : undefined}
               >
                 <Plus className="w-4 h-4" />
                 <span className="text-sm font-medium">Add New Bot</span>
@@ -169,6 +187,7 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
         onOpenChange={setDialogOpen}
         accountId={accountId}
         existingBots={bots}
+        blockedReason={addBotDisabled ? addBotDisabledReason : null}
         onBotAdded={() => {
           onBotAdded();
           setDialogOpen(false);

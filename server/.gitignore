@@ -3,3 +3,4 @@ venv
 __pycache__
 smarfrobottrade-firebase.json
 uploads/avatars/*.*
+tmp/

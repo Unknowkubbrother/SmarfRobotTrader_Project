@@ -12,6 +12,7 @@ from firebase_admin import credentials, auth as firebase_auth
 
 from ..database.client import r_cache, db
 from ..models.auth_model import Register_OTP, Register_Verify, Register_Complete, Login_Verify, Google_Register_OTP, Google_Register_Verify, Google_Register_Complete, CheckUser_Request, Login_OTP_Init, SetPassword_Request
+from ..utils.subscription_access import get_user_subscription_access_state
 from lib.untils import random_with_N_digits, send_otp_email
 from ..utils.turnstile import verify_turnstile
 
@@ -435,13 +436,20 @@ async def logout(response: Response):
 
 @auth_router.get("/me", tags=["auth"])
 async def get_me(current_user: Annotated[any, Depends(get_current_active_user)]):
+    access_state = await get_user_subscription_access_state(str(current_user.id))
     return {
         "id": str(current_user.id),
         "username": current_user.username,
         "email": current_user.email,
         "role": current_user.role,
         "status": current_user.status,
-        "avatar_url": current_user.avatarUrl
+        "avatar_url": current_user.avatarUrl,
+        "subscription_status": access_state.subscription_status,
+        "subscription_blocked": access_state.blocked,
+        "subscription_block_message": access_state.block_message,
+        "subscription_unpaid_invoice_id": access_state.unpaid_invoice_id,
+        "subscription_unpaid_invoice_status": access_state.unpaid_invoice_status,
+        "subscription_has_active_payment_method": access_state.has_active_payment_method,
     }
 
 
