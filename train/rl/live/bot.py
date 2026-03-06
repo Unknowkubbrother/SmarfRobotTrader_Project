@@ -865,6 +865,36 @@ class LiveTradingBot:
                 except Exception:
                     pass
 
+    def _llm_text_log_entry_exists_locked(self, ts_key: str) -> bool:
+        log_file = self.llm_text_log_file
+        target_ts = str(ts_key or "").strip()
+        if not log_file or not target_ts or not os.path.exists(log_file):
+            return False
+        target_symbol = str(SYMBOL or "").strip().upper()
+        target_timeframe = str(TIMEFRAME_NAME or "").strip().upper()
+        try:
+            with open(log_file, "r", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except Exception:
+                        continue
+                    if str(payload.get("time", "")).strip() != target_ts:
+                        continue
+                    if str(payload.get("symbol", "")).strip().upper() != target_symbol:
+                        continue
+                    if str(payload.get("timeframe", "")).strip().upper() != target_timeframe:
+                        continue
+                    return True
+        except FileNotFoundError:
+            return False
+        except Exception as exc:
+            print(f" LLM text log dedupe scan failed: {exc}")
+        return False
+
     def _load_llm_semantic_cache(self):
         self.llm_semantic_cache = {}
         cache_file = self.llm_semantic_cache_file
@@ -1162,6 +1192,8 @@ class LiveTradingBot:
                 "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             }
             with self._exclusive_file_lock(self.llm_text_log_file):
+                if self._llm_text_log_entry_exists_locked(ts_val):
+                    return
                 with open(self.llm_text_log_file, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception as exc:
