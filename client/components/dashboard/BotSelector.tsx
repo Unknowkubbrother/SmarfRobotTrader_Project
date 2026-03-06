@@ -24,8 +24,12 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
   const [dialogOpen, setDialogOpen] = useState(false);
 
   const selectedBot = bots.find(b => b.id === selectedBotId);
-  const runningCount = bots.filter((b) => b.status === "running" || b.status === "starting").length;
+  const runningCount = bots.filter((b) => {
+    const status = String(b.status || b.container_status || "").toLowerCase();
+    return status === "running" || status === "starting";
+  }).length;
   const selectedBotVersionInactive = selectedBot?.bot_version?.is_active === false;
+  const selectedBotStatus = String(selectedBot?.status || selectedBot?.container_status || "").toLowerCase();
 
   return (
     <div className="flex items-center gap-3">
@@ -44,10 +48,12 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
                       "w-2 h-2 rounded-full",
                       selectedBotVersionInactive
                         ? "bg-destructive"
-                        : selectedBot.status === "running"
+                        : selectedBotStatus === "running"
                         ? "bg-success"
-                        : selectedBot.status === "starting"
+                        : selectedBotStatus === "starting"
                           ? "bg-warning"
+                          : selectedBotStatus === "error"
+                            ? "bg-destructive"
                           : "bg-muted-foreground"
                     )} />
                     {selectedBotVersionInactive && (
@@ -92,50 +98,55 @@ export function BotSelector({ bots, selectedBotId, onBotSelect, accountId, onBot
               <div className="p-2 text-xs font-medium text-muted-foreground uppercase tracking-wider">
                 Available Bots
               </div>
-              {bots.map((bot) => (
-                <DropdownMenuItem
-                  key={bot.id}
-                  onClick={() => onBotSelect(bot.id)}
-                  className="flex items-center gap-3 p-3 cursor-pointer"
-                >
-                  <div className="w-8 h-8 rounded-lg bg-secondary flex items-center justify-center relative">
-                    {bot.status === "running" ? (
-                      <Play className="w-4 h-4 text-success" />
-                    ) : bot.status === "starting" ? (
-                      <Play className="w-4 h-4 text-warning" />
-                    ) : (
-                      <Square className="w-4 h-4 text-muted-foreground" />
-                    )}
-                  </div>
-                  <div className="flex-1">
-                    <div className="flex items-center justify-between">
-                      <p className="text-sm font-medium">{bot.bot_version?.label || "Bot"}</p>
-                      <div className="flex items-center gap-2">
-                        {bot.bot_version?.is_active === false && (
-                          <span className="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">
-                            <AlertTriangle className="h-2.5 w-2.5" />
-                            Locked
+              {bots.map((bot) => {
+                const status = String(bot.status || bot.container_status || "").toLowerCase();
+                return (
+                  <DropdownMenuItem
+                    key={bot.id}
+                    onClick={() => onBotSelect(bot.id)}
+                    className="flex items-center gap-3 p-3 cursor-pointer"
+                  >
+                    <div className="w-8 h-8 rounded-lg bg-secondary flex items-center justify-center relative">
+                      {status === "running" ? (
+                        <Play className="w-4 h-4 text-success" />
+                      ) : status === "starting" ? (
+                        <Play className="w-4 h-4 text-warning" />
+                      ) : status === "error" ? (
+                        <AlertTriangle className="w-4 h-4 text-destructive" />
+                      ) : (
+                        <Square className="w-4 h-4 text-muted-foreground" />
+                      )}
+                    </div>
+                    <div className="flex-1">
+                      <div className="flex items-center justify-between">
+                        <p className="text-sm font-medium">{bot.bot_version?.label || "Bot"}</p>
+                        <div className="flex items-center gap-2">
+                          {bot.bot_version?.is_active === false && (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">
+                              <AlertTriangle className="h-2.5 w-2.5" />
+                              Locked
+                            </span>
+                          )}
+                          <span className={cn(
+                            "text-xs font-mono",
+                            bot.today_pnl >= 0 ? "text-success" : "text-destructive"
+                          )}>
+                            {bot.today_pnl >= 0 ? "+" : ""}${bot.today_pnl.toFixed(2)}
                           </span>
-                        )}
-                        <span className={cn(
-                          "text-xs font-mono",
-                          bot.today_pnl >= 0 ? "text-success" : "text-destructive"
-                        )}>
-                          {bot.today_pnl >= 0 ? "+" : ""}${bot.today_pnl.toFixed(2)}
-                        </span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                        <span>{bot.bot_version?.symbol}</span>
+                        <span>•</span>
+                        <span>{bot.bot_version?.timeframe}</span>
                       </div>
                     </div>
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <span>{bot.bot_version?.symbol}</span>
-                      <span>•</span>
-                      <span>{bot.bot_version?.timeframe}</span>
-                    </div>
-                  </div>
-                  {selectedBotId === bot.id && (
-                    <Check className="w-4 h-4 text-primary" />
-                  )}
-                </DropdownMenuItem>
-              ))}
+                    {selectedBotId === bot.id && (
+                      <Check className="w-4 h-4 text-primary" />
+                    )}
+                  </DropdownMenuItem>
+                );
+              })}
             </>
           )}
           {bots.length > 0 && (

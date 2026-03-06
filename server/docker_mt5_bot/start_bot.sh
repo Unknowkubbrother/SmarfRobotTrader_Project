@@ -31,6 +31,8 @@ MT5_ALLOW_PARTIAL_START="${MT5_ALLOW_PARTIAL_START:-0}"
 BOT_WAIT_FOR_WS_REGISTER="${BOT_WAIT_FOR_WS_REGISTER:-1}"
 BOT_WS_READY_TIMEOUT_SECONDS="${BOT_WS_READY_TIMEOUT_SECONDS:-120}"
 MT5_ALGO_STABILIZE_SECONDS="${MT5_ALGO_STABILIZE_SECONDS:-20}"
+STACK_STARTED=0
+START_COMPLETED=0
 
 trim_outer_whitespace() {
   local raw="$1"
@@ -134,6 +136,21 @@ compose() {
   echo "Error: ไม่พบ docker compose หรือ docker-compose"
   exit 1
 }
+
+cleanup_failed_start_stack() {
+  local exit_code="${1:-0}"
+  if [[ "$exit_code" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ "$STACK_STARTED" -ne 1 || "$START_COMPLETED" -eq 1 ]]; then
+    return 0
+  fi
+
+  echo "[cleanup] startup failed; stopping MT5 compose stack..."
+  compose down --remove-orphans >/dev/null 2>&1 || true
+}
+
+trap 'cleanup_failed_start_stack "$?"' EXIT
 
 run_with_timeout() {
   local timeout_seconds="${1:-0}"
@@ -360,8 +377,10 @@ if not login_text or not password:
 try:
     login_id = int(login_text)
 except ValueError:
+    print("fatal_login_error=invalid_login_id")
+    print("login_failure_reason=invalid_login_id")
     print(f"invalid_login={login_text}")
-    sys.exit(1)
+    sys.exit(2)
 
 def normalize_server_name(name: str) -> str:
     return " ".join(str(name or "").split()).strip()
@@ -371,6 +390,51 @@ def add_candidate(candidates: list[str], value: str) -> None:
     normalized = normalize_server_name(value)
     if normalized and normalized not in candidates:
         candidates.append(normalized)
+
+
+def normalize_error_text(value: str) -> str:
+    return " ".join(str(value or "").lower().split()).strip()
+
+
+def classify_login_failure_reason(error_text: str) -> str:
+    text = normalize_error_text(error_text)
+    if not text:
+        return ""
+
+    if any(
+        marker in text
+        for marker in (
+            "authorization failed",
+            "authorisation failed",
+            "invalid account",
+            "invalid login",
+            "invalid password",
+            "wrong password",
+            "wrong login",
+            "wrong account",
+            "not authorized",
+            "unauthorized",
+            "failed authorize",
+            "failed authorise",
+            "rejected by trade server",
+            "account password",
+        )
+    ):
+        return "invalid_credentials"
+
+    if any(
+        marker in text
+        for marker in (
+            "account disabled",
+            "trade account disabled",
+            "account blocked",
+            "account closed",
+            "account is disabled",
+        )
+    ):
+        return "account_disabled"
+
+    return ""
 
 
 def build_server_candidates(primary: str, fallbacks: str) -> list[str]:
@@ -404,6 +468,8 @@ def probe_login(server_name: str, login_id: int, pwd: str, rpc_timeout: int, res
         "login": 0,
         "account_server": "",
         "error": "",
+        "fatal": False,
+        "reason": "",
     }
     mt5 = None
     try:
@@ -425,6 +491,8 @@ def probe_login(server_name: str, login_id: int, pwd: str, rpc_timeout: int, res
             payload["error"] = str(mt5.last_error())
         except Exception:
             payload["error"] = ""
+        payload["reason"] = classify_login_failure_reason(payload["error"])
+        payload["fatal"] = bool(payload["reason"])
 
         account = mt5.account_info()
         if account is not None:
@@ -481,6 +549,8 @@ for attempt in range(1, retries + 1):
                 "login": 0,
                 "account_server": "",
                 "error": "no_result",
+                "fatal": False,
+                "reason": "",
             }
 
         print(
@@ -489,6 +559,8 @@ for attempt in range(1, retries + 1):
             f" login={int(result.get('login') or 0)}"
             f" account_server={result.get('account_server','')}"
             f" error={result.get('error','')}"
+            f" fatal={int(bool(result.get('fatal')))}"
+            f" reason={result.get('reason','')}"
         )
 
         if bool(result.get("ok")):
@@ -498,10 +570,17 @@ for attempt in range(1, retries + 1):
             print(f"login_ok={int(result.get('login') or login_id)}")
             sys.exit(0)
 
+        if bool(result.get("fatal")):
+            reason = str(result.get("reason") or "invalid_credentials").strip() or "invalid_credentials"
+            print(f"fatal_login_error={reason}")
+            print(f"login_failure_reason={reason}")
+            sys.exit(2)
+
     if attempt < retries:
         print(f"waiting_login_retry={attempt}/{retries}")
     time.sleep(retry_seconds)
 
+print("login_failure_reason=unknown")
 print("login_failed=1")
 sys.exit(1)
 PY
@@ -519,6 +598,29 @@ PY
     append_runner_progress "warning: MT5 login probe timed out (${MT5_LOGIN_CHECK_TIMEOUT_SECONDS}s)."
     cleanup_stale_mt5_exec_processes || true
     return 1
+  fi
+
+  if [[ "$rc" -eq 2 ]]; then
+    local fatal_reason
+    local fatal_message
+    fatal_reason="$(printf '%s\n' "$login_output" | sed -n 's/^fatal_login_error=//p' | tail -n 1 | tr -d '\r')"
+    case "$fatal_reason" in
+      invalid_login_id)
+        fatal_message="MT5 login ID is invalid. Check the trading account login."
+        ;;
+      account_disabled)
+        fatal_message="MT5 account is disabled or blocked. Check login ID, password, and server."
+        ;;
+      *)
+        fatal_message="MT5 login failed. Check login ID, password, and server."
+        ;;
+    esac
+    MT5_LOGIN_FATAL_REASON="$fatal_reason"
+    export MT5_LOGIN_FATAL_REASON
+    echo "  error: $fatal_message"
+    append_runner_progress "error: $fatal_message"
+    cleanup_stale_mt5_exec_processes || true
+    return 2
   fi
 
   local resolved_server
@@ -1458,6 +1560,7 @@ ensure_image_ready
 
 echo "[1/6] Starting MT5 container..."
 compose up -d --no-build "$SERVICE_NAME"
+STACK_STARTED=1
 if ! enable_bot_log_stream_if_needed; then
   echo "  warning: failed to enable runner progress stream to Docker logs."
 fi
@@ -1503,18 +1606,27 @@ append_runner_progress "mt5linux server is ready."
 dismiss_mt5_dialogs || true
 if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
   mt5_login_ready=0
-  if ! ensure_mt5_login_if_configured; then
-    echo "  warning: MT5 API login precheck failed, trying UI login fallback."
-    append_runner_progress "warning: MT5 API login precheck failed, trying UI login fallback."
-    search_company_dialog_by_server "$MT5_SERVER_VAL" || true
-    dismiss_mt5_dialogs || true
-    login_mt5_account_via_ui "$MT5_LOGIN_VAL" "$MT5_PASSWORD_VAL" "$MT5_SERVER_VAL" || true
-    dismiss_mt5_dialogs || true
-    if ensure_mt5_login_if_configured; then
-      mt5_login_ready=1
-    fi
-  else
+  login_precheck_rc=0
+  MT5_LOGIN_FATAL_REASON="${MT5_LOGIN_FATAL_REASON:-}"
+  if ensure_mt5_login_if_configured; then
     mt5_login_ready=1
+    login_precheck_rc=0
+  else
+    login_precheck_rc=$?
+    if [[ "$login_precheck_rc" -ne 2 ]]; then
+      echo "  warning: MT5 API login precheck failed, trying UI login fallback."
+      append_runner_progress "warning: MT5 API login precheck failed, trying UI login fallback."
+      search_company_dialog_by_server "$MT5_SERVER_VAL" || true
+      dismiss_mt5_dialogs || true
+      login_mt5_account_via_ui "$MT5_LOGIN_VAL" "$MT5_PASSWORD_VAL" "$MT5_SERVER_VAL" || true
+      dismiss_mt5_dialogs || true
+      if ensure_mt5_login_if_configured; then
+        mt5_login_ready=1
+        login_precheck_rc=0
+      else
+        login_precheck_rc=$?
+      fi
+    fi
   fi
 
   if [[ "$mt5_login_ready" -ne 1 ]]; then
@@ -1522,8 +1634,24 @@ if [[ ! "$MT5_SKIP_PRECHECKS" =~ ^(1|true|yes|on)$ ]]; then
       echo "  warning: MT5 login precheck still failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
       append_runner_progress "warning: MT5 login precheck still failed, continuing because MT5_ALLOW_PARTIAL_START=$MT5_ALLOW_PARTIAL_START"
     else
-      echo "Error: MT5 login precheck failed and fallback login did not succeed."
-      append_runner_progress "Error: MT5 login precheck failed and fallback login did not succeed."
+      if [[ "$login_precheck_rc" -eq 2 ]]; then
+        case "${MT5_LOGIN_FATAL_REASON:-}" in
+          invalid_login_id)
+            fatal_message="MT5 login ID is invalid. Check the trading account login."
+            ;;
+          account_disabled)
+            fatal_message="MT5 account is disabled or blocked. Check login ID, password, and server."
+            ;;
+          *)
+            fatal_message="MT5 login failed. Check login ID, password, and server."
+            ;;
+        esac
+        echo "Error: $fatal_message"
+        append_runner_progress "Error: $fatal_message"
+      else
+        echo "Error: MT5 login precheck failed and fallback login did not succeed."
+        append_runner_progress "Error: MT5 login precheck failed and fallback login did not succeed."
+      fi
       echo "       Set MT5_ALLOW_PARTIAL_START=1 only if you intentionally want best-effort start."
       exit 1
     fi
@@ -1888,6 +2016,7 @@ if bot_process_is_running; then
 	  append_bot_log_marker "[RUNNER] bot_version_active tag=${BOT_VERSION_TAG:-base} script=/bots/${BOT_SCRIPT} image=${METATRADER_IMAGE}"
 	  append_bot_log_marker "[RUNNER] start_ok"
 	  append_runner_progress "Bot started successfully."
+	  START_COMPLETED=1
 	  echo "Bot started successfully."
   echo "Log file: ${BOT_LOG}"
   echo "Follow logs with:"

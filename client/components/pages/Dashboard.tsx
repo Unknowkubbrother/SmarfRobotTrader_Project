@@ -223,6 +223,7 @@ export default function Dashboard() {
       toast.info("Operation still in progress. Tracking status from backend...");
       return;
     }
+    toast.error(result.error || (newStatus === "running" ? "Bot start failed" : "Bot stop failed"));
     setBotActionState(null);
     saveActiveBotAction(null);
   };

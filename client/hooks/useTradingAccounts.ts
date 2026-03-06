@@ -288,6 +288,7 @@ export function useTradingAccounts() {
           error: message,
         };
       }
+      await fetchAccounts();
       toast.error(message);
       return {
         success: false,
@@ -373,6 +374,7 @@ export function useTradingAccounts() {
           error: message,
         };
       }
+      await fetchAccounts();
       toast.error(message);
       return {
         success: false,

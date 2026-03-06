@@ -631,7 +631,7 @@ export default function BotControl() {
   const handleToggleBotClick = () => {
     if (isBusy) return;
     if (!selectedBot) return;
-    const currentStatus = selectedBot.status || "stopped";
+    const currentStatus = selectedBot.status || selectedBot.container_status || "stopped";
     if (currentStatus === "running") {
       setStopConfirmOpen(true);
     } else {
@@ -664,7 +664,7 @@ export default function BotControl() {
       appendActionLog("info", `${actionTitle} request accepted. Waiting for backend sync...`, selectedBot.id);
       toast.info("Operation still in progress. Tracking status from backend...");
     } else {
-      appendActionLog("error", `${actionTitle} failed`, selectedBot.id);
+      appendActionLog("error", result.error || `${actionTitle} failed`, selectedBot.id);
       finishUiAction();
     }
     setStopConfirmOpen(false);
@@ -694,7 +694,7 @@ export default function BotControl() {
       appendActionLog("info", `${actionTitle} request accepted. Waiting for backend sync...`, selectedBot.id);
       toast.info("Restart is in progress. Tracking status from backend...");
     } else {
-      appendActionLog("error", `${actionTitle} failed`, selectedBot.id);
+      appendActionLog("error", result.error || `${actionTitle} failed`, selectedBot.id);
       finishUiAction();
     }
   };
@@ -826,7 +826,7 @@ export default function BotControl() {
       `Changing model to ${availableModels.find((m) => m.model_id === pendingModelId)?.label || pendingModelId}`,
       {
         botId: selectedBot.id,
-        expectedStatus: (selectedBot.status === "running" ? "running" : "stopped"),
+        expectedStatus: ((selectedBot.status || selectedBot.container_status) === "running" ? "running" : "stopped"),
         kind: "change_model",
       }
     );
@@ -870,7 +870,7 @@ export default function BotControl() {
         toast.info("Update is still in progress. Tracking status from backend...");
         return;
       }
-      appendActionLog("error", "Bot update failed", selectedBot.id);
+      appendActionLog("error", result.error || "Bot update failed", selectedBot.id);
       finishUiAction();
     } finally {
       applyUpdateInFlightRef.current = false;
@@ -900,7 +900,7 @@ export default function BotControl() {
     finishUiAction();
   };
 
-  const botStatus = selectedBot?.status || "stopped";
+  const botStatus = selectedBot?.status || selectedBot?.container_status || "stopped";
   const normalizedBotStatus = String(botStatus || "").toLowerCase();
   const isRunningStatus = normalizedBotStatus === "running";
   const isStartingStatus = normalizedBotStatus === "starting";
@@ -913,6 +913,7 @@ export default function BotControl() {
   const visibleActionLogs = selectedBot
     ? actionLogs.filter((log) => log.botId === selectedBot.id)
     : [];
+  const latestErrorLog = visibleActionLogs.find((log) => log.level === "error");
   const latestApplyUpdateLog = visibleActionLogs.find((log) => log.action === "apply_update");
   const isApplyUpdatePendingFromLogs = Boolean(
     latestApplyUpdateLog?.phase === "requested" &&
@@ -927,6 +928,8 @@ export default function BotControl() {
         return <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-success/10 text-success"><span className="w-1.5 h-1.5 rounded-full bg-success" />Running</span>;
       case "starting":
         return <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-warning/10 text-warning"><RefreshCw className="w-3 h-3 animate-spin" />Starting</span>;
+      case "error":
+        return <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-destructive/10 text-destructive"><AlertTriangle className="w-3 h-3" />Failed</span>;
       case "paused":
         return <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-warning/10 text-warning">Paused</span>;
       default:
@@ -1276,6 +1279,13 @@ export default function BotControl() {
                       <p className="text-sm text-destructive">Bot model is inactive</p>
                       <p className="text-xs mt-1">
                         Change model to an active version before starting this bot again.
+                      </p>
+                    </>
+                  ) : normalizedBotStatus === "error" ? (
+                    <>
+                      <p className="text-sm text-destructive">Bot start failed</p>
+                      <p className="text-xs mt-1">
+                        {latestErrorLog?.message || "Check MT5 login ID, password, and server, then start again."}
                       </p>
                     </>
                   ) : (

@@ -34,7 +34,7 @@ export function BotCard({
   isBusy = false
 }: BotCardProps) {
   const [showStopConfirm, setShowStopConfirm] = useState(false);
-  const status = String(bot.status || "stopped").toLowerCase();
+  const status = String(bot.status || bot.container_status || "stopped").toLowerCase();
   const isStarting = status === "starting";
   const isRunning = status === "running";
   const isVersionInactive = bot.bot_version?.is_active === false;
@@ -76,6 +76,13 @@ export function BotCard({
             Starting
           </span>
         );
+      case "error":
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-destructive/10 text-destructive">
+            <AlertTriangle className="w-3 h-3" />
+            Failed
+          </span>
+        );
       case "paused":
         return (
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-warning/10 text-warning">
@@ -113,11 +120,23 @@ export function BotCard({
           <div className="flex items-center gap-3 flex-1 min-w-0">
             <div className={cn(
               "w-10 h-10 rounded-xl flex items-center justify-center shrink-0",
-              status === "running" ? "bg-success/10" : status === "starting" ? "bg-warning/10" : "bg-secondary"
+              status === "running"
+                ? "bg-success/10"
+                : status === "starting"
+                  ? "bg-warning/10"
+                  : status === "error"
+                    ? "bg-destructive/10"
+                    : "bg-secondary"
             )}>
               <Activity className={cn(
                 "w-5 h-5",
-                status === "running" ? "text-success" : status === "starting" ? "text-warning" : "text-muted-foreground"
+                status === "running"
+                  ? "text-success"
+                  : status === "starting"
+                    ? "text-warning"
+                    : status === "error"
+                      ? "text-destructive"
+                      : "text-muted-foreground"
               )} />
             </div>
             <div className="min-w-0 flex-1">

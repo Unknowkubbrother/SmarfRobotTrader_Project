@@ -216,6 +216,9 @@ async def _extract_runtime_context(
 
 
 def _runner_error_message(prefix: str, exc: BotRunnerError) -> str:
+    summarized = _extract_runner_failure_detail(exc)
+    if summarized:
+        return f"{prefix}: {summarized}"
     stderr = str(getattr(exc, "stderr", "") or "").strip()
     stdout = str(getattr(exc, "stdout", "") or "").strip()
     if stderr:
@@ -223,6 +226,58 @@ def _runner_error_message(prefix: str, exc: BotRunnerError) -> str:
     if stdout:
         return f"{prefix}: {exc}. stdout={stdout}"
     return f"{prefix}: {exc}"
+
+
+def _extract_runner_failure_detail(exc: BotRunnerError) -> str | None:
+    stderr = str(getattr(exc, "stderr", "") or "")
+    stdout = str(getattr(exc, "stdout", "") or "")
+    combined = "\n".join(part for part in (stderr, stdout) if part)
+    if not combined.strip():
+        return None
+
+    markers: dict[str, str] = {}
+    lines = [str(line or "").strip() for line in combined.splitlines() if str(line or "").strip()]
+    for line in lines:
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        normalized_key = str(key or "").strip()
+        if normalized_key in {
+            "fatal_login_error",
+            "login_failure_reason",
+            "invalid_login",
+        }:
+            markers[normalized_key] = str(value or "").strip()
+
+    invalid_login = markers.get("invalid_login")
+    if invalid_login:
+        return f"MT5 login ID is invalid: {invalid_login}"
+
+    reason = (
+        str(markers.get("fatal_login_error") or "").strip()
+        or str(markers.get("login_failure_reason") or "").strip()
+    )
+    if reason == "invalid_login_id":
+        return "MT5 login ID is invalid. Check the trading account login."
+    if reason == "account_disabled":
+        return "MT5 account is disabled or blocked. Check login ID, password, and server."
+    if reason == "invalid_credentials":
+        return "MT5 login failed. Check login ID, password, and server."
+
+    normalized_text = " ".join(combined.lower().split())
+    if "error: mt5 login failed. check login id, password, and server." in normalized_text:
+        return "MT5 login failed. Check login ID, password, and server."
+    if "error: mt5 account is disabled or blocked." in normalized_text:
+        return "MT5 account is disabled or blocked. Check login ID, password, and server."
+    if "error: mt5 login id is invalid." in normalized_text:
+        return "MT5 login ID is invalid. Check the trading account login."
+    if "error: mt5 login precheck failed and fallback login did not succeed." in normalized_text:
+        return "MT5 login failed. Check login ID, password, and server."
+    return None
+
+
+def _runner_failure_detail(exc: BotRunnerError) -> str:
+    return _extract_runner_failure_detail(exc) or str(exc)
 
 
 async def _emit_lifecycle_event(
@@ -454,7 +509,7 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
                 bot_config_id=str(data.botConfigId),
                 action=action,
                 phase="failed",
-                detail=str(exc),
+                detail=_runner_failure_detail(exc),
                 status="error",
                 owner_user_id=request.state.user_id,
             )
@@ -512,7 +567,7 @@ async def update_bot_status(request: Request, data: Update_Bot_Status):
                 bot_config_id=str(data.botConfigId),
                 action="stop",
                 phase="failed",
-                detail=str(exc),
+                detail=_runner_failure_detail(exc),
                 status="error",
                 owner_user_id=request.state.user_id,
             )
@@ -809,7 +864,7 @@ async def emergency_stop_bot(request: Request, data: Emergency_Bot_Stop):
                 bot_config_id=str(data.botConfigId),
                 action="emergency_stop",
                 phase="failed",
-                detail=str(exc),
+                detail=_runner_failure_detail(exc),
                 status="error",
                 metadata={"close_result": close_result},
                 owner_user_id=request.state.user_id,
@@ -947,7 +1002,7 @@ async def change_bot_model(request: Request, data: Change_Bot_Model):
                 bot_config_id=str(data.botConfigId),
                 action="change_model",
                 phase="failed",
-                detail=str(exc),
+                detail=_runner_failure_detail(exc),
                 status="error",
                 metadata={"new_model_id": str(data.newModelId)},
                 owner_user_id=request.state.user_id,
@@ -1107,7 +1162,7 @@ async def apply_bot_update(request: Request, data: Apply_Bot_Update):
                 bot_config_id=str(data.botConfigId),
                 action="apply_update",
                 phase="failed",
-                detail=str(exc),
+                detail=_runner_failure_detail(exc),
                 status="error",
                 owner_user_id=request.state.user_id,
             )
@@ -1131,7 +1186,7 @@ async def apply_bot_update(request: Request, data: Apply_Bot_Update):
                     bot_config_id=str(data.botConfigId),
                     action="apply_update",
                     phase="failed",
-                    detail=str(exc),
+                    detail=_runner_failure_detail(exc),
                     status="error",
                     owner_user_id=request.state.user_id,
                 )
@@ -1241,7 +1296,7 @@ async def delete_bot(request: Request, data: Delete_Bot):
                 bot_config_id=str(data.botConfigId),
                 action="delete",
                 phase="failed",
-                detail=str(exc),
+                detail=_runner_failure_detail(exc),
                 status="error",
                 owner_user_id=request.state.user_id,
             )
