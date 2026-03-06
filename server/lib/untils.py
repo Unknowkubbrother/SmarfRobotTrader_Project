@@ -33,6 +33,14 @@ def generate_otp_email_template(otp: str, purpose: str = "login") -> str:
             "title": "Verification code",
             "message": "Enter the following verification code to reset your password:",
         },
+        "password_change": {
+            "title": "Confirm password change",
+            "message": "Enter the following verification code to update your password:",
+        },
+        "profile_change": {
+            "title": "Confirm account changes",
+            "message": "Enter the following verification code to update your account information:",
+        },
     }
 
     config = purpose_config.get(purpose, purpose_config["login"])
@@ -120,6 +128,8 @@ def send_otp_email(to_email: str, otp: str, purpose: str = "login"):
         "login": "Your Login Verification Code - SmarfRobotTrade",
         "register": "Complete Your Registration - SmarfRobotTrade",
         "forgot_password": "Password Reset Code - SmarfRobotTrade",
+        "password_change": "Confirm Your Password Change - SmarfRobotTrade",
+        "profile_change": "Confirm Your Account Changes - SmarfRobotTrade",
     }
     subject = subject_map.get(purpose, subject_map["login"])
     html_content = generate_otp_email_template(otp, purpose)

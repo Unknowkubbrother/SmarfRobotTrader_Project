@@ -11,6 +11,7 @@ from lib.untils import random_with_N_digits, send_otp_email
 from ..models.settings_model import (
     UserProfileResponse, 
     NotificationConfigResponse, 
+    SecurityOtpRequest,
     UpdateProfileRequest, 
     UpdatePasswordRequest, 
     UpdateNotificationsRequest, 
@@ -23,6 +24,10 @@ UPLOADS_DIR = os.path.join(BASE_DIR, "uploads", "avatars")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 settings_router = APIRouter()
+
+
+def _security_otp_cache_key(user_id: str, purpose: str) -> str:
+    return f"security_otp:{user_id}:{purpose}"
 
 
 def _mask_discord_webhook_url(value: Optional[str]) -> Optional[str]:
@@ -76,15 +81,17 @@ async def get_profile(
 
 @settings_router.post("/security/otp")
 async def request_security_otp(
-    current_user: Annotated[any, Depends(get_current_active_user)]
+    current_user: Annotated[any, Depends(get_current_active_user)],
+    data: Optional[SecurityOtpRequest] = None,
 ):
     if not current_user.recoveryEmail:
         raise HTTPException(status_code=400, detail="No recovery email set")
 
+    purpose = data.purpose if data else "password_change"
     otp = str(random_with_N_digits(6))
-    r_cache.setex(f"security_otp:{current_user.id}", 300, otp)
+    r_cache.setex(_security_otp_cache_key(str(current_user.id), purpose), 300, otp)
     
-    send_otp_email(current_user.recoveryEmail, otp, purpose="password_change")
+    send_otp_email(current_user.recoveryEmail, otp, purpose=purpose)
 
     return {
         "message": "OTP sent to recovery email",
@@ -133,44 +140,80 @@ async def update_profile(
     update_data: UpdateProfileRequest,
     current_user: Annotated[any, Depends(get_current_active_user)]
 ):
+    provided_fields = set(getattr(update_data, "model_fields_set", getattr(update_data, "__fields_set__", set())))
     data_to_update = {}
-    if update_data.username:
-        # Check if username exists
-        existing = await db.user.find_first(
-            where={
-                "username": update_data.username,
-                "NOT": {"id": str(current_user.id)}
-            }
-        )
-        if existing:
-            raise HTTPException(status_code=400, detail="Username already taken")
-        data_to_update["username"] = update_data.username
-        
-    if update_data.email:
-        # Check if email exists
-        existing = await db.user.find_first(
-            where={
-                "email": update_data.email,
-                "NOT": {"id": str(current_user.id)}
-            }
-        )
-        if existing:
-            raise HTTPException(status_code=400, detail="Email already taken")
-        data_to_update["email"] = update_data.email
-        
-    if update_data.recoveryEmail:
-        data_to_update["recoveryEmail"] = update_data.recoveryEmail
+    sensitive_change_requested = False
 
-    if update_data.avatarUrl is not None:
-        data_to_update["avatarUrl"] = update_data.avatarUrl
+    if "username" in provided_fields:
+        username = update_data.username.strip() if update_data.username else None
+        if username != current_user.username:
+            if not username:
+                raise HTTPException(status_code=400, detail="Username is required")
+
+        # Check if username exists
+            existing = await db.user.find_first(
+                where={
+                    "username": username,
+                    "NOT": {"id": str(current_user.id)}
+                }
+            )
+            if existing:
+                raise HTTPException(status_code=400, detail="Username already taken")
+
+            data_to_update["username"] = username
+            sensitive_change_requested = True
+
+    if "email" in provided_fields:
+        email = str(update_data.email).strip() if update_data.email is not None else None
+        if email != current_user.email:
+        # Check if email exists
+            if not email:
+                raise HTTPException(status_code=400, detail="Email is required")
+
+            existing = await db.user.find_first(
+                where={
+                    "email": email,
+                    "NOT": {"id": str(current_user.id)}
+                }
+            )
+            if existing:
+                raise HTTPException(status_code=400, detail="Email already taken")
+
+            data_to_update["email"] = email
+            sensitive_change_requested = True
+
+    if "recoveryEmail" in provided_fields:
+        recovery_email = str(update_data.recoveryEmail).strip() if update_data.recoveryEmail is not None else None
+        if recovery_email != current_user.recoveryEmail:
+            data_to_update["recoveryEmail"] = recovery_email
+            sensitive_change_requested = True
+
+    if "avatarUrl" in provided_fields:
+        avatar_url = update_data.avatarUrl.strip() if isinstance(update_data.avatarUrl, str) else update_data.avatarUrl
+        if avatar_url != current_user.avatarUrl:
+            data_to_update["avatarUrl"] = avatar_url
 
     if not data_to_update:
          return await get_profile(current_user)
+
+    if sensitive_change_requested:
+        if not update_data.otp:
+            raise HTTPException(status_code=400, detail="OTP is required to update account information")
+
+        stored_otp = r_cache.get(_security_otp_cache_key(str(current_user.id), "profile_change"))
+        if not stored_otp:
+            raise HTTPException(status_code=400, detail="OTP expired or not requested")
+
+        if stored_otp != update_data.otp:
+            raise HTTPException(status_code=400, detail="Invalid OTP")
 
     updated_user = await db.user.update(
         where={"id": str(current_user.id)},
         data=data_to_update
     )
+
+    if sensitive_change_requested:
+        r_cache.delete(_security_otp_cache_key(str(current_user.id), "profile_change"))
     
     # Re-fetch profile to include config
     return await get_profile(updated_user)
@@ -181,7 +224,7 @@ async def update_password(
     current_user: Annotated[any, Depends(get_current_active_user)]
 ):
     # Verify OTP
-    stored_otp = r_cache.get(f"security_otp:{current_user.id}")
+    stored_otp = r_cache.get(_security_otp_cache_key(str(current_user.id), "password_change"))
     if not stored_otp:
         raise HTTPException(status_code=400, detail="OTP expired or not requested")
     
@@ -196,7 +239,7 @@ async def update_password(
     )
     
     # Clear OTP
-    r_cache.delete(f"security_otp:{current_user.id}")
+    r_cache.delete(_security_otp_cache_key(str(current_user.id), "password_change"))
     
     return {"message": "Password updated successfully"}
 

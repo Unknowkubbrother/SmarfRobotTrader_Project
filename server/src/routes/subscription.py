@@ -1,4 +1,5 @@
 import asyncio
+import html
 import os
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -39,6 +40,12 @@ from ..utils.subscription_access import (
     suspend_user_bot_runtime,
     sync_subscription_status_from_invoices,
 )
+from ..utils.notification_delivery import (
+    build_absolute_related_link,
+    build_generic_notification_email_html,
+    claim_notification_dedupe,
+    dispatch_notification_to_user,
+)
 from .authentication import get_current_active_user
 
 try:
@@ -54,6 +61,7 @@ subscription_router = APIRouter(tags=["Subscription"])
 ADMIN_FEE_TYPES = {"percentage", "fixed"}
 ADMIN_SUB_STATUSES = {"active", "past_due", "canceled"}
 COLLECTION_MODES = {"automatic", "manual"}
+_PAYMENT_METHOD_NOTIFICATION_RELATED_LINK = "/subscription"
 
 
 def _to_float(value: Optional[Decimal]) -> float:
@@ -171,6 +179,65 @@ def _ensure_stripe_configured():
 
 async def _stripe_call(callable_obj, *args, **kwargs):
     return await asyncio.to_thread(callable_obj, *args, **kwargs)
+
+
+def _escape_text(value: object) -> str:
+    return html.escape(str(value or "").strip())
+
+
+def _payment_method_label(method) -> str:
+    brand = str(getattr(method, "cardBrand", "") or "").strip().upper() or "CARD"
+    last4 = str(getattr(method, "cardLast4", "") or "").strip()
+    if last4:
+        return f"{brand} ending in {last4}"
+    return brand
+
+
+async def _notify_payment_method_added(*, user, method, set_as_default: bool) -> None:
+    try:
+        method_id = str(getattr(method, "id", "") or "").strip()
+        if not method_id:
+            return
+
+        provider_method_id = str(getattr(method, "providerMethodId", "") or "").strip() or method_id
+        user_id = str(getattr(user, "id", "") or "").strip()
+        if not user_id:
+            return
+
+        if not claim_notification_dedupe(
+            key=f"payment_method_added:{user_id}:{provider_method_id}",
+            ttl_seconds=300,
+        ):
+            return
+
+        method_label = _payment_method_label(method)
+        default_text = " This card is now your default payment method." if set_as_default else ""
+        title = "Payment method added"
+        message = f"{method_label} was added to your billing profile.{default_text}".strip()
+        action_url = build_absolute_related_link(_PAYMENT_METHOD_NOTIFICATION_RELATED_LINK) or _PAYMENT_METHOD_NOTIFICATION_RELATED_LINK
+        email_html = build_generic_notification_email_html(
+            title=title,
+            greeting=f"Hi {str(getattr(user, 'username', '') or getattr(user, 'email', '') or 'Trader').strip()},",
+            message=(
+                f"You added {method_label} to your SmarfRobotTrade billing profile."
+                f"{default_text} Open Subscription & Billing to review saved cards and billing mode."
+            ),
+            related_link=action_url,
+            action_label="Open billing",
+        )
+
+        await dispatch_notification_to_user(
+            user,
+            title=title,
+            message=message,
+            related_link=_PAYMENT_METHOD_NOTIFICATION_RELATED_LINK,
+            email_subject=f"Payment method added ({_escape_text(method_label)}) - SmarfRobotTrade",
+            email_html=email_html,
+            action_label="Open billing",
+            send_discord_channel=False,
+        )
+    except Exception:
+        return
 
 
 def _map_subscription_response(subscription, *, status_override: str | None = None, next_billing_date: str | None = None):
@@ -602,6 +669,12 @@ async def attach_payment_method(
         local_method = await db.userpaymentmethod.find_unique(where={"id": str(local_method.id)})
         if not local_method:
             raise HTTPException(status_code=500, detail="Failed to fetch payment method")
+
+    await _notify_payment_method_added(
+        user=current_user,
+        method=local_method,
+        set_as_default=bool(getattr(local_method, "isDefault", False)),
+    )
 
     return _map_payment_method(local_method)
 

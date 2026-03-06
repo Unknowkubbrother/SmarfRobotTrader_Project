@@ -37,7 +37,7 @@ from ..utils.bot_magic import derive_magic_number, normalize_magic_number
 from ..utils.bot_operation_events import emit_and_store_bot_operation_event
 from ..utils.notification_delivery import dispatch_notification_to_user
 from ..utils.subscription_access import sync_subscription_status_from_invoices
-from ..utils.subscription_billing import sync_daily_aggregate_status_for_invoice
+from ..utils.subscription_billing import notify_invoice_event, sync_daily_aggregate_status_for_invoice
 from .authentication import get_current_active_user
 
 admin_router = APIRouter(tags=["Admin"])
@@ -970,12 +970,23 @@ async def skip_admin_user_invoice(
     if invoice_status == "skipped":
         return {"message": "Invoice already skipped"}
 
-    await db.invoice.update(
+    updated_invoice = await db.invoice.update(
         where={"id": invoice_id},
         data={"status": "skipped"},
     )
     await sync_daily_aggregate_status_for_invoice(invoice_id, "skipped")
     await sync_subscription_status_from_invoices(str(invoice.subId))
+    user = await db.user.find_unique(where={"id": user_id}, include={"notificationConfig": True})
+    if user:
+        await notify_invoice_event(
+            invoice=updated_invoice,
+            user=user,
+            subscription=invoice.subscription,
+            event_type="invoice_skipped",
+            note=f"Skipped by admin {str(getattr(current_user, 'email', '') or getattr(current_user, 'username', '') or 'admin').strip()}",
+            source="admin",
+            event_token=f"admin-skip-{invoice_id}",
+        )
     return {"message": "Invoice skipped"}
 
 

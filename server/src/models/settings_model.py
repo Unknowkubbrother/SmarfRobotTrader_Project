@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, List
+from typing import Optional, List, Literal
 from datetime import datetime
 from decimal import Decimal
 
@@ -37,10 +37,14 @@ class UpdateProfileRequest(BaseModel):
     email: Optional[EmailStr] = None
     recoveryEmail: Optional[EmailStr] = None
     avatarUrl: Optional[str] = None
+    otp: Optional[str] = None
 
 class UpdatePasswordRequest(BaseModel):
     otp: str
     newPassword: str = Field(..., min_length=6)
+
+class SecurityOtpRequest(BaseModel):
+    purpose: Literal["password_change", "profile_change"] = "password_change"
 
 class UpdateNotificationsRequest(BaseModel):
     emailNotificationEnable: Optional[bool] = None

@@ -33,6 +33,16 @@ export interface ActivityLog {
     topic: string | null;
 }
 
+export interface UpdateProfilePayload {
+    username?: string;
+    email?: string;
+    recoveryEmail?: string | null;
+    avatarUrl?: string | null;
+    otp?: string;
+}
+
+export type SecurityOtpPurpose = "password_change" | "profile_change";
+
 export function useSettings() {
     const [loading, setLoading] = useState(false);
     const [profile, setProfile] = useState<UserProfile | null>(null);
@@ -43,9 +53,9 @@ export function useSettings() {
             setLoading(true);
             const response = await api.get("/settings/profile");
             setProfile(response.data);
-        } catch (error) {
+        } catch (error: any) {
             console.error("Failed to fetch profile:", error);
-            toast.error("Failed to load settings");
+            toast.error(error.message || "Failed to load settings");
         } finally {
             setLoading(false);
         }
@@ -60,7 +70,7 @@ export function useSettings() {
         }
     }, []);
 
-    const updateProfile = async (data: Partial<UserProfile>) => {
+    const updateProfile = async (data: UpdateProfilePayload) => {
         try {
             setLoading(true);
             const response = await api.patch("/settings/profile", data);
@@ -69,22 +79,22 @@ export function useSettings() {
             return true;
         } catch (error: any) {
             console.error("Failed to update profile:", error);
-            toast.error(error.response?.data?.detail || "Failed to update profile");
+            toast.error(error.response?.data?.detail || error.message || "Failed to update profile");
             return false;
         } finally {
             setLoading(false);
         }
     };
 
-    const requestSecurityOtp = async () => {
+    const requestSecurityOtp = async (purpose: SecurityOtpPurpose = "password_change") => {
         try {
             setLoading(true);
-            const { data } = await api.post("/settings/security/otp");
+            const { data } = await api.post("/settings/security/otp", { purpose });
             toast.success(data.message);
             return data;
         } catch (error: any) {
             console.error("Failed to request OTP:", error);
-            toast.error(error.response?.data?.detail || "Failed to send OTP");
+            toast.error(error.response?.data?.detail || error.message || "Failed to send OTP");
             return null;
         } finally {
             setLoading(false);
@@ -104,7 +114,7 @@ export function useSettings() {
             return true;
         } catch (error: any) {
             console.error("Failed to update password:", error);
-            toast.error(error.response?.data?.detail || "Failed to update password");
+            toast.error(error.response?.data?.detail || error.message || "Failed to update password");
             return false;
         } finally {
             setLoading(false);
@@ -128,7 +138,7 @@ export function useSettings() {
             return true;
         } catch (error: any) {
             console.error("Failed to update notifications:", error);
-            toast.error(error.response?.data?.detail || "Failed to update notifications");
+            toast.error(error.response?.data?.detail || error.message || "Failed to update notifications");
             return false;
         } finally {
             setLoading(false);
@@ -155,7 +165,7 @@ export function useSettings() {
             return true;
         } catch (error: any) {
             console.error(error);
-            toast.error(error.response?.data?.detail || "Failed to upload profile photo");
+            toast.error(error.response?.data?.detail || error.message || "Failed to upload profile photo");
             return false;
         } finally {
             setLoading(false);

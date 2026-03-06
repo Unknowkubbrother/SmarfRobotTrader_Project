@@ -3,7 +3,7 @@ import { User, Shield, Bell, Monitor, Key, Loader2, Gamepad2, Camera } from "luc
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { useSettings, NotificationConfig } from "@/hooks/useSettings";
+import { useSettings, NotificationConfig, UpdateProfilePayload } from "@/hooks/useSettings";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
@@ -44,8 +44,10 @@ export default function Settings() {
     confirmPassword: ""
   });
 
-  const [showOtpInput, setShowOtpInput] = useState(false);
-  const [otp, setOtp] = useState("");
+  const [showProfileOtpInput, setShowProfileOtpInput] = useState(false);
+  const [profileOtp, setProfileOtp] = useState("");
+  const [showPasswordOtpInput, setShowPasswordOtpInput] = useState(false);
+  const [passwordOtp, setPasswordOtp] = useState("");
 
   const [tokenForm, setTokenForm] = useState({
     discordWebhookUrl: ""
@@ -104,12 +106,42 @@ export default function Settings() {
     });
   };
 
+  const getProfileChanges = (): UpdateProfilePayload => {
+    if (!profile) return {};
+
+    const nextUsername = profileForm.username.trim();
+    const nextEmail = profileForm.email.trim();
+    const nextRecoveryEmail = profileForm.recoveryEmail.trim();
+    const changes: UpdateProfilePayload = {};
+
+    if (nextUsername !== profile.username) {
+      changes.username = nextUsername;
+    }
+
+    if (nextEmail !== profile.email) {
+      changes.email = nextEmail;
+    }
+
+    if (nextRecoveryEmail !== (profile.recoveryEmail || "")) {
+      changes.recoveryEmail = nextRecoveryEmail || null;
+    }
+
+    return changes;
+  };
+
   const handleProfileSave = async () => {
-    await updateProfile({
-      username: profileForm.username,
-      email: profileForm.email,
-      recoveryEmail: profileForm.recoveryEmail
-    });
+    const changes = getProfileChanges();
+
+    if (Object.keys(changes).length === 0) {
+      toast.error("No account information changes to save");
+      return;
+    }
+
+    const res = await requestSecurityOtp("profile_change");
+    if (res) {
+      setProfileOtp("");
+      setShowProfileOtpInput(true);
+    }
   };
 
   const handlePasswordSave = async () => {
@@ -124,20 +156,47 @@ export default function Settings() {
 
     const res = await requestSecurityOtp();
     if (res) {
-      setShowOtpInput(true);
+      setPasswordOtp("");
+      setShowPasswordOtpInput(true);
     }
   };
 
-  const handleOtpSubmit = async () => {
-    if (!otp || otp.length < 6) {
+  const handleProfileOtpSubmit = async () => {
+    if (!profileOtp || profileOtp.length < 6) {
       toast.error("Please enter a valid OTP");
       return;
     }
-    const success = await updatePassword(passwordForm.newPassword, otp);
+
+    const changes = getProfileChanges();
+    if (Object.keys(changes).length === 0) {
+      toast.error("No account information changes to save");
+      setProfileOtp("");
+      setShowProfileOtpInput(false);
+      return;
+    }
+
+    const success = await updateProfile({
+      ...changes,
+      otp: profileOtp
+    });
+
+    if (success) {
+      setProfileOtp("");
+      setShowProfileOtpInput(false);
+    }
+  };
+
+  const handlePasswordOtpSubmit = async () => {
+    if (!passwordOtp || passwordOtp.length < 6) {
+      toast.error("Please enter a valid OTP");
+      return;
+    }
+
+    const success = await updatePassword(passwordForm.newPassword, passwordOtp);
     if (success) {
       setPasswordForm({ newPassword: "", confirmPassword: "" });
-      setOtp("");
-      setShowOtpInput(false);
+      setPasswordOtp("");
+      setShowPasswordOtpInput(false);
     }
   };
 
@@ -307,10 +366,46 @@ export default function Settings() {
                   </select>
                 </div>
               </div>
-              <Button onClick={handleProfileSave} className="mt-6">
-                {loading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
-                Save Changes
-              </Button>
+
+              {!showProfileOtpInput ? (
+                <Button onClick={handleProfileSave} className="mt-6" disabled={loading}>
+                  {loading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
+                  Save Changes
+                </Button>
+              ) : (
+                <div className="space-y-4 max-w-md animate-fade-in mt-6">
+                  <div className="bg-secondary/60 p-3 rounded-lg border border-border text-sm text-foreground">
+                    Enter the OTP sent to your recovery email to confirm these account changes.
+                  </div>
+                  <div>
+                    <label className="block text-sm text-muted-foreground mb-2">One-Time Password (OTP)</label>
+                    <input
+                      type="text"
+                      value={profileOtp}
+                      onChange={(e) => setProfileOtp(e.target.value)}
+                      className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50 text-center tracking-widest font-mono"
+                      placeholder="000000"
+                      maxLength={6}
+                    />
+                  </div>
+                  <div className="flex gap-2">
+                    <Button onClick={handleProfileOtpSubmit} disabled={loading} className="flex-1">
+                      {loading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
+                      Confirm & Save
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        setProfileOtp("");
+                        setShowProfileOtpInput(false);
+                      }}
+                      disabled={loading}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 
@@ -385,7 +480,7 @@ export default function Settings() {
               </h3>
             </div>
 
-            {!showOtpInput ? (
+            {!showPasswordOtpInput ? (
               <div className="space-y-4 max-w-md">
                 <div>
                   <label className="block text-sm text-muted-foreground mb-2">New Password</label>
@@ -421,19 +516,26 @@ export default function Settings() {
                   <label className="block text-sm text-muted-foreground mb-2">One-Time Password (OTP)</label>
                   <input
                     type="text"
-                    value={otp}
-                    onChange={(e) => setOtp(e.target.value)}
+                    value={passwordOtp}
+                    onChange={(e) => setPasswordOtp(e.target.value)}
                     className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-sm focus:outline-none focus:border-primary/50 text-center tracking-widest font-mono"
                     placeholder="000000"
                     maxLength={6}
                   />
                 </div>
                 <div className="flex gap-2">
-                  <Button onClick={handleOtpSubmit} disabled={loading} className="flex-1">
+                  <Button onClick={handlePasswordOtpSubmit} disabled={loading} className="flex-1">
                     {loading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
                     Confirm & Save
                   </Button>
-                  <Button variant="outline" onClick={() => setShowOtpInput(false)} disabled={loading}>
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setPasswordOtp("");
+                      setShowPasswordOtpInput(false);
+                    }}
+                    disabled={loading}
+                  >
                     Cancel
                   </Button>
                 </div>

@@ -16,6 +16,7 @@ except Exception:
     Json = None
 
 from ..database.client import db
+from .notification_delivery import build_absolute_related_link, claim_notification_dedupe, dispatch_notification_to_user
 from .subscription_access import sync_subscription_status_from_invoices
 try:
     from prisma.errors import UniqueViolationError
@@ -35,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 _BILLING_POLL_SECONDS = max(60, int(os.getenv("SUBSCRIPTION_BILLING_POLL_SECONDS", "900")))
 _PROCESSABLE_SUB_STATUSES = {"active"}
+_BILLING_NOTIFICATION_RELATED_LINK = "/subscription"
+_BILLING_NOTIFICATION_DEDUPE_TTL_SECONDS = 60 * 60 * 24 * 45
 
 
 @dataclass
@@ -415,6 +418,377 @@ def _invoice_charge_update_payload(
         "paidAt": charge_result.paid_at,
     }
     return payload
+
+
+def _escape_text(value: Any) -> str:
+    return html.escape(str(value or "").strip())
+
+
+def _trim_notification_text(value: Any, *, max_length: int = 240) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_length:
+        return text
+    return f"{text[:max_length - 1].rstrip()}…"
+
+
+def _format_display_date(value: Any, *, include_time: bool = False) -> str:
+    if not value:
+        return "-"
+    if isinstance(value, datetime):
+        current = value
+        if current.tzinfo is not None:
+            current = current.astimezone(timezone.utc)
+        return current.strftime("%b %d, %Y %H:%M UTC" if include_time else "%b %d, %Y")
+    if isinstance(value, date):
+        return value.strftime("%b %d, %Y")
+    return str(value)
+
+
+def _format_period_display(start_value: date | None, end_value: date | None) -> str:
+    if start_value and end_value:
+        return f"{_format_display_date(start_value)} - {_format_display_date(end_value)}"
+    if start_value:
+        return _format_display_date(start_value)
+    if end_value:
+        return _format_display_date(end_value)
+    return "-"
+
+
+def _format_currency(amount: float) -> str:
+    return f"${amount:,.2f}"
+
+
+def _invoice_label(invoice: Any) -> str:
+    invoice_id = str(getattr(invoice, "id", "") or "").strip()
+    return f"INV-{invoice_id[:8].upper()}" if invoice_id else "INV-UNKNOWN"
+
+
+def _invoice_notification_reason(invoice: Any, note: str | None = None) -> str | None:
+    explicit_note = str(note or "").strip()
+    if explicit_note:
+        return _trim_notification_text(explicit_note)
+
+    payment_error_details = getattr(invoice, "paymentErrorDetails", None)
+    if isinstance(payment_error_details, dict):
+        message = str(payment_error_details.get("message") or "").strip()
+        if message:
+            return _trim_notification_text(message)
+
+    return None
+
+
+async def _load_notification_user(user: Any) -> Any | None:
+    if not user:
+        return None
+    user_id = str(getattr(user, "id", "") or "").strip()
+    if not user_id:
+        return None
+
+    notification_config = getattr(user, "notificationConfig", None)
+    if notification_config is not None:
+        return user
+
+    return await db.user.find_unique(
+        where={"id": user_id},
+        include={"notificationConfig": True},
+    )
+
+
+async def _resolve_invoice_payment_method_for_notification(
+    *,
+    invoice: Any,
+    subscription: Any | None,
+    user_id: str,
+) -> Any | None:
+    payment_method_id = str(getattr(invoice, "paymentMethodUsed", "") or "").strip()
+    if payment_method_id:
+        payment_method = await db.userpaymentmethod.find_first(
+            where={
+                "id": payment_method_id,
+                "userId": user_id,
+            }
+        )
+        if payment_method:
+            return payment_method
+
+    default_method_id = str(getattr(subscription, "defaultPaymentMethodId", "") or "").strip() if subscription else ""
+    if default_method_id:
+        return await db.userpaymentmethod.find_first(
+            where={
+                "id": default_method_id,
+                "userId": user_id,
+            }
+        )
+
+    return await db.userpaymentmethod.find_first(
+        where={
+            "userId": user_id,
+            "isDefault": True,
+        }
+    )
+
+
+def _payment_method_label(payment_method: Any | None) -> str:
+    if not payment_method:
+        return "No saved card selected"
+    brand = str(getattr(payment_method, "cardBrand", "") or "").strip().upper() or "CARD"
+    last4 = str(getattr(payment_method, "cardLast4", "") or "").strip()
+    if last4:
+        return f"{brand} ending in {last4}"
+    return brand
+
+
+def _build_billing_notification_copy(
+    *,
+    event_type: str,
+    invoice_label: str,
+    amount: float,
+    period_label: str,
+    reason: str | None,
+    collection_mode: str,
+    source: str,
+) -> tuple[str, str, str, str]:
+    amount_label = _format_currency(amount)
+    manual_hint = "Manual collection is enabled. Please open billing and pay this invoice." if collection_mode == "manual" else "Review the billing page if you need to update your payment method."
+
+    if event_type == "payment_received":
+        title = "Billing payment received"
+        subject = f"Payment received for {invoice_label} - SmarfRobotTrade"
+        message = f"{invoice_label} was paid successfully. Collected {amount_label} for {period_label}."
+        intro = "Your weekly billing payment was collected successfully."
+        return title, subject, message, intro
+
+    if event_type == "payment_failed":
+        title = "Automatic billing failed" if source == "automatic" else "Billing payment failed"
+        subject = f"Payment failed for {invoice_label} - SmarfRobotTrade"
+        suffix = f" Reason: {reason}" if reason else ""
+        message = (
+            f"We could not collect {amount_label} for {invoice_label} ({period_label})."
+            f"{suffix} {manual_hint}"
+        ).strip()
+        intro = "We could not complete your billing payment."
+        return title, subject, message, intro
+
+    if event_type == "invoice_skipped":
+        title = "Billing cycle skipped"
+        subject = f"Billing cycle skipped for {invoice_label} - SmarfRobotTrade"
+        suffix = f" Reason: {reason}" if reason else ""
+        message = f"{invoice_label} for {period_label} was skipped.{suffix}".strip()
+        intro = "No charge will be collected for this billing period."
+        return title, subject, message, intro
+
+    title = "New billing invoice ready"
+    subject = f"Billing invoice ready ({invoice_label}) - SmarfRobotTrade"
+    suffix = f" {reason}" if reason else ""
+    message = (
+        f"{invoice_label} is ready for {period_label}. Amount due {amount_label}."
+        f"{suffix} {manual_hint}"
+    ).strip()
+    intro = "A new weekly billing invoice is ready."
+    return title, subject, message, intro
+
+
+def _build_billing_notification_email_html(
+    *,
+    user: Any,
+    subscription: Any | None,
+    invoice: Any,
+    payment_method: Any | None,
+    title: str,
+    intro: str,
+    reason: str | None,
+) -> str:
+    invoice_label = _invoice_label(invoice)
+    period_start = _extract_date(getattr(invoice, "billingStartDate", None))
+    period_end = _extract_date(getattr(invoice, "billingEndDate", None))
+    created_at = getattr(invoice, "createdAt", None)
+    paid_at = getattr(invoice, "paidAt", None)
+    status_label = str(_enum_value(getattr(invoice, "status", None)) or "pending").replace("_", " ").title()
+    amount = _to_float(getattr(invoice, "calculatedFee", None), 0.0)
+    total_period_profit = _to_float(getattr(invoice, "totalPeriodProfit", None), 0.0)
+    fee_type = str(_enum_value(getattr(subscription, "feeType", None)) or "percentage") if subscription else "percentage"
+    fee_value = _to_float(getattr(subscription, "feeValue", None), 0.0) if subscription else 0.0
+    collection_mode = str(_enum_value(getattr(subscription, "collectionMode", None)) or "automatic").title() if subscription else "Automatic"
+    user_name = str(getattr(user, "username", "") or "").strip() or str(getattr(user, "email", "") or "").strip() or "Trader"
+    payment_method_label = _payment_method_label(payment_method)
+    reason_block = ""
+    if reason:
+        reason_block = (
+            '<div style="margin-top:20px; padding:16px; border-radius:12px; background:#fff7ed; '
+            'border:1px solid #fdba74;">'
+            '<div style="font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:#9a3412; font-weight:700;">'
+            'Details</div>'
+            f'<div style="margin-top:8px; color:#7c2d12; line-height:1.6;">{_escape_text(reason)}</div>'
+            "</div>"
+        )
+
+    fee_model_label = f"{fee_type.title()} at {fee_value:.2f}{'%' if fee_type == 'percentage' else ' USD'}"
+
+    action_url = build_absolute_related_link(_BILLING_NOTIFICATION_RELATED_LINK) or _BILLING_NOTIFICATION_RELATED_LINK
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{_escape_text(title)}</title>
+</head>
+<body style="margin:0; padding:24px; background:#f8fafc; font-family:Arial, sans-serif; color:#0f172a;">
+  <div style="max-width:680px; margin:0 auto; background:#ffffff; border:1px solid #e2e8f0; border-radius:18px; overflow:hidden;">
+    <div style="padding:24px 28px; background:linear-gradient(135deg, #0f172a 0%, #1d4ed8 100%); color:#ffffff;">
+      <div style="font-size:12px; letter-spacing:0.1em; text-transform:uppercase; opacity:0.82;">SmarfRobotTrade</div>
+      <div style="margin-top:8px; font-size:28px; font-weight:800;">{_escape_text(title)}</div>
+      <div style="margin-top:10px; color:#dbeafe; line-height:1.6;">{_escape_text(intro)}</div>
+    </div>
+
+    <div style="padding:28px;">
+      <div style="font-size:16px; color:#334155; line-height:1.7;">Hi {_escape_text(user_name)},</div>
+
+      <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin-top:20px;">
+        <tr>
+          <td valign="top" width="50%" style="padding-right:8px;">
+            <div style="padding:18px; border:1px solid #e2e8f0; border-radius:14px; background:#f8fafc;">
+              <div style="font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:#64748b; font-weight:700;">Invoice</div>
+              <div style="margin-top:8px; font-size:22px; font-weight:800; color:#0f172a;">{_escape_text(invoice_label)}</div>
+              <div style="margin-top:6px; color:#475569;">Status: {_escape_text(status_label)}</div>
+              <div style="margin-top:4px; color:#475569;">Amount: {_escape_text(_format_currency(amount))}</div>
+            </div>
+          </td>
+          <td valign="top" width="50%" style="padding-left:8px;">
+            <div style="padding:18px; border:1px solid #e2e8f0; border-radius:14px; background:#f8fafc;">
+              <div style="font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:#64748b; font-weight:700;">Billing Period</div>
+              <div style="margin-top:8px; font-size:18px; font-weight:700; color:#0f172a;">{_escape_text(_format_period_display(period_start, period_end))}</div>
+              <div style="margin-top:6px; color:#475569;">Issued: {_escape_text(_format_display_date(created_at, include_time=True))}</div>
+              <div style="margin-top:4px; color:#475569;">Paid: {_escape_text(_format_display_date(paid_at, include_time=True))}</div>
+            </div>
+          </td>
+        </tr>
+      </table>
+
+      <div style="margin-top:20px; padding:18px; border:1px solid #e2e8f0; border-radius:14px; background:#ffffff;">
+        <div style="font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:#64748b; font-weight:700;">Billing Summary</div>
+        <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin-top:10px; color:#0f172a;">
+          <tr>
+            <td style="padding:8px 0; color:#64748b;">Net profit</td>
+            <td style="padding:8px 0; text-align:right; font-weight:700;">{_escape_text(_format_currency(total_period_profit))}</td>
+          </tr>
+          <tr>
+            <td style="padding:8px 0; color:#64748b;">Fee model</td>
+            <td style="padding:8px 0; text-align:right; font-weight:700;">{_escape_text(fee_model_label)}</td>
+          </tr>
+          <tr>
+            <td style="padding:8px 0; color:#64748b;">Collection mode</td>
+            <td style="padding:8px 0; text-align:right; font-weight:700;">{_escape_text(collection_mode)}</td>
+          </tr>
+          <tr>
+            <td style="padding:8px 0; color:#64748b;">Payment method</td>
+            <td style="padding:8px 0; text-align:right; font-weight:700;">{_escape_text(payment_method_label)}</td>
+          </tr>
+        </table>
+      </div>
+
+      {reason_block}
+
+      <div style="margin-top:24px;">
+        <a href="{_escape_text(action_url)}" style="display:inline-block; background:#2563eb; color:#ffffff; text-decoration:none; padding:12px 18px; border-radius:10px; font-weight:700;">
+          Open Billing
+        </a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+async def notify_invoice_event(
+    *,
+    invoice: Any,
+    user: Any,
+    subscription: Any | None = None,
+    event_type: str,
+    note: str | None = None,
+    source: str = "system",
+    event_token: str | None = None,
+) -> dict[str, bool]:
+    try:
+        notification_user = await _load_notification_user(user)
+        if not notification_user:
+            return {"in_app": False, "email": False, "discord": False}
+
+        user_id = str(getattr(notification_user, "id", "") or "").strip()
+        if not user_id:
+            return {"in_app": False, "email": False, "discord": False}
+
+        resolved_subscription = subscription
+        if resolved_subscription is None:
+            sub_id = str(getattr(invoice, "subId", "") or "").strip()
+            if sub_id:
+                resolved_subscription = await db.subscription.find_unique(where={"id": sub_id})
+
+        payment_method = await _resolve_invoice_payment_method_for_notification(
+            invoice=invoice,
+            subscription=resolved_subscription,
+            user_id=user_id,
+        )
+        invoice_label = _invoice_label(invoice)
+        amount = round(_to_float(getattr(invoice, "calculatedFee", None), 0.0), 2)
+        period_start = _extract_date(getattr(invoice, "billingStartDate", None))
+        period_end = _extract_date(getattr(invoice, "billingEndDate", None))
+        period_label = _format_period_display(period_start, period_end)
+        collection_mode = str(_enum_value(getattr(resolved_subscription, "collectionMode", None)) or "automatic").strip().lower()
+        reason = _invoice_notification_reason(invoice, note)
+
+        title, subject, message, intro = _build_billing_notification_copy(
+            event_type=event_type,
+            invoice_label=invoice_label,
+            amount=amount,
+            period_label=period_label,
+            reason=reason,
+            collection_mode=collection_mode,
+            source=source,
+        )
+
+        dedupe_token = _trim_notification_text(
+            event_token
+            or getattr(invoice, "stripePaymentIntentId", None)
+            or getattr(invoice, "paidAt", None)
+            or getattr(invoice, "createdAt", None)
+            or event_type,
+            max_length=120,
+        )
+        if not claim_notification_dedupe(
+            key=f"billing_notification:{str(getattr(invoice, 'id', '') or '')}:{event_type}:{dedupe_token}",
+            ttl_seconds=_BILLING_NOTIFICATION_DEDUPE_TTL_SECONDS,
+        ):
+            return {"in_app": False, "email": False, "discord": False}
+
+        email_html = _build_billing_notification_email_html(
+            user=notification_user,
+            subscription=resolved_subscription,
+            invoice=invoice,
+            payment_method=payment_method,
+            title=title,
+            intro=intro,
+            reason=reason,
+        )
+
+        return await dispatch_notification_to_user(
+            notification_user,
+            title=title,
+            message=message,
+            related_link=_BILLING_NOTIFICATION_RELATED_LINK,
+            email_subject=subject,
+            email_html=email_html,
+            action_label="Open billing",
+            send_discord_channel=False,
+        )
+    except Exception:
+        logger.exception(
+            "failed to dispatch billing notification | invoice=%s event=%s",
+            getattr(invoice, "id", None),
+            event_type,
+        )
+        return {"in_app": False, "email": False, "discord": False}
 
 
 async def _create_or_get_invoice_record(
@@ -1009,6 +1383,16 @@ async def process_due_subscription(subscription: Any, *, today: date | None = No
                 )
             )
             await sync_subscription_status_from_invoices(str(subscription.id))
+            if invoice_created:
+                await notify_invoice_event(
+                    invoice=invoice,
+                    user=user,
+                    subscription=subscription,
+                    event_type="invoice_ready",
+                    note="Manual collection mode requires customer payment before bot usage resumes.",
+                    source="automatic",
+                    event_token="created-manual",
+                )
             break
 
         if not charge_candidate_methods:
@@ -1041,6 +1425,16 @@ async def process_due_subscription(subscription: Any, *, today: date | None = No
                 )
             )
             await sync_subscription_status_from_invoices(str(subscription.id))
+            if invoice_created:
+                await notify_invoice_event(
+                    invoice=invoice,
+                    user=user,
+                    subscription=subscription,
+                    event_type="invoice_ready",
+                    note="Automatic billing could not start because no active payment method is available.",
+                    source="automatic",
+                    event_token="created-no-payment-method",
+                )
             break
 
         invoice, invoice_created = await _create_or_get_invoice_record(
@@ -1093,19 +1487,50 @@ async def process_due_subscription(subscription: Any, *, today: date | None = No
         )
         await sync_daily_aggregate_status_for_invoice(str(invoice.id), getattr(invoice, "status", None) or charge_result.status)
         await sync_subscription_status_from_invoices(str(subscription.id))
+        invoice_status = str(_enum_value(getattr(invoice, "status", None)) or charge_result.status).lower()
+        if invoice_status == "paid":
+            await notify_invoice_event(
+                invoice=invoice,
+                user=user,
+                subscription=subscription,
+                event_type="payment_received",
+                note=charge_result.note,
+                source="automatic",
+                event_token=charge_result.payment_intent_id or charge_result.request_id or "auto-paid",
+            )
+        elif invoice_status == "failed":
+            await notify_invoice_event(
+                invoice=invoice,
+                user=user,
+                subscription=subscription,
+                event_type="payment_failed",
+                note=charge_result.note,
+                source="automatic",
+                event_token=charge_result.payment_intent_id or charge_result.request_id or charge_result.note or "auto-failed",
+            )
+        elif invoice_status == "pending":
+            await notify_invoice_event(
+                invoice=invoice,
+                user=user,
+                subscription=subscription,
+                event_type="invoice_ready",
+                note=charge_result.note,
+                source="automatic",
+                event_token=charge_result.payment_intent_id or charge_result.request_id or "auto-pending",
+            )
         results.append(
             BillingCycleResult(
                 subscription_id=str(subscription.id),
                 invoice_id=str(invoice.id),
                 invoice_created=True,
-                status=str(_enum_value(getattr(invoice, "status", None)) or charge_result.status),
+                status=invoice_status,
                 amount=round(_to_float(getattr(invoice, "calculatedFee", None), calculated_fee), 2),
                 period_start=period_start,
                 period_end=period_end,
                 note=charge_result.note,
             )
         )
-        if str(_enum_value(getattr(invoice, "status", None)) or charge_result.status).lower() in {"paid", "skipped"}:
+        if invoice_status in {"paid", "skipped"}:
             next_due_date += timedelta(days=7)
             continue
         break
@@ -1214,7 +1639,7 @@ async def pay_invoice_now(
         period_end=period_end,
     )
     if charge_result.status != "paid":
-        await db.invoice.update(
+        updated_invoice = await db.invoice.update(
             where={"id": str(invoice.id)},
             data=_invoice_charge_update_payload(
                 charge_result,
@@ -1227,6 +1652,15 @@ async def pay_invoice_now(
             "failed" if charge_result.status == "failed" else "pending",
         )
         await sync_subscription_status_from_invoices(str(subscription.id))
+        await notify_invoice_event(
+            invoice=updated_invoice,
+            user=user,
+            subscription=subscription,
+            event_type="payment_failed" if charge_result.status == "failed" else "invoice_ready",
+            note=charge_result.note,
+            source="manual",
+            event_token=charge_result.payment_intent_id or charge_result.request_id or charge_result.note or "manual-attempt",
+        )
         raise ValueError(charge_result.note or "Unable to collect payment")
 
     updated_invoice = await db.invoice.update(
@@ -1239,6 +1673,15 @@ async def pay_invoice_now(
     )
     await sync_daily_aggregate_status_for_invoice(str(updated_invoice.id), getattr(updated_invoice, "status", None) or "paid")
     await sync_subscription_status_from_invoices(str(subscription.id))
+    await notify_invoice_event(
+        invoice=updated_invoice,
+        user=user,
+        subscription=subscription,
+        event_type="payment_received",
+        note=charge_result.note,
+        source="manual",
+        event_token=charge_result.payment_intent_id or charge_result.request_id or getattr(updated_invoice, "paidAt", None) or "manual-paid",
+    )
     return updated_invoice
 
 
