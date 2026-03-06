@@ -464,6 +464,18 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
     )
       .filter((row): row is BotLiveIntrabarReview => !!row && typeof row === "object")
       .slice(-5);
+    const reviewLogTimestampByTicket = new Map<string, string>();
+    for (let i = 0; i < recentLogs.length; i += 1) {
+      const row = recentLogs[i];
+      const phase = String(row?.phase || "").trim().toUpperCase();
+      const event = String(row?.event || "").trim().toLowerCase();
+      if (phase !== "INTRABAR" || event !== "review") continue;
+      const ticket = String(normalizeMeta(row?.meta)?.ticket || "").trim();
+      const timestampUtc = typeof row?.timestamp_utc === "string" ? row.timestamp_utc : "";
+      if (ticket && timestampUtc) {
+        reviewLogTimestampByTicket.set(ticket, timestampUtc);
+      }
+    }
     const dedup = new Set<string>();
     const rows: LogEntry[] = [];
 
@@ -497,9 +509,10 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
 
     for (let i = 0; i < recentIntrabarReviews.length; i += 1) {
       const review = recentIntrabarReviews[i];
-      const timestampUtc = typeof review.reviewed_at_bar_end_utc === "string"
-        ? review.reviewed_at_bar_end_utc
-        : review.bar_end_utc;
+      const ticketKey = String(review.ticket || "").trim();
+      const reviewLogTimestampUtc = ticketKey ? reviewLogTimestampByTicket.get(ticketKey) : "";
+      const timestampUtc = reviewLogTimestampUtc
+        || (typeof review.reviewed_at_bar_end_utc === "string" ? review.reviewed_at_bar_end_utc : review.bar_end_utc);
       const timestamp = toLocalClockText(timestampUtc, "--:--:--");
       const message = toReviewLogMessage(review);
       const type = toReviewLogType(review.review_outcome);
