@@ -1,6 +1,5 @@
 import { Terminal, TrendingUp, AlertTriangle, CheckCircle, Bot } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { Badge } from "@/components/ui/badge";
 import type { BotLiveIntrabarReview, BotLiveLogEntry, BotLiveState } from "@/hooks/useBotLiveState";
 
 interface LogEntry {
@@ -116,6 +115,12 @@ function formatPositiveNumber(value: unknown, digits = 2, suffix = ""): string {
   return `${Math.abs(parsed).toFixed(digits)}${suffix}`;
 }
 
+function formatRatioPercent(value: unknown): string {
+  const parsed = toNum(value);
+  if (parsed === null) return "-";
+  return `${Math.round(parsed * 100)}%`;
+}
+
 function toIntrabarSourceLabel(value: unknown): string {
   const source = String(value || "").trim().toLowerCase();
   if (!source) return "reviewed at candle close";
@@ -138,17 +143,6 @@ function toReviewOutcomeLabel(value: unknown): string {
   return "Review";
 }
 
-function toReviewOutcomeClasses(value: unknown): string {
-  const outcome = String(value || "").trim().toLowerCase();
-  if (outcome === "intrabar_better") {
-    return "border-success/30 bg-success/10 text-success";
-  }
-  if (outcome === "hold_better") {
-    return "border-warning/30 bg-warning/10 text-warning";
-  }
-  return "border-border bg-secondary text-muted-foreground";
-}
-
 function toReviewHeadline(review: Partial<BotLiveIntrabarReview>): string {
   const outcome = String(review.review_outcome || "").trim().toLowerCase();
   const delta = Math.abs(toNum(review.delta_vs_hold_money) || 0);
@@ -163,6 +157,32 @@ function toReviewHeadline(review: Partial<BotLiveIntrabarReview>): string {
       : "Holding to candle close finished better";
   }
   return "Early exit and candle close finished almost the same";
+}
+
+function toReviewLogType(value: unknown): LogEntry["type"] {
+  const outcome = String(value || "").trim().toLowerCase();
+  if (outcome === "intrabar_better") return "success";
+  if (outcome === "hold_better") return "warning";
+  return "analysis";
+}
+
+function toReviewLogMessage(review: Partial<BotLiveIntrabarReview>): string {
+  const ticket = String(review.ticket || "").trim();
+  const side = String(review.side || "").trim().toUpperCase();
+  const headline = toReviewHeadline(review);
+  const actualMoney = formatSignedNumber(review.actual_pnl_money, 2);
+  const holdMoney = formatSignedNumber(review.hold_to_close_pnl_money, 2);
+  const actualChange = formatSignedNumber(review.actual_change_pct, 3, "%");
+  const holdChange = formatSignedNumber(review.hold_to_close_change_pct, 3, "%");
+  const sourceLabel = toIntrabarSourceLabel(review.bar_close_exit_source);
+  const triggerReasons = Array.isArray(review.trigger_reasons)
+    ? review.trigger_reasons.filter((item) => String(item || "").trim()).join(" | ")
+    : "";
+  const subject = [toReviewOutcomeLabel(review.review_outcome), side, ticket ? `#${ticket}` : ""]
+    .filter(Boolean)
+    .join(" | ");
+  const triggerText = triggerReasons ? ` | trigger: ${triggerReasons}` : "";
+  return `${subject} | ${headline} | actual ${actualMoney} (${actualChange}) vs close ${holdMoney} (${holdChange}) | ${sourceLabel}${triggerText}`;
 }
 
 function shouldHideLog(log: Partial<BotLiveLogEntry>): boolean {
@@ -282,12 +302,18 @@ function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
     const changePct = toNum(meta?.take_profit_change_pct);
     const pips = toNum(meta?.take_profit_pips);
     const money = toNum(meta?.take_profit_money);
+    const trailingEnabled = Boolean(meta?.trailing_enabled);
+    const trendKeep = formatRatioPercent(meta?.trail_keep_ratio_trend);
+    const normalKeep = formatRatioPercent(meta?.trail_keep_ratio_normal);
+    const tightKeep = formatRatioPercent(meta?.trail_keep_ratio_tight);
     if (changePct !== null && changePct > 0) parts.push(`change ${changePct.toFixed(3)}%`);
     if (pips !== null && pips > 0) parts.push(`pips ${pips.toFixed(1)}`);
     if (money !== null && money > 0) parts.push(`money ${money.toFixed(2)}`);
-    return parts.length > 0
-      ? `Intrabar take-profit active (${parts.join(" | ")})`
-      : "Intrabar take-profit active";
+    if (trailingEnabled) {
+      parts.push(`trailing lock ${trendKeep}/${normalKeep}/${tightKeep}`);
+    }
+    const label = trailingEnabled ? "Intrabar profit lock active" : "Intrabar take-profit active";
+    return parts.length > 0 ? `${label} (${parts.join(" | ")})` : label;
   }
   if (phase === "INTRABAR" && event === "take_profit_hit") {
     const side = String(meta?.side || "").trim().toUpperCase();
@@ -299,13 +325,59 @@ function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
     const suffix = reasons ? ` | trigger: ${reasons}` : "";
     return `Intrabar take-profit hit: closing ${subject || "position"} | change ${changePct} | PnL ${pnlMoney}${suffix}`;
   }
+  if (phase === "INTRABAR" && event === "trail_armed") {
+    const side = String(meta?.side || "").trim().toUpperCase();
+    const ticket = String(meta?.ticket || "").trim();
+    const regime = String(meta?.regime || "").trim().toLowerCase();
+    const keepRatio = formatRatioPercent(meta?.keep_ratio);
+    const changePct = formatSignedNumber(meta?.change_pct, 3, "%");
+    const pnlMoney = formatSignedNumber(meta?.pnl_money, 2);
+    const reasons = String(meta?.reasons || "").trim();
+    const subject = [side, ticket ? `#${ticket}` : ""].filter(Boolean).join(" ");
+    const regimeText = regime ? ` | regime ${regime}` : "";
+    const keepText = keepRatio !== "-" ? ` | lock ${keepRatio} of extra profit` : "";
+    const reasonText = reasons ? ` | trigger: ${reasons}` : "";
+    return `Intrabar trailing armed for ${subject || "position"}${regimeText}${keepText} | now ${changePct} | PnL ${pnlMoney}${reasonText}`;
+  }
+  if (phase === "INTRABAR" && event === "trail_regime") {
+    const side = String(meta?.side || "").trim().toUpperCase();
+    const ticket = String(meta?.ticket || "").trim();
+    const previousRegime = String(meta?.previous_regime || "").trim().toLowerCase();
+    const regime = String(meta?.regime || "").trim().toLowerCase();
+    const keepRatio = formatRatioPercent(meta?.keep_ratio);
+    const floorChangePct = toNum(meta?.floor_change_pct);
+    const peakChangePct = toNum(meta?.peak_change_pct);
+    const subject = [side, ticket ? `#${ticket}` : ""].filter(Boolean).join(" ");
+    const fromText = previousRegime ? `${previousRegime} -> ` : "";
+    const floorText = floorChangePct !== null ? ` | floor ${floorChangePct.toFixed(3)}%` : "";
+    const peakText = peakChangePct !== null ? ` | peak ${peakChangePct.toFixed(3)}%` : "";
+    return `Intrabar trailing regime updated for ${subject || "position"} | ${fromText}${regime || "unknown"} | lock ${keepRatio}${peakText}${floorText}`;
+  }
+  if (phase === "INTRABAR" && event === "trail_floor_hit") {
+    const side = String(meta?.side || "").trim().toUpperCase();
+    const ticket = String(meta?.ticket || "").trim();
+    const regime = String(meta?.regime || "").trim().toLowerCase();
+    const changePct = formatSignedNumber(meta?.change_pct, 3, "%");
+    const pnlMoney = formatSignedNumber(meta?.pnl_money, 2);
+    const peakChangePct = toNum(meta?.peak_change_pct);
+    const floorChangePct = toNum(meta?.floor_change_pct);
+    const reasons = String(meta?.reasons || "").trim();
+    const subject = [side, ticket ? `#${ticket}` : ""].filter(Boolean).join(" ");
+    const regimeText = regime ? ` | regime ${regime}` : "";
+    const peakText = peakChangePct !== null ? ` | peak ${formatSignedNumber(peakChangePct, 3, "%")}` : "";
+    const floorText = floorChangePct !== null ? ` | floor ${formatSignedNumber(floorChangePct, 3, "%")}` : "";
+    const reasonText = reasons ? ` | trigger: ${reasons}` : "";
+    return `Intrabar trailing floor hit: closing ${subject || "position"}${regimeText} | now ${changePct} | PnL ${pnlMoney}${peakText}${floorText}${reasonText}`;
+  }
   if (phase === "INTRABAR" && event === "review_pending") {
     const ticket = String(meta?.ticket || "").trim();
     const side = String(meta?.side || "").trim().toUpperCase();
     const barEndUtc = String(meta?.bar_end_utc || "").trim();
+    const exitMode = String(meta?.exit_mode || "").trim().toLowerCase();
     const whenText = barEndUtc ? ` at candle close (${toLocalDateTimeText(barEndUtc)})` : " at candle close";
     const subject = [side, ticket ? `#${ticket}` : ""].filter(Boolean).join(" ");
-    return `Intrabar exit stored for review${subject ? `: ${subject}` : ""} | compare again${whenText}`;
+    const exitLabel = exitMode === "trailing_floor_hit" ? "Trailing exit" : "Intrabar exit";
+    return `${exitLabel} stored for review${subject ? `: ${subject}` : ""} | compare again${whenText}`;
   }
   if (phase === "INTRABAR" && event === "review") {
     const outcome = String(meta?.outcome || "").trim().toLowerCase();
@@ -344,10 +416,14 @@ interface AIConsoleProps {
 export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
   const isLive = !!liveState?.connected;
   const llmText = liveState?.llm_text || "";
-  const pendingIntrabarReviewCount = Math.max(0, Number(liveState?.pending_intrabar_review_count || 0));
 
   const logs: LogEntry[] = (() => {
     const recentLogs = Array.isArray(liveState?.recent_logs) ? liveState.recent_logs : [];
+    const recentIntrabarReviews = (
+      Array.isArray(liveState?.recent_intrabar_reviews) ? liveState.recent_intrabar_reviews : []
+    )
+      .filter((row): row is BotLiveIntrabarReview => !!row && typeof row === "object")
+      .slice(-5);
     const dedup = new Set<string>();
     const rows: LogEntry[] = [];
 
@@ -356,6 +432,7 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
       const type = row?.type && row.type in typeConfig ? row.type : "info";
       const phase = String(row?.phase || "").trim().toUpperCase();
       const event = String(row?.event || "").trim().toLowerCase();
+      if (phase === "INTRABAR" && event === "review" && recentIntrabarReviews.length > 0) continue;
       const insufficientFunds = isInsufficientFundsLog(row);
       const timestamp = toLocalClockText(
         typeof row?.timestamp_utc === "string" ? row.timestamp_utc : undefined,
@@ -378,6 +455,27 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
       });
     }
 
+    for (let i = 0; i < recentIntrabarReviews.length; i += 1) {
+      const review = recentIntrabarReviews[i];
+      const timestampUtc = typeof review.reviewed_at_bar_end_utc === "string"
+        ? review.reviewed_at_bar_end_utc
+        : review.bar_end_utc;
+      const timestamp = toLocalClockText(timestampUtc, "--:--:--");
+      const message = toReviewLogMessage(review);
+      const type = toReviewLogType(review.review_outcome);
+      const key = `${timestamp}|${type}|${message}`;
+      if (dedup.has(key)) continue;
+      dedup.add(key);
+      rows.push({
+        id: `review|${review.review_id || key}|${i}`,
+        timestamp,
+        type,
+        message,
+        phase: "INTRABAR",
+        event: "review_summary",
+      });
+    }
+
     const llmSummary = compactLlmText(llmText);
     if (llmSummary) {
       const ts = rows.length > 0 ? rows[rows.length - 1].timestamp : "--:--:--";
@@ -392,13 +490,6 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
 
     return rows.slice(-120);
   })();
-
-  const recentIntrabarReviews = (
-    Array.isArray(liveState?.recent_intrabar_reviews) ? liveState.recent_intrabar_reviews : []
-  )
-    .filter((row): row is BotLiveIntrabarReview => !!row && typeof row === "object")
-    .slice(-3)
-    .reverse();
 
   return (
     <div
@@ -417,68 +508,6 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
           </span>
         )}
       </div>
-
-      {(pendingIntrabarReviewCount > 0 || recentIntrabarReviews.length > 0) && (
-        <div className="mb-3 space-y-2 shrink-0">
-          {pendingIntrabarReviewCount > 0 && (
-            <div className="rounded-lg border border-warning/25 bg-warning/10 px-3 py-2">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold text-warning">Intrabar review pending</span>
-                <Badge variant="outline" className="border-warning/30 bg-white/60 text-warning">
-                  {pendingIntrabarReviewCount} waiting
-                </Badge>
-              </div>
-              <p className="mt-1 text-xs text-warning/90">
-                Closed positions from the current candle will be compared against the candle-close result as soon as the bar ends.
-              </p>
-            </div>
-          )}
-
-          {recentIntrabarReviews.map((review, index) => {
-            const ticket = String(review.ticket || "").trim();
-            const side = String(review.side || "").trim().toUpperCase();
-            const actualMoney = formatSignedNumber(review.actual_pnl_money, 2);
-            const holdMoney = formatSignedNumber(review.hold_to_close_pnl_money, 2);
-            const actualChange = formatSignedNumber(review.actual_change_pct, 3, "%");
-            const holdChange = formatSignedNumber(review.hold_to_close_change_pct, 3, "%");
-            const reviewedAt = toLocalDateTimeText(
-              typeof review.reviewed_at_bar_end_utc === "string" ? review.reviewed_at_bar_end_utc : review.bar_end_utc
-            );
-            const triggerReasons = Array.isArray(review.trigger_reasons)
-              ? review.trigger_reasons.filter((item) => String(item || "").trim()).join(" | ")
-              : "";
-
-            return (
-              <div
-                key={review.review_id || `${ticket}|${reviewedAt}|${index}`}
-                className="rounded-lg border border-border bg-slate-50/80 px-3 py-2"
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium text-foreground">{toReviewHeadline(review)}</p>
-                    <p className="mt-0.5 text-[11px] text-muted-foreground">
-                      {[side, ticket ? `#${ticket}` : "", reviewedAt].filter(Boolean).join(" | ")}
-                    </p>
-                  </div>
-                  <Badge variant="outline" className={cn("shrink-0", toReviewOutcomeClasses(review.review_outcome))}>
-                    {toReviewOutcomeLabel(review.review_outcome)}
-                  </Badge>
-                </div>
-
-                <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                  <span>Actual {actualMoney} ({actualChange})</span>
-                  <span>Close {holdMoney} ({holdChange})</span>
-                  <span>{toIntrabarSourceLabel(review.bar_close_exit_source)}</span>
-                </div>
-
-                {triggerReasons && (
-                  <p className="mt-1 text-[11px] text-muted-foreground">Trigger: {triggerReasons}</p>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
 
       <div className="bg-secondary/50 rounded-lg p-3 flex-1 min-h-0 overflow-auto overscroll-contain scrollbar-thin">
         {logs.length === 0 ? (

@@ -376,6 +376,12 @@ class PPOBridge:
             "final_action": int(action),
             "probs": probs_list,
             "semantic_quality": float(semantic_quality),
+            "bar_context": {
+                "atr_norm": float(last_bar.get("atr_norm", 0.0)),
+                "trend": float(last_bar.get("trend", 0.0)),
+                "adx": float(last_bar.get("adx", 0.0)),
+                "sma_cross": float(last_bar.get("sma_cross", 0.0)),
+            },
             "cooldown_before": int(trade_cooldown_before),
             "cooldown_after": int(self.trade_cooldown),
             "defensive_mode_before": int(defensive_mode_before),

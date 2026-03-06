@@ -32,6 +32,7 @@ export interface BotLiveIntrabarReview {
     review_id?: string;
     ticket?: number;
     side?: string;
+    exit_mode?: string;
     triggered_at_utc?: string;
     bar_end_utc?: string;
     reviewed_at_bar_end_utc?: string;
@@ -46,6 +47,7 @@ export interface BotLiveIntrabarReview {
     review_outcome?: "intrabar_better" | "hold_better" | "flat" | string;
     bar_close_exit_source?: string;
     trigger_reasons?: string[];
+    exit_meta?: Record<string, unknown>;
 }
 
 export interface BotLiveState {

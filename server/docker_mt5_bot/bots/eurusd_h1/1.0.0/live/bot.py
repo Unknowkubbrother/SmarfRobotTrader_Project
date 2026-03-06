@@ -28,10 +28,15 @@ from .config import (
     DEVIATION,
     ENABLE_CATCHUP_REPLAY,
     EVAL_ON_START,
+    EMBED_QUALITY_MIN,
     EXECUTE_STALE_REPLAY_ORDERS,
     INTRABAR_TAKE_PROFIT_CHANGE_PCT,
     INTRABAR_TAKE_PROFIT_MONEY,
     INTRABAR_TAKE_PROFIT_PIPS,
+    INTRABAR_TRAILING_ENABLED,
+    INTRABAR_TRAIL_KEEP_RATIO_NORMAL,
+    INTRABAR_TRAIL_KEEP_RATIO_TIGHT,
+    INTRABAR_TRAIL_KEEP_RATIO_TREND,
     LIVE_DYNAMIC_LOT,
     LIVE_SYNC_ACCOUNT_STATE,
     LLM_SEMANTIC_CACHE_FILE,
@@ -139,6 +144,8 @@ class LiveTradingBot:
         self._perf_ticket_net = {}
         self.pending_intrabar_reviews = []
         self.recent_intrabar_reviews = []
+        self.intrabar_trailing_state = {}
+        self.intrabar_regime_snapshot = {}
         self._sem_retry_not_before = {}  # ts_key -> epoch seconds
         self.last_action = "HOLD"
         self._last_status_tick = None  # {"bid": float, "ask": float, "time": int}
@@ -156,6 +163,10 @@ class LiveTradingBot:
         self.intrabar_take_profit_change_pct = float(INTRABAR_TAKE_PROFIT_CHANGE_PCT)
         self.intrabar_take_profit_pips = float(INTRABAR_TAKE_PROFIT_PIPS)
         self.intrabar_take_profit_money = float(INTRABAR_TAKE_PROFIT_MONEY)
+        self.intrabar_trailing_enabled = bool(INTRABAR_TRAILING_ENABLED)
+        self.intrabar_trail_keep_ratio_trend = float(INTRABAR_TRAIL_KEEP_RATIO_TREND)
+        self.intrabar_trail_keep_ratio_normal = float(INTRABAR_TRAIL_KEEP_RATIO_NORMAL)
+        self.intrabar_trail_keep_ratio_tight = float(INTRABAR_TRAIL_KEEP_RATIO_TIGHT)
         self.vision_llm_api_url = str(VISION_LLM_API_URL or "").strip()
         self.vision_llm_embed_text_api_url = str(VISION_LLM_EMBED_TEXT_API_URL or "").strip()
         # Live real-only semantic can take long on model warmup; avoid false timeout loops.
@@ -2271,6 +2282,8 @@ class LiveTradingBot:
             "intrabar": {
                 "pending_reviews": list(getattr(self, "pending_intrabar_reviews", [])[-50:]),
                 "recent_reviews": list(getattr(self, "recent_intrabar_reviews", [])[-50:]),
+                "trailing_state": dict(getattr(self, "intrabar_trailing_state", {}) or {}),
+                "regime_snapshot": dict(getattr(self, "intrabar_regime_snapshot", {}) or {}),
             },
             "gate_history": self.gate_provider.to_records(max_rows=max(BAR_HISTORY * 2, 400)),
         }
@@ -2349,6 +2362,8 @@ class LiveTradingBot:
         if isinstance(intrabar_state, dict):
             pending_reviews = intrabar_state.get("pending_reviews", [])
             recent_reviews = intrabar_state.get("recent_reviews", [])
+            trailing_state = intrabar_state.get("trailing_state", {})
+            regime_snapshot = intrabar_state.get("regime_snapshot", {})
             if isinstance(pending_reviews, list):
                 self.pending_intrabar_reviews = [
                     dict(row) for row in pending_reviews[-50:] if isinstance(row, dict)
@@ -2357,6 +2372,10 @@ class LiveTradingBot:
                 self.recent_intrabar_reviews = [
                     dict(row) for row in recent_reviews[-50:] if isinstance(row, dict)
                 ]
+            if isinstance(trailing_state, dict):
+                self.intrabar_trailing_state = dict(trailing_state)
+            if isinstance(regime_snapshot, dict):
+                self.intrabar_regime_snapshot = dict(regime_snapshot)
 
         runtime_cfg = payload.get("runtime_config", {})
         if isinstance(runtime_cfg, dict):
@@ -2857,6 +2876,8 @@ class LiveTradingBot:
         prev_pos = int(self.bridge.position)
         current_pos, pos = self._get_mt5_position()
         current_ticket = int(pos.ticket) if pos is not None else 0
+        prev_ticket = int(self.last_known_ticket)
+        cleared_trailing = False
 
         self.bridge.position = current_pos
         if current_pos != 0 and pos is not None:
@@ -2899,8 +2920,22 @@ class LiveTradingBot:
             self.bridge.lot_size = max(0.01, float(self.bridge.lot_size))
         self.bridge.spread_cost = SPREAD_PIPS * PIP_VALUE * self.bridge.lot_size
 
+        if current_pos == 0:
+            cleared_trailing = self._clear_intrabar_trailing_state() or cleared_trailing
+        else:
+            trailing_state = dict(getattr(self, "intrabar_trailing_state", {}) or {})
+            trailing_ticket = int(trailing_state.get("ticket", 0) or 0)
+            trailing_side = str(trailing_state.get("side", "") or "").upper()
+            actual_side = "LONG" if current_pos == 1 else "SHORT"
+            ticket_changed = prev_ticket != 0 and prev_ticket != current_ticket
+            side_changed = trailing_side and trailing_side != actual_side
+            if ticket_changed or (trailing_ticket > 0 and trailing_ticket != current_ticket) or side_changed:
+                cleared_trailing = self._clear_intrabar_trailing_state() or cleared_trailing
+
         self.current_lot = self.bridge.lot_size
         self.last_known_ticket = current_ticket
+        if cleared_trailing:
+            self._save_runtime_state(reason="intrabar_trail_sync_reset")
         self._sync_performance_from_mt5_history(force=False, full_resync=False, reason="bridge_heartbeat")
 
     def _fetch_window(self, bar_end_ts: int):
@@ -3513,6 +3548,139 @@ class LiveTradingBot:
             return self._last_status_tick, True
         return None, False
 
+    def _clear_intrabar_trailing_state(self) -> bool:
+        state = dict(getattr(self, "intrabar_trailing_state", {}) or {})
+        if not state:
+            return False
+        self.intrabar_trailing_state = {}
+        return True
+
+    def _update_intrabar_regime_snapshot(self, bar_end_ts: int, decision: dict | None = None) -> None:
+        decision = decision if isinstance(decision, dict) else {}
+        bar_context = decision.get("bar_context", {})
+        snapshot = {
+            "bar_end_ts": int(bar_end_ts),
+            "bar_end_utc": datetime.fromtimestamp(int(bar_end_ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+            "semantic_quality": float(decision.get("semantic_quality", 0.0) or 0.0),
+            "defensive_mode_bars": int(getattr(getattr(self, "bridge", None), "defensive_mode_bars", 0) or 0),
+            "atr_norm": 0.0,
+            "trend": 0.0,
+            "adx": 0.0,
+            "sma_cross": 0.0,
+        }
+        if isinstance(bar_context, dict):
+            for key in ("atr_norm", "trend", "adx", "sma_cross"):
+                snapshot[key] = float(bar_context.get(key, 0.0) or 0.0)
+        self.intrabar_regime_snapshot = snapshot
+
+    def _intrabar_threshold_targets(self) -> dict[str, float]:
+        targets: dict[str, float] = {}
+        if self.intrabar_take_profit_change_pct > 0.0:
+            targets["change_pct"] = float(self.intrabar_take_profit_change_pct)
+        if self.intrabar_take_profit_pips > 0.0:
+            targets["pnl_pips"] = float(self.intrabar_take_profit_pips)
+        if self.intrabar_take_profit_money > 0.0:
+            targets["pnl_money"] = float(self.intrabar_take_profit_money)
+        return targets
+
+    def _compute_intrabar_floor(self, arm_value: float, peak_value: float, keep_ratio: float) -> float:
+        arm_value = float(arm_value or 0.0)
+        peak_value = float(peak_value or 0.0)
+        keep_ratio = float(np.clip(keep_ratio, 0.0, 1.0))
+        if arm_value <= 0.0:
+            return 0.0
+        if peak_value <= arm_value:
+            return float(arm_value)
+        return float(arm_value + max(0.0, peak_value - arm_value) * keep_ratio)
+
+    def _intrabar_regime(self, current_pos: int) -> tuple[str, float, dict]:
+        snapshot = dict(getattr(self, "intrabar_regime_snapshot", {}) or {})
+        gate_stats = dict(getattr(getattr(self, "bridge", None), "gate_stats", {}) or {})
+
+        atr_norm = float(snapshot.get("atr_norm", 0.0) or 0.0)
+        trend = float(snapshot.get("trend", 0.0) or 0.0)
+        adx = float(snapshot.get("adx", 0.0) or 0.0)
+        sma_cross = float(snapshot.get("sma_cross", 0.0) or 0.0)
+        semantic_quality = float(snapshot.get("semantic_quality", 0.0) or 0.0)
+        defensive_mode_bars = int(snapshot.get("defensive_mode_bars", 0) or 0)
+
+        direction = 1 if int(current_pos) >= 0 else -1
+        abs_trend = abs(trend)
+        trend_flat = float(gate_stats.get("trend_flat", 0.08) or 0.08)
+        trend_strong = float(gate_stats.get("trend_strong", 0.25) or 0.25)
+        adx_flat = float(gate_stats.get("adx_flat", -0.20) or -0.20)
+        adx_strong = float(gate_stats.get("adx_strong", 0.20) or 0.20)
+        atr_extreme = float(gate_stats.get("atr_extreme", 0.0025) or 0.0025)
+
+        aligned_trend = abs_trend >= trend_strong and adx >= adx_strong and np.sign(trend) == direction
+        flat_market = abs_trend <= trend_flat and adx <= adx_flat
+        counter_trend = (
+            (direction == 1 and (trend < -trend_flat or sma_cross < 0.0))
+            or (direction == -1 and (trend > trend_flat or sma_cross > 0.0))
+        )
+        low_semantic = semantic_quality < max(float(EMBED_QUALITY_MIN) + 0.05, 0.35)
+
+        if defensive_mode_bars > 0 or low_semantic or flat_market or counter_trend or atr_norm >= atr_extreme:
+            regime = "tight"
+            keep_ratio = float(self.intrabar_trail_keep_ratio_tight)
+        elif aligned_trend:
+            regime = "trend"
+            keep_ratio = float(self.intrabar_trail_keep_ratio_trend)
+        else:
+            regime = "normal"
+            keep_ratio = float(self.intrabar_trail_keep_ratio_normal)
+
+        return regime, keep_ratio, {
+            "atr_norm": float(atr_norm),
+            "trend": float(trend),
+            "adx": float(adx),
+            "sma_cross": float(sma_cross),
+            "semantic_quality": float(semantic_quality),
+            "defensive_mode_bars": int(defensive_mode_bars),
+            "aligned_trend": bool(aligned_trend),
+            "flat_market": bool(flat_market),
+            "counter_trend": bool(counter_trend),
+        }
+
+    def _build_intrabar_metrics(self, current_pos: int, pos, tick_data: dict | None) -> dict | None:
+        if current_pos == 0 or pos is None or not isinstance(tick_data, dict):
+            return None
+
+        entry_price = float(getattr(pos, "price_open", 0.0) or 0.0)
+        if entry_price <= 0.0:
+            return None
+
+        exit_price = float(tick_data.get("bid", 0.0) if current_pos == 1 else tick_data.get("ask", 0.0))
+        if exit_price <= 0.0:
+            return None
+
+        change_pct = float(current_pos * (exit_price - entry_price) / max(entry_price, 1e-10) * 100.0)
+        pnl_pips = float(current_pos * (exit_price - entry_price) / max(self.pip_size, 1e-10))
+        pnl_money = float(getattr(pos, "profit", 0.0) or 0.0)
+        return {
+            "ticket": int(getattr(pos, "ticket", 0) or 0),
+            "side": "LONG" if current_pos == 1 else "SHORT",
+            "entry_price": float(entry_price),
+            "exit_price": float(exit_price),
+            "change_pct": float(change_pct),
+            "pnl_pips": float(pnl_pips),
+            "pnl_money": float(pnl_money),
+            "volume": float(getattr(pos, "volume", 0.0) or 0.0),
+        }
+
+    def _intrabar_threshold_hit_reasons(self, metrics: dict, targets: dict[str, float]) -> list[str]:
+        reasons: list[str] = []
+        change_pct = float(metrics.get("change_pct", 0.0) or 0.0)
+        pnl_pips = float(metrics.get("pnl_pips", 0.0) or 0.0)
+        pnl_money = float(metrics.get("pnl_money", 0.0) or 0.0)
+        if float(targets.get("change_pct", 0.0) or 0.0) > 0.0 and change_pct >= float(targets["change_pct"]):
+            reasons.append(f"change {change_pct:.3f}%>={float(targets['change_pct']):.3f}%")
+        if float(targets.get("pnl_pips", 0.0) or 0.0) > 0.0 and pnl_pips >= float(targets["pnl_pips"]):
+            reasons.append(f"pips {pnl_pips:.1f}>={float(targets['pnl_pips']):.1f}")
+        if float(targets.get("pnl_money", 0.0) or 0.0) > 0.0 and pnl_money >= float(targets["pnl_money"]):
+            reasons.append(f"money {pnl_money:.2f}>={float(targets['pnl_money']):.2f}")
+        return reasons
+
     def _resolve_bar_close_exit_price(
         self,
         *,
@@ -3582,6 +3750,8 @@ class LiveTradingBot:
         pnl_pips: float,
         pnl_money: float,
         trigger_reasons: list[str],
+        exit_mode: str = "hard_take_profit",
+        exit_meta: dict | None = None,
     ) -> None:
         review_bar_end_ts = int(current_bar_time + self.timeframe_seconds)
         event_ts = int(exit_time_ts or time.time())
@@ -3601,8 +3771,12 @@ class LiveTradingBot:
             "actual_change_pct": float(change_pct),
             "actual_pnl_pips": float(pnl_pips),
             "actual_pnl_money": float(pnl_money),
+            "exit_mode": str(exit_mode or "hard_take_profit"),
             "trigger_reasons": [str(x) for x in list(trigger_reasons or []) if str(x).strip()],
         }
+        clean_exit_meta = self._sanitize_log_meta(exit_meta)
+        if clean_exit_meta:
+            record["exit_meta"] = dict(clean_exit_meta)
         pending = list(getattr(self, "pending_intrabar_reviews", []) or [])
         pending.append(record)
         self.pending_intrabar_reviews = pending[-50:]
@@ -3619,6 +3793,7 @@ class LiveTradingBot:
                 "actual_change_pct": float(change_pct),
                 "actual_pnl_pips": float(pnl_pips),
                 "actual_pnl_money": float(pnl_money),
+                "exit_mode": str(record.get("exit_mode", "")),
                 "reasons": " | ".join(record["trigger_reasons"]),
             },
         )
@@ -3740,15 +3915,14 @@ class LiveTradingBot:
     def _maybe_take_profit_intrabar(self, current_bar_time: int) -> bool:
         if current_bar_time <= 0 or current_bar_time != self.last_bar_time:
             return False
-        if (
-            self.intrabar_take_profit_change_pct <= 0.0
-            and self.intrabar_take_profit_pips <= 0.0
-            and self.intrabar_take_profit_money <= 0.0
-        ):
+        targets = self._intrabar_threshold_targets()
+        if len(targets) == 0:
+            self._clear_intrabar_trailing_state()
             return False
 
         current_pos, pos = self._get_mt5_position()
         if current_pos == 0 or pos is None:
+            self._clear_intrabar_trailing_state()
             return False
 
         tick_data, stale_tick = self._get_status_tick()
@@ -3762,53 +3936,218 @@ class LiveTradingBot:
         if stale_tick and stale_age_sec > max_stale_sec:
             return False
 
-        entry_price = float(getattr(pos, "price_open", 0.0) or 0.0)
-        if entry_price <= 0.0:
+        metrics = self._build_intrabar_metrics(current_pos, pos, tick_data)
+        if metrics is None:
             return False
 
-        exit_price = float(tick_data.get("bid", 0.0) if current_pos == 1 else tick_data.get("ask", 0.0))
-        if exit_price <= 0.0:
-            return False
+        ticket = int(metrics.get("ticket", 0) or 0)
+        trailing_state = dict(getattr(self, "intrabar_trailing_state", {}) or {})
+        if trailing_state and int(trailing_state.get("ticket", 0) or 0) != ticket:
+            self._clear_intrabar_trailing_state()
+            trailing_state = {}
 
-        change_pct = float(current_pos * (exit_price - entry_price) / max(entry_price, 1e-10) * 100.0)
-        pnl_pips = float(current_pos * (exit_price - entry_price) / max(self.pip_size, 1e-10))
-        pnl_money = float(getattr(pos, "profit", 0.0) or 0.0)
-
-        hit_reasons = []
-        if (
-            self.intrabar_take_profit_change_pct > 0.0
-            and change_pct >= self.intrabar_take_profit_change_pct
-        ):
-            hit_reasons.append(
-                f"change {change_pct:.3f}%>={self.intrabar_take_profit_change_pct:.3f}%"
-            )
-        if self.intrabar_take_profit_pips > 0.0 and pnl_pips >= self.intrabar_take_profit_pips:
-            hit_reasons.append(f"pips {pnl_pips:.1f}>={self.intrabar_take_profit_pips:.1f}")
-        if self.intrabar_take_profit_money > 0.0 and pnl_money >= self.intrabar_take_profit_money:
-            hit_reasons.append(f"money {pnl_money:.2f}>={self.intrabar_take_profit_money:.2f}")
+        hit_reasons = self._intrabar_threshold_hit_reasons(metrics, targets)
         if not hit_reasons:
+            if not self.intrabar_trailing_enabled:
+                self._clear_intrabar_trailing_state()
+                return False
+        if not self.intrabar_trailing_enabled:
+            if not hit_reasons:
+                return False
+
+            side = str(metrics.get("side", ""))
+            print(
+                "\n [INTRABAR] take-profit hit -> close "
+                f"| side={side} | price={float(metrics['exit_price']):.{self.digits}f} "
+                f"| change={float(metrics['change_pct']):+.3f}% | pips={float(metrics['pnl_pips']):+.1f} "
+                f"| pnl={float(metrics['pnl_money']):+.2f} | trigger={' ; '.join(hit_reasons)}"
+            )
+            self._add_log(
+                "action",
+                "Intrabar take-profit hit -> closing position",
+                phase="intrabar",
+                event="take_profit_hit",
+                meta={
+                    "side": side,
+                    "ticket": int(ticket),
+                    "price": float(metrics["exit_price"]),
+                    "change_pct": float(metrics["change_pct"]),
+                    "pnl_pips": float(metrics["pnl_pips"]),
+                    "pnl_money": float(metrics["pnl_money"]),
+                    "reasons": " | ".join(hit_reasons),
+                },
+            )
+            if not self.close_all():
+                return False
+
+            self._queue_intrabar_review(
+                pos=pos,
+                current_bar_time=int(current_bar_time),
+                exit_time_ts=int(tick_time_ts or now_epoch),
+                side=side,
+                entry_price=float(metrics["entry_price"]),
+                exit_price=float(metrics["exit_price"]),
+                change_pct=float(metrics["change_pct"]),
+                pnl_pips=float(metrics["pnl_pips"]),
+                pnl_money=float(metrics["pnl_money"]),
+                trigger_reasons=hit_reasons,
+                exit_mode="hard_take_profit",
+            )
+            self.last_action = "CLOSE"
+            return True
+
+        regime, keep_ratio, regime_meta = self._intrabar_regime(current_pos)
+        side = str(metrics.get("side", ""))
+        state_changed = False
+
+        if not trailing_state:
+            if not hit_reasons:
+                return False
+            trailing_state = {
+                "ticket": int(ticket),
+                "side": side,
+                "bar_open_ts": int(current_bar_time),
+                "bar_open_utc": datetime.fromtimestamp(int(current_bar_time), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+                "armed_at_ts": int(tick_time_ts or now_epoch),
+                "armed_at_utc": datetime.fromtimestamp(int(tick_time_ts or now_epoch), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+                "regime": str(regime),
+                "keep_ratio": float(keep_ratio),
+                "arm_targets": {key: float(val) for key, val in targets.items()},
+                "peak_change_pct": float(metrics["change_pct"]),
+                "peak_pnl_pips": float(metrics["pnl_pips"]),
+                "peak_pnl_money": float(metrics["pnl_money"]),
+                "last_change_pct": float(metrics["change_pct"]),
+                "last_pnl_pips": float(metrics["pnl_pips"]),
+                "last_pnl_money": float(metrics["pnl_money"]),
+                "armed_reasons": [str(x) for x in hit_reasons],
+                "regime_meta": dict(regime_meta),
+            }
+            for metric_key, arm_value in targets.items():
+                trailing_state[f"floor_{metric_key}"] = self._compute_intrabar_floor(
+                    float(arm_value),
+                    float(metrics[metric_key]),
+                    keep_ratio,
+                )
+            self.intrabar_trailing_state = dict(trailing_state)
+            print(
+                "\n [INTRABAR] trailing armed "
+                f"| side={side} | regime={regime} | keep={keep_ratio:.2f} "
+                f"| change={float(metrics['change_pct']):+.3f}% | pips={float(metrics['pnl_pips']):+.1f} "
+                f"| pnl={float(metrics['pnl_money']):+.2f} | trigger={' ; '.join(hit_reasons)}"
+            )
+            self._add_log(
+                "info",
+                "Intrabar trailing armed",
+                phase="intrabar",
+                event="trail_armed",
+                meta={
+                    "ticket": int(ticket),
+                    "side": side,
+                    "regime": str(regime),
+                    "keep_ratio": float(keep_ratio),
+                    "change_pct": float(metrics["change_pct"]),
+                    "pnl_pips": float(metrics["pnl_pips"]),
+                    "pnl_money": float(metrics["pnl_money"]),
+                    "reasons": " | ".join(hit_reasons),
+                },
+            )
+            self._save_runtime_state(reason="intrabar_trail_armed")
             return False
 
-        side = "LONG" if current_pos == 1 else "SHORT"
+        prev_regime = str(trailing_state.get("regime", "") or "")
+        prev_keep_ratio = float(trailing_state.get("keep_ratio", keep_ratio) or keep_ratio)
+        if prev_regime != regime or abs(prev_keep_ratio - float(keep_ratio)) > 1e-9:
+            trailing_state["regime"] = str(regime)
+            trailing_state["keep_ratio"] = float(keep_ratio)
+            trailing_state["regime_meta"] = dict(regime_meta)
+            state_changed = True
+
+        trailing_state["last_change_pct"] = float(metrics["change_pct"])
+        trailing_state["last_pnl_pips"] = float(metrics["pnl_pips"])
+        trailing_state["last_pnl_money"] = float(metrics["pnl_money"])
+
+        for metric_key, arm_value in targets.items():
+            peak_key = f"peak_{metric_key}"
+            floor_key = f"floor_{metric_key}"
+            current_value = float(metrics.get(metric_key, 0.0) or 0.0)
+            peak_value = float(trailing_state.get(peak_key, arm_value) or arm_value)
+            if current_value > peak_value:
+                peak_value = current_value
+                trailing_state[peak_key] = float(peak_value)
+                state_changed = True
+            floor_value = self._compute_intrabar_floor(float(arm_value), float(peak_value), keep_ratio)
+            if abs(float(trailing_state.get(floor_key, 0.0) or 0.0) - float(floor_value)) > 1e-9:
+                trailing_state[floor_key] = float(floor_value)
+                state_changed = True
+
+        self.intrabar_trailing_state = dict(trailing_state)
+
+        floor_hit_reasons: list[str] = []
+        if float(targets.get("change_pct", 0.0) or 0.0) > 0.0:
+            floor_value = float(trailing_state.get("floor_change_pct", 0.0) or 0.0)
+            if float(metrics["change_pct"]) <= floor_value:
+                floor_hit_reasons.append(
+                    f"change {float(metrics['change_pct']):.3f}%<=floor {floor_value:.3f}%"
+                )
+        if float(targets.get("pnl_pips", 0.0) or 0.0) > 0.0:
+            floor_value = float(trailing_state.get("floor_pnl_pips", 0.0) or 0.0)
+            if float(metrics["pnl_pips"]) <= floor_value:
+                floor_hit_reasons.append(
+                    f"pips {float(metrics['pnl_pips']):.1f}<=floor {floor_value:.1f}"
+                )
+        if float(targets.get("pnl_money", 0.0) or 0.0) > 0.0:
+            floor_value = float(trailing_state.get("floor_pnl_money", 0.0) or 0.0)
+            if float(metrics["pnl_money"]) <= floor_value:
+                floor_hit_reasons.append(
+                    f"money {float(metrics['pnl_money']):.2f}<=floor {floor_value:.2f}"
+                )
+        if not floor_hit_reasons:
+            if state_changed and prev_regime != regime:
+                self._add_log(
+                    "info",
+                    "Intrabar trailing regime updated",
+                    phase="intrabar",
+                    event="trail_regime",
+                    meta={
+                        "ticket": int(ticket),
+                        "side": side,
+                        "previous_regime": str(prev_regime),
+                        "regime": str(regime),
+                        "keep_ratio": float(keep_ratio),
+                        "peak_change_pct": float(trailing_state.get("peak_change_pct", metrics["change_pct"]) or metrics["change_pct"]),
+                        "floor_change_pct": float(trailing_state.get("floor_change_pct", 0.0) or 0.0),
+                    },
+                )
+            return False
+
         print(
-            "\n [INTRABAR] take-profit hit -> close "
-            f"| side={side} | price={exit_price:.{self.digits}f} "
-            f"| change={change_pct:+.3f}% | pips={pnl_pips:+.1f} | pnl={pnl_money:+.2f} "
-            f"| trigger={' ; '.join(hit_reasons)}"
+            "\n [INTRABAR] trailing floor hit -> close "
+            f"| side={side} | regime={regime} | keep={keep_ratio:.2f} "
+            f"| price={float(metrics['exit_price']):.{self.digits}f} "
+            f"| change={float(metrics['change_pct']):+.3f}% | pips={float(metrics['pnl_pips']):+.1f} "
+            f"| pnl={float(metrics['pnl_money']):+.2f} | trigger={' ; '.join(floor_hit_reasons)}"
         )
         self._add_log(
             "action",
-            "Intrabar take-profit hit -> closing position",
+            "Intrabar trailing floor hit -> closing position",
             phase="intrabar",
-            event="take_profit_hit",
+            event="trail_floor_hit",
             meta={
+                "ticket": int(ticket),
                 "side": side,
-                "ticket": int(getattr(pos, "ticket", 0) or 0),
-                "price": float(exit_price),
-                "change_pct": float(change_pct),
-                "pnl_pips": float(pnl_pips),
-                "pnl_money": float(pnl_money),
-                "reasons": " | ".join(hit_reasons),
+                "regime": str(regime),
+                "keep_ratio": float(keep_ratio),
+                "price": float(metrics["exit_price"]),
+                "change_pct": float(metrics["change_pct"]),
+                "pnl_pips": float(metrics["pnl_pips"]),
+                "pnl_money": float(metrics["pnl_money"]),
+                "peak_change_pct": float(trailing_state.get("peak_change_pct", metrics["change_pct"]) or metrics["change_pct"]),
+                "peak_pnl_pips": float(trailing_state.get("peak_pnl_pips", metrics["pnl_pips"]) or metrics["pnl_pips"]),
+                "peak_pnl_money": float(trailing_state.get("peak_pnl_money", metrics["pnl_money"]) or metrics["pnl_money"]),
+                "floor_change_pct": float(trailing_state.get("floor_change_pct", 0.0) or 0.0),
+                "floor_pnl_pips": float(trailing_state.get("floor_pnl_pips", 0.0) or 0.0),
+                "floor_pnl_money": float(trailing_state.get("floor_pnl_money", 0.0) or 0.0),
+                "reasons": " | ".join(floor_hit_reasons),
             },
         )
         if not self.close_all():
@@ -3819,13 +4158,25 @@ class LiveTradingBot:
             current_bar_time=int(current_bar_time),
             exit_time_ts=int(tick_time_ts or now_epoch),
             side=side,
-            entry_price=float(entry_price),
-            exit_price=float(exit_price),
-            change_pct=float(change_pct),
-            pnl_pips=float(pnl_pips),
-            pnl_money=float(pnl_money),
-            trigger_reasons=hit_reasons,
+            entry_price=float(metrics["entry_price"]),
+            exit_price=float(metrics["exit_price"]),
+            change_pct=float(metrics["change_pct"]),
+            pnl_pips=float(metrics["pnl_pips"]),
+            pnl_money=float(metrics["pnl_money"]),
+            trigger_reasons=floor_hit_reasons,
+            exit_mode="trailing_floor_hit",
+            exit_meta={
+                "regime": str(regime),
+                "keep_ratio": float(keep_ratio),
+                "peak_change_pct": float(trailing_state.get("peak_change_pct", metrics["change_pct"]) or metrics["change_pct"]),
+                "peak_pnl_pips": float(trailing_state.get("peak_pnl_pips", metrics["pnl_pips"]) or metrics["pnl_pips"]),
+                "peak_pnl_money": float(trailing_state.get("peak_pnl_money", metrics["pnl_money"]) or metrics["pnl_money"]),
+                "floor_change_pct": float(trailing_state.get("floor_change_pct", 0.0) or 0.0),
+                "floor_pnl_pips": float(trailing_state.get("floor_pnl_pips", 0.0) or 0.0),
+                "floor_pnl_money": float(trailing_state.get("floor_pnl_money", 0.0) or 0.0),
+            },
         )
+        self._clear_intrabar_trailing_state()
         self.last_action = "CLOSE"
         return True
 
@@ -3849,6 +4200,7 @@ class LiveTradingBot:
 
         self.bridge.trade_cooldown = 0
         self.bridge.first_bar = False
+        self._clear_intrabar_trailing_state()
         self.last_action = "CLOSE"
         self._save_runtime_state(reason="intrabar_flat")
 
@@ -4187,6 +4539,8 @@ class LiveTradingBot:
                 decision["defensive_mode_before"] = int(pre_defensive_mode)
                 decision["defensive_mode_after"] = int(pre_defensive_mode)
 
+        self._update_intrabar_regime_snapshot(bar_end_ts, decision)
+
         action_name = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}.get(action, "?")
         raw_action = int(decision.get("raw_action", action))
         raw_action_name = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}.get(raw_action, "?")
@@ -4397,12 +4751,21 @@ class LiveTradingBot:
             or self.intrabar_take_profit_money > 0.0
         ):
             intrabar_parts = []
+            intrabar_mode = "trailing" if self.intrabar_trailing_enabled else "hard_close"
+            intrabar_parts.append(f"mode={intrabar_mode}")
             if self.intrabar_take_profit_change_pct > 0.0:
                 intrabar_parts.append(f"change={self.intrabar_take_profit_change_pct:.3f}%")
             if self.intrabar_take_profit_pips > 0.0:
                 intrabar_parts.append(f"pips={self.intrabar_take_profit_pips:.1f}")
             if self.intrabar_take_profit_money > 0.0:
                 intrabar_parts.append(f"money={self.intrabar_take_profit_money:.2f}")
+            if self.intrabar_trailing_enabled:
+                intrabar_parts.append(
+                    "keep="
+                    f"{self.intrabar_trail_keep_ratio_trend:.2f}/"
+                    f"{self.intrabar_trail_keep_ratio_normal:.2f}/"
+                    f"{self.intrabar_trail_keep_ratio_tight:.2f}"
+                )
             print(f" [INTRABAR] realtime close active | {' | '.join(intrabar_parts)}")
             self._add_log(
                 "info",
@@ -4413,6 +4776,10 @@ class LiveTradingBot:
                     "take_profit_change_pct": float(self.intrabar_take_profit_change_pct),
                     "take_profit_pips": float(self.intrabar_take_profit_pips),
                     "take_profit_money": float(self.intrabar_take_profit_money),
+                    "trailing_enabled": bool(self.intrabar_trailing_enabled),
+                    "trail_keep_ratio_trend": float(self.intrabar_trail_keep_ratio_trend),
+                    "trail_keep_ratio_normal": float(self.intrabar_trail_keep_ratio_normal),
+                    "trail_keep_ratio_tight": float(self.intrabar_trail_keep_ratio_tight),
                 },
             )
         self._start_ws_listener()
