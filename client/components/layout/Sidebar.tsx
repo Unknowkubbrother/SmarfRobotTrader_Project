@@ -48,20 +48,26 @@ export function Sidebar() {
         collapsed ? "w-16" : "w-56"
       )}
     >
-      {/* Logo */}
-      {/* Logo */}
-      <div className={cn(
-        "flex items-center h-14 px-4 border-b border-border transition-all",
-        collapsed ? "justify-center" : "justify-between"
-      )}>
-        {!collapsed && (
-          <div className="flex items-center gap-2 overflow-hidden whitespace-nowrap">
-            <div className="flex items-center gap-1">
+      <div className="flex h-14 items-center justify-between border-b border-border px-3 transition-all">
+        <Link
+          href="/"
+          title="กลับหน้าแรก"
+          aria-label="กลับหน้าแรก"
+          className={cn(
+            "flex min-w-0 items-center gap-2 rounded-lg px-1 py-1 transition-colors hover:text-primary",
+            collapsed && "gap-0"
+          )}
+        >
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">
+            SR
+          </div>
+          {!collapsed && (
+            <div className="flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap">
               <span className="text-lg font-bold text-foreground">RoBot</span>
               <span className="text-lg font-bold text-primary">Smarf</span>
             </div>
-          </div>
-        )}
+          )}
+        </Link>
         <button
           onClick={() => setCollapsed(!collapsed)}
           className="p-1 rounded hover:bg-secondary transition-colors"
