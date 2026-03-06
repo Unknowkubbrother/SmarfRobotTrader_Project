@@ -306,11 +306,15 @@ function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
     const trendKeep = formatRatioPercent(meta?.trail_keep_ratio_trend);
     const normalKeep = formatRatioPercent(meta?.trail_keep_ratio_normal);
     const tightKeep = formatRatioPercent(meta?.trail_keep_ratio_tight);
+    const bufferRatio = formatRatioPercent(meta?.trail_arm_buffer_ratio);
+    const confirmPolls = toNum(meta?.trail_confirm_polls);
     if (changePct !== null && changePct > 0) parts.push(`change ${changePct.toFixed(3)}%`);
     if (pips !== null && pips > 0) parts.push(`pips ${pips.toFixed(1)}`);
     if (money !== null && money > 0) parts.push(`money ${money.toFixed(2)}`);
     if (trailingEnabled) {
       parts.push(`trailing lock ${trendKeep}/${normalKeep}/${tightKeep}`);
+      if (bufferRatio !== "-") parts.push(`buffer ${bufferRatio}`);
+      if (confirmPolls !== null) parts.push(`confirm ${confirmPolls.toFixed(0)} polls`);
     }
     const label = trailingEnabled ? "Intrabar profit lock active" : "Intrabar take-profit active";
     return parts.length > 0 ? `${label} (${parts.join(" | ")})` : label;
@@ -333,11 +337,15 @@ function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
     const changePct = formatSignedNumber(meta?.change_pct, 3, "%");
     const pnlMoney = formatSignedNumber(meta?.pnl_money, 2);
     const reasons = String(meta?.reasons || "").trim();
+    const floorChangePct = toNum(meta?.initial_floor_change_pct);
+    const activationChangePct = toNum(meta?.activation_peak_change_pct);
     const subject = [side, ticket ? `#${ticket}` : ""].filter(Boolean).join(" ");
     const regimeText = regime ? ` | regime ${regime}` : "";
     const keepText = keepRatio !== "-" ? ` | lock ${keepRatio} of extra profit` : "";
+    const floorText = floorChangePct !== null ? ` | soft floor ${floorChangePct.toFixed(3)}%` : "";
+    const activationText = activationChangePct !== null ? ` | trail after ${activationChangePct.toFixed(3)}%` : "";
     const reasonText = reasons ? ` | trigger: ${reasons}` : "";
-    return `Intrabar trailing armed for ${subject || "position"}${regimeText}${keepText} | now ${changePct} | PnL ${pnlMoney}${reasonText}`;
+    return `Intrabar trailing armed for ${subject || "position"}${regimeText}${keepText}${floorText}${activationText} | now ${changePct} | PnL ${pnlMoney}${reasonText}`;
   }
   if (phase === "INTRABAR" && event === "trail_regime") {
     const side = String(meta?.side || "").trim().toUpperCase();
@@ -353,6 +361,33 @@ function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
     const peakText = peakChangePct !== null ? ` | peak ${peakChangePct.toFixed(3)}%` : "";
     return `Intrabar trailing regime updated for ${subject || "position"} | ${fromText}${regime || "unknown"} | lock ${keepRatio}${peakText}${floorText}`;
   }
+  if (phase === "INTRABAR" && event === "trail_floor_pending") {
+    const side = String(meta?.side || "").trim().toUpperCase();
+    const ticket = String(meta?.ticket || "").trim();
+    const confirmCount = toNum(meta?.confirm_count);
+    const confirmPolls = toNum(meta?.confirm_polls);
+    const changePct = formatSignedNumber(meta?.change_pct, 3, "%");
+    const floorChangePct = toNum(meta?.floor_change_pct);
+    const reasons = String(meta?.reasons || "").trim();
+    const subject = [side, ticket ? `#${ticket}` : ""].filter(Boolean).join(" ");
+    const confirmText = confirmCount !== null && confirmPolls !== null
+      ? ` | confirm ${confirmCount.toFixed(0)}/${confirmPolls.toFixed(0)}`
+      : "";
+    const floorText = floorChangePct !== null ? ` | floor ${floorChangePct.toFixed(3)}%` : "";
+    const reasonText = reasons ? ` | trigger: ${reasons}` : "";
+    return `Intrabar floor breached for ${subject || "position"}${confirmText}${floorText} | now ${changePct}${reasonText}`;
+  }
+  if (phase === "INTRABAR" && event === "trail_floor_recovered") {
+    const side = String(meta?.side || "").trim().toUpperCase();
+    const ticket = String(meta?.ticket || "").trim();
+    const recoveredAfter = toNum(meta?.recovered_after);
+    const changePct = formatSignedNumber(meta?.change_pct, 3, "%");
+    const floorChangePct = toNum(meta?.floor_change_pct);
+    const subject = [side, ticket ? `#${ticket}` : ""].filter(Boolean).join(" ");
+    const afterText = recoveredAfter !== null ? ` after ${recoveredAfter.toFixed(0)} watch poll(s)` : "";
+    const floorText = floorChangePct !== null ? ` | floor ${floorChangePct.toFixed(3)}%` : "";
+    return `Intrabar trailing recovered for ${subject || "position"}${afterText}${floorText} | now ${changePct}`;
+  }
   if (phase === "INTRABAR" && event === "trail_floor_hit") {
     const side = String(meta?.side || "").trim().toUpperCase();
     const ticket = String(meta?.ticket || "").trim();
@@ -361,13 +396,18 @@ function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
     const pnlMoney = formatSignedNumber(meta?.pnl_money, 2);
     const peakChangePct = toNum(meta?.peak_change_pct);
     const floorChangePct = toNum(meta?.floor_change_pct);
+    const confirmCount = toNum(meta?.confirm_count);
+    const confirmPolls = toNum(meta?.confirm_polls);
     const reasons = String(meta?.reasons || "").trim();
     const subject = [side, ticket ? `#${ticket}` : ""].filter(Boolean).join(" ");
     const regimeText = regime ? ` | regime ${regime}` : "";
     const peakText = peakChangePct !== null ? ` | peak ${formatSignedNumber(peakChangePct, 3, "%")}` : "";
     const floorText = floorChangePct !== null ? ` | floor ${formatSignedNumber(floorChangePct, 3, "%")}` : "";
+    const confirmText = confirmCount !== null && confirmPolls !== null
+      ? ` | confirm ${confirmCount.toFixed(0)}/${confirmPolls.toFixed(0)}`
+      : "";
     const reasonText = reasons ? ` | trigger: ${reasons}` : "";
-    return `Intrabar trailing floor hit: closing ${subject || "position"}${regimeText} | now ${changePct} | PnL ${pnlMoney}${peakText}${floorText}${reasonText}`;
+    return `Intrabar trailing floor hit: closing ${subject || "position"}${regimeText}${confirmText} | now ${changePct} | PnL ${pnlMoney}${peakText}${floorText}${reasonText}`;
   }
   if (phase === "INTRABAR" && event === "review_pending") {
     const ticket = String(meta?.ticket || "").trim();

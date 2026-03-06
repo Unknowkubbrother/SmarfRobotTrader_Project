@@ -34,6 +34,8 @@ from .config import (
     INTRABAR_TAKE_PROFIT_MONEY,
     INTRABAR_TAKE_PROFIT_PIPS,
     INTRABAR_TRAILING_ENABLED,
+    INTRABAR_TRAIL_ARM_BUFFER_RATIO,
+    INTRABAR_TRAIL_CONFIRM_POLLS,
     INTRABAR_TRAIL_KEEP_RATIO_NORMAL,
     INTRABAR_TRAIL_KEEP_RATIO_TIGHT,
     INTRABAR_TRAIL_KEEP_RATIO_TREND,
@@ -167,6 +169,8 @@ class LiveTradingBot:
         self.intrabar_trail_keep_ratio_trend = float(INTRABAR_TRAIL_KEEP_RATIO_TREND)
         self.intrabar_trail_keep_ratio_normal = float(INTRABAR_TRAIL_KEEP_RATIO_NORMAL)
         self.intrabar_trail_keep_ratio_tight = float(INTRABAR_TRAIL_KEEP_RATIO_TIGHT)
+        self.intrabar_trail_arm_buffer_ratio = float(INTRABAR_TRAIL_ARM_BUFFER_RATIO)
+        self.intrabar_trail_confirm_polls = max(1, int(INTRABAR_TRAIL_CONFIRM_POLLS))
         self.vision_llm_api_url = str(VISION_LLM_API_URL or "").strip()
         self.vision_llm_embed_text_api_url = str(VISION_LLM_EMBED_TEXT_API_URL or "").strip()
         # Live real-only semantic can take long on model warmup; avoid false timeout loops.
@@ -3615,15 +3619,37 @@ class LiveTradingBot:
             targets["pnl_money"] = float(self.intrabar_take_profit_money)
         return targets
 
-    def _compute_intrabar_floor(self, arm_value: float, peak_value: float, keep_ratio: float) -> float:
+    def _intrabar_trail_buffer_value(self, arm_value: float) -> float:
+        arm_value = float(arm_value or 0.0)
+        if arm_value <= 0.0:
+            return 0.0
+        return float(abs(arm_value) * max(0.0, float(self.intrabar_trail_arm_buffer_ratio)))
+
+    def _compute_intrabar_floor_state(
+        self,
+        arm_value: float,
+        peak_value: float,
+        keep_ratio: float,
+    ) -> tuple[float, float, float, bool]:
         arm_value = float(arm_value or 0.0)
         peak_value = float(peak_value or 0.0)
         keep_ratio = float(np.clip(keep_ratio, 0.0, 1.0))
         if arm_value <= 0.0:
-            return 0.0
-        if peak_value <= arm_value:
-            return float(arm_value)
-        return float(arm_value + max(0.0, peak_value - arm_value) * keep_ratio)
+            return 0.0, 0.0, 0.0, False
+
+        buffer_value = self._intrabar_trail_buffer_value(arm_value)
+        initial_floor = max(0.0, arm_value - buffer_value)
+        activation_peak = arm_value + buffer_value
+        if peak_value < activation_peak:
+            return float(initial_floor), float(initial_floor), float(activation_peak), False
+
+        dynamic_floor = arm_value + max(0.0, peak_value - arm_value) * keep_ratio
+        floor_value = max(initial_floor, dynamic_floor)
+        return float(floor_value), float(initial_floor), float(activation_peak), True
+
+    def _compute_intrabar_floor(self, arm_value: float, peak_value: float, keep_ratio: float) -> float:
+        floor_value, _, _, _ = self._compute_intrabar_floor_state(arm_value, peak_value, keep_ratio)
+        return float(floor_value)
 
     def _intrabar_regime(self, current_pos: int) -> tuple[str, float, dict]:
         snapshot = dict(getattr(self, "intrabar_regime_snapshot", {}) or {})
@@ -4053,13 +4079,19 @@ class LiveTradingBot:
                 "last_pnl_money": float(metrics["pnl_money"]),
                 "armed_reasons": [str(x) for x in hit_reasons],
                 "regime_meta": dict(regime_meta),
+                "floor_breach_count": 0,
+                "floor_confirm_polls": int(self.intrabar_trail_confirm_polls),
             }
             for metric_key, arm_value in targets.items():
-                trailing_state[f"floor_{metric_key}"] = self._compute_intrabar_floor(
+                floor_value, initial_floor, activation_peak, floor_active = self._compute_intrabar_floor_state(
                     float(arm_value),
                     float(metrics[metric_key]),
                     keep_ratio,
                 )
+                trailing_state[f"floor_{metric_key}"] = float(floor_value)
+                trailing_state[f"initial_floor_{metric_key}"] = float(initial_floor)
+                trailing_state[f"activation_peak_{metric_key}"] = float(activation_peak)
+                trailing_state[f"floor_active_{metric_key}"] = bool(floor_active)
             self.intrabar_trailing_state = dict(trailing_state)
             print(
                 "\n [INTRABAR] trailing armed "
@@ -4080,6 +4112,10 @@ class LiveTradingBot:
                     "change_pct": float(metrics["change_pct"]),
                     "pnl_pips": float(metrics["pnl_pips"]),
                     "pnl_money": float(metrics["pnl_money"]),
+                    "buffer_ratio": float(self.intrabar_trail_arm_buffer_ratio),
+                    "confirm_polls": int(self.intrabar_trail_confirm_polls),
+                    "initial_floor_change_pct": float(trailing_state.get("initial_floor_change_pct", 0.0) or 0.0),
+                    "activation_peak_change_pct": float(trailing_state.get("activation_peak_change_pct", 0.0) or 0.0),
                     "reasons": " | ".join(hit_reasons),
                 },
             )
@@ -4107,13 +4143,30 @@ class LiveTradingBot:
                 peak_value = current_value
                 trailing_state[peak_key] = float(peak_value)
                 state_changed = True
-            floor_value = self._compute_intrabar_floor(float(arm_value), float(peak_value), keep_ratio)
+            floor_value, initial_floor, activation_peak, floor_active = self._compute_intrabar_floor_state(
+                float(arm_value),
+                float(peak_value),
+                keep_ratio,
+            )
             if abs(float(trailing_state.get(floor_key, 0.0) or 0.0) - float(floor_value)) > 1e-9:
                 trailing_state[floor_key] = float(floor_value)
                 state_changed = True
+            if abs(
+                float(trailing_state.get(f"initial_floor_{metric_key}", 0.0) or 0.0) - float(initial_floor)
+            ) > 1e-9:
+                trailing_state[f"initial_floor_{metric_key}"] = float(initial_floor)
+                state_changed = True
+            if abs(
+                float(trailing_state.get(f"activation_peak_{metric_key}", 0.0) or 0.0) - float(activation_peak)
+            ) > 1e-9:
+                trailing_state[f"activation_peak_{metric_key}"] = float(activation_peak)
+                state_changed = True
+            if bool(trailing_state.get(f"floor_active_{metric_key}", False)) != bool(floor_active):
+                trailing_state[f"floor_active_{metric_key}"] = bool(floor_active)
+                state_changed = True
 
-        self.intrabar_trailing_state = dict(trailing_state)
-
+        prev_breach_count = int(trailing_state.get("floor_breach_count", 0) or 0)
+        confirm_required = max(1, int(trailing_state.get("floor_confirm_polls", self.intrabar_trail_confirm_polls) or 1))
         floor_hit_reasons: list[str] = []
         if float(targets.get("change_pct", 0.0) or 0.0) > 0.0:
             floor_value = float(trailing_state.get("floor_change_pct", 0.0) or 0.0)
@@ -4134,6 +4187,28 @@ class LiveTradingBot:
                     f"money {float(metrics['pnl_money']):.2f}<=floor {floor_value:.2f}"
                 )
         if not floor_hit_reasons:
+            if prev_breach_count > 0:
+                trailing_state["floor_breach_count"] = 0
+                trailing_state.pop("last_floor_hit_reasons", None)
+                state_changed = True
+                self._add_log(
+                    "info",
+                    "Intrabar trailing recovered above floor",
+                    phase="intrabar",
+                    event="trail_floor_recovered",
+                    meta={
+                        "ticket": int(ticket),
+                        "side": side,
+                        "regime": str(regime),
+                        "keep_ratio": float(keep_ratio),
+                        "confirm_polls": int(confirm_required),
+                        "recovered_after": int(prev_breach_count),
+                        "change_pct": float(metrics["change_pct"]),
+                        "floor_change_pct": float(trailing_state.get("floor_change_pct", 0.0) or 0.0),
+                    },
+                )
+                self._save_runtime_state(reason="intrabar_trail_recovered")
+            self.intrabar_trailing_state = dict(trailing_state)
             if state_changed and prev_regime != regime:
                 self._add_log(
                     "info",
@@ -4148,16 +4223,51 @@ class LiveTradingBot:
                         "keep_ratio": float(keep_ratio),
                         "peak_change_pct": float(trailing_state.get("peak_change_pct", metrics["change_pct"]) or metrics["change_pct"]),
                         "floor_change_pct": float(trailing_state.get("floor_change_pct", 0.0) or 0.0),
+                        "initial_floor_change_pct": float(trailing_state.get("initial_floor_change_pct", 0.0) or 0.0),
                     },
                 )
             return False
+
+        breach_count = prev_breach_count + 1
+        trailing_state["floor_breach_count"] = int(breach_count)
+        trailing_state["last_floor_hit_reasons"] = [str(x) for x in floor_hit_reasons]
+        self.intrabar_trailing_state = dict(trailing_state)
+        if confirm_required > 1 and breach_count < confirm_required:
+            print(
+                "\n [INTRABAR] trailing floor pending "
+                f"| side={side} | regime={regime} | confirm={breach_count}/{confirm_required} "
+                f"| change={float(metrics['change_pct']):+.3f}% | floor={float(trailing_state.get('floor_change_pct', 0.0) or 0.0):+.3f}% "
+                f"| trigger={' ; '.join(floor_hit_reasons)}"
+            )
+            self._add_log(
+                "info",
+                "Intrabar trailing floor breached, waiting for confirmation",
+                phase="intrabar",
+                event="trail_floor_pending",
+                meta={
+                    "ticket": int(ticket),
+                    "side": side,
+                    "regime": str(regime),
+                    "keep_ratio": float(keep_ratio),
+                    "confirm_count": int(breach_count),
+                    "confirm_polls": int(confirm_required),
+                    "change_pct": float(metrics["change_pct"]),
+                    "floor_change_pct": float(trailing_state.get("floor_change_pct", 0.0) or 0.0),
+                    "reasons": " | ".join(floor_hit_reasons),
+                },
+            )
+            if breach_count == 1:
+                self._save_runtime_state(reason="intrabar_trail_pending")
+            return False
+
+        close_reasons = [f"confirm {breach_count}/{confirm_required}"] + list(floor_hit_reasons)
 
         print(
             "\n [INTRABAR] trailing floor hit -> close "
             f"| side={side} | regime={regime} | keep={keep_ratio:.2f} "
             f"| price={float(metrics['exit_price']):.{self.digits}f} "
             f"| change={float(metrics['change_pct']):+.3f}% | pips={float(metrics['pnl_pips']):+.1f} "
-            f"| pnl={float(metrics['pnl_money']):+.2f} | trigger={' ; '.join(floor_hit_reasons)}"
+            f"| pnl={float(metrics['pnl_money']):+.2f} | trigger={' ; '.join(close_reasons)}"
         )
         self._add_log(
             "action",
@@ -4179,7 +4289,11 @@ class LiveTradingBot:
                 "floor_change_pct": float(trailing_state.get("floor_change_pct", 0.0) or 0.0),
                 "floor_pnl_pips": float(trailing_state.get("floor_pnl_pips", 0.0) or 0.0),
                 "floor_pnl_money": float(trailing_state.get("floor_pnl_money", 0.0) or 0.0),
-                "reasons": " | ".join(floor_hit_reasons),
+                "initial_floor_change_pct": float(trailing_state.get("initial_floor_change_pct", 0.0) or 0.0),
+                "activation_peak_change_pct": float(trailing_state.get("activation_peak_change_pct", 0.0) or 0.0),
+                "confirm_count": int(breach_count),
+                "confirm_polls": int(confirm_required),
+                "reasons": " | ".join(close_reasons),
             },
         )
         if not self.close_all():
@@ -4195,7 +4309,7 @@ class LiveTradingBot:
             change_pct=float(metrics["change_pct"]),
             pnl_pips=float(metrics["pnl_pips"]),
             pnl_money=float(metrics["pnl_money"]),
-            trigger_reasons=floor_hit_reasons,
+            trigger_reasons=close_reasons,
             exit_mode="trailing_floor_hit",
             exit_meta={
                 "regime": str(regime),
@@ -4206,6 +4320,10 @@ class LiveTradingBot:
                 "floor_change_pct": float(trailing_state.get("floor_change_pct", 0.0) or 0.0),
                 "floor_pnl_pips": float(trailing_state.get("floor_pnl_pips", 0.0) or 0.0),
                 "floor_pnl_money": float(trailing_state.get("floor_pnl_money", 0.0) or 0.0),
+                "initial_floor_change_pct": float(trailing_state.get("initial_floor_change_pct", 0.0) or 0.0),
+                "activation_peak_change_pct": float(trailing_state.get("activation_peak_change_pct", 0.0) or 0.0),
+                "confirm_count": int(breach_count),
+                "confirm_polls": int(confirm_required),
             },
         )
         self._clear_intrabar_trailing_state()
@@ -4798,6 +4916,8 @@ class LiveTradingBot:
                     f"{self.intrabar_trail_keep_ratio_normal:.2f}/"
                     f"{self.intrabar_trail_keep_ratio_tight:.2f}"
                 )
+                intrabar_parts.append(f"buffer={self.intrabar_trail_arm_buffer_ratio:.2f}")
+                intrabar_parts.append(f"confirm={self.intrabar_trail_confirm_polls}")
             print(f" [INTRABAR] realtime close active | {' | '.join(intrabar_parts)}")
             self._add_log(
                 "info",
@@ -4812,6 +4932,8 @@ class LiveTradingBot:
                     "trail_keep_ratio_trend": float(self.intrabar_trail_keep_ratio_trend),
                     "trail_keep_ratio_normal": float(self.intrabar_trail_keep_ratio_normal),
                     "trail_keep_ratio_tight": float(self.intrabar_trail_keep_ratio_tight),
+                    "trail_arm_buffer_ratio": float(self.intrabar_trail_arm_buffer_ratio),
+                    "trail_confirm_polls": int(self.intrabar_trail_confirm_polls),
                 },
             )
         self._start_ws_listener()
