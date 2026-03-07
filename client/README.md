@@ -24,4 +24,3 @@ The app will be available at http://localhost:3000.
 - React
 - shadcn-ui
 - Tailwind CSS
-- Supabase
