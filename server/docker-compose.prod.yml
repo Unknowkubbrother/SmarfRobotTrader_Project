@@ -6,16 +6,20 @@ services:
     container_name: smarf-api
     restart: unless-stopped
     env_file:
-      - .env.prod
+      - path: .env.prod
+        required: false
     environment:
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      RUNNER_DIR: /opt/mt5-runner
+      API_PORT: "${API_PORT:-8000}"
+      RUNNER_DIR: "${RUNNER_HOST_DIR:-/opt/mt5-runner}"
+      BOT_RUNNER_PUBLIC_HOST: "${BOT_RUNNER_PUBLIC_HOST:-host.docker.internal}"
+      BOT_RUNNER_PUBLIC_PORT: "${BOT_RUNNER_PUBLIC_PORT:-}"
     ports:
       - "${API_BIND_ADDRESS:-0.0.0.0}:${API_PORT:-8000}:8000"
     volumes:
       - ./uploads:/app/uploads
-      - ./docker_mt5_bot:/opt/mt5-runner
+      - "${RUNNER_HOST_DIR:-./docker_mt5_bot}:${RUNNER_HOST_DIR:-/opt/mt5-runner}"
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       postgres:

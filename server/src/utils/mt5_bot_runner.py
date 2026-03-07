@@ -129,15 +129,33 @@ def build_bot_runtime_env(
     bot_version_tag: str | None = None,
     magic_number: int | None = None,
 ) -> dict[str, str]:
+    public_host = str(
+        os.getenv("BOT_RUNNER_PUBLIC_HOST")
+        or os.getenv("BOT_PUBLIC_HOST")
+        or "host.docker.internal"
+    ).strip()
+
+    public_port_raw = str(
+        os.getenv("BOT_RUNNER_PUBLIC_PORT")
+        or os.getenv("BOT_PUBLIC_PORT")
+        or os.getenv("API_PORT")
+        or os.getenv("PORT")
+        or "8000"
+    ).strip()
+    try:
+        public_port = str(max(1, int(public_port_raw)))
+    except ValueError:
+        public_port = "8000"
+
     ws_url = (
         os.getenv("BOT_RUNNER_WS_URL")
         or os.getenv("BOT_WS_URL")
-        or "ws://host.docker.internal:8000/bot/ws"
+        or f"ws://{public_host}:{public_port}/bot/ws"
     )
     vision_url = (
         os.getenv("BOT_RUNNER_VISION_LLM_API_URL")
         or os.getenv("VISION_LLM_API_URL")
-        or "http://host.docker.internal:8000/vision_llm/"
+        or f"http://{public_host}:{public_port}/vision_llm/"
     )
 
     rpc_timeout_ms_raw = str(os.getenv("BOT_RUNNER_MT5_RPC_TIMEOUT_MS", "180000") or "").strip()
@@ -353,7 +371,7 @@ def purge_bot_instance_state(
     env = os.environ.copy()
     env["COMPOSE_PROJECT_NAME"] = project_name
 
-    down_cmd = ["docker", "compose", "down", "--remove-orphans"]
+    down_cmd = [*_resolve_docker_compose_cmd(), "down", "--remove-orphans"]
     try:
         down_proc = subprocess.run(
             down_cmd,
@@ -668,6 +686,30 @@ def _ensure_docker_access() -> None:
             stdout=_shorten_output(probe.stdout),
             stderr=_shorten_output(probe.stderr),
         )
+
+
+def _resolve_docker_compose_cmd() -> list[str]:
+    if shutil.which("docker") is not None:
+        probe = subprocess.run(
+            ["docker", "compose", "version"],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0:
+            return ["docker", "compose"]
+
+    if shutil.which("docker-compose") is not None:
+        probe = subprocess.run(
+            ["docker-compose", "version"],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0:
+            return ["docker-compose"]
+
+    raise BotRunnerError(
+        "Docker Compose CLI not found. Install 'docker compose' or 'docker-compose' in server runtime."
+    )
 
 
 def _resolve_container_id(project_name: str) -> str | None:

@@ -10,6 +10,7 @@ interface LogEntry {
   phase?: string;
   event?: string;
   isInsufficientFunds?: boolean;
+  _sortKey?: Date | null;
 }
 
 function parseUtcLike(raw: string): Date | null {
@@ -486,8 +487,9 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
       const event = String(row?.event || "").trim().toLowerCase();
       if (phase === "INTRABAR" && event === "review" && recentIntrabarReviews.length > 0) continue;
       const insufficientFunds = isInsufficientFundsLog(row);
+      const rawUtc = typeof row?.timestamp_utc === "string" ? row.timestamp_utc : undefined;
       const timestamp = toLocalClockText(
-        typeof row?.timestamp_utc === "string" ? row.timestamp_utc : undefined,
+        rawUtc,
         String(row?.timestamp || "")
       );
       if (shouldHideLog(row)) continue;
@@ -504,6 +506,7 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
         phase,
         event,
         isInsufficientFunds: insufficientFunds,
+        _sortKey: parseUtcLike(rawUtc || ""),
       });
     }
 
@@ -526,20 +529,31 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
         message,
         phase: "INTRABAR",
         event: "review_summary",
+        _sortKey: parseUtcLike(timestampUtc || ""),
       });
     }
 
     const llmSummary = compactLlmText(llmText);
     if (llmSummary) {
-      const ts = rows.length > 0 ? rows[rows.length - 1].timestamp : "--:--:--";
+      const llmBarTime = typeof liveState?.last_bar_time === "string" ? liveState.last_bar_time : "";
+      const llmSortKey = parseUtcLike(llmBarTime);
+      const ts = llmSortKey ? toLocalClockText(llmBarTime) : (rows.length > 0 ? rows[rows.length - 1].timestamp : "--:--:--");
       const message = `AI Analysis: ${llmSummary}`;
       rows.push({
         id: `llm-analysis|${message}`,
         timestamp: ts,
         type: "analysis",
         message,
+        _sortKey: llmSortKey,
       });
     }
+
+    // Sort all entries chronologically
+    rows.sort((a, b) => {
+      const ta = a._sortKey?.getTime() ?? Infinity;
+      const tb = b._sortKey?.getTime() ?? Infinity;
+      return ta - tb;
+    });
 
     return rows.slice(-120);
   })();

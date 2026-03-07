@@ -1,6 +1,11 @@
 .git
 .gitignore
 .DS_Store
+.env
+.env.prod
+.env.prod.example
+tmp
+.venv
 venv
 __pycache__
 *.pyc
@@ -10,7 +15,5 @@ __pycache__
 .mypy_cache
 .ruff_cache
 uploads
-docker_mt5_bot/.instances
-docker_mt5_bot/logs
-docker_mt5_bot/snapshots
+docker_mt5_bot
 node_modules

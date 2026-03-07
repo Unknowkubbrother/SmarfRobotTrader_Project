@@ -131,19 +131,33 @@ MT5_CLEAN_ACCOUNT_CACHE_ON_START=1
 
 ## Docker Outside of Docker (Server อยู่ใน container แต่สร้าง bot container บน host)
 
-ให้ mount docker socket ของ host เข้า container server:
+ให้ mount docker socket ของ host เข้า container server และ mount runner ด้วย absolute path เดียวกันทั้งฝั่ง host/container:
 
 ```yaml
 services:
   bot-server:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /path/to/project/server/docker_mt5_bot:/opt/mt5-runner
     environment:
-      - RUNNER_DIR=/opt/mt5-runner
+      - RUNNER_DIR=/path/to/project/server/docker_mt5_bot
+```
+
+ตัวอย่างกับ compose ของ server:
+
+```yaml
+services:
+  api:
+    environment:
+      - RUNNER_HOST_DIR=/path/to/project/server/docker_mt5_bot
+    volumes:
+      - /path/to/project/server/docker_mt5_bot:/path/to/project/server/docker_mt5_bot
+      - /var/run/docker.sock:/var/run/docker.sock
 ```
 
 และใน image ของ server ต้องมี Docker CLI (`docker` + `docker compose`)
+
+ถ้า API publish port ไม่ใช่ `8000` ให้ตั้ง `API_PORT` หรือ override `BOT_RUNNER_PUBLIC_HOST/BOT_RUNNER_PUBLIC_PORT`
+เพื่อให้ bot container ยิงกลับมาที่ `/bot/ws` และ `/vision_llm/` ได้ถูกพอร์ต
 
 ## รีเซ็ตทั้งระบบแล้วขึ้นใหม่ทีเดียว
 

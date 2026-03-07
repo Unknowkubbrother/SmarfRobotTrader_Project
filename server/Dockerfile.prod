@@ -1,7 +1,10 @@
+FROM docker:28-cli AS dockercli
+
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
@@ -11,12 +14,15 @@ RUN apt-get update \
       build-essential \
       ca-certificates \
       curl \
-      docker.io \
-      docker-compose \
       git \
       libgl1 \
       libglib2.0-0 \
+      zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=dockercli /usr/local/bin/docker-compose /usr/local/bin/docker-compose
+COPY --from=dockercli /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip \
