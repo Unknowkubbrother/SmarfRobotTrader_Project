@@ -12,8 +12,10 @@ function TradingViewWidget({ symbol, theme = 'dark', autosize = true }: TradingV
     useEffect(() => {
         if (!container.current) return;
 
+        const el = container.current;
+
         // Clear previous widget if any
-        container.current.innerHTML = '';
+        el.innerHTML = '';
 
         const script = document.createElement('script');
         script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
@@ -40,13 +42,11 @@ function TradingViewWidget({ symbol, theme = 'dark', autosize = true }: TradingV
             "support_host": "https://www.tradingview.com"
         });
 
-        container.current.appendChild(script);
+        el.appendChild(script);
 
         return () => {
             // Cleanup is handled by clearing innerHTML on next effect run
-            if (container.current) {
-                container.current.innerHTML = '';
-            }
+            el.innerHTML = '';
         };
     }, [symbol, theme, autosize]);
 

@@ -215,7 +215,7 @@ export default function HomePage() {
                         <p className="text-xs font-medium uppercase tracking-[0.2em] text-primary">How It Works</p>
                         <h2 className="mt-3 text-3xl font-semibold">How the AI Trades for You</h2>
                         <p className="mt-2 max-w-2xl mx-auto text-muted-foreground">
-                            Our bots don't rely on fixed rules — they learn from real charts and adapt to market conditions.
+                            Our bots don&apos;t rely on fixed rules — they learn from real charts and adapt to market conditions.
                         </p>
                     </div>
 

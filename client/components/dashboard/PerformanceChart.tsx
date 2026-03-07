@@ -192,6 +192,7 @@ export function PerformanceChart({ liveState, botId, className }: PerformanceCha
       const maxKeep = 3000;
       return next.length > maxKeep ? next.slice(next.length - maxKeep) : next;
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLive, liveState?.balance, liveState?.equity]);
 
   const chartData = useMemo<ChartRenderPoint[]>(() => {
