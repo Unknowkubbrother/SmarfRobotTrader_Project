@@ -7,6 +7,7 @@ import TickerTagWidget from "../dashboard/TickerTagWidget";
 import { useAuth } from "@/contexts/AuthContext";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import Image from "next/image";
 import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
@@ -263,7 +264,7 @@ export function Header() {
               <Button variant="ghost" size="icon" className="rounded-full">
                 <div className="w-8 h-8 rounded-full bg-secondary flex items-center justify-center overflow-hidden">
                   {user?.avatar_url ? (
-                    <img src={getAvatarSrc(user?.avatar_url)} alt="Avatar" className="w-full h-full object-cover" />
+                    <Image src={getAvatarSrc(user?.avatar_url)} alt="Avatar" className="w-full h-full object-cover" width={32} height={32} unoptimized />
                   ) : (
                     <User className="w-4 h-4 text-muted-foreground" />
                   )}

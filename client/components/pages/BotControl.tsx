@@ -263,6 +263,7 @@ export default function BotControl() {
   // Load available bot versions on mount
   useEffect(() => {
     getBotVersions().then(setAvailableModels);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // When opened from global search, honor ?botId=... and focus that exact bot/account.
@@ -315,6 +316,7 @@ export default function BotControl() {
         setSelectedBot(null);
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accounts]);
 
   // Auto-select first bot when account changes
@@ -326,6 +328,7 @@ export default function BotControl() {
     } else {
       setSelectedBot(null);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedAccount]);
 
   // Load bot settings when selected bot changes
@@ -338,6 +341,7 @@ export default function BotControl() {
         enabled: savedSchedule[s.day.toLowerCase()] ?? s.enabled,
       })));
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedBot]);
 
   useEffect(() => {
@@ -385,6 +389,7 @@ export default function BotControl() {
     }
 
     setRuntimeHealth(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     activeAction?.botId,
     isBotWsConnected,
@@ -404,6 +409,7 @@ export default function BotControl() {
       return;
     }
     void refreshSelectedBotLogs(botId, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedBot?.id]);
 
   const appendActionLog = (
@@ -617,6 +623,7 @@ export default function BotControl() {
       void refetch();
     }, 12000);
     return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedBot?.id, selectedBot?.status, selectedBot?.container_status, isBotWsConnected, refetch]);
 
   useEffect(() => {
@@ -1154,8 +1161,8 @@ export default function BotControl() {
                         isSelectedBotStartLockedBySubscription
                           ? subscriptionBlockedReason
                           : isSelectedBotStartLockedByVersion
-                          ? "This bot model is inactive. Change model before starting."
-                          : undefined
+                            ? "This bot model is inactive. Change model before starting."
+                            : undefined
                       }
                     >
                       {isSelectedBotStartLockedBySubscription ? (
@@ -1195,8 +1202,8 @@ export default function BotControl() {
                           subscriptionBlocked
                             ? subscriptionBlockedReason
                             : isSelectedBotVersionInactive
-                            ? "This bot model is inactive. Change model before restarting."
-                            : undefined
+                              ? "This bot model is inactive. Change model before restarting."
+                              : undefined
                         }
                       >
                         <RefreshCw className="w-4 h-4" />

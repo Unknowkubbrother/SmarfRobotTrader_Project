@@ -258,6 +258,7 @@ export default function ProfitCalendar() {
       )
     );
     return ids.map((id) => formatAccountLabel(id));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tradeHistory, accountById]);
 
   const calendarAccountOptions = useMemo(
@@ -266,6 +267,7 @@ export default function ProfitCalendar() {
         .filter((account) => Boolean(account.id))
         .map((account) => ({ id: account.id, label: formatAccountLabel(account.id) }))
         .sort((a, b) => a.label.localeCompare(b.label)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [tradingAccounts, accountById]
   );
 

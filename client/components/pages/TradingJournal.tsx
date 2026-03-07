@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import Image from "next/image";
 import {
   BookOpen,
   Calendar,
@@ -489,11 +490,13 @@ export default function TradingJournal() {
                               className="group relative shrink-0"
                               title={`Open screenshot ${idx + 1}`}
                             >
-                              <img
+                              <Image
                                 src={url}
                                 alt={`Screenshot ${idx + 1} for ticket ${row.ticketId}`}
-                                className="h-12 w-20 rounded-md border border-border object-cover transition-opacity group-hover:opacity-90"
-                                loading="lazy"
+                                className="rounded-md border border-border object-cover transition-opacity group-hover:opacity-90"
+                                width={80}
+                                height={48}
+                                unoptimized
                               />
                               <span className="absolute bottom-1 right-1 inline-flex items-center rounded bg-black/55 px-1 py-0.5 text-[10px] text-white">
                                 {idx + 1}
