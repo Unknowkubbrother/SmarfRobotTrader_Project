@@ -241,7 +241,7 @@ cat .instances/103853956.env
 ตัวอย่าง follow log ของบอทใน instance:
 
 ```bash
-docker compose -p mt5_103853956 exec -it metatrader5-macos tail -f /config/103853956_eurusd_h1.log
+docker compose -p mt5_103853956 exec -it smarfrobot-mt5 tail -f /config/103853956_eurusd_h1.log
 ```
 
 ## หมายเหตุสำคัญ

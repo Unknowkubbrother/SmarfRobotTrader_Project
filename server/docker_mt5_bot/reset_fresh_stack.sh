@@ -34,7 +34,7 @@ fi
 echo "[2/7] Stopping and removing all mt5_* projects..."
 project_names="$(
   docker ps -a --format '{{.Names}}' \
-    | sed -n 's/-metatrader5-macos-1$//p' \
+    | sed -n 's/-smarfrobot-mt5-1$//p' \
     | rg '^mt5_' \
     | sort -u || true
 )"
@@ -58,7 +58,7 @@ else
 fi
 
 echo "[4/7] Removing old MT5 images..."
-mt5_images="$(docker images --format '{{.Repository}}:{{.Tag}}' | rg '^metatrader5_macos:|^unknowkubbrother/metatrader5_macos:' || true)"
+mt5_images="$(docker images --format '{{.Repository}}:{{.Tag}}' | rg '^smarfrobot_mt5:|^unknowkubbrother/smarfrobot_mt5:' || true)"
 if [[ -n "$mt5_images" ]]; then
   while IFS= read -r img; do
     [[ -z "$img" ]] && continue
@@ -73,7 +73,7 @@ rm -rf "$ROOT_DIR/.instances" "$ROOT_DIR/logs"
 mkdir -p "$ROOT_DIR/.instances" "$ROOT_DIR/logs"
 
 echo "[6/7] Building new MT5 image..."
-compose build metatrader5-macos
+compose build smarfrobot-mt5
 
 if [[ "$SKIP_START" =~ ^(1|true|yes|on)$ ]]; then
   echo "[7/7] SKIP_START enabled, skipping instance start."

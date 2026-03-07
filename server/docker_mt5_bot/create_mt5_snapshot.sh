@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-SERVICE_NAME="${SERVICE_NAME:-metatrader5-macos}"
+SERVICE_NAME="${SERVICE_NAME:-smarfrobot-mt5}"
 OUTPUT_PATH="${1:-snapshots/mt5-config-snapshot.tgz}"
 OUTPUT_DIR="$(dirname "$OUTPUT_PATH")"
 OUTPUT_FILE="$(basename "$OUTPUT_PATH")"

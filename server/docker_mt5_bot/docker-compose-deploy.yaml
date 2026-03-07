@@ -1,7 +1,7 @@
 services:
-  metatrader5-macos:
+  smarfrobot-mt5:
     platform: linux/amd64
-    image: ${METATRADER_IMAGE:-unknowkubbrother/metatrader5_macos}
+    image: ${METATRADER_IMAGE:-unknowkubbrother/smarfrobot_mt5}
     volumes:
       - config:/config
       - ./bots:/bots
