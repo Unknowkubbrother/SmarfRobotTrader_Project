@@ -1,9 +1,3 @@
-"""
-Vision LLM route — one-off HTTP endpoint (with Redis cache).
-
-WebSocket and cron endpoints have been moved to ``bot_ws.py``.
-"""
-
 import asyncio
 import hashlib
 import json

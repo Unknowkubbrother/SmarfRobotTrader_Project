@@ -384,6 +384,7 @@ export default function Dashboard() {
               onBotSelect={setSelectedBotId}
               accountId={selectedAccount.id}
               onBotAdded={refetch}
+              getBotPnl={(botId, fallbackPnl) => getBotState(botId)?.total_pnl ?? fallbackPnl}
               addBotDisabled={subscriptionBlocked}
               addBotDisabledReason={subscriptionBlockedReason}
             />

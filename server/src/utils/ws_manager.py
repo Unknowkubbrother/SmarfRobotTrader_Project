@@ -1,11 +1,3 @@
-"""
-Bot Hub — WebSocket connection manager for bots and dashboard clients.
-
-Two types of clients:
-- **Bots** (from Docker containers): identified by ``bot_config_id``, grouped by symbol+timeframe
-- **Dashboard** (Next.js): receive all bot state updates in real-time
-"""
-
 import asyncio
 import json
 import logging

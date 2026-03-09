@@ -18,6 +18,7 @@ interface BotSelectorProps {
   onBotSelect: (botId: string) => void;
   accountId: string;
   onBotAdded: () => void;
+  getBotPnl?: (botId: string, fallbackPnl: number) => number;
   addBotDisabled?: boolean;
   addBotDisabledReason?: string | null;
 }
@@ -28,6 +29,7 @@ export function BotSelector({
   onBotSelect,
   accountId,
   onBotAdded,
+  getBotPnl,
   addBotDisabled = false,
   addBotDisabledReason = null,
 }: BotSelectorProps) {
@@ -40,6 +42,8 @@ export function BotSelector({
   }).length;
   const selectedBotVersionInactive = selectedBot?.bot_version?.is_active === false;
   const selectedBotStatus = String(selectedBot?.status || selectedBot?.container_status || "").toLowerCase();
+  const resolveBotPnl = (bot: BotConfigWithVersion): number =>
+    Number(getBotPnl?.(bot.id, Number(bot.today_pnl ?? 0)) ?? bot.today_pnl ?? 0);
 
   return (
     <div className="flex items-center gap-3">
@@ -112,6 +116,7 @@ export function BotSelector({
               </div>
               {bots.map((bot) => {
                 const status = String(bot.status || bot.container_status || "").toLowerCase();
+                const botPnl = resolveBotPnl(bot);
                 return (
                   <DropdownMenuItem
                     key={bot.id}
@@ -141,9 +146,9 @@ export function BotSelector({
                           )}
                           <span className={cn(
                             "text-xs font-mono",
-                            bot.today_pnl >= 0 ? "text-success" : "text-destructive"
+                            botPnl >= 0 ? "text-success" : "text-destructive"
                           )}>
-                            {bot.today_pnl >= 0 ? "+" : ""}${bot.today_pnl.toFixed(2)}
+                            {botPnl >= 0 ? "+" : ""}${botPnl.toFixed(2)}
                           </span>
                         </div>
                       </div>

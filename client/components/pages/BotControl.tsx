@@ -245,6 +245,7 @@ export default function BotControl() {
   const livePosition = liveState?.position ?? 0;
   const liveLotSize = liveState?.lot_size ?? 0;
   const liveAction = liveState?.last_action || "—";
+  const selectedBotPnl = liveState?.total_pnl ?? selectedBot?.today_pnl ?? 0;
   const liveScheduleSummary = (() => {
     const src = normalizeTradingSchedule(liveState?.trading_schedule ?? selectedBot?.trading_schedule);
     const days = [
@@ -1013,6 +1014,7 @@ export default function BotControl() {
               }}
               accountId={selectedAccount.id}
               onBotAdded={refetch}
+              getBotPnl={(botId, fallbackPnl) => getBotState(botId)?.total_pnl ?? fallbackPnl}
               addBotDisabled={subscriptionBlocked}
               addBotDisabledReason={subscriptionBlockedReason}
             />
@@ -1137,10 +1139,10 @@ export default function BotControl() {
                       <span
                         className={cn(
                           "font-mono font-medium",
-                          selectedBot.today_pnl >= 0 ? "text-success" : "text-destructive"
+                          selectedBotPnl >= 0 ? "text-success" : "text-destructive"
                         )}
                       >
-                        {selectedBot.today_pnl >= 0 ? "+" : ""}${selectedBot.today_pnl.toFixed(2)}
+                        {selectedBotPnl >= 0 ? "+" : ""}${selectedBotPnl.toFixed(2)}
                       </span>
                     </div>
                     <Button
