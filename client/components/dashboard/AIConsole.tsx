@@ -26,6 +26,13 @@ function parseUtcLike(raw: string): Date | null {
     const parsed = new Date(patched);
     if (!Number.isNaN(parsed.getTime())) return parsed;
   }
+
+  // Treat bare bot timestamps as UTC instead of browser-local time.
+  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/i.test(text)) {
+    const patched = `${text.replace(" ", "T")}Z`;
+    const parsed = new Date(patched);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
   return null;
 }
 
@@ -37,14 +44,17 @@ function toLocalClockText(rawUtc?: string, fallback?: string): string {
   return parsed.toLocaleTimeString([], { hour12: false });
 }
 
-function toLocalDateTimeText(rawUtc?: string): string {
-  const parsed = parseUtcLike(String(rawUtc || ""));
-  if (!parsed) {
-    return String(rawUtc || "").trim();
+function normalizeBrokerDateTimeText(raw?: string): string {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+
+  const matched = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}:\d{2}:\d{2})(?:Z)?$/i);
+  if (matched) {
+    const [, year, month, day, clock] = matched;
+    return `${day}/${month}/${year} ${clock}`;
   }
-  const dateText = parsed.toLocaleDateString();
-  const timeText = parsed.toLocaleTimeString([], { hour12: false });
-  return `${dateText} ${timeText}`;
+
+  return text.replace("T", " ").replace(/Z$/i, "").trim();
 }
 
 const typeConfig = {
@@ -56,6 +66,7 @@ const typeConfig = {
 };
 
 const HIDDEN_PHASES = new Set(["SEM", "MODEL", "GATE", "DECISION"]);
+const AI_ANALYSIS_LOG_EVENTS = new Set(["embedding_ready", "cache_hit", "cache_alias_hit"]);
 
 function normalizeMeta(meta: unknown): Record<string, unknown> | undefined {
   if (!meta || typeof meta !== "object" || Array.isArray(meta)) return undefined;
@@ -101,6 +112,19 @@ function compactLlmText(raw: string, limit = 280): string {
   if (!cleaned) return "";
   if (cleaned.length <= limit) return cleaned;
   return `${cleaned.slice(0, Math.max(0, limit - 1))}...`;
+}
+
+function findLatestAiAnalysisTimestamp(logs: BotLiveLogEntry[]): string {
+  for (let i = logs.length - 1; i >= 0; i -= 1) {
+    const row = logs[i];
+    const phase = String(row?.phase || "").trim().toUpperCase();
+    const event = String(row?.event || "").trim().toLowerCase();
+    const timestampUtc = typeof row?.timestamp_utc === "string" ? row.timestamp_utc : "";
+    if (phase === "SEM" && AI_ANALYSIS_LOG_EVENTS.has(event) && timestampUtc) {
+      return timestampUtc;
+    }
+  }
+  return "";
 }
 
 function formatSignedNumber(value: unknown, digits = 2, suffix = ""): string {
@@ -216,7 +240,7 @@ function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
   if (phase === "CLOCK" && event === "waiting_new_candle") return "Waiting for next candle";
   if (phase === "CLOCK" && event === "new_closed_candle") {
     const ts = String(meta?.closed_utc || "").trim();
-    return ts ? `New candle closed (${toLocalDateTimeText(ts)})` : "New candle closed";
+    return ts ? `New candle close detected | broker candle time ${normalizeBrokerDateTimeText(ts)}` : "New candle close detected";
   }
 
   if (phase === "STARTUP" && event === "snapshot_no_order") {
@@ -235,7 +259,7 @@ function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
   }
   if (phase === "BAR" && event === "bar_start") {
     const endUtc = String(meta?.end_utc || "").trim();
-    return endUtc ? `Evaluating closed bar (${toLocalDateTimeText(endUtc)})` : "Evaluating closed bar";
+    return endUtc ? `Evaluating closed bar | broker candle time ${normalizeBrokerDateTimeText(endUtc)}` : "Evaluating closed bar";
   }
   if (phase === "BAR" && event === "bar_complete") {
     const finalAction = String(meta?.final_action || "").trim().toUpperCase();
@@ -415,7 +439,7 @@ function toFriendlyMessage(log: Partial<BotLiveLogEntry>): string {
     const side = String(meta?.side || "").trim().toUpperCase();
     const barEndUtc = String(meta?.bar_end_utc || "").trim();
     const exitMode = String(meta?.exit_mode || "").trim().toLowerCase();
-    const whenText = barEndUtc ? ` at candle close (${toLocalDateTimeText(barEndUtc)})` : " at candle close";
+    const whenText = barEndUtc ? ` at broker candle close (${normalizeBrokerDateTimeText(barEndUtc)})` : " at broker candle close";
     const subject = [side, ticket ? `#${ticket}` : ""].filter(Boolean).join(" ");
     const exitLabel = exitMode === "trailing_floor_hit" ? "Trailing exit" : "Intrabar exit";
     return `${exitLabel} stored for review${subject ? `: ${subject}` : ""} | compare again${whenText}`;
@@ -535,12 +559,24 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
 
     const llmSummary = compactLlmText(llmText);
     if (llmSummary) {
-      const llmBarTime = typeof liveState?.last_bar_time === "string" ? liveState.last_bar_time : "";
-      const llmSortKey = parseUtcLike(llmBarTime);
-      const ts = llmSortKey ? toLocalClockText(llmBarTime) : (rows.length > 0 ? rows[rows.length - 1].timestamp : "--:--:--");
+      const latestVisibleTimestampUtc = (() => {
+        for (let i = recentLogs.length - 1; i >= 0; i -= 1) {
+          const rawUtc = typeof recentLogs[i]?.timestamp_utc === "string" ? recentLogs[i].timestamp_utc : "";
+          if (rawUtc) return rawUtc;
+        }
+        return "";
+      })();
+      const llmTimestampUtc =
+        findLatestAiAnalysisTimestamp(recentLogs)
+        || latestVisibleTimestampUtc
+        || (typeof liveState?.last_bar_time === "string" ? liveState.last_bar_time : "");
+      const llmSortKey = parseUtcLike(llmTimestampUtc);
+      const ts = llmSortKey
+        ? toLocalClockText(llmTimestampUtc)
+        : (rows.length > 0 ? rows[rows.length - 1].timestamp : "--:--:--");
       const message = `AI Analysis: ${llmSummary}`;
       rows.push({
-        id: `llm-analysis|${message}`,
+        id: `llm-analysis|${llmTimestampUtc}|${message}`,
         timestamp: ts,
         type: "analysis",
         message,
@@ -564,9 +600,14 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
       style={{ animationDelay: "150ms" }}
     >
       <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <Terminal className="w-4 h-4 text-muted-foreground" />
-          <h3 className="font-semibold text-foreground">Activity Log</h3>
+        <div>
+          <div className="flex items-center gap-2">
+            <Terminal className="w-4 h-4 text-muted-foreground" />
+            <h3 className="font-semibold text-foreground">Activity Log</h3>
+          </div>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Left time is local event time. Broker candle time is the chart candle label from MT5.
+          </p>
         </div>
         {isLive && (
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-success/10 text-success">

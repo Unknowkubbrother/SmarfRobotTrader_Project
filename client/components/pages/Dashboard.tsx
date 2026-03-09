@@ -25,6 +25,18 @@ import {
   type PersistedBotAction,
 } from "@/lib/botOperationStore";
 
+function normalizeBrokerBarText(raw: string): string {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  return text.replace("T", " ").replace(/Z$/i, "").trim();
+}
+
+function toBrokerBarClockText(raw?: string): string {
+  const normalized = normalizeBrokerBarText(String(raw || ""));
+  const matched = normalized.match(/(\d{2}:\d{2}:\d{2})$/);
+  return matched ? matched[1] : normalized;
+}
+
 export default function Dashboard() {
   const { user } = useAuth();
   const { accounts, loading, updateBotStatus, deleteBot, updateAccount, deleteAccount, refetch, getPendingUpdatesCount } = useTradingAccounts();
@@ -324,7 +336,7 @@ export default function Dashboard() {
       icon: Activity,
       label: "Last Action",
       value: isLive ? liveAction : "—",
-      change: isLive && liveState?.last_bar_time ? liveState.last_bar_time.slice(11, 19) : "",
+      change: isLive ? (toBrokerBarClockText(liveState?.last_bar_time) ? `Broker ${toBrokerBarClockText(liveState?.last_bar_time)}` : "") : "",
       changeType: (isLive && (liveAction === "BUY")) ? "positive" as const : (isLive && liveAction === "SELL") ? "negative" as const : "positive" as const,
     },
   ];

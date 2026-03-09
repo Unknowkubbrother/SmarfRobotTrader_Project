@@ -43,6 +43,18 @@ import {
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
+function normalizeBrokerBarText(raw: string): string {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  return text.replace("T", " ").replace(/Z$/i, "").trim();
+}
+
+function toBrokerBarClockText(raw?: string): string {
+  const normalized = normalizeBrokerBarText(String(raw || ""));
+  const matched = normalized.match(/(\d{2}:\d{2}:\d{2})$/);
+  return matched ? matched[1] : (normalized || "—");
+}
+
 const riskLevels = [
   { id: "low", label: "Low", description: "Conservative trading with minimal risk", color: "text-success" },
   { id: "medium", label: "Medium", description: "Balanced approach with moderate risk", color: "text-warning" },
@@ -1323,9 +1335,9 @@ export default function BotControl() {
                     </p>
                   </div>
                   <div className="p-3 rounded-xl bg-secondary/50">
-                    <p className="text-xs text-muted-foreground mb-1">Lot / Last Bar</p>
+                    <p className="text-xs text-muted-foreground mb-1">Lot / Broker Bar</p>
                     <p className="text-sm font-mono">
-                      {liveLotSize.toFixed(2)} · <span className="text-muted-foreground">{liveState?.last_bar_time?.slice(11, 19) || "—"}</span>
+                      {liveLotSize.toFixed(2)} · <span className="text-muted-foreground">{toBrokerBarClockText(liveState?.last_bar_time)}</span>
                     </p>
                   </div>
                   <div className="p-3 rounded-xl bg-secondary/50 md:col-span-2">
