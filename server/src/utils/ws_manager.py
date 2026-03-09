@@ -121,6 +121,22 @@ class BotHub:
         }
         await self._broadcast_dashboards(payload)
 
+    async def patch_bot_state(self, bot_config_id: str, state_patch: dict) -> None:
+        """Merge a partial state into the bot's last state and forward it."""
+        bot_id = str(bot_config_id).strip()
+        if not bot_id or not isinstance(state_patch, dict) or not state_patch:
+            return
+
+        conn = self._bots.get(bot_id)
+        if conn is None:
+            return
+
+        merged_state = {
+            **dict(conn.last_state or {}),
+            **state_patch,
+        }
+        await self.update_bot_state(bot_id, merged_state)
+
     async def broadcast_lifecycle_event(
         self,
         bot_config_id: str,

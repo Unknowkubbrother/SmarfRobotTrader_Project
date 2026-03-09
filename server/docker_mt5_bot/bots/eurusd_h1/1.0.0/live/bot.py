@@ -1061,6 +1061,7 @@ class LiveTradingBot:
         if self.semantic_runtime is not None:
             self.semantic_runtime.global_time_to_vec[ts_key] = vec
         self._sem_retry_not_before.pop(ts_key, None)
+        self._hydrate_last_llm_text_from_cache(ts_key)
         self._save_llm_semantic_cache(reason="cache_alias")
         print(f"\n [SEM] ready (cache_alias) ts={ts_key} <- {alias_key} dim={vec.size}")
         self._add_log(
@@ -1098,6 +1099,17 @@ class LiveTradingBot:
                 return candidate_key, llm_text
 
         return None, None
+
+    def _hydrate_last_llm_text_from_cache(self, ts_key: str) -> bool:
+        text_key, llm_text = self._resolve_cached_llm_text_alias(ts_key)
+        if not llm_text:
+            return False
+
+        self.last_llm_text = str(llm_text or "")
+        if text_key and text_key != ts_key:
+            self.llm_text_cache[ts_key] = self.last_llm_text
+            self._append_llm_text_log(ts_key, self.last_llm_text)
+        return bool(self.last_llm_text)
 
     def _request_llm_text_embedding_from_server(self, llm_text: str, timeout_sec: float | None = None):
         if not self.vision_llm_embed_text_api_url:
@@ -1365,8 +1377,8 @@ class LiveTradingBot:
                                 continue
                             msg_type = msg.get("type")
                             if msg_type == "llm_result":
-                                # Live semantic path is HTTP endpoint + shared cache.
-                                # Ignore ws-pushed llm_result to keep one deterministic source.
+                                # WS llm_result is broadcast by symbol/timeframe only.
+                                # Keep semantic ownership on the bot's direct HTTP request path.
                                 pass
                             elif msg_type == "bot_config":
                                 self._apply_runtime_config(msg, source="ws")
@@ -1927,6 +1939,7 @@ class LiveTradingBot:
             "date_time": ts_key,
             "symbol": SYMBOL.upper(),
             "timeframe": TIMEFRAME_NAME.upper(),
+            "bot_config_id": BOT_CONFIG_ID,
         }
         body = json.dumps(payload).encode("utf-8")
         req = urlrequest.Request(
@@ -2011,6 +2024,7 @@ class LiveTradingBot:
         if alias_vec is not None:
             if alias_key == ts_key:
                 self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(alias_vec, dtype=np.float32)
+                self._hydrate_last_llm_text_from_cache(ts_key)
             else:
                 self._adopt_semantic_alias(ts_key, alias_key, alias_vec)
             self._add_log(
@@ -2065,6 +2079,7 @@ class LiveTradingBot:
         if alias_vec is not None:
             if alias_key == ts_key:
                 self.semantic_runtime.global_time_to_vec[ts_key] = np.asarray(alias_vec, dtype=np.float32)
+                self._hydrate_last_llm_text_from_cache(ts_key)
             else:
                 self._adopt_semantic_alias(ts_key, alias_key, alias_vec)
             return True

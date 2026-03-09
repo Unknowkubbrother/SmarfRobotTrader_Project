@@ -21,6 +21,7 @@ from ..utils.vision_llm.llm_client import (
 from ..utils.vision_llm.embedding import text_to_cls_embedding
 from ..utils.vision_llm.use_llm import generate_llm_cls_for_bar
 from ..database.client import r_cache
+from ..utils.ws_manager import bot_hub
 
 logger = logging.getLogger(__name__)
 
@@ -125,11 +126,14 @@ async def vision_llm(request: Request, data: VisionLLMRequest):
     dt_str = data.date_time.strftime("%Y-%m-%d %H:%M:%S")
     symbol = _normalize_symbol(data.symbol)
     timeframe = _normalize_timeframe(getattr(data, "timeframe", "H1"))
+    bot_config_id = str(getattr(data, "bot_config_id", "") or "").strip()
     logger.info("vision_llm  ▶  %s/%s  %s", symbol, timeframe, dt_str)
 
     cached = _get_cached(symbol, timeframe, dt_str)
     if cached:
         logger.info("vision_llm  ⚡  cache hit")
+        if bot_config_id and cached.get("llm_text"):
+            await bot_hub.patch_bot_state(bot_config_id, {"llm_text": str(cached.get("llm_text") or "")})
         return {"message": "success", "cached": True, **cached}
 
     cache_key = _cache_key(symbol, timeframe, dt_str)
@@ -139,6 +143,8 @@ async def vision_llm(request: Request, data: VisionLLMRequest):
         cached_after_wait = _get_cached(symbol, timeframe, dt_str)
         if cached_after_wait:
             logger.info("vision_llm  ⚡  cache hit after wait")
+            if bot_config_id and cached_after_wait.get("llm_text"):
+                await bot_hub.patch_bot_state(bot_config_id, {"llm_text": str(cached_after_wait.get("llm_text") or "")})
             return {"message": "success", "cached": True, **cached_after_wait}
 
         try:
@@ -171,6 +177,8 @@ async def vision_llm(request: Request, data: VisionLLMRequest):
         await _release_inflight_lock(cache_key, lock)
 
     logger.info("vision_llm  ✔  %.1fs", elapsed)
+    if bot_config_id and result_data.get("llm_text"):
+        await bot_hub.patch_bot_state(bot_config_id, {"llm_text": str(result_data.get("llm_text") or "")})
     return {"message": "success", "cached": False, **result_data}
 
 

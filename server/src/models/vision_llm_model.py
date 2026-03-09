@@ -1,11 +1,13 @@
 from pydantic import BaseModel, field_validator
 from datetime import datetime
+from typing import Optional
 
 
 class VisionLLMRequest(BaseModel):
     date_time: datetime
     symbol: str
     timeframe: str = "H1"
+    bot_config_id: Optional[str] = None
 
     @field_validator("date_time", mode="before")
     @classmethod
