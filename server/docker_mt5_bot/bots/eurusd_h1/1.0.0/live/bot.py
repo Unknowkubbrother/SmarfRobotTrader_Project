@@ -36,6 +36,8 @@ from .config import (
     INTRABAR_TRAILING_ENABLED,
     INTRABAR_TRAIL_ARM_BUFFER_RATIO,
     INTRABAR_TRAIL_CONFIRM_POLLS,
+    INTRABAR_DISABLE_LAST_SEC,
+    INTRABAR_MIN_BAR_AGE_SEC,
     INTRABAR_TRAIL_KEEP_RATIO_NORMAL,
     INTRABAR_TRAIL_KEEP_RATIO_TIGHT,
     INTRABAR_TRAIL_KEEP_RATIO_TREND,
@@ -171,6 +173,8 @@ class LiveTradingBot:
         self.intrabar_trail_keep_ratio_tight = float(INTRABAR_TRAIL_KEEP_RATIO_TIGHT)
         self.intrabar_trail_arm_buffer_ratio = float(INTRABAR_TRAIL_ARM_BUFFER_RATIO)
         self.intrabar_trail_confirm_polls = max(1, int(INTRABAR_TRAIL_CONFIRM_POLLS))
+        self.intrabar_min_bar_age_sec = max(0, int(INTRABAR_MIN_BAR_AGE_SEC))
+        self.intrabar_disable_last_sec = max(0, int(INTRABAR_DISABLE_LAST_SEC))
         self.vision_llm_api_url = str(VISION_LLM_API_URL or "").strip()
         self.vision_llm_embed_text_api_url = str(VISION_LLM_EMBED_TEXT_API_URL or "").strip()
         # Live real-only semantic can take long on model warmup; avoid false timeout loops.
@@ -3634,6 +3638,21 @@ class LiveTradingBot:
             targets["pnl_money"] = float(self.intrabar_take_profit_money)
         return targets
 
+    def _intrabar_guard_window(self, current_bar_time: int, tick_time_ts: int) -> tuple[bool, str]:
+        if current_bar_time <= 0 or int(self.timeframe_seconds) <= 0:
+            return True, ""
+
+        ref_ts = int(tick_time_ts or 0) or int(time.time())
+        seconds_into_bar = max(0, ref_ts - int(current_bar_time))
+        seconds_into_bar = min(seconds_into_bar, int(self.timeframe_seconds))
+        seconds_to_close = max(0, int(self.timeframe_seconds) - seconds_into_bar)
+
+        if self.intrabar_min_bar_age_sec > 0 and seconds_into_bar < int(self.intrabar_min_bar_age_sec):
+            return False, "min_bar_age"
+        if self.intrabar_disable_last_sec > 0 and seconds_to_close <= int(self.intrabar_disable_last_sec):
+            return False, "bar_close_lockout"
+        return True, ""
+
     def _intrabar_trail_buffer_value(self, arm_value: float) -> float:
         arm_value = float(arm_value or 0.0)
         if arm_value <= 0.0:
@@ -4007,6 +4026,10 @@ class LiveTradingBot:
         stale_age_sec = max(0, now_epoch - tick_time_ts) if tick_time_ts > 0 else 999999
         max_stale_sec = max(5, int(round(float(POLL_SECONDS) * 3.0)))
         if stale_tick and stale_age_sec > max_stale_sec:
+            return False
+        guard_allowed, _guard_reason = self._intrabar_guard_window(current_bar_time, tick_time_ts)
+        if not guard_allowed:
+            self._clear_intrabar_trailing_state()
             return False
 
         metrics = self._build_intrabar_metrics(current_pos, pos, tick_data)
@@ -4708,10 +4731,17 @@ class LiveTradingBot:
 
         action_name = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}.get(action, "?")
         raw_action = int(decision.get("raw_action", action))
+        model_raw_action = int(decision.get("model_raw_action", raw_action))
         raw_action_name = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}.get(raw_action, "?")
+        model_raw_action_name = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}.get(model_raw_action, "?")
+        selection_reasons = [str(x) for x in decision.get("selection_reasons", []) if str(x).strip()]
+        selection_suffix = ""
+        if model_raw_action != raw_action:
+            selection_label = ", ".join(selection_reasons) if selection_reasons else "adjusted"
+            selection_suffix = f" | model={model_raw_action_name} | selection={selection_label}"
         self.last_action = action_name
         print(
-            f" [MODEL] action={action_name} raw={raw_action_name} | price={model_price:.5f} | "
+            f" [MODEL] action={action_name} raw={raw_action_name}{selection_suffix} | price={model_price:.5f} | "
             f"dTick={delta_tick} | dPrice={delta_price:.5f} | {delta_note}"
         )
         probs = decision.get("probs")
@@ -4723,16 +4753,25 @@ class LiveTradingBot:
             )
         gate_reasons = [str(x) for x in decision.get("gate_reasons", []) if str(x).strip()]
         if action == 0 and raw_action != 0 and gate_reasons:
-            print(f" [GATE] blocked -> HOLD | reasons: {', '.join(gate_reasons)}")
+            if gate_reasons == ["close_without_position"]:
+                print(" [GATE] close ignored while flat -> HOLD")
+            else:
+                print(f" [GATE] blocked -> HOLD | reasons: {', '.join(gate_reasons)}")
         self._add_log(
             "analysis",
-            f"{mode} | action={action_name} raw={raw_action_name} | price={model_price:.5f} | dTick={delta_tick}",
+            (
+                f"{mode} | action={action_name} raw={raw_action_name}"
+                f"{f' model={model_raw_action_name}' if model_raw_action != raw_action else ''}"
+                f" | price={model_price:.5f} | dTick={delta_tick}"
+            ),
             phase="model",
             event="bar_inference",
             meta={
                 "mode": mode,
                 "final_action": action_name,
                 "raw_action": raw_action_name,
+                "model_raw_action": model_raw_action_name,
+                "selection_reasons": " | ".join(selection_reasons),
                 "price": float(model_price),
                 "delta_tick": int(delta_tick),
                 "delta_price": float(delta_price),
@@ -4755,7 +4794,7 @@ class LiveTradingBot:
         if action == 0 and raw_action != 0 and gate_reasons:
             self._add_log(
                 "warning",
-                "Gate blocked signal -> HOLD",
+                "Close ignored while flat -> HOLD" if gate_reasons == ["close_without_position"] else "Gate blocked signal -> HOLD",
                 phase="gate",
                 event="blocked",
                 meta={"raw_action": raw_action_name, "reasons": " | ".join(gate_reasons)},
@@ -4789,21 +4828,29 @@ class LiveTradingBot:
         self.last_action = action_name
 
         decision_status = "pass"
+        flat_close_ignored = (
+            (model_raw_action == 3 and "mask_close_when_flat" in selection_reasons)
+            or gate_reasons == ["close_without_position"]
+        )
         if raw_action == 0 and action == 0:
-            decision_status = "model_hold"
+            decision_status = "flat_close_ignored" if flat_close_ignored else "model_hold"
         elif raw_action != 0 and action == 0:
             if schedule_blocked:
                 decision_status = "schedule_blocked"
             elif startup_entry_blocked:
                 decision_status = "startup_entry_blocked"
+            elif flat_close_ignored:
+                decision_status = "flat_close_ignored"
             elif gate_reasons:
                 decision_status = "gate_blocked"
             else:
                 decision_status = "suppressed"
-        elif raw_action != action:
+        elif raw_action != action or model_raw_action != raw_action:
             decision_status = "adjusted"
 
         reason_parts = []
+        if selection_reasons:
+            reason_parts.append("selection:" + ", ".join(selection_reasons))
         if gate_reasons:
             reason_parts.append("gate:" + ", ".join(gate_reasons))
         if schedule_blocked:
@@ -4816,19 +4863,21 @@ class LiveTradingBot:
         cooldown_after = int(decision.get("cooldown_after", 0))
         print(
             " [DECISION] "
-            f"raw={raw_action_name} final={action_name} "
+            f"raw={raw_action_name} model={model_raw_action_name} final={action_name} "
             f"status={decision_status} sem_q={sem_q:.2f} "
             f"cooldown={cooldown_after} reasons={' | '.join(reason_parts)}"
         )
         self._add_log(
             "analysis",
-            f"Decision {decision_status}: raw={raw_action_name} final={action_name}",
+            f"Decision {decision_status}: raw={raw_action_name} model={model_raw_action_name} final={action_name}",
             phase="decision",
             event="summary",
             meta={
                 "status": decision_status,
                 "raw_action": raw_action_name,
+                "model_raw_action": model_raw_action_name,
                 "final_action": action_name,
+                "selection_reasons": " | ".join(selection_reasons),
                 "semantic_quality": float(sem_q),
                 "cooldown_after": int(cooldown_after),
                 "reasons": " | ".join(reason_parts),
@@ -4875,8 +4924,10 @@ class LiveTradingBot:
             meta={
                 "mode": mode,
                 "raw_action": raw_action_name,
+                "model_raw_action": model_raw_action_name,
                 "final_action": action_name,
                 "status": decision_status,
+                "selection_reasons": " | ".join(selection_reasons),
                 "execute_orders": bool(execute_orders),
                 "order_ok": bool(order_ok),
             },
@@ -4933,6 +4984,10 @@ class LiveTradingBot:
                 )
                 intrabar_parts.append(f"buffer={self.intrabar_trail_arm_buffer_ratio:.2f}")
                 intrabar_parts.append(f"confirm={self.intrabar_trail_confirm_polls}")
+            if self.intrabar_min_bar_age_sec > 0:
+                intrabar_parts.append(f"min_age={self.intrabar_min_bar_age_sec}s")
+            if self.intrabar_disable_last_sec > 0:
+                intrabar_parts.append(f"stop_last={self.intrabar_disable_last_sec}s")
             print(f" [INTRABAR] realtime close active | {' | '.join(intrabar_parts)}")
             self._add_log(
                 "info",
@@ -4949,6 +5004,8 @@ class LiveTradingBot:
                     "trail_keep_ratio_tight": float(self.intrabar_trail_keep_ratio_tight),
                     "trail_arm_buffer_ratio": float(self.intrabar_trail_arm_buffer_ratio),
                     "trail_confirm_polls": int(self.intrabar_trail_confirm_polls),
+                    "min_bar_age_sec": int(self.intrabar_min_bar_age_sec),
+                    "disable_last_sec": int(self.intrabar_disable_last_sec),
                 },
             )
         self._start_ws_listener()

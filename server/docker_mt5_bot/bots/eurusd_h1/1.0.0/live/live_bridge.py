@@ -31,6 +31,7 @@ from .config import (
     HOLD_EDGE_THRESHOLD,
     INITIAL_BALANCE,
     MAX_HOLD_STEPS,
+    MASK_CLOSE_WHEN_FLAT,
     MIN_ACTION_MARGIN,
     OPEN_EDGE_THRESHOLD,
     OPEN_PROB_THRESHOLD,
@@ -98,6 +99,20 @@ class PPOBridge:
         self.recent_trade_pips = deque(maxlen=max(DEF_LOOKBACK_TRADES, 5))
         self.semantic_skips = 0
         self.last_decision = {}
+
+    def _resolve_live_action(self, probs):
+        model_probs = np.array(probs, dtype=np.float32, copy=True)
+        effective_probs = np.array(model_probs, copy=True)
+        model_raw_action = int(np.argmax(model_probs)) if model_probs.size else 0
+        selection_reasons = []
+
+        if MASK_CLOSE_WHEN_FLAT and self.position == 0 and effective_probs.size >= 4:
+            effective_probs[3] = 0.0
+            if model_raw_action == 3:
+                selection_reasons.append("mask_close_when_flat")
+
+        raw_action = int(np.argmax(effective_probs)) if effective_probs.size and float(np.max(effective_probs)) > 0.0 else 0
+        return model_probs, effective_probs, model_raw_action, raw_action, selection_reasons
 
     def _calc_pnl(self, entry, exit_price, direction):
         pips = (exit_price - entry) / PIP_SIZE
@@ -312,7 +327,7 @@ class PPOBridge:
         obs_input = np.array([obs_norm], dtype=np.float32)
         obs_tensor = self.model.policy.obs_to_tensor(obs_input)[0]
         probs = self.model.policy.get_distribution(obs_tensor).distribution.probs.detach().cpu().numpy()[0]
-        raw_action = int(np.argmax(probs))
+        model_probs, effective_probs, model_raw_action, raw_action, selection_reasons = self._resolve_live_action(probs)
         action = int(raw_action)
         cooldown_after_trade = TRADE_COOLDOWN_BARS
         if ADAPTIVE_GATE and self.defensive_mode_bars > 0:
@@ -330,14 +345,14 @@ class PPOBridge:
 
         if action in (1, 2):
             opposite_action = 2 if action == 1 else 1
-            confidence = float(probs[action])
-            edge = confidence - float(probs[opposite_action])
-            hold_edge = confidence - float(probs[0])
-            sorted_probs = np.sort(probs)
+            confidence = float(effective_probs[action])
+            edge = confidence - float(effective_probs[opposite_action])
+            hold_edge = confidence - float(effective_probs[0])
+            sorted_probs = np.sort(effective_probs)
             margin = float(sorted_probs[-1] - sorted_probs[-2]) if len(sorted_probs) > 1 else 0.0
             conf_thr, edge_thr, margin_thr, hold_edge_thr, cooldown_after_trade = self._gate_thresholds(
                 action,
-                probs,
+                effective_probs,
                 last_bar,
                 semantic_quality,
             )
@@ -369,12 +384,14 @@ class PPOBridge:
             gate_reasons.append("close_without_position")
             action = 0
 
-        probs_list = [float(x) for x in probs.tolist()]
+        probs_list = [float(x) for x in model_probs.tolist()]
         decision = {
             "ts_key": ts_key,
+            "model_raw_action": int(model_raw_action),
             "raw_action": int(raw_action),
             "final_action": int(action),
             "probs": probs_list,
+            "selection_reasons": list(selection_reasons),
             "semantic_quality": float(semantic_quality),
             "bar_context": {
                 "atr_norm": float(last_bar.get("atr_norm", 0.0)),
