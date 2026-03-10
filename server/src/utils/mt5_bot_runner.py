@@ -30,6 +30,13 @@ class BotRuntimeHealthResult:
     stderr: str = ""
 
 
+@dataclass
+class BotRuntimeContainerRef:
+    instance_name: str
+    project_name: str
+    container_id: str | None
+
+
 class BotRunnerError(RuntimeError):
     def __init__(
         self,
@@ -639,6 +646,21 @@ except Exception as exc:
     )
 
 
+def resolve_bot_runtime_container(*, instance_name: str) -> BotRuntimeContainerRef:
+    normalized_instance = str(instance_name or "").strip()
+    if not normalized_instance:
+        raise BotRunnerError("instance_name is required.")
+
+    _ensure_docker_access()
+    project_name = f"mt5_{_sanitize_instance_name(normalized_instance)}"
+    container_id = _resolve_container_id(project_name)
+    return BotRuntimeContainerRef(
+        instance_name=normalized_instance,
+        project_name=project_name,
+        container_id=container_id,
+    )
+
+
 def _resolve_runner_dir() -> Path:
     candidates: list[Path] = []
     configured = str(os.getenv("RUNNER_DIR", "") or "").strip()
@@ -713,24 +735,35 @@ def _resolve_docker_compose_cmd() -> list[str]:
 
 
 def _resolve_container_id(project_name: str) -> str | None:
-    service_name = str(os.getenv("MT5_SERVICE_NAME", "metatrader5-macos")).strip() or "metatrader5-macos"
-    proc = subprocess.run(
-        [
+    configured_service = str(os.getenv("MT5_SERVICE_NAME", "") or "").strip()
+    service_candidates: list[str | None] = []
+    for candidate in [configured_service, "smarfrobot-mt5", "metatrader5-macos", None]:
+        normalized = str(candidate or "").strip() or None
+        if normalized in service_candidates:
+            continue
+        service_candidates.append(normalized)
+
+    for service_name in service_candidates:
+        cmd = [
             "docker",
             "ps",
             "-aq",
             "--filter",
             f"label=com.docker.compose.project={project_name}",
-            "--filter",
-            f"label=com.docker.compose.service={service_name}",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        return None
-    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-    return lines[0] if lines else None
+        ]
+        if service_name:
+            cmd.extend(["--filter", f"label=com.docker.compose.service={service_name}"])
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            continue
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if lines:
+            return lines[0]
+    return None
 
 
 def _shorten_output(output: str | bytes | None, limit: int = 4000) -> str:

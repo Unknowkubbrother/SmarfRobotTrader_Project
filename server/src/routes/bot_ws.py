@@ -23,6 +23,7 @@ from ..utils.vision_llm.llm_client import (
     VisionLLMServiceUnavailableError,
 )
 from ..utils.trading_schedule import normalize_trading_schedule
+from ..utils.vision_llm.source_context import build_vision_cache_key, resolve_vision_source_context
 from ..utils.vision_llm.use_llm import generate_llm_cls_for_bar
 from ..utils.ws_manager import bot_hub
 from ..database.client import db, r_cache
@@ -51,8 +52,8 @@ _INSUFFICIENT_FUNDS_HINTS = (
 )
 
 
-def _cache_key(symbol: str, timeframe: str, dt_str: str) -> str:
-    return f"vision_llm:{symbol}:{timeframe}:{dt_str}"
+def _cache_key(symbol: str, timeframe: str, dt_str: str, source_context) -> str:
+    return build_vision_cache_key(symbol, timeframe, dt_str, source_context)
 
 
 def _enum_value(value):
@@ -735,9 +736,9 @@ async def _persist_bot_state(bot_config_id: str, state: dict) -> None:
         logger.warning("closed orders sync failed for %s: %s", bot_config_id, exc)
 
 
-def _get_cached(symbol: str, timeframe: str, dt_str: str) -> dict | None:
+def _get_cached(symbol: str, timeframe: str, dt_str: str, source_context) -> dict | None:
     try:
-        raw = r_cache.get(_cache_key(symbol, timeframe, dt_str))
+        raw = r_cache.get(_cache_key(symbol, timeframe, dt_str, source_context))
         if raw:
             return json.loads(raw)
     except Exception:
@@ -745,10 +746,10 @@ def _get_cached(symbol: str, timeframe: str, dt_str: str) -> dict | None:
     return None
 
 
-def _set_cached(symbol: str, timeframe: str, dt_str: str, data: dict) -> None:
+def _set_cached(symbol: str, timeframe: str, dt_str: str, source_context, data: dict) -> None:
     try:
         r_cache.setex(
-            _cache_key(symbol, timeframe, dt_str),
+            _cache_key(symbol, timeframe, dt_str, source_context),
             _CACHE_TTL,
             json.dumps(data, ensure_ascii=False),
         )
@@ -905,18 +906,25 @@ async def bot_ws_cron(data: VisionLLMRequest):
     """
     dt_str = data.date_time.strftime("%Y-%m-%d %H:%M:%S")
     timeframe = getattr(data, "timeframe", "H1") or "H1"
-    logger.info("cron  ▶  %s/%s  %s", data.symbol, timeframe, dt_str)
+    bot_config_id = str(getattr(data, "bot_config_id", "") or "").strip()
+    source_context = resolve_vision_source_context(bot_config_id)
+    logger.info("cron  ▶  %s/%s  %s  source=%s", data.symbol, timeframe, dt_str, source_context.display_label)
 
     # Check cache
-    cached = _get_cached(data.symbol, timeframe, dt_str)
+    cached = _get_cached(data.symbol, timeframe, dt_str, source_context)
     if cached:
         result_data = cached
         logger.info("cron  ⚡  cache hit %s/%s", data.symbol, timeframe)
     else:
         try:
             start = time.perf_counter()
-            result, cls_vec = await asyncio.to_thread(
-                generate_llm_cls_for_bar, data.date_time, data.symbol, timeframe,
+            result, cls_vec, chart_result = await asyncio.to_thread(
+                generate_llm_cls_for_bar,
+                date_time=data.date_time,
+                symbol=data.symbol,
+                timeframe=timeframe,
+                dataset_json=None,
+                bot_config_id=bot_config_id or None,
             )
             elapsed = time.perf_counter() - start
             result_data = {
@@ -926,8 +934,15 @@ async def bot_ws_cron(data: VisionLLMRequest):
                 "llm_text": result,
                 "cls_vec": cls_vec.tolist(),
                 "elapsed_seconds": round(elapsed, 2),
+                "chart_source": {
+                    "cache_scope": source_context.cache_scope,
+                    "requested_label": source_context.display_label,
+                    "mode": chart_result.source_mode,
+                    "label": chart_result.source_label,
+                    "resolved_bar_time": chart_result.resolved_bar_time,
+                },
             }
-            _set_cached(data.symbol, timeframe, dt_str, result_data)
+            _set_cached(data.symbol, timeframe, dt_str, source_context, result_data)
         except NoMarketDataError as exc:
             logger.warning("cron skip %s/%s %s: %s", data.symbol, timeframe, dt_str, exc)
             return {

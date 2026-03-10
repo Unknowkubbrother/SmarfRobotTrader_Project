@@ -140,7 +140,7 @@ for p in _raw_pairs.split(","):
     if ":" in p:
         sym, tf = p.split(":", 1)
         CRON_PAIRS.append((sym.strip().upper(), tf.strip().upper()))
-CRON_ENABLED = os.getenv("CRON_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
+CRON_ENABLED = os.getenv("CRON_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
 
 # Timeframe → seconds
 _TF_SECS = {

@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from ..models.vision_llm_model import VisionLLMRequest, VisionLLMTextEmbeddingRequest
 from ..utils.vision_llm.chart import MT5ConnectionError
+from ..utils.vision_llm.source_context import build_vision_cache_key, resolve_vision_source_context
 from ..utils.vision_llm.llm_client import (
     VisionLLMConfigError,
     VisionLLMServiceUnavailableError,
@@ -36,8 +37,13 @@ def _normalize_timeframe(timeframe: str) -> str:
     return tf or "H1"
 
 
-def _cache_key(symbol: str, timeframe: str, dt_str: str) -> str:
-    return f"vision_llm:{_normalize_symbol(symbol)}:{_normalize_timeframe(timeframe)}:{dt_str}"
+def _cache_key(symbol: str, timeframe: str, dt_str: str, source_context) -> str:
+    return build_vision_cache_key(
+        _normalize_symbol(symbol),
+        _normalize_timeframe(timeframe),
+        dt_str,
+        source_context,
+    )
 
 
 def _text_embed_cache_key(text: str) -> str:
@@ -45,9 +51,9 @@ def _text_embed_cache_key(text: str) -> str:
     return f"vision_llm:text_embed:{digest}"
 
 
-def _get_cached(symbol: str, timeframe: str, dt_str: str) -> dict | None:
+def _get_cached(symbol: str, timeframe: str, dt_str: str, source_context) -> dict | None:
     try:
-        raw = r_cache.get(_cache_key(symbol, timeframe, dt_str))
+        raw = r_cache.get(_cache_key(symbol, timeframe, dt_str, source_context))
         if raw:
             return json.loads(raw)
     except Exception:
@@ -55,10 +61,10 @@ def _get_cached(symbol: str, timeframe: str, dt_str: str) -> dict | None:
     return None
 
 
-def _set_cached(symbol: str, timeframe: str, dt_str: str, data: dict) -> None:
+def _set_cached(symbol: str, timeframe: str, dt_str: str, source_context, data: dict) -> None:
     try:
         r_cache.setex(
-            _cache_key(symbol, timeframe, dt_str),
+            _cache_key(symbol, timeframe, dt_str, source_context),
             _CACHE_TTL,
             json.dumps(data, ensure_ascii=False),
         )
@@ -121,20 +127,27 @@ async def vision_llm(request: Request, data: VisionLLMRequest):
     symbol = _normalize_symbol(data.symbol)
     timeframe = _normalize_timeframe(getattr(data, "timeframe", "H1"))
     bot_config_id = str(getattr(data, "bot_config_id", "") or "").strip()
-    logger.info("vision_llm  ▶  %s/%s  %s", symbol, timeframe, dt_str)
+    source_context = resolve_vision_source_context(bot_config_id)
+    logger.info(
+        "vision_llm  ▶  %s/%s  %s  source=%s",
+        symbol,
+        timeframe,
+        dt_str,
+        source_context.display_label,
+    )
 
-    cached = _get_cached(symbol, timeframe, dt_str)
+    cached = _get_cached(symbol, timeframe, dt_str, source_context)
     if cached:
         logger.info("vision_llm  ⚡  cache hit")
         if bot_config_id and cached.get("llm_text"):
             await bot_hub.patch_bot_state(bot_config_id, {"llm_text": str(cached.get("llm_text") or "")})
         return {"message": "success", "cached": True, **cached}
 
-    cache_key = _cache_key(symbol, timeframe, dt_str)
+    cache_key = _cache_key(symbol, timeframe, dt_str, source_context)
     lock = await _acquire_inflight_lock(cache_key)
     try:
         # Double-check after waiting lock: another request may have filled cache.
-        cached_after_wait = _get_cached(symbol, timeframe, dt_str)
+        cached_after_wait = _get_cached(symbol, timeframe, dt_str, source_context)
         if cached_after_wait:
             logger.info("vision_llm  ⚡  cache hit after wait")
             if bot_config_id and cached_after_wait.get("llm_text"):
@@ -143,8 +156,13 @@ async def vision_llm(request: Request, data: VisionLLMRequest):
 
         try:
             start = time.perf_counter()
-            result, cls_vec = await asyncio.to_thread(
-                generate_llm_cls_for_bar, data.date_time, symbol, timeframe,
+            result, cls_vec, chart_result = await asyncio.to_thread(
+                generate_llm_cls_for_bar,
+                date_time=data.date_time,
+                symbol=symbol,
+                timeframe=timeframe,
+                dataset_json=None,
+                bot_config_id=bot_config_id or None,
             )
             elapsed = time.perf_counter() - start
 
@@ -155,8 +173,15 @@ async def vision_llm(request: Request, data: VisionLLMRequest):
                 "llm_text": result,
                 "cls_vec": cls_vec.tolist(),
                 "elapsed_seconds": round(elapsed, 2),
+                "chart_source": {
+                    "cache_scope": source_context.cache_scope,
+                    "requested_label": source_context.display_label,
+                    "mode": chart_result.source_mode,
+                    "label": chart_result.source_label,
+                    "resolved_bar_time": chart_result.resolved_bar_time,
+                },
             }
-            _set_cached(symbol, timeframe, dt_str, result_data)
+            _set_cached(symbol, timeframe, dt_str, source_context, result_data)
 
         except MT5ConnectionError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
