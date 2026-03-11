@@ -1,4 +1,3 @@
-version: '3'
 services:
   metatrader5-macos:
     platform: linux/amd64

@@ -4,6 +4,7 @@ orchestrates the multi-step retrieval-augmented generation workflow.
 """
 
 import os
+import threading
 from urllib.parse import urlparse
 from typing import Optional
 
@@ -39,6 +40,8 @@ _DEFAULT_DATASET_JSON = os.getenv(
     "LLM_DATASET_JSON", os.path.join(_LLM_ROOT, "dataset.json"),
 )
 _runtime_cache: dict = {}
+_runtime_locks: dict[str, threading.Lock] = {}
+_runtime_locks_guard = threading.Lock()
 
 
 # ── Errors ───────────────────────────────────────────────────────────
@@ -160,6 +163,15 @@ def _normalize_dataset_json(dataset_json: Optional[str]) -> str:
     return os.path.abspath(path)
 
 
+def _get_runtime_lock(dataset_path: str) -> threading.Lock:
+    with _runtime_locks_guard:
+        lock = _runtime_locks.get(dataset_path)
+        if lock is None:
+            lock = threading.Lock()
+            _runtime_locks[dataset_path] = lock
+        return lock
+
+
 def get_runtime(dataset_json: Optional[str] = None) -> dict:
     """Return (or lazily create) the runtime dict with chart_db, text_db, and vision_llm."""
     dataset_path = _normalize_dataset_json(dataset_json)
@@ -167,18 +179,23 @@ def get_runtime(dataset_json: Optional[str] = None) -> dict:
     if runtime is not None:
         return runtime
 
-    chart_db = upsert_image_dataset(dataset_path)
-    text_db = upsert_text_dataset(dataset_path)
-    vision_llm = VisionLLMClient()
+    with _get_runtime_lock(dataset_path):
+        runtime = _runtime_cache.get(dataset_path)
+        if runtime is not None:
+            return runtime
 
-    runtime = {
-        "dataset_json": dataset_path,
-        "chart_db": chart_db,
-        "text_db": text_db,
-        "vision_llm": vision_llm,
-    }
-    _runtime_cache[dataset_path] = runtime
-    return runtime
+        chart_db = upsert_image_dataset(dataset_path)
+        text_db = upsert_text_dataset(dataset_path)
+        vision_llm = VisionLLMClient()
+
+        runtime = {
+            "dataset_json": dataset_path,
+            "chart_db": chart_db,
+            "text_db": text_db,
+            "vision_llm": vision_llm,
+        }
+        _runtime_cache[dataset_path] = runtime
+        return runtime
 
 
 # ── RAG pipeline ─────────────────────────────────────────────────────
