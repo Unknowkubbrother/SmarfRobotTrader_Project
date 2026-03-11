@@ -3,9 +3,9 @@ import html
 import os
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import Response
 
 from ..database.client import db
@@ -17,6 +17,8 @@ from ..models.subscription_model import (
     AdminSubscriptionManagementResponse,
     AdminSubscriptionStatsResponse,
     AttachPaymentMethodRequest,
+    CreateCheckoutSessionRequest,
+    CreateCheckoutSessionResponse,
     CreateSetupIntentResponse,
     InvoiceResponse,
     PayInvoiceRequest,
@@ -30,10 +32,34 @@ from ..models.subscription_model import (
     WeeklyPreviewResponse,
 )
 from ..utils.subscription_billing import (
+    ChargeAttemptResult,
+    _build_payment_breakdown,
+    _build_payment_error_details,
+    _build_payment_method_details,
+    _extract_presentment_breakdown as _build_presentment_breakdown,
+    _format_invoice_payment_method_display,
+    _extract_request_id,
+    _invoice_charge_update_payload,
+    _to_prisma_json,
     billing_period_for_due_date,
     build_invoice_pdf,
+    build_expected_payment_breakdown,
+    convert_invoice_amount_to_promptpay_currency,
+    get_billing_base_currency,
+    get_invoice_payment_amount_details,
+    get_promptpay_currency,
+    get_promptpay_exchange_rate,
+    get_assignable_period_daily_aggregates,
+    promptpay_checkout_configured,
+    merge_payment_breakdown_with_expected_amount,
+    normalize_subscription_next_billing_date,
+    notify_invoice_event,
     pay_invoice_now,
+    promptpay_amount_to_minor_units,
     process_all_due_billing,
+    reconcile_open_invoice_amount,
+    resolve_promptpay_exchange_rate,
+    sync_daily_aggregate_status_for_invoice,
 )
 from ..utils.subscription_access import (
     get_user_subscription_access_state,
@@ -62,10 +88,18 @@ ADMIN_FEE_TYPES = {"percentage", "fixed"}
 ADMIN_SUB_STATUSES = {"active", "past_due", "canceled"}
 COLLECTION_MODES = {"automatic", "manual"}
 _PAYMENT_METHOD_NOTIFICATION_RELATED_LINK = "/subscription"
+STRIPE_WEBHOOK_SECRET = str(os.getenv("STRIPE_WEBHOOK_SECRET", "") or "").strip()
+CHECKOUT_PAYMENT_FLOWS = {"card", "promptpay"}
+PROMPTPAY_MIN_AMOUNT_THB = 10.0
 
 
-def _to_float(value: Optional[Decimal]) -> float:
-    return float(value) if value is not None else 0.0
+def _to_float(value: Optional[Decimal], default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
 
 
 def _enum_value(value):
@@ -160,6 +194,40 @@ def _calculate_estimated_fee(
     return max((net_profit * fee_value) / 100.0, 0.0)
 
 
+def _summarize_daily_aggregate_rows(rows: list[Any]) -> tuple[float, float, float]:
+    gross_profit = 0.0
+    gross_loss = 0.0
+
+    for aggregate in rows:
+        pnl = _to_float(getattr(aggregate, "dailyNetProfit", None), 0.0)
+        if pnl >= 0:
+            gross_profit += pnl
+        else:
+            gross_loss += abs(pnl)
+
+    net_profit = gross_profit - gross_loss
+    return (round(gross_profit, 2), round(gross_loss, 2), round(net_profit, 2))
+
+
+async def _load_billing_preview_rows(
+    *,
+    user_id: str,
+    period_start: date,
+    period_end: date,
+    invoice_id: str | None = None,
+) -> list[Any]:
+    if invoice_id:
+        return await db.dailyaggregate.find_many(
+            where={"billingInvoiceId": invoice_id}
+        )
+
+    return await get_assignable_period_daily_aggregates(
+        user_id=user_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+
+
 def _require_admin(current_user):
     role = _enum_value(getattr(current_user, "role", None))
     if role != "admin":
@@ -181,8 +249,70 @@ async def _stripe_call(callable_obj, *args, **kwargs):
     return await asyncio.to_thread(callable_obj, *args, **kwargs)
 
 
+def _resolve_frontend_base_url() -> str:
+    frontend_url = build_absolute_related_link("/") or "http://localhost:3000/"
+    return str(frontend_url).rstrip("/")
+
+
+def _resolve_checkout_currency() -> str:
+    return get_billing_base_currency().strip().lower() or "usd"
+
+
+def _resolve_checkout_payment_method_types(payment_flow: str) -> list[str]:
+    if payment_flow == "promptpay":
+        return ["promptpay"]
+    return ["card"]
+
+
+def _build_checkout_success_url(invoice_id: str) -> str:
+    return (
+        f"{_resolve_frontend_base_url()}/subscription"
+        f"?checkout=success&invoice_id={invoice_id}&session_id={{CHECKOUT_SESSION_ID}}"
+    )
+
+
+def _build_checkout_cancel_url(invoice_id: str) -> str:
+    return f"{_resolve_frontend_base_url()}/subscription?checkout=cancelled&invoice_id={invoice_id}"
+
+
+def _checkout_session_is_reusable(session) -> bool:
+    return str(session.get("status") or "").strip().lower() == "open" and bool(session.get("url"))
+
+
+def _extract_stripe_object_id(value) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, dict):
+        object_id = str(value.get("id") or "").strip()
+        return object_id or None
+    object_id = str(getattr(value, "id", "") or "").strip()
+    return object_id or None
+
+
+def _checkout_note_for_status(status: str) -> str:
+    if status == "paid":
+        return "Stripe Checkout payment completed."
+    if status == "failed":
+        return "Stripe Checkout payment failed."
+    return "Awaiting Stripe Checkout payment completion."
+
+
 def _escape_text(value: object) -> str:
     return html.escape(str(value or "").strip())
+
+
+def _promptpay_enabled() -> bool:
+    return promptpay_checkout_configured()
+
+
+def _normalize_checkout_payment_flow(raw_value: str | None) -> str:
+    payment_flow = str(raw_value or "card").strip().lower() or "card"
+    if payment_flow not in CHECKOUT_PAYMENT_FLOWS:
+        raise HTTPException(status_code=400, detail="payment_flow must be card or promptpay")
+    if payment_flow == "promptpay" and not _promptpay_enabled():
+        raise HTTPException(status_code=400, detail="PromptPay checkout is not configured")
+    return payment_flow
 
 
 def _payment_method_label(method) -> str:
@@ -240,7 +370,13 @@ async def _notify_payment_method_added(*, user, method, set_as_default: bool) ->
         return
 
 
-def _map_subscription_response(subscription, *, status_override: str | None = None, next_billing_date: str | None = None):
+def _map_subscription_response(
+    subscription,
+    *,
+    status_override: str | None = None,
+    next_billing_date: str | None = None,
+    promptpay_exchange_rate: float | None = None,
+):
     fee_type = _enum_value(subscription.feeType) or "percentage"
     fee_value = _to_float(subscription.feeValue)
     min_profit_threshold = _to_float(subscription.minProfitThreshold)
@@ -253,6 +389,15 @@ def _map_subscription_response(subscription, *, status_override: str | None = No
         min_profit_threshold=round(min_profit_threshold, 2),
         next_billing_date=next_billing_date if next_billing_date is not None else _to_date_string(subscription.nextBillingDate),
         default_payment_method_id=subscription.defaultPaymentMethodId,
+        billing_currency=get_billing_base_currency(),
+        billing_exchange_rate=1.0,
+        promptpay_enabled=_promptpay_enabled(),
+        promptpay_currency=get_promptpay_currency() if _promptpay_enabled() else None,
+        promptpay_exchange_rate=(
+            promptpay_exchange_rate
+            if _promptpay_enabled() and promptpay_exchange_rate is not None
+            else (get_promptpay_exchange_rate() if _promptpay_enabled() else None)
+        ),
     )
 
 
@@ -397,6 +542,68 @@ async def _sync_customer_payment_methods(user_id: str, stripe_customer_id: str):
             )
 
 
+async def _sync_checkout_card_payment_method(
+    *,
+    user_id: str,
+    stripe_customer_id: str | None,
+    stripe_payment_intent,
+    subscription_id: str,
+):
+    if not stripe_customer_id or not _stripe_enabled():
+        return None
+
+    provider_method_id = _extract_stripe_object_id((stripe_payment_intent or {}).get("payment_method"))
+    existing_local_method = None
+    if provider_method_id:
+        existing_local_method = await db.userpaymentmethod.find_first(
+            where={
+                "userId": user_id,
+                "providerMethodId": provider_method_id,
+                "isActive": True,
+            }
+        )
+
+    had_active_methods = await db.userpaymentmethod.count(where={"userId": user_id, "isActive": True}) > 0
+    await _sync_customer_payment_methods(user_id, stripe_customer_id)
+
+    if not provider_method_id:
+        return None
+
+    local_method = await db.userpaymentmethod.find_first(
+        where={
+            "userId": user_id,
+            "providerMethodId": provider_method_id,
+            "isActive": True,
+        }
+    )
+    if not local_method:
+        return None
+
+    subscription = await db.subscription.find_unique(where={"id": subscription_id})
+    if not subscription:
+        return local_method
+
+    should_set_default = not had_active_methods or not getattr(subscription, "defaultPaymentMethodId", None)
+    if should_set_default:
+        await _set_default_payment_method(
+            user_id=user_id,
+            method_id=str(local_method.id),
+            stripe_customer_id=stripe_customer_id,
+        )
+        local_method = await db.userpaymentmethod.find_unique(where={"id": str(local_method.id)}) or local_method
+
+    if existing_local_method is None:
+        user = await db.user.find_unique(where={"id": user_id})
+        if user:
+            await _notify_payment_method_added(
+                user=user,
+                method=local_method,
+                set_as_default=bool(getattr(local_method, "isDefault", False)),
+            )
+
+    return local_method
+
+
 async def _set_default_payment_method(
     user_id: str,
     method_id: str,
@@ -446,6 +653,323 @@ def _map_payment_method(method) -> PaymentMethodResponse:
     )
 
 
+def _extract_invoice_payment_display(invoice) -> tuple[float | None, str | None]:
+    amount_details = get_invoice_payment_amount_details(invoice)
+    payment_amount = amount_details.get("actual_payment_amount")
+    payment_currency = amount_details.get("actual_payment_currency")
+
+    if payment_amount is None or not payment_currency:
+        payment_amount = amount_details.get("expected_payment_amount")
+        payment_currency = amount_details.get("expected_payment_currency")
+
+    if payment_amount is None:
+        payment_amount = round(_to_float(getattr(invoice, "calculatedFee", None), 0.0), 2)
+    if not payment_currency:
+        payment_currency = get_billing_base_currency()
+
+    return (round(_to_float(payment_amount, 0.0), 2), str(payment_currency).upper())
+
+
+def _map_invoice_response(invoice) -> InvoiceResponse:
+    payment_amount, payment_currency = _extract_invoice_payment_display(invoice)
+    return InvoiceResponse(
+        id=str(invoice.id),
+        billing_start_date=_to_date_string(invoice.billingStartDate),
+        billing_end_date=_to_date_string(invoice.billingEndDate),
+        total_period_profit=round(_to_float(invoice.totalPeriodProfit), 2),
+        calculated_fee=round(_to_float(invoice.calculatedFee), 2),
+        payment_amount=payment_amount,
+        payment_currency=payment_currency,
+        status=_enum_value(invoice.status),
+        payment_method_used=invoice.paymentMethodUsed,
+        payment_method_label=_format_invoice_payment_method_display(invoice),
+        paid_at=_to_datetime_string(invoice.paidAt),
+        created_at=_to_datetime_string(invoice.createdAt),
+    )
+
+
+def _invoice_period(invoice) -> tuple[date | None, date | None]:
+    return (
+        _extract_date(getattr(invoice, "billingStartDate", None)),
+        _extract_date(getattr(invoice, "billingEndDate", None)),
+    )
+
+
+def _invoice_periods_overlap(left_invoice, right_invoice) -> bool:
+    left_start, left_end = _invoice_period(left_invoice)
+    right_start, right_end = _invoice_period(right_invoice)
+    if not left_start or not left_end or not right_start or not right_end:
+        return False
+    return left_start <= right_end and right_start <= left_end
+
+
+def _filter_user_visible_invoices(invoices: list[Any]) -> list[Any]:
+    visible_invoices: list[Any] = []
+    for invoice in invoices:
+        invoice_status = str(_enum_value(getattr(invoice, "status", None)) or "").strip().lower()
+        invoice_amount = round(_to_float(getattr(invoice, "calculatedFee", None), 0.0), 2)
+        overlaps_another_invoice = any(
+            str(getattr(other_invoice, "id", "") or "") != str(getattr(invoice, "id", "") or "")
+            and _invoice_periods_overlap(invoice, other_invoice)
+            for other_invoice in invoices
+        )
+        if invoice_status == "skipped" and invoice_amount <= 0 and overlaps_another_invoice:
+            continue
+        visible_invoices.append(invoice)
+    return visible_invoices
+
+
+def _checkout_session_is_paid(session: Any) -> bool:
+    if not session or not hasattr(session, "get"):
+        return False
+    return str(session.get("payment_status") or "").strip().lower() == "paid"
+
+
+async def _find_paid_checkout_session_for_invoice(
+    *,
+    invoice_id: str,
+    stripe_customer_id: str | None,
+    preferred_session_id: str | None = None,
+) -> Any | None:
+    seen_session_ids: set[str] = set()
+
+    async def try_session(session_id: str | None) -> Any | None:
+        if not session_id or not session_id.startswith("cs_") or session_id in seen_session_ids:
+            return None
+        seen_session_ids.add(session_id)
+        try:
+            session = await _stripe_call(
+                stripe.checkout.Session.retrieve,
+                session_id,
+                expand=["payment_intent"],
+            )
+        except Exception:
+            return None
+        metadata = (session.get("metadata") or {}) if hasattr(session, "get") else {}
+        if str(metadata.get("invoice_id") or "").strip() != invoice_id:
+            return None
+        if _checkout_session_is_paid(session):
+            return session
+        return None
+
+    paid_session = await try_session(preferred_session_id)
+    if paid_session:
+        return paid_session
+
+    if not stripe_customer_id:
+        return None
+
+    try:
+        payment_intents = await _stripe_call(
+            stripe.PaymentIntent.list,
+            customer=stripe_customer_id,
+            limit=25,
+        )
+    except Exception:
+        return None
+
+    for payment_intent in (payment_intents.get("data") or []):
+        metadata = (payment_intent.get("metadata") or {}) if hasattr(payment_intent, "get") else {}
+        if str(metadata.get("invoice_id") or "").strip() != invoice_id:
+            continue
+        if str(payment_intent.get("status") or "").strip().lower() != "succeeded":
+            continue
+
+        payment_details = payment_intent.get("payment_details") or {}
+        order_reference = str(payment_details.get("order_reference") or "").strip()
+        paid_session = await try_session(order_reference)
+        if paid_session:
+            return paid_session
+
+        return {
+            "id": order_reference or f"checkout-{payment_intent.get('id')}",
+            "customer": stripe_customer_id,
+            "payment_intent": payment_intent.get("id"),
+            "payment_status": "paid",
+            "status": "complete",
+            "metadata": metadata,
+        }
+
+    return None
+
+
+async def _finalize_paid_checkout_invoice_if_available(
+    *,
+    invoice,
+    user,
+    preferred_session_id: str | None = None,
+    notify_user: bool = False,
+):
+    if not _stripe_enabled():
+        return invoice
+
+    invoice_status = str(_enum_value(getattr(invoice, "status", None)) or "").strip().lower()
+    if invoice_status == "paid":
+        return invoice
+
+    stripe_customer_id = str(getattr(user, "stripeCustomerId", "") or "").strip() or None
+    paid_session = await _find_paid_checkout_session_for_invoice(
+        invoice_id=str(invoice.id),
+        stripe_customer_id=stripe_customer_id,
+        preferred_session_id=preferred_session_id or str(getattr(invoice, "processorRequestId", "") or "").strip() or None,
+    )
+    if not paid_session:
+        return invoice
+
+    return await _finalize_checkout_invoice(
+        invoice=invoice,
+        user=user,
+        stripe_session=paid_session,
+        target_status="paid",
+        notify_user=notify_user,
+    )
+
+
+async def _build_checkout_charge_result(
+    *,
+    invoice,
+    stripe_session,
+    stripe_payment_intent,
+    local_payment_method,
+    status: str,
+):
+    latest_charge = (stripe_payment_intent or {}).get("latest_charge") or {}
+    if not isinstance(latest_charge, dict) and not hasattr(latest_charge, "get"):
+        latest_charge = {}
+    invoice_amount_usd = round(_to_float(getattr(invoice, "calculatedFee", None), 0.0), 2)
+    amount_details = get_invoice_payment_amount_details(invoice)
+    expected_payment_amount = amount_details.get("expected_payment_amount")
+    expected_payment_currency = amount_details.get("expected_payment_currency")
+    configured_exchange_rate = amount_details.get("configured_exchange_rate")
+
+    payment_breakdown = _build_payment_breakdown(stripe_payment_intent)
+    presentment_breakdown = _build_presentment_breakdown(stripe_session) or _build_presentment_breakdown(
+        stripe_payment_intent
+    )
+    if presentment_breakdown:
+        payment_breakdown = {**(payment_breakdown or {}), **presentment_breakdown}
+
+    return ChargeAttemptResult(
+        status=status,
+        payment_intent_id=_extract_stripe_object_id(stripe_payment_intent),
+        paid_at=datetime.utcnow() if status == "paid" else None,
+        note=_checkout_note_for_status(status),
+        local_payment_method_id=str(getattr(local_payment_method, "id", "") or "").strip() or None,
+        provider_payment_method_id=_extract_stripe_object_id((stripe_payment_intent or {}).get("payment_method")),
+        request_id=_extract_request_id(stripe_payment_intent) or getattr(invoice, "processorRequestId", None),
+        charge_id=_extract_stripe_object_id(latest_charge),
+        balance_transaction_id=_extract_stripe_object_id(latest_charge.get("balance_transaction")),
+        payment_breakdown=merge_payment_breakdown_with_expected_amount(
+            payment_breakdown,
+            invoice_amount_usd=invoice_amount_usd,
+            expected_payment_amount=expected_payment_amount,
+            expected_payment_currency=expected_payment_currency,
+            configured_exchange_rate=configured_exchange_rate,
+        ),
+        payment_method_details=_build_payment_method_details(
+            local_payment_method=local_payment_method,
+            stripe_payment_method=(stripe_payment_intent or {}).get("payment_method"),
+        ),
+        payment_error_details=_build_payment_error_details(None, payment_intent=stripe_payment_intent),
+    )
+
+
+async def _finalize_checkout_invoice(
+    *,
+    invoice,
+    user,
+    stripe_session,
+    target_status: str,
+    notify_user: bool,
+):
+    subscription = getattr(invoice, "subscription", None)
+    if subscription is None:
+        subscription = await db.subscription.find_unique(where={"id": str(invoice.subId)})
+    if subscription is None:
+        raise HTTPException(status_code=404, detail="Subscription not found for invoice")
+
+    stripe_payment_intent = None
+    payment_intent_id = _extract_stripe_object_id((stripe_session or {}).get("payment_intent"))
+    if payment_intent_id:
+        try:
+            stripe_payment_intent = await _stripe_call(
+                stripe.PaymentIntent.retrieve,
+                payment_intent_id,
+                expand=["latest_charge.balance_transaction", "payment_method"],
+            )
+        except Exception:
+            stripe_payment_intent = None
+
+    local_payment_method = None
+    stripe_customer_id = _extract_stripe_object_id((stripe_session or {}).get("customer")) or str(
+        getattr(user, "stripeCustomerId", "") or ""
+    ).strip() or None
+    payment_method_data = (stripe_payment_intent or {}).get("payment_method") or {}
+    payment_method_type = ""
+    if isinstance(payment_method_data, dict):
+        payment_method_type = str(payment_method_data.get("type") or "").strip().lower()
+
+    if stripe_payment_intent and stripe_customer_id and payment_method_type == "card":
+        local_payment_method = await _sync_checkout_card_payment_method(
+            user_id=str(user.id),
+            stripe_customer_id=stripe_customer_id,
+            stripe_payment_intent=stripe_payment_intent,
+            subscription_id=str(subscription.id),
+        )
+
+    if stripe_payment_intent:
+        charge_result = await _build_checkout_charge_result(
+            invoice=invoice,
+            stripe_session=stripe_session,
+            stripe_payment_intent=stripe_payment_intent,
+            local_payment_method=local_payment_method,
+            status=target_status,
+        )
+        update_payload = _invoice_charge_update_payload(
+            charge_result,
+            payment_method_used=charge_result.local_payment_method_id,
+            status=target_status,
+        )
+    else:
+        invoice_amount_usd = round(_to_float(getattr(invoice, "calculatedFee", None), 0.0), 2)
+        amount_details = get_invoice_payment_amount_details(invoice)
+        payment_breakdown = merge_payment_breakdown_with_expected_amount(
+            _build_presentment_breakdown(stripe_session),
+            invoice_amount_usd=invoice_amount_usd,
+            expected_payment_amount=amount_details.get("expected_payment_amount"),
+            expected_payment_currency=amount_details.get("expected_payment_currency"),
+            configured_exchange_rate=amount_details.get("configured_exchange_rate"),
+        )
+        update_payload = {
+            "status": target_status,
+            "paidAt": datetime.utcnow() if target_status == "paid" else None,
+            "stripePaymentIntentId": payment_intent_id,
+            "processorRequestId": _extract_stripe_object_id(stripe_session),
+            "paymentBreakdown": _to_prisma_json(payment_breakdown) if payment_breakdown else None,
+        }
+
+    updated_invoice = await db.invoice.update(
+        where={"id": str(invoice.id)},
+        data=update_payload,
+        include={"subscription": True},
+    )
+    await sync_daily_aggregate_status_for_invoice(str(updated_invoice.id), target_status)
+    await sync_subscription_status_from_invoices(str(subscription.id))
+
+    if notify_user:
+        await notify_invoice_event(
+            invoice=updated_invoice,
+            user=user,
+            subscription=updated_invoice.subscription,
+            event_type="payment_received" if target_status == "paid" else "payment_failed",
+            note=_checkout_note_for_status(target_status),
+            source="manual",
+            event_token=payment_intent_id or _extract_stripe_object_id(stripe_session) or target_status,
+        )
+
+    return updated_invoice
+
+
 @subscription_router.get("/summary", response_model=SubscriptionSummaryResponse)
 async def get_subscription_summary(
     current_user: Annotated[any, Depends(get_current_active_user)],
@@ -465,20 +989,17 @@ async def get_subscription_summary(
     await process_all_due_billing(today=today, user_id=user_id)
     await sync_subscription_status_from_invoices(str(subscription.id), allow_reactivate=False)
     subscription = await db.subscription.find_unique(where={"id": str(subscription.id)}) or subscription
-    current_next_billing_date = _extract_date(subscription.nextBillingDate)
-    resolved_next_billing_date = current_next_billing_date
-    if not resolved_next_billing_date:
-        resolved_next_billing_date = _resolve_subscription_next_billing_date(
+    fallback_next_billing_date = _extract_date(subscription.nextBillingDate)
+    if not fallback_next_billing_date:
+        fallback_next_billing_date = _resolve_subscription_next_billing_date(
             subscription.nextBillingDate,
             config=config,
             today=today,
         )
-        subscription = await db.subscription.update(
-            where={"id": str(subscription.id)},
-            data={"nextBillingDate": datetime.combine(resolved_next_billing_date, datetime.min.time())},
-        )
-    access_state = await get_user_subscription_access_state(user_id)
-
+    subscription, resolved_next_billing_date = await normalize_subscription_next_billing_date(
+        subscription,
+        fallback_due_date=fallback_next_billing_date,
+    )
     payment_methods = await db.userpaymentmethod.find_many(
         where={"userId": user_id, "isActive": True}
     )
@@ -492,63 +1013,83 @@ async def get_subscription_summary(
         order={"createdAt": "desc"},
         take=20,
     )
-
-    billing_period_start, billing_period_end = billing_period_for_due_date(resolved_next_billing_date)
-    weekly_aggregates = await db.dailyaggregate.find_many(
-        where={
-            "account": {
-                "userId": user_id,
-                "recordStatus": "active",
-            },
-            "date": {
-                "gte": datetime.combine(billing_period_start, datetime.min.time()),
-                "lte": datetime.combine(billing_period_end, datetime.max.time()),
-            },
-        }
+    invoices = _filter_user_visible_invoices(invoices)
+    unresolved_invoice = next(
+        (
+            invoice
+            for invoice in invoices
+            if str(_enum_value(getattr(invoice, "status", None)) or "").strip().lower() in {"pending", "failed"}
+        ),
+        None,
     )
+    if unresolved_invoice:
+        unresolved_invoice = await _finalize_paid_checkout_invoice_if_available(
+            invoice=unresolved_invoice,
+            user=current_user,
+            notify_user=False,
+        )
+        unresolved_invoice = await reconcile_open_invoice_amount(
+            unresolved_invoice,
+            subscription=subscription,
+            user_id=user_id,
+        )
+        invoices = [
+            unresolved_invoice if str(invoice.id) == str(unresolved_invoice.id) else invoice
+            for invoice in invoices
+        ]
+        if str(_enum_value(getattr(unresolved_invoice, "status", None)) or "").strip().lower() not in {"pending", "failed"}:
+            unresolved_invoice = None
 
-    gross_profit = 0.0
-    gross_loss = 0.0
-
-    for aggregate in weekly_aggregates:
-        pnl = _to_float(aggregate.dailyNetProfit)
-        if pnl >= 0:
-            gross_profit += pnl
-        else:
-            gross_loss += abs(pnl)
-
-    net_profit = gross_profit - gross_loss
     fee_type = _enum_value(subscription.feeType) or "percentage"
     fee_value = _to_float(subscription.feeValue)
     min_profit_threshold = _to_float(subscription.minProfitThreshold)
-    estimated_fee = _calculate_estimated_fee(
-        net_profit=net_profit,
-        fee_type=fee_type,
-        fee_value=fee_value,
-        min_profit_threshold=min_profit_threshold,
-    )
-    next_billing_date = resolved_next_billing_date.isoformat()
+    if unresolved_invoice:
+        billing_period_start = _extract_date(getattr(unresolved_invoice, "billingStartDate", None)) or today
+        billing_period_end = _extract_date(getattr(unresolved_invoice, "billingEndDate", None)) or billing_period_start
+        weekly_aggregates = await _load_billing_preview_rows(
+            user_id=user_id,
+            period_start=billing_period_start,
+            period_end=billing_period_end,
+            invoice_id=str(unresolved_invoice.id),
+        )
+        gross_profit, gross_loss, net_profit = _summarize_daily_aggregate_rows(weekly_aggregates)
+        net_profit = round(_to_float(getattr(unresolved_invoice, "totalPeriodProfit", None), net_profit), 2)
+        estimated_fee = round(_to_float(getattr(unresolved_invoice, "calculatedFee", None), 0.0), 2)
+        if not weekly_aggregates:
+            gross_profit = max(net_profit, 0.0)
+            gross_loss = abs(min(net_profit, 0.0))
+    else:
+        billing_period_start, billing_period_end = billing_period_for_due_date(resolved_next_billing_date or today)
+        weekly_aggregates = await _load_billing_preview_rows(
+            user_id=user_id,
+            period_start=billing_period_start,
+            period_end=billing_period_end,
+        )
+        gross_profit, gross_loss, net_profit = _summarize_daily_aggregate_rows(weekly_aggregates)
+        estimated_fee = _calculate_estimated_fee(
+            net_profit=net_profit,
+            fee_type=fee_type,
+            fee_value=fee_value,
+            min_profit_threshold=min_profit_threshold,
+        )
+    next_billing_date = resolved_next_billing_date.isoformat() if resolved_next_billing_date else None
+    promptpay_exchange_rate = None
+    if _promptpay_enabled():
+        try:
+            promptpay_exchange_rate = await resolve_promptpay_exchange_rate(require_config=False)
+        except Exception:
+            promptpay_exchange_rate = get_promptpay_exchange_rate()
+    subscription = await db.subscription.find_unique(where={"id": str(subscription.id)}) or subscription
+    access_state = await get_user_subscription_access_state(user_id)
 
     mapped_subscription = _map_subscription_response(
         subscription,
         status_override=access_state.subscription_status or _enum_value(subscription.status) or "active",
         next_billing_date=next_billing_date,
+        promptpay_exchange_rate=promptpay_exchange_rate,
     )
 
-    mapped_invoices = [
-        InvoiceResponse(
-            id=str(invoice.id),
-            billing_start_date=_to_date_string(invoice.billingStartDate),
-            billing_end_date=_to_date_string(invoice.billingEndDate),
-            total_period_profit=round(_to_float(invoice.totalPeriodProfit), 2),
-            calculated_fee=round(_to_float(invoice.calculatedFee), 2),
-            status=_enum_value(invoice.status),
-            payment_method_used=invoice.paymentMethodUsed,
-            paid_at=_to_datetime_string(invoice.paidAt),
-            created_at=_to_datetime_string(invoice.createdAt),
-        )
-        for invoice in invoices
-    ]
+    mapped_invoices = [_map_invoice_response(invoice) for invoice in invoices]
 
     mapped_payment_methods = [_map_payment_method(method) for method in payment_methods_sorted]
 
@@ -559,6 +1100,8 @@ async def get_subscription_summary(
         gross_loss=round(gross_loss, 2),
         net_profit=round(net_profit, 2),
         estimated_fee=round(estimated_fee, 2),
+        estimated_fee_payment=round(estimated_fee, 2),
+        estimated_fee_payment_currency=get_billing_base_currency(),
     )
 
     return SubscriptionSummaryResponse(
@@ -579,6 +1122,19 @@ async def update_subscription_collection_mode(
         raise HTTPException(status_code=400, detail="collection_mode must be automatic or manual")
 
     subscription = await _get_or_create_subscription(str(current_user.id))
+    if next_collection_mode == "automatic":
+        has_active_payment_method = await db.userpaymentmethod.find_first(
+            where={
+                "userId": str(current_user.id),
+                "isActive": True,
+            }
+        )
+        if has_active_payment_method is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Add a saved card before switching billing to automatic",
+            )
+
     updated_subscription = await db.subscription.update(
         where={"id": str(subscription.id)},
         data={"collectionMode": next_collection_mode},
@@ -787,6 +1343,229 @@ async def download_invoice(
     )
 
 
+@subscription_router.post(
+    "/invoices/{invoice_id}/checkout-session",
+    response_model=CreateCheckoutSessionResponse,
+)
+async def create_invoice_checkout_session(
+    invoice_id: str,
+    current_user: Annotated[any, Depends(get_current_active_user)],
+    data: CreateCheckoutSessionRequest | None = None,
+):
+    _ensure_stripe_configured()
+
+    invoice = await db.invoice.find_unique(
+        where={"id": invoice_id},
+        include={"subscription": True},
+    )
+    if not invoice or str(invoice.subscription.userId) != str(current_user.id):
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    invoice_status = (_enum_value(invoice.status) or "").lower()
+    if invoice_status == "paid":
+        raise HTTPException(status_code=400, detail="Invoice already paid")
+    if invoice_status == "skipped":
+        raise HTTPException(status_code=400, detail="Skipped invoice cannot be paid")
+    invoice = await _finalize_paid_checkout_invoice_if_available(
+        invoice=invoice,
+        user=current_user,
+        notify_user=False,
+    )
+    invoice_status = (_enum_value(invoice.status) or "").lower()
+    if invoice_status == "paid":
+        raise HTTPException(status_code=400, detail="Invoice already paid")
+    if invoice_status in {"pending", "failed"}:
+        invoice = await reconcile_open_invoice_amount(
+            invoice,
+            subscription=invoice.subscription,
+            user_id=str(current_user.id),
+        )
+        invoice = await db.invoice.find_unique(
+            where={"id": invoice_id},
+            include={"subscription": True},
+        ) or invoice
+        invoice_status = (_enum_value(invoice.status) or "").lower()
+        if invoice_status == "skipped":
+            raise HTTPException(status_code=400, detail="Invoice no longer requires payment")
+
+    payment_flow = _normalize_checkout_payment_flow(getattr(data, "payment_flow", "card"))
+
+    existing_session_id = str(getattr(invoice, "processorRequestId", "") or "").strip()
+    if existing_session_id.startswith("cs_"):
+        try:
+            existing_session = await _stripe_call(stripe.checkout.Session.retrieve, existing_session_id)
+            existing_flow = str((existing_session.get("metadata") or {}).get("payment_flow") or "").strip().lower()
+            if _checkout_session_is_reusable(existing_session) and existing_flow == payment_flow:
+                return CreateCheckoutSessionResponse(
+                    session_id=str(existing_session.get("id")),
+                    url=existing_session.get("url"),
+                )
+        except Exception:
+            pass
+
+    customer_id = await _get_or_create_stripe_customer(current_user)
+    amount = round(_to_float(invoice.calculatedFee), 2)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Invoice amount must be greater than zero")
+
+    period_label = None
+    billing_start = _to_date_string(invoice.billingStartDate)
+    billing_end = _to_date_string(invoice.billingEndDate)
+    if billing_start and billing_end:
+        period_label = f"{billing_start} to {billing_end}"
+    elif billing_start:
+        period_label = billing_start
+    elif billing_end:
+        period_label = billing_end
+    else:
+        period_label = _to_datetime_string(invoice.createdAt) or str(invoice.id)
+
+    currency = _resolve_checkout_currency()
+    amount_minor = max(0, int(round(amount * 100)))
+    expected_payment_breakdown = build_expected_payment_breakdown(
+        amount,
+        expected_payment_amount=amount,
+        expected_payment_currency=currency.upper(),
+        configured_exchange_rate=1.0,
+    )
+    payment_method_options = None
+
+    if payment_flow == "promptpay":
+        currency = get_promptpay_currency().strip().lower() or "thb"
+        try:
+            promptpay_exchange_rate = await resolve_promptpay_exchange_rate(require_config=True)
+            payment_amount = convert_invoice_amount_to_promptpay_currency(
+                amount,
+                require_config=True,
+                exchange_rate=promptpay_exchange_rate,
+            )
+            amount_minor = promptpay_amount_to_minor_units(
+                amount,
+                require_config=True,
+                exchange_rate=promptpay_exchange_rate,
+            )
+        except RuntimeError as error:
+            raise HTTPException(status_code=500, detail=str(error))
+
+        if payment_amount < PROMPTPAY_MIN_AMOUNT_THB:
+            raise HTTPException(
+                status_code=400,
+                detail=f"PromptPay requires a minimum checkout amount of THB {PROMPTPAY_MIN_AMOUNT_THB:,.2f}",
+            )
+
+        expected_payment_breakdown = build_expected_payment_breakdown(
+            amount,
+            expected_payment_amount=payment_amount,
+            expected_payment_currency=currency.upper(),
+            configured_exchange_rate=promptpay_exchange_rate,
+        )
+    else:
+        payment_method_options = {
+            "card": {
+                "setup_future_usage": "off_session",
+            }
+        }
+
+    session_metadata = {
+        "invoice_id": str(invoice.id),
+        "subscription_id": str(invoice.subscription.id),
+        "user_id": str(current_user.id),
+        "payment_flow": payment_flow,
+        "invoice_currency": get_billing_base_currency(),
+        "invoice_amount": f"{amount:.2f}",
+        "charge_currency": currency.upper(),
+        "charge_amount": f"{round(_to_float(expected_payment_breakdown.get('expected_payment_amount')), 2):.2f}",
+        "configured_exchange_rate": f"{_to_float(expected_payment_breakdown.get('configured_exchange_rate'), 1.0):.6f}",
+    }
+
+    session_payload = {
+        "mode": "payment",
+        "customer": customer_id,
+        "success_url": _build_checkout_success_url(str(invoice.id)),
+        "cancel_url": _build_checkout_cancel_url(str(invoice.id)),
+        "line_items": [
+            {
+                "quantity": 1,
+                "price_data": {
+                    "currency": currency,
+                    "unit_amount": amount_minor,
+                    "product_data": {
+                        "name": "SmarfRobotTrade subscription invoice",
+                        "description": f"Billing period {period_label}",
+                    },
+                },
+            }
+        ],
+        "metadata": session_metadata,
+        "payment_intent_data": {
+            "metadata": session_metadata,
+        },
+        "locale": "auto",
+        "payment_method_types": _resolve_checkout_payment_method_types(payment_flow),
+    }
+    if payment_method_options:
+        session_payload["payment_method_options"] = payment_method_options
+
+    try:
+        session = await _stripe_call(stripe.checkout.Session.create, **session_payload)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Stripe error: {str(error)}")
+
+    session_id = str(session.get("id") or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=500, detail="Stripe did not return a checkout session id")
+
+    await db.invoice.update(
+        where={"id": str(invoice.id)},
+        data={
+            "processorRequestId": session_id,
+            "paymentBreakdown": _to_prisma_json(expected_payment_breakdown),
+        },
+    )
+
+    return CreateCheckoutSessionResponse(
+        session_id=session_id,
+        url=session.get("url"),
+    )
+
+
+@subscription_router.post(
+    "/invoices/{invoice_id}/checkout-confirm",
+    response_model=InvoiceResponse,
+)
+async def confirm_invoice_checkout(
+    invoice_id: str,
+    current_user: Annotated[any, Depends(get_current_active_user)],
+    session_id: str | None = None,
+):
+    invoice = await db.invoice.find_unique(
+        where={"id": invoice_id},
+        include={"subscription": True},
+    )
+    if not invoice or str(invoice.subscription.userId) != str(current_user.id):
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    invoice = await _finalize_paid_checkout_invoice_if_available(
+        invoice=invoice,
+        user=current_user,
+        preferred_session_id=session_id,
+        notify_user=False,
+    )
+
+    if str(_enum_value(getattr(invoice, "status", None)) or "").strip().lower() in {"pending", "failed"}:
+        invoice = await reconcile_open_invoice_amount(
+            invoice,
+            subscription=invoice.subscription,
+            user_id=str(current_user.id),
+        )
+
+    invoice = await db.invoice.find_unique(
+        where={"id": invoice_id},
+        include={"subscription": True},
+    ) or invoice
+    return _map_invoice_response(invoice)
+
+
 @subscription_router.post("/invoices/{invoice_id}/pay")
 async def pay_invoice(
     invoice_id: str,
@@ -816,6 +1595,79 @@ async def pay_invoice(
         raise HTTPException(status_code=400, detail=str(error))
 
     return {"message": "Invoice paid successfully"}
+
+
+@subscription_router.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    _ensure_stripe_configured()
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Stripe webhook secret is not configured")
+
+    payload = await request.body()
+    signature = request.headers.get("stripe-signature")
+    if not signature:
+        raise HTTPException(status_code=400, detail="Missing Stripe signature")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, signature, STRIPE_WEBHOOK_SECRET)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Invalid Stripe webhook payload: {str(error)}")
+
+    event_type = str(event.get("type") or "").strip()
+    if event_type not in {
+        "checkout.session.completed",
+        "checkout.session.async_payment_succeeded",
+        "checkout.session.async_payment_failed",
+    }:
+        return {"received": True}
+
+    session = event.get("data", {}).get("object") or {}
+    invoice_id = str((session.get("metadata") or {}).get("invoice_id") or "").strip()
+    if not invoice_id:
+        return {"received": True}
+
+    invoice = await db.invoice.find_unique(
+        where={"id": invoice_id},
+        include={"subscription": True},
+    )
+    if not invoice:
+        return {"received": True}
+    if str(_enum_value(invoice.status) or "").strip().lower() == "paid":
+        return {"received": True}
+
+    user = await db.user.find_unique(where={"id": str(invoice.subscription.userId)})
+    if not user:
+        return {"received": True}
+
+    if event_type == "checkout.session.async_payment_failed":
+        await _finalize_checkout_invoice(
+            invoice=invoice,
+            user=user,
+            stripe_session=session,
+            target_status="failed",
+            notify_user=True,
+        )
+        return {"received": True}
+
+    payment_status = str(session.get("payment_status") or "").strip().lower()
+    if event_type == "checkout.session.completed" and payment_status != "paid":
+        await _finalize_checkout_invoice(
+            invoice=invoice,
+            user=user,
+            stripe_session=session,
+            target_status="pending",
+            notify_user=False,
+        )
+        return {"received": True}
+
+    await _finalize_checkout_invoice(
+        invoice=invoice,
+        user=user,
+        stripe_session=session,
+        target_status="paid",
+        notify_user=True,
+    )
+    return {"received": True}
 
 
 def _map_billing_config(config) -> AdminBillingConfigResponse:

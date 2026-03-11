@@ -44,6 +44,9 @@ PUBLIC_PATHS = [
 
     # Bot WebSocket + Cron
     "/bot/ws/cron",
+
+    # Stripe webhooks
+    "/subscription/stripe/webhook",
 ]
 
 

@@ -7,6 +7,15 @@ class CreateSetupIntentResponse(BaseModel):
     client_secret: str
 
 
+class CreateCheckoutSessionResponse(BaseModel):
+    session_id: str
+    url: Optional[str] = None
+
+
+class CreateCheckoutSessionRequest(BaseModel):
+    payment_flow: str = "card"
+
+
 class AttachPaymentMethodRequest(BaseModel):
     paymentMethodId: str
     setAsDefault: bool = False
@@ -32,8 +41,11 @@ class InvoiceResponse(BaseModel):
     billing_end_date: Optional[str] = None
     total_period_profit: float = 0.0
     calculated_fee: float = 0.0
+    payment_amount: Optional[float] = None
+    payment_currency: Optional[str] = None
     status: Optional[str] = None
     payment_method_used: Optional[str] = None
+    payment_method_label: Optional[str] = None
     paid_at: Optional[str] = None
     created_at: Optional[str] = None
 
@@ -47,6 +59,11 @@ class SubscriptionResponse(BaseModel):
     min_profit_threshold: float
     next_billing_date: Optional[str] = None
     default_payment_method_id: Optional[str] = None
+    billing_currency: str = "USD"
+    billing_exchange_rate: float = 1.0
+    promptpay_enabled: bool = False
+    promptpay_currency: Optional[str] = None
+    promptpay_exchange_rate: Optional[float] = None
 
 
 class WeeklyPreviewResponse(BaseModel):
@@ -56,6 +73,8 @@ class WeeklyPreviewResponse(BaseModel):
     gross_loss: float
     net_profit: float
     estimated_fee: float
+    estimated_fee_payment: float
+    estimated_fee_payment_currency: str = "USD"
 
 
 class SubscriptionSummaryResponse(BaseModel):

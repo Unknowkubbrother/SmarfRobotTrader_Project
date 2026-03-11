@@ -37,7 +37,11 @@ from ..utils.bot_magic import derive_magic_number, normalize_magic_number
 from ..utils.bot_operation_events import emit_and_store_bot_operation_event
 from ..utils.notification_delivery import dispatch_notification_to_user
 from ..utils.subscription_access import sync_subscription_status_from_invoices
-from ..utils.subscription_billing import notify_invoice_event, sync_daily_aggregate_status_for_invoice
+from ..utils.subscription_billing import (
+    get_minimum_next_billing_date_for_subscription,
+    notify_invoice_event,
+    sync_daily_aggregate_status_for_invoice,
+)
 from .authentication import get_current_active_user
 
 admin_router = APIRouter(tags=["Admin"])
@@ -918,6 +922,16 @@ async def update_admin_user_subscription_billing(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Subscription status is invalid for update",
         )
+    if parsed_next_billing_date:
+        minimum_next_billing_date = await get_minimum_next_billing_date_for_subscription(subscription_id)
+        if minimum_next_billing_date and parsed_next_billing_date < minimum_next_billing_date:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "next_billing_date would overlap an existing invoice period. "
+                    f"Use {minimum_next_billing_date.isoformat()} or later."
+                ),
+            )
 
     update_payload = {
         "collectionMode": collection_mode,

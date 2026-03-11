@@ -1,16 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CheckCircle,
   Clock,
   CreditCard,
-  Download,
   Lock,
   Receipt,
   Shield,
-  Sparkles,
-  Star,
   Trash2,
 } from "lucide-react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -25,7 +23,8 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import { useSubscription, type InvoiceData, type PaymentMethodData } from "@/hooks/useSubscription";
+import { useAuth } from "@/contexts/AuthContext";
+import { useSubscription, type CheckoutPaymentFlow, type InvoiceData, type PaymentMethodData } from "@/hooks/useSubscription";
 import { cn } from "@/lib/utils";
 
 type SubscriptionTab = "overview" | "history" | "payment";
@@ -75,12 +74,20 @@ function ensureStripeJsLoaded() {
   return stripeJsPromise;
 }
 
-function formatCurrency(amount: number) {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-  }).format(amount);
+function formatCurrency(amount: number, currency = "USD") {
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency,
+      minimumFractionDigits: 2,
+    }).format(amount);
+  } catch {
+    return `${currency.toUpperCase()} ${amount.toFixed(2)}`;
+  }
+}
+
+function formatUsdCurrency(amount: number) {
+  return formatCurrency(amount, "USD");
 }
 
 function formatDate(dateValue: string | null | undefined) {
@@ -93,6 +100,15 @@ function formatDate(dateValue: string | null | undefined) {
     day: "numeric",
     year: "numeric",
   });
+}
+
+function addDaysToIsoDate(dateValue: string | null | undefined, days: number) {
+  if (!dateValue) return null;
+  const normalized = dateValue.includes("T") ? dateValue : `${dateValue}T00:00:00`;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setDate(date.getDate() + days);
+  return date.toISOString();
 }
 
 function formatInvoicePeriod(start: string | null, end: string | null, fallback: string | null) {
@@ -121,6 +137,18 @@ function formatPaymentMethodLabel(method: PaymentMethodData) {
     expiry,
     label: `${brand} ending in ${last4}`,
   };
+}
+
+function formatInvoiceCharge(invoice: InvoiceData) {
+  return formatCurrency(invoice.payment_amount ?? invoice.calculated_fee ?? 0, invoice.payment_currency || "USD");
+}
+
+function getInvoicePaymentMethodLabel(invoice: InvoiceData) {
+  const label = invoice.payment_method_label?.trim();
+  if (label && label.toLowerCase() !== "not available") {
+    return label;
+  }
+  return invoice.status?.toLowerCase() === "paid" ? "Recorded by Stripe" : "-";
 }
 
 interface StripeAddCardFormProps {
@@ -251,18 +279,18 @@ function StripeAddCardForm({
 
   return (
     <div className="space-y-5">
-      <div className="rounded-xl border border-primary/20 bg-gradient-to-br from-primary/10 via-primary/5 to-background p-4">
+      <div className="rounded-xl border border-border bg-white p-4">
         <div className="mb-3 flex items-start justify-between gap-3">
           <div>
             <p className="text-sm font-semibold text-foreground">Card details</p>
             <p className="text-xs text-muted-foreground">Enter your card once for manual or automatic billing.</p>
           </div>
-          <span className="inline-flex items-center gap-1 rounded-full border border-border bg-background/80 px-2 py-1 text-[11px] font-medium text-muted-foreground">
+          <span className="inline-flex items-center gap-1 rounded-full border border-border bg-muted/30 px-2 py-1 text-[11px] font-medium text-muted-foreground">
             <Lock className="h-3 w-3" />
-            PCI DSS
+            Secure
           </span>
         </div>
-        <div className="rounded-lg border border-border bg-background/80 p-3 shadow-inner">
+        <div className="rounded-lg border border-border bg-muted/20 p-3">
           <div ref={paymentElementContainerRef} className="min-h-[112px]" />
         </div>
         <div className="mt-3 flex flex-wrap gap-2">
@@ -277,7 +305,7 @@ function StripeAddCardForm({
         </div>
       </div>
 
-      <div className="flex items-start gap-3 rounded-lg border border-border bg-secondary/30 p-3">
+      <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/20 p-3">
         <Checkbox
           id="setAsDefault"
           checked={setAsDefault}
@@ -304,6 +332,10 @@ function StripeAddCardForm({
 }
 
 export default function Subscription() {
+  const { refreshUser } = useAuth();
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [activeTab, setActiveTab] = useState<SubscriptionTab>("overview");
   const [addCardOpen, setAddCardOpen] = useState(false);
   const [setupIntentSecret, setSetupIntentSecret] = useState<string | null>(null);
@@ -312,10 +344,7 @@ export default function Subscription() {
   const [submittingCard, setSubmittingCard] = useState(false);
   const [methodActionId, setMethodActionId] = useState<string | null>(null);
   const [invoiceActionId, setInvoiceActionId] = useState<string | null>(null);
-  const [invoiceActionType, setInvoiceActionType] = useState<"download" | "pay" | null>(null);
-  const [payDialogOpen, setPayDialogOpen] = useState(false);
-  const [payDialogInvoice, setPayDialogInvoice] = useState<InvoiceData | null>(null);
-  const [selectedPayMethodId, setSelectedPayMethodId] = useState<string>("");
+  const [invoiceActionType, setInvoiceActionType] = useState<"download" | "pay" | "promptpay" | null>(null);
   const [pendingCollectionMode, setPendingCollectionMode] = useState<"automatic" | "manual">("automatic");
   const [savingCollectionMode, setSavingCollectionMode] = useState(false);
   const setupIntentRequestedRef = useRef(false);
@@ -331,7 +360,9 @@ export default function Subscription() {
     setDefaultPaymentMethod,
     removePaymentMethod,
     downloadInvoice,
-    payInvoice,
+    createInvoiceCheckoutSession,
+    confirmInvoiceCheckout,
+    refetch,
     updateCollectionMode,
   } = useSubscription();
 
@@ -342,30 +373,42 @@ export default function Subscription() {
       ? `${formatDate(weeklyPreview.week_start)} - ${formatDate(weeklyPreview.week_end)}`
       : null;
 
-  const feeLabel = useMemo(() => {
-    if (!subscription) return "20%";
-    if (subscription.fee_type === "fixed") {
-      return formatCurrency(subscription.fee_value);
-    }
-    return `${subscription.fee_value}%`;
-  }, [subscription]);
-
   const nextBillingLabel = formatDate(subscription?.next_billing_date);
   const subscriptionStatus = subscription?.status ?? "active";
   const statusIsActive = subscriptionStatus === "active";
   const collectionMode = subscription?.collection_mode ?? "automatic";
   const collectionModeLabel = collectionMode === "manual" ? "Manual payment" : "Automatic charge";
   const hasActivePaymentMethod = paymentMethods.length > 0;
+  const canEnableAutomaticCollection = hasActivePaymentMethod;
+  const promptpayEnabled = Boolean(subscription?.promptpay_enabled);
+  const promptpayCurrency = String(subscription?.promptpay_currency || "THB").toUpperCase();
+  const promptpayExchangeRate = subscription?.promptpay_exchange_rate ?? null;
+  const promptpayMinimumUsdAmount =
+    promptpayEnabled && promptpayExchangeRate && promptpayExchangeRate > 0 ? 10 / promptpayExchangeRate : null;
   const unresolvedInvoice = invoices.find((invoice) => {
     const status = String(invoice.status || "").toLowerCase();
     return status === "pending" || status === "failed";
   });
+  const overviewInvoice = unresolvedInvoice ?? null;
+  const overviewProfit = overviewInvoice ? overviewInvoice.total_period_profit ?? 0 : weeklyProfit;
+  const overviewCharge = overviewInvoice ? overviewInvoice.calculated_fee ?? 0 : estimatedFee;
+  const overviewPeriodLabel = overviewInvoice
+    ? formatInvoicePeriod(overviewInvoice.billing_start_date, overviewInvoice.billing_end_date, overviewInvoice.created_at)
+    : previewPeriodLabel;
+  const overviewDueDate = overviewInvoice
+    ? formatDate(addDaysToIsoDate(overviewInvoice.billing_end_date, 1))
+    : nextBillingLabel;
+  const overviewProfitLabel = overviewInvoice ? "Outstanding Billing Period Profit" : "Current Billing Period Profit";
+  const overviewChargeLabel = overviewInvoice ? "Outstanding Charge (USD)" : "Estimated Charge (USD)";
+  const overviewDateLabel = overviewInvoice ? "Invoice Due" : "Next Billing";
+  const sectionClass = "rounded-xl border border-border bg-white";
+  const statCellClass = "p-5";
   const subscriptionAlertMessage =
     subscriptionStatus === "canceled"
       ? "Your subscription is canceled. Reactivate billing before using bots again."
       : unresolvedInvoice
-      ? "Your bot access is paused until the outstanding invoice is paid or skipped by admin."
-      : "Your bot access is paused until billing is resolved.";
+        ? "Your bot access is paused until the outstanding invoice is paid or skipped by admin."
+        : "Your bot access is paused until billing is resolved.";
 
   const initializeStripeSetup = useCallback(async () => {
     if (!STRIPE_READY) {
@@ -406,16 +449,41 @@ export default function Subscription() {
   }, [collectionMode]);
 
   useEffect(() => {
-    if (!payDialogOpen) {
-      setPayDialogInvoice(null);
-      setSelectedPayMethodId("");
+    const checkoutStatus = searchParams.get("checkout");
+    const checkoutInvoiceId = searchParams.get("invoice_id");
+    const checkoutSessionId = searchParams.get("session_id");
+    if (!checkoutStatus) {
       return;
     }
 
-    const defaultMethodId =
-      paymentMethods.find((method) => method.is_default)?.id ?? paymentMethods[0]?.id ?? "";
-    setSelectedPayMethodId((current) => current || defaultMethodId);
-  }, [payDialogOpen, paymentMethods]);
+    const handleCheckoutReturn = async () => {
+      if (checkoutStatus === "success") {
+        let confirmedStatus: string | null = null;
+        if (checkoutInvoiceId) {
+          const confirmedInvoice = await confirmInvoiceCheckout(checkoutInvoiceId, checkoutSessionId);
+          confirmedStatus = confirmedInvoice?.status?.toLowerCase() ?? null;
+        }
+
+        if (confirmedStatus === "paid") {
+          toast.success("Payment confirmed");
+        } else {
+          toast.success("Returned from Stripe Checkout. Refreshing billing status...");
+          await Promise.all([refetch(), refreshUser()]);
+          window.setTimeout(() => {
+            void Promise.all([refetch(), refreshUser()]);
+          }, 2500);
+        }
+        setActiveTab("history");
+      } else if (checkoutStatus === "cancelled") {
+        toast.message("Stripe Checkout was cancelled");
+        setActiveTab("history");
+      }
+
+      router.replace(pathname || "/subscription");
+    };
+
+    handleCheckoutReturn();
+  }, [confirmInvoiceCheckout, pathname, refetch, refreshUser, router, searchParams]);
 
   const onAttachPaymentMethod = async (paymentMethodId: string, makeDefault: boolean) => {
     setSubmittingCard(true);
@@ -451,39 +519,57 @@ export default function Subscription() {
     setInvoiceActionType(null);
   };
 
-  const openPayInvoiceDialog = (invoice: InvoiceData) => {
-    if (paymentMethods.length === 0) {
-      toast.error("Add a payment method before paying this invoice");
-      setActiveTab("payment");
-      return;
-    }
-    const defaultMethodId =
-      paymentMethods.find((method) => method.is_default)?.id ?? paymentMethods[0]?.id ?? "";
-    setPayDialogInvoice(invoice);
-    setSelectedPayMethodId(defaultMethodId);
-    setPayDialogOpen(true);
-  };
+  const onCheckoutInvoice = async (invoice: InvoiceData, paymentFlow: CheckoutPaymentFlow) => {
+    setInvoiceActionId(invoice.id);
+    setInvoiceActionType(paymentFlow === "promptpay" ? "promptpay" : "pay");
 
-  const onPayInvoice = async () => {
-    if (!payDialogInvoice) return;
-    if (!selectedPayMethodId) {
-      toast.error("Choose a payment method");
-      return;
-    }
+    try {
+      const session = await createInvoiceCheckoutSession(invoice.id, paymentFlow);
+      if (!session) {
+        return;
+      }
 
-    setInvoiceActionId(payDialogInvoice.id);
-    setInvoiceActionType("pay");
-    const success = await payInvoice(payDialogInvoice.id, selectedPayMethodId);
-    setInvoiceActionId(null);
-    setInvoiceActionType(null);
-    if (success) {
-      setPayDialogOpen(false);
+      if (STRIPE_READY && session.session_id) {
+        try {
+          await ensureStripeJsLoaded();
+          if (window.Stripe) {
+            const stripe = window.Stripe(STRIPE_PUBLISHABLE_KEY);
+            const result = await stripe.redirectToCheckout({ sessionId: session.session_id });
+            if (result?.error) {
+              if (session.url) {
+                window.location.href = session.url;
+                return;
+              }
+              throw new Error(result.error.message || "Failed to redirect to Stripe Checkout");
+            }
+            return;
+          }
+        } catch {
+          if (session.url) {
+            window.location.href = session.url;
+            return;
+          }
+          throw new Error("Failed to initialize Stripe.js");
+        }
+      }
+
+      if (session.url) {
+        window.location.href = session.url;
+        return;
+      }
+
+      throw new Error("Stripe Checkout session is missing both session id and URL");
+    } catch (error: any) {
+      toast.error(error?.message || "Failed to open Stripe Checkout");
+    } finally {
+      setInvoiceActionId(null);
+      setInvoiceActionType(null);
     }
   };
 
   const onSaveCollectionMode = async () => {
-    if (!hasActivePaymentMethod) {
-      toast.error("Add a payment method before changing collection mode");
+    if (pendingCollectionMode === "automatic" && !hasActivePaymentMethod) {
+      toast.error("Add a saved card before switching billing to automatic");
       setActiveTab("payment");
       return;
     }
@@ -512,16 +598,18 @@ export default function Subscription() {
         <p className="text-sm text-muted-foreground">Manage your weekly profit-based subscription</p>
       </div>
 
-      <div className="glass-card p-6 animate-slide-up">
-        <div className="flex items-center justify-between mb-6">
+      <div className={sectionClass}>
+        <div className="flex flex-col gap-4 border-b border-border p-5 md:flex-row md:items-center md:justify-between">
           <div className="flex items-center gap-3">
             <div
               className={cn(
-                "w-12 h-12 rounded-xl flex items-center justify-center",
-                statusIsActive ? "bg-success/10" : "bg-warning/10"
+                "flex h-10 w-10 items-center justify-center rounded-lg border",
+                statusIsActive
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                  : "border-amber-200 bg-amber-50 text-amber-700"
               )}
             >
-              <CheckCircle className={cn("w-6 h-6", statusIsActive ? "text-success" : "text-warning")} />
+              <CheckCircle className="h-5 w-5" />
             </div>
             <div>
               <h3 className="text-lg font-semibold capitalize">{subscriptionStatus.replace("_", " ")} Subscription</h3>
@@ -532,39 +620,41 @@ export default function Subscription() {
           </div>
           <span
             className={cn(
-              "px-3 py-1 rounded-full text-sm font-medium capitalize",
-              statusIsActive ? "bg-success/10 text-success" : "bg-warning/10 text-warning"
+              "inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium capitalize",
+              statusIsActive
+                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                : "border-amber-200 bg-amber-50 text-amber-700"
             )}
           >
             {subscriptionStatus.replace("_", " ")}
           </span>
         </div>
 
-        <div className="grid md:grid-cols-4 gap-6">
-          <div className="p-4 rounded-lg bg-secondary/50">
-            <p className="text-sm text-muted-foreground mb-1">Current Billing Period Profit</p>
-            <p className={cn("text-2xl font-bold font-mono", weeklyProfit >= 0 ? "profit-text" : "loss-text")}>
-              {weeklyProfit >= 0 ? "+" : ""}
-              {formatCurrency(weeklyProfit)}
+        <div className="grid divide-y divide-border md:grid-cols-4 md:divide-x md:divide-y-0">
+          <div className={statCellClass}>
+            <p className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">{overviewProfitLabel}</p>
+            <p className={cn("mt-2 text-2xl font-semibold font-mono", overviewProfit >= 0 ? "profit-text" : "loss-text")}>
+              {overviewProfit >= 0 ? "+" : ""}
+              {formatUsdCurrency(overviewProfit)}
             </p>
           </div>
-          <div className="p-4 rounded-lg bg-secondary/50">
-            <p className="text-sm text-muted-foreground mb-1">Collection Mode</p>
-            <p className="text-2xl font-bold">{collectionModeLabel}</p>
+          <div className={statCellClass}>
+            <p className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Collection Mode</p>
+            <p className="mt-2 text-2xl font-semibold">{collectionModeLabel}</p>
           </div>
-          <div className="p-4 rounded-lg bg-secondary/50">
-            <p className="text-sm text-muted-foreground mb-1">Estimated Fee ({feeLabel})</p>
-            <p className="text-2xl font-bold font-mono">{formatCurrency(estimatedFee)}</p>
+          <div className={statCellClass}>
+            <p className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">{overviewChargeLabel}</p>
+            <p className="mt-2 text-2xl font-semibold font-mono">{formatUsdCurrency(overviewCharge)}</p>
           </div>
-          <div className="p-4 rounded-lg bg-secondary/50">
-            <p className="text-sm text-muted-foreground mb-1">Next Billing</p>
-            <p className="text-2xl font-bold font-mono">{nextBillingLabel}</p>
+          <div className={statCellClass}>
+            <p className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">{overviewDateLabel}</p>
+            <p className="mt-2 text-2xl font-semibold font-mono">{overviewDueDate}</p>
           </div>
         </div>
       </div>
 
       {!statusIsActive && (
-        <Alert className="border-warning/30 bg-warning/5 text-foreground [&>svg]:text-warning">
+        <Alert className="border-amber-200 bg-amber-50 text-foreground [&>svg]:text-amber-700">
           <Shield className="h-4 w-4" />
           <AlertTitle className="capitalize">{subscriptionStatus.replace("_", " ")} subscription</AlertTitle>
           <AlertDescription>
@@ -574,11 +664,14 @@ export default function Subscription() {
       )}
 
       {!hasActivePaymentMethod && (
-        <Alert className="border-primary/30 bg-primary/5 text-foreground [&>svg]:text-primary">
+        <Alert className="border-border bg-white text-foreground [&>svg]:text-muted-foreground">
           <CreditCard className="h-4 w-4" />
-          <AlertTitle>Payment method required</AlertTitle>
+          <AlertTitle>Saved card optional in manual mode</AlertTitle>
           <AlertDescription className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-            <span>Add a payment method first. Trading account setup and bot creation stay locked until billing is configured.</span>
+            <span>
+              Add a card for automatic billing, or switch to manual payment and choose either card checkout with card saving
+              or PromptPay checkout in THB when you pay an invoice.
+            </span>
             <Button size="sm" variant="outline" className="w-full md:w-auto" onClick={() => setActiveTab("payment")}>
               Open Payment Methods
             </Button>
@@ -586,7 +679,7 @@ export default function Subscription() {
         </Alert>
       )}
 
-      <div className="flex gap-2 border-b border-border">
+      <div className="inline-flex rounded-lg border border-border bg-white p-1">
         {[
           { id: "overview", label: "Overview", icon: Receipt },
           { id: "history", label: "Billing History", icon: Clock },
@@ -596,10 +689,10 @@ export default function Subscription() {
             key={tab.id}
             onClick={() => setActiveTab(tab.id as SubscriptionTab)}
             className={cn(
-              "flex items-center gap-2 px-4 py-3 text-sm font-medium transition-colors border-b-2 -mb-px",
+              "flex items-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium transition-colors",
               activeTab === tab.id
-                ? "text-primary border-primary"
-                : "text-muted-foreground border-transparent hover:text-foreground"
+                ? "bg-muted text-foreground"
+                : "text-muted-foreground hover:text-foreground"
             )}
           >
             <tab.icon className="w-4 h-4" />
@@ -610,7 +703,7 @@ export default function Subscription() {
 
       {activeTab === "overview" && (
         <div className="space-y-6">
-          <div className="glass-card p-6 animate-slide-up">
+          <div className={`${sectionClass} p-6`}>
             <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
               <div className="space-y-1">
                 <h3 className="text-lg font-semibold">Billing Preferences</h3>
@@ -620,7 +713,11 @@ export default function Subscription() {
               </div>
               <Button
                 onClick={onSaveCollectionMode}
-                disabled={savingCollectionMode || pendingCollectionMode === collectionMode || !hasActivePaymentMethod}
+                disabled={
+                  savingCollectionMode ||
+                  pendingCollectionMode === collectionMode ||
+                  (pendingCollectionMode === "automatic" && !canEnableAutomaticCollection)
+                }
               >
                 {savingCollectionMode ? "Saving..." : "Save Collection Mode"}
               </Button>
@@ -630,17 +727,22 @@ export default function Subscription() {
               value={pendingCollectionMode}
               onValueChange={(value) => setPendingCollectionMode(value as "automatic" | "manual")}
               className="mt-5 grid gap-3 md:grid-cols-2"
-              disabled={savingCollectionMode || !hasActivePaymentMethod}
+              disabled={savingCollectionMode}
             >
               <Label
                 htmlFor="collection-mode-automatic"
                 className={cn(
-                  "flex cursor-pointer items-start gap-3 rounded-xl border p-4 transition-colors",
-                  pendingCollectionMode === "automatic" ? "border-primary bg-primary/5" : "border-border bg-secondary/20",
-                  (!hasActivePaymentMethod || savingCollectionMode) && "cursor-not-allowed opacity-70"
+                  "flex cursor-pointer items-start gap-3 rounded-lg border p-4 transition-colors",
+                  pendingCollectionMode === "automatic" ? "border-foreground bg-muted/20" : "border-border bg-white",
+                  (!canEnableAutomaticCollection || savingCollectionMode) && "opacity-70"
                 )}
               >
-                <RadioGroupItem value="automatic" id="collection-mode-automatic" className="mt-1" />
+                <RadioGroupItem
+                  value="automatic"
+                  id="collection-mode-automatic"
+                  className="mt-1"
+                  disabled={!canEnableAutomaticCollection}
+                />
                 <div>
                   <p className="text-sm font-semibold text-foreground">Automatic charge</p>
                   <p className="text-xs text-muted-foreground">
@@ -652,16 +754,17 @@ export default function Subscription() {
               <Label
                 htmlFor="collection-mode-manual"
                 className={cn(
-                  "flex cursor-pointer items-start gap-3 rounded-xl border p-4 transition-colors",
-                  pendingCollectionMode === "manual" ? "border-primary bg-primary/5" : "border-border bg-secondary/20",
-                  (!hasActivePaymentMethod || savingCollectionMode) && "cursor-not-allowed opacity-70"
+                  "flex cursor-pointer items-start gap-3 rounded-lg border p-4 transition-colors",
+                  pendingCollectionMode === "manual" ? "border-foreground bg-muted/20" : "border-border bg-white",
+                  savingCollectionMode && "opacity-70"
                 )}
               >
                 <RadioGroupItem value="manual" id="collection-mode-manual" className="mt-1" />
                 <div>
                   <p className="text-sm font-semibold text-foreground">Manual payment</p>
                   <p className="text-xs text-muted-foreground">
-                    When an invoice becomes due, access pauses until you choose one of your saved cards and pay it manually.
+                    When an invoice becomes due, access pauses until you open Stripe Checkout and choose either card
+                    payment with save-for-later support or PromptPay in THB.
                   </p>
                 </div>
               </Label>
@@ -669,90 +772,97 @@ export default function Subscription() {
 
             {!hasActivePaymentMethod && (
               <p className="mt-4 text-xs text-muted-foreground">
-                Add a payment method first to unlock collection mode changes and trading setup.
+                Automatic billing still requires at least one saved card. Manual billing can work without a saved card.
               </p>
             )}
+            {promptpayEnabled && promptpayExchangeRate ? (
+              <p className="mt-2 text-xs text-muted-foreground">
+                PromptPay sessions are charged in {promptpayCurrency} using the latest fetched rate of {promptpayExchangeRate.toFixed(2)} {promptpayCurrency} per USD.
+              </p>
+            ) : null}
           </div>
 
           <div className="grid gap-6 md:grid-cols-2">
-          <div className="glass-card p-6 animate-slide-up">
-            <h3 className="text-lg font-semibold mb-4">How It Works</h3>
-            <div className="space-y-4">
-              <div className="flex gap-4">
-                <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
-                  <span className="text-primary font-bold">1</span>
+            <div className={`${sectionClass} p-6`}>
+              <h3 className="text-lg font-semibold mb-4">How It Works</h3>
+              <div className="divide-y divide-border">
+                <div className="flex gap-4 py-4 first:pt-0">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-border bg-muted/20 text-sm font-semibold text-foreground">
+                    1
+                  </div>
+                  <div>
+                    <p className="font-medium">Billing Period Profit Calculation</p>
+                    <p className="text-sm text-muted-foreground">
+                      Net profit is calculated from your active connected accounts across the next billable 7-day period.
+                    </p>
+                  </div>
                 </div>
-                <div>
-                  <p className="font-medium">Billing Period Profit Calculation</p>
-                  <p className="text-sm text-muted-foreground">
-                    Net profit is calculated from your active connected accounts across the next billable 7-day period.
-                  </p>
+                <div className="flex gap-4 py-4">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-border bg-muted/20 text-sm font-semibold text-foreground">
+                    2
+                  </div>
+                  <div>
+                    <p className="font-medium">Profit-Based Fee</p>
+                    <p className="text-sm text-muted-foreground">
+                      Fee is only charged when net profit is above your subscription threshold.
+                    </p>
+                  </div>
                 </div>
-              </div>
-              <div className="flex gap-4">
-                <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
-                  <span className="text-primary font-bold">2</span>
-                </div>
-                <div>
-                  <p className="font-medium">Profit-Based Fee</p>
-                  <p className="text-sm text-muted-foreground">
-                    Fee is only charged when net profit is above your subscription threshold.
-                  </p>
-                </div>
-              </div>
-              <div className="flex gap-4">
-                <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
-                  <span className="text-primary font-bold">3</span>
-                </div>
-                <div>
-                  <p className="font-medium">
-                    {collectionMode === "manual" ? "Manual Payment Required" : "Automatic Billing"}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    {collectionMode === "manual"
-                      ? "On the billing date, an invoice is created and bot access is paused until you choose one of your saved cards to pay it or admin skips it."
-                      : "On the billing date, that 7-day period is invoiced using your saved payment methods automatically."}
-                  </p>
+                <div className="flex gap-4 py-4 last:pb-0">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-border bg-muted/20 text-sm font-semibold text-foreground">
+                    3
+                  </div>
+                  <div>
+                    <p className="font-medium">
+                      {collectionMode === "manual" ? "Manual Payment Required" : "Automatic Billing"}
+                    </p>
+                    <p className="text-sm text-muted-foreground">
+                      {collectionMode === "manual"
+                        ? "On the billing date, an invoice is created and bot access is paused until you pay it in Stripe Checkout or admin skips it."
+                        : "On the billing date, that 7-day period is invoiced using your saved payment methods automatically."}
+                    </p>
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
 
-          <div className="glass-card p-6 animate-slide-up" style={{ animationDelay: "100ms" }}>
-            <div className="mb-4">
-              <h3 className="text-lg font-semibold">Billing Period Estimate</h3>
-              <p className="text-sm text-muted-foreground">
-                {previewPeriodLabel ? `For ${previewPeriodLabel}` : "For your next billing period"}
-              </p>
+            <div className={`${sectionClass} p-6`}>
+              <div className="mb-4">
+                <h3 className="text-lg font-semibold">
+                  {overviewInvoice ? "Outstanding Invoice Summary" : "Billing Period Estimate"}
+                </h3>
+                <p className="text-sm text-muted-foreground">
+                  {overviewPeriodLabel ? `For ${overviewPeriodLabel}` : "For your next billing period"}
+                </p>
+              </div>
+              <div className="divide-y divide-border">
+                <div className="flex justify-between py-3">
+                  <span className="text-muted-foreground">Gross Profit</span>
+                  <span className="font-mono profit-text">+{formatUsdCurrency(weeklyPreview?.gross_profit ?? 0)}</span>
+                </div>
+                <div className="flex justify-between py-3">
+                  <span className="text-muted-foreground">Gross Loss</span>
+                  <span className="font-mono loss-text">-{formatUsdCurrency(weeklyPreview?.gross_loss ?? 0)}</span>
+                </div>
+                <div className="flex justify-between py-3">
+                  <span className="text-muted-foreground">Net Profit</span>
+                  <span className={cn("font-mono font-bold", overviewProfit >= 0 ? "profit-text" : "loss-text")}>
+                    {overviewProfit >= 0 ? "+" : ""}
+                    {formatUsdCurrency(overviewProfit)}
+                  </span>
+                </div>
+                <div className="flex justify-between py-3">
+                  <span className="text-muted-foreground">{overviewInvoice ? "Outstanding Charge" : "Estimated Charge"}</span>
+                  <span className="font-mono font-bold">{formatUsdCurrency(overviewCharge)}</span>
+                </div>
+              </div>
             </div>
-            <div className="space-y-3">
-              <div className="flex justify-between py-2 border-b border-border">
-                <span className="text-muted-foreground">Gross Profit</span>
-                <span className="font-mono profit-text">+{formatCurrency(weeklyPreview?.gross_profit ?? 0)}</span>
-              </div>
-              <div className="flex justify-between py-2 border-b border-border">
-                <span className="text-muted-foreground">Gross Loss</span>
-                <span className="font-mono loss-text">-{formatCurrency(weeklyPreview?.gross_loss ?? 0)}</span>
-              </div>
-              <div className="flex justify-between py-2 border-b border-border">
-                <span className="text-muted-foreground">Net Profit</span>
-                <span className={cn("font-mono font-bold", weeklyProfit >= 0 ? "profit-text" : "loss-text")}>
-                  {weeklyProfit >= 0 ? "+" : ""}
-                  {formatCurrency(weeklyProfit)}
-                </span>
-              </div>
-              <div className="flex justify-between py-2">
-                <span className="text-muted-foreground">Estimated Fee</span>
-                <span className="font-mono font-bold">{formatCurrency(estimatedFee)}</span>
-              </div>
-            </div>
-          </div>
           </div>
         </div>
       )}
 
       {activeTab === "history" && (
-        <div className="glass-card p-6 animate-slide-up">
+        <div className={`${sectionClass} p-6`}>
           {invoices.length === 0 ? (
             <div className="text-center text-sm text-muted-foreground py-12">
               No invoices yet.
@@ -763,11 +873,12 @@ export default function Subscription() {
               <table className="w-full">
                 <thead>
                   <tr className="border-b border-border">
-                    <th className="text-left text-xs font-medium text-muted-foreground py-3 px-2">Period</th>
-                    <th className="text-right text-xs font-medium text-muted-foreground py-3 px-2">Net Profit</th>
-                    <th className="text-right text-xs font-medium text-muted-foreground py-3 px-2">Fee</th>
-                    <th className="text-center text-xs font-medium text-muted-foreground py-3 px-2">Status</th>
-                    <th className="text-right text-xs font-medium text-muted-foreground py-3 px-2">Actions</th>
+                    <th className="px-2 py-3 text-left text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Period</th>
+                    <th className="px-2 py-3 text-right text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Net Profit</th>
+                    <th className="px-2 py-3 text-right text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Charge</th>
+                    <th className="px-2 py-3 text-left text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Method</th>
+                    <th className="px-2 py-3 text-center text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Status</th>
+                    <th className="px-2 py-3 text-right text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -780,25 +891,35 @@ export default function Subscription() {
                     const hasVisibleAction = canPayNow || canDownload;
 
                     return (
-                      <tr key={invoice.id} className="border-b border-border/50 hover:bg-secondary/30 transition-colors">
+                      <tr key={invoice.id} className="border-b border-border/70">
                         <td className="py-4 px-2 font-medium">
                           {formatInvoicePeriod(invoice.billing_start_date, invoice.billing_end_date, invoice.created_at)}
                         </td>
                         <td className="py-4 px-2 text-right">
                           <span className={cn("font-mono", profit >= 0 ? "profit-text" : "loss-text")}>
                             {profit >= 0 ? "+" : ""}
-                            {formatCurrency(profit)}
+                            {formatUsdCurrency(profit)}
                           </span>
                         </td>
-                        <td className="py-4 px-2 text-right font-mono">{formatCurrency(invoice.calculated_fee ?? 0)}</td>
+                        <td className="py-4 px-2 text-right">
+                          <div className="font-mono">{formatInvoiceCharge(invoice)}</div>
+                          {invoice.payment_currency && invoice.payment_currency.toUpperCase() !== "USD" && (
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              USD basis {formatUsdCurrency(invoice.calculated_fee ?? 0)}
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-4 px-2 text-sm text-muted-foreground">
+                          {getInvoicePaymentMethodLabel(invoice)}
+                        </td>
                         <td className="py-4 px-2 text-center">
                           <span
                             className={cn(
-                              "px-2 py-1 rounded-full text-xs font-medium capitalize",
-                              status === "paid" && "bg-success/10 text-success",
-                              status === "pending" && "bg-warning/10 text-warning",
-                              status === "failed" && "bg-destructive/10 text-destructive",
-                              status === "skipped" && "bg-muted text-muted-foreground"
+                              "inline-flex rounded-full border px-2 py-1 text-xs font-medium capitalize",
+                              status === "paid" && "border-emerald-200 bg-emerald-50 text-emerald-700",
+                              status === "pending" && "border-amber-200 bg-amber-50 text-amber-700",
+                              status === "failed" && "border-red-200 bg-red-50 text-red-700",
+                              status === "skipped" && "border-border bg-muted/30 text-muted-foreground"
                             )}
                           >
                             {status}
@@ -807,14 +928,32 @@ export default function Subscription() {
                         <td className="py-4 px-2 text-right">
                           <div className="flex items-center justify-end gap-2">
                             {canPayNow && (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                disabled={isActionLoading}
-                                onClick={() => openPayInvoiceDialog(invoice)}
-                              >
-                                {isActionLoading && invoiceActionType === "pay" ? "Paying..." : "Pay now"}
-                              </Button>
+                              <>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={isActionLoading}
+                                  onClick={() => onCheckoutInvoice(invoice, "card")}
+                                >
+                                  {isActionLoading && invoiceActionType === "pay" ? "Opening..." : "Pay card"}
+                                </Button>
+                                {promptpayEnabled && (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={
+                                      isActionLoading ||
+                                      Boolean(
+                                        promptpayMinimumUsdAmount &&
+                                        (invoice.calculated_fee ?? 0) < promptpayMinimumUsdAmount
+                                      )
+                                    }
+                                    onClick={() => onCheckoutInvoice(invoice, "promptpay")}
+                                  >
+                                    {isActionLoading && invoiceActionType === "promptpay" ? "Opening..." : "Pay PromptPay"}
+                                  </Button>
+                                )}
+                              </>
                             )}
                             {canDownload && (
                               <Button
@@ -823,11 +962,7 @@ export default function Subscription() {
                                 disabled={isActionLoading}
                                 onClick={() => onDownloadInvoice(invoice.id)}
                               >
-                                {isActionLoading && invoiceActionType === "download" ? (
-                                  "Downloading..."
-                                ) : (
-                                  <Download className="w-4 h-4" />
-                                )}
+                                {isActionLoading && invoiceActionType === "download" ? "Downloading..." : "Download PDF"}
                               </Button>
                             )}
                             {!hasVisibleAction && (
@@ -848,8 +983,14 @@ export default function Subscription() {
       {activeTab === "payment" && (
         <div className="space-y-4">
           {paymentMethods.length === 0 ? (
-            <div className="glass-card p-8 text-center">
-              <p className="text-sm text-muted-foreground mb-4">No payment method added yet.</p>
+            <div className={`${sectionClass} p-8 text-center`}>
+              <p className="text-sm text-muted-foreground mb-2">No saved card added yet.</p>
+              <p className="text-xs text-muted-foreground mb-4">
+                You can still pay due invoices in Stripe Checkout. Paying by card there will save a card for future automatic billing.
+                {promptpayEnabled && promptpayExchangeRate
+                  ? ` PromptPay is also available in ${promptpayCurrency} at about ${promptpayExchangeRate.toFixed(2)} ${promptpayCurrency}/USD.`
+                  : ""}
+              </p>
               <Button variant="outline" onClick={() => setAddCardOpen(true)}>
                 <CreditCard className="w-4 h-4" />
                 Add Payment Method
@@ -857,7 +998,7 @@ export default function Subscription() {
             </div>
           ) : (
             <>
-              {paymentMethods.map((method, index) => {
+              {paymentMethods.map((method) => {
                 const { brand, last4, expiry } = formatPaymentMethodLabel(method);
                 const isActionLoading = methodActionId === method.id;
 
@@ -865,13 +1006,12 @@ export default function Subscription() {
                   <div
                     key={method.id}
                     className={cn(
-                      "glass-card p-4 flex items-center justify-between animate-slide-up",
-                      method.is_default && "ring-1 ring-primary"
+                      "flex items-center justify-between rounded-lg border border-border bg-white p-4",
+                      method.is_default && "border-foreground"
                     )}
-                    style={{ animationDelay: `${index * 100}ms` }}
                   >
                     <div className="flex items-center gap-4">
-                      <div className="w-12 h-8 rounded bg-secondary flex items-center justify-center">
+                      <div className="flex h-10 w-12 items-center justify-center rounded border border-border bg-muted/20">
                         <CreditCard className="w-5 h-5 text-muted-foreground" />
                       </div>
                       <div>
@@ -883,8 +1023,7 @@ export default function Subscription() {
                     </div>
                     <div className="flex items-center gap-2">
                       {method.is_default && (
-                        <span className="px-2 py-1 rounded bg-primary/10 text-primary text-xs font-medium flex items-center gap-1">
-                          <Star className="w-3 h-3" />
+                        <span className="rounded-full border border-border bg-muted/20 px-2 py-1 text-xs font-medium text-foreground">
                           Default
                         </span>
                       )}
@@ -920,7 +1059,9 @@ export default function Subscription() {
 
           <div className="flex items-center gap-2 justify-center text-sm text-muted-foreground mt-4">
             <Shield className="w-4 h-4" />
-            <span>Payments secured by Stripe</span>
+            <span>
+              Payments secured by Stripe. Card checkout saves cards for automatic billing, while PromptPay checkout pays in THB.
+            </span>
           </div>
         </div>
       )}
@@ -928,24 +1069,21 @@ export default function Subscription() {
       <Dialog open={addCardOpen} onOpenChange={setAddCardOpen}>
         <DialogContent className="max-w-lg">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Sparkles className="h-4 w-4 text-primary" />
-              Add Payment Method
-            </DialogTitle>
+            <DialogTitle>Add Payment Method</DialogTitle>
             <DialogDescription>
               Your card details are collected securely by Stripe.
             </DialogDescription>
           </DialogHeader>
 
-          <div className="rounded-xl border border-primary/20 bg-gradient-to-r from-primary/10 via-primary/5 to-transparent p-4">
+          <div className="rounded-lg border border-border bg-muted/20 p-4">
             <div className="flex items-start gap-3">
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/15">
-                <CreditCard className="h-4 w-4 text-primary" />
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border bg-white">
+                <CreditCard className="h-4 w-4 text-muted-foreground" />
               </div>
               <div>
                 <p className="text-sm font-semibold text-foreground">Secure card setup</p>
                 <p className="text-xs text-muted-foreground">
-                  Tokenized by Stripe. We never store your full card number or CVC.
+                  Tokenized by Stripe. We never store your full card number or CVC. Paying an invoice in Checkout can also save the card automatically for future billing.
                 </p>
               </div>
             </div>
@@ -996,89 +1134,6 @@ export default function Subscription() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={payDialogOpen} onOpenChange={setPayDialogOpen}>
-        <DialogContent className="max-w-lg">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <CreditCard className="h-4 w-4 text-primary" />
-              Choose Payment Method
-            </DialogTitle>
-            <DialogDescription>
-              Select which saved card to charge for this invoice before confirming payment.
-            </DialogDescription>
-          </DialogHeader>
-
-          <div className="rounded-xl border border-primary/20 bg-gradient-to-r from-primary/10 via-primary/5 to-transparent p-4">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <p className="text-sm font-semibold text-foreground">
-                  {payDialogInvoice
-                    ? formatInvoicePeriod(
-                        payDialogInvoice.billing_start_date,
-                        payDialogInvoice.billing_end_date,
-                        payDialogInvoice.created_at
-                      )
-                    : "Invoice"}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  {payDialogInvoice
-                    ? `Charge amount: ${formatCurrency(payDialogInvoice.calculated_fee ?? 0)}`
-                    : "Choose a saved card to continue"}
-                </p>
-              </div>
-              <span className="rounded-full border border-border bg-background/80 px-2 py-1 text-xs font-medium text-muted-foreground">
-                {collectionMode === "manual" ? "Manual payment" : "Saved card"}
-              </span>
-            </div>
-          </div>
-
-          <RadioGroup value={selectedPayMethodId} onValueChange={setSelectedPayMethodId} className="gap-3">
-            {paymentMethods.map((method) => {
-              const { brand, last4, expiry, label } = formatPaymentMethodLabel(method);
-              return (
-                <div
-                  key={method.id}
-                  className={cn(
-                    "rounded-xl border p-4 transition-colors",
-                    selectedPayMethodId === method.id ? "border-primary bg-primary/5" : "border-border bg-secondary/20"
-                  )}
-                >
-                  <div className="flex items-start gap-3">
-                    <RadioGroupItem value={method.id} id={`pay-method-${method.id}`} className="mt-1" />
-                    <Label htmlFor={`pay-method-${method.id}`} className="flex-1 cursor-pointer">
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <p className="text-sm font-semibold text-foreground">{label}</p>
-                          <p className="text-xs text-muted-foreground">Expires {expiry}</p>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {method.is_default && (
-                            <span className="rounded-full bg-primary/10 px-2 py-1 text-[11px] font-medium text-primary">
-                              Default
-                            </span>
-                          )}
-                          <span className="rounded-full border border-border bg-background/80 px-2 py-1 text-[11px] font-medium text-muted-foreground">
-                            {brand} •••• {last4}
-                          </span>
-                        </div>
-                      </div>
-                    </Label>
-                  </div>
-                </div>
-              );
-            })}
-          </RadioGroup>
-
-          <div className="flex flex-col-reverse gap-2 pt-1 sm:flex-row sm:justify-end">
-            <Button variant="outline" onClick={() => setPayDialogOpen(false)} disabled={invoiceActionType === "pay"}>
-              Cancel
-            </Button>
-            <Button onClick={onPayInvoice} disabled={!selectedPayMethodId || invoiceActionType === "pay"}>
-              {invoiceActionType === "pay" ? "Paying..." : "Confirm Payment"}
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

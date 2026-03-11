@@ -13,6 +13,11 @@ export interface SubscriptionData {
   min_profit_threshold: number;
   next_billing_date: string | null;
   default_payment_method_id: string | null;
+  billing_currency: string;
+  billing_exchange_rate: number;
+  promptpay_enabled: boolean;
+  promptpay_currency: string | null;
+  promptpay_exchange_rate: number | null;
 }
 
 export interface InvoiceData {
@@ -21,8 +26,11 @@ export interface InvoiceData {
   billing_end_date: string | null;
   total_period_profit: number;
   calculated_fee: number;
+  payment_amount: number | null;
+  payment_currency: string | null;
   status: string | null;
   payment_method_used: string | null;
+  payment_method_label: string | null;
   paid_at: string | null;
   created_at: string | null;
 }
@@ -44,6 +52,8 @@ export interface WeeklyPreviewData {
   gross_loss: number;
   net_profit: number;
   estimated_fee: number;
+  estimated_fee_payment: number;
+  estimated_fee_payment_currency: string;
 }
 
 interface SubscriptionSummaryResponse {
@@ -56,6 +66,13 @@ interface SubscriptionSummaryResponse {
 interface CreateSetupIntentResponse {
   client_secret: string;
 }
+
+interface CreateCheckoutSessionResponse {
+  session_id: string;
+  url?: string | null;
+}
+
+export type CheckoutPaymentFlow = "card" | "promptpay";
 
 interface AttachPaymentMethodPayload {
   paymentMethodId: string;
@@ -216,6 +233,45 @@ export function useSubscription() {
     }
   };
 
+  const createInvoiceCheckoutSession = async (invoiceId: string, paymentFlow: CheckoutPaymentFlow = "card") => {
+    if (!user) return null;
+
+    try {
+      const { data } = await api.post<CreateCheckoutSessionResponse>(
+        `/subscription/invoices/${invoiceId}/checkout-session`,
+        { payment_flow: paymentFlow }
+      );
+      return data;
+    } catch (error: any) {
+      console.error("Error creating checkout session:", error);
+      toast.error(error?.message || "Failed to open Stripe Checkout");
+      return null;
+    }
+  };
+
+  const confirmInvoiceCheckout = async (invoiceId: string, sessionId?: string | null) => {
+    if (!user) return null;
+
+    try {
+      const { data } = await api.post<InvoiceData>(
+        `/subscription/invoices/${invoiceId}/checkout-confirm`,
+        undefined,
+        {
+          params: {
+            session_id: sessionId || undefined,
+          },
+        }
+      );
+      await refreshUser();
+      await fetchData();
+      return data;
+    } catch (error: any) {
+      console.error("Error confirming checkout payment:", error);
+      toast.error(error?.message || "Failed to confirm checkout payment");
+      return null;
+    }
+  };
+
   const updateCollectionMode = async (collectionMode: "automatic" | "manual") => {
     if (!user) return false;
 
@@ -248,6 +304,8 @@ export function useSubscription() {
     removePaymentMethod,
     downloadInvoice,
     payInvoice,
+    createInvoiceCheckoutSession,
+    confirmInvoiceCheckout,
     updateCollectionMode,
   };
 }

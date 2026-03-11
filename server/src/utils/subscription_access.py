@@ -40,8 +40,11 @@ def _build_block_message(subscription_status: str, invoice_status: str | None = 
 
 def _build_missing_payment_method_message(invoice_status: str | None = None) -> str:
     if invoice_status in {"pending", "failed"}:
-        return "Add a payment method, then pay the outstanding invoice or ask admin to skip it before connecting trading accounts or using bots."
-    return "Add a payment method before connecting trading accounts or using bots."
+        return (
+            "Add a payment method or switch billing to manual, then pay the outstanding invoice "
+            "or ask admin to skip it before connecting trading accounts or using bots."
+        )
+    return "Add a payment method or switch billing to manual before connecting trading accounts or using bots."
 
 
 @dataclass
@@ -98,6 +101,7 @@ async def get_user_subscription_access_state(user_id: str) -> SubscriptionAccess
         )
 
     current_status = _normalize_status(getattr(subscription, "status", None), "active")
+    collection_mode = _normalize_status(getattr(subscription, "collectionMode", None), "automatic")
     unresolved_invoice = await get_latest_unresolved_invoice(str(subscription.id))
     unresolved_status = (
         _normalize_status(getattr(unresolved_invoice, "status", None), "pending")
@@ -112,10 +116,11 @@ async def get_user_subscription_access_state(user_id: str) -> SubscriptionAccess
     else:
         effective_status = "active"
 
-    blocked = effective_status in BLOCKING_SUB_STATUSES or not has_active_payment_method
+    requires_saved_payment_method = collection_mode == "automatic"
+    blocked = effective_status in BLOCKING_SUB_STATUSES or (requires_saved_payment_method and not has_active_payment_method)
     if effective_status in BLOCKING_SUB_STATUSES:
         block_message = _build_block_message(effective_status, unresolved_status)
-    elif not has_active_payment_method:
+    elif requires_saved_payment_method and not has_active_payment_method:
         block_message = _build_missing_payment_method_message(unresolved_status)
     else:
         block_message = None

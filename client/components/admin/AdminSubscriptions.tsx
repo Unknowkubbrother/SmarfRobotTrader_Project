@@ -769,6 +769,15 @@ export function AdminSubscriptions() {
                             </span>
                           </div>
                           <div className="flex justify-between gap-3">
+                            <span className="text-muted-foreground">Customer presentment</span>
+                            <span>
+                              {formatCurrencyAmount(
+                                asNumber(breakdown?.presentment_amount),
+                                asString(breakdown?.presentment_currency) || "USD"
+                              )}
+                            </span>
+                          </div>
+                          <div className="flex justify-between gap-3">
                             <span className="text-muted-foreground">Settlement amount</span>
                             <span>
                               {formatCurrencyAmount(
