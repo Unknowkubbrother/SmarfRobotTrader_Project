@@ -161,15 +161,31 @@ export default function HomePage() {
                         </div>
 
                         <div className="flex flex-col gap-4 sm:flex-row">
-                            <Button asChild size="xl" className="rounded-full px-8">
-                                <Link href="/auth/register">
-                                    Start for Free
-                                    <ArrowRight className="h-4 w-4" />
-                                </Link>
-                            </Button>
-                            <Button asChild size="xl" variant="outline" className="rounded-full px-8">
-                                <Link href="/dashboard">View Dashboard</Link>
-                            </Button>
+                            {hasAccessToken ? (
+                                <>
+                                    <Button asChild size="xl" className="rounded-full px-8">
+                                        <Link href="/dashboard">
+                                            Open Dashboard
+                                            <ArrowRight className="h-4 w-4" />
+                                        </Link>
+                                    </Button>
+                                    <Button asChild size="xl" variant="outline" className="rounded-full px-8">
+                                        <Link href="/bot-control">Manage Bots</Link>
+                                    </Button>
+                                </>
+                            ) : (
+                                <>
+                                    <Button asChild size="xl" className="rounded-full px-8">
+                                        <Link href="/auth/register">
+                                            Start for Free
+                                            <ArrowRight className="h-4 w-4" />
+                                        </Link>
+                                    </Button>
+                                    <Button asChild size="xl" variant="outline" className="rounded-full px-8">
+                                        <Link href="/auth/login">Sign In</Link>
+                                    </Button>
+                                </>
+                            )}
                         </div>
 
                         {/* Highlight Stats */}

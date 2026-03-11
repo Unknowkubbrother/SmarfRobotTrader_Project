@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, status, Response, Request, Form
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 from pydantic import BaseModel
@@ -11,7 +11,7 @@ import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 
 from ..database.client import r_cache, db
-from ..models.auth_model import Register_OTP, Register_Verify, Register_Complete, Login_Verify, Google_Register_OTP, Google_Register_Verify, Google_Register_Complete, CheckUser_Request, Login_OTP_Init, SetPassword_Request
+from ..models.auth_model import Register_OTP, Register_Verify, Register_Complete, ForgotPassword_Request, ForgotPassword_Verify, ForgotPassword_Reset, Login_Verify, Google_Register_OTP, Google_Register_Verify, Google_Register_Complete, CheckUser_Request, Login_OTP_Init, SetPassword_Request
 from ..utils.subscription_access import get_user_subscription_access_state
 from lib.untils import random_with_N_digits, send_otp_email
 from ..utils.turnstile import verify_turnstile
@@ -52,6 +52,13 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+
+def mask_email(email: str) -> str:
+    if "@" not in email:
+        return email
+    local_part, domain = email.split("@", 1)
+    return f"{local_part[:4]}****@{domain}"
 
 
 async def get_current_user(
@@ -137,7 +144,7 @@ async def login(
         "require_otp": True,
         "message": "OTP sent to your recovery email",
         "email": user.email,
-        "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}"
+        "recovery_email_hint": mask_email(user.recoveryEmail)
     }
 
 
@@ -253,7 +260,7 @@ async def google_auth(response: Response, google_auth: GoogleAuth):
             "require_otp": True,
             "message": "OTP sent to your recovery email",
             "email": user.email,
-            "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}"
+            "recovery_email_hint": mask_email(user.recoveryEmail)
         }
 
 
@@ -369,65 +376,6 @@ async def register_complete(register_complete: Register_Complete):
     }
 
 
-@auth_router.post("/login", response_model=Token, tags=["auth"])
-async def login(
-    response: Response, 
-    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
-    cf_token: Annotated[Optional[str], Form()] = None
-):
-    if not await verify_turnstile(cf_token):
-         raise HTTPException(status_code=400, detail="Invalid security token")
-
-    user = await db.user.find_unique(where={"email": form_data.username})
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    if not user.password:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Please login with Google",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    if not bcrypt.checkpw(form_data.password.encode('utf-8'), user.password.encode('utf-8')):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    if user.status == "banned":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account has been banned",
-        )
-    
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={
-            "sub": str(user.id),
-            "email": user.email,
-            "role": user.role
-        },
-        expires_delta=access_token_expires
-    )
-    
-    response.set_cookie(
-        key=COOKIE_NAME,
-        value=access_token,
-        httponly=True,
-        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        samesite="lax",
-        secure=False
-    )
-    
-    return Token(access_token=access_token, token_type="bearer")
-
-
 @auth_router.post("/logout", tags=["auth"])
 async def logout(response: Response):
     response.delete_cookie(key=COOKIE_NAME)
@@ -454,12 +402,8 @@ async def get_me(current_user: Annotated[any, Depends(get_current_active_user)])
 
 
 @auth_router.post("/forgot-password/request", tags=["auth"])
-async def forgot_password_request(data: dict):
-    email = data.get("email")
-    if not email:
-        raise HTTPException(status_code=400, detail="Email is required")
-    
-    user = await db.user.find_unique(where={"email": email})
+async def forgot_password_request(data: ForgotPassword_Request):
+    user = await db.user.find_unique(where={"email": data.email})
     if not user:
         raise HTTPException(status_code=404, detail="Email not found in system")
     
@@ -469,7 +413,7 @@ async def forgot_password_request(data: dict):
     otp = str(random_with_N_digits(6))
     
     r_cache.setex(
-        f"forgot_password_otp:{email}",
+        f"forgot_password_otp:{data.email}",
         300,
         otp
     )
@@ -478,59 +422,46 @@ async def forgot_password_request(data: dict):
     
     return {
         "message": f"OTP sent to recovery email",
-        "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}"
+        "recovery_email_hint": mask_email(user.recoveryEmail)
     }
 
 
 @auth_router.post("/forgot-password/verify", tags=["auth"])
-async def forgot_password_verify(data: dict):
-    email = data.get("email")
-    otp = data.get("otp")
-    
-    if not email or not otp:
-        raise HTTPException(status_code=400, detail="Email and OTP are required")
-    
-    stored_otp = r_cache.get(f"forgot_password_otp:{email}")
+async def forgot_password_verify(data: ForgotPassword_Verify):
+    stored_otp = r_cache.get(f"forgot_password_otp:{data.email}")
     if not stored_otp:
         raise HTTPException(status_code=400, detail="OTP expired or not found")
     
-    if stored_otp != otp:
+    if stored_otp != data.otp:
         raise HTTPException(status_code=400, detail="Invalid OTP")
     
     return {"message": "OTP verified", "verified": True}
 
 
 @auth_router.post("/forgot-password/reset", tags=["auth"])
-async def forgot_password_reset(data: dict):
-    email = data.get("email")
-    otp = data.get("otp")
-    new_password = data.get("new_password")
-    
-    if not email or not otp or not new_password:
-        raise HTTPException(status_code=400, detail="Email, OTP, and new password are required")
-    
-    if len(new_password) < 6:
+async def forgot_password_reset(data: ForgotPassword_Reset):
+    if len(data.new_password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
     
-    stored_otp = r_cache.get(f"forgot_password_otp:{email}")
+    stored_otp = r_cache.get(f"forgot_password_otp:{data.email}")
     if not stored_otp:
         raise HTTPException(status_code=400, detail="OTP expired or not found")
     
-    if stored_otp != otp:
+    if stored_otp != data.otp:
         raise HTTPException(status_code=400, detail="Invalid OTP")
     
-    user = await db.user.find_unique(where={"email": email})
+    user = await db.user.find_unique(where={"email": data.email})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    hashed_password = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt())
+    hashed_password = bcrypt.hashpw(data.new_password.encode("utf-8"), bcrypt.gensalt())
     
     await db.user.update(
         where={"id": user.id},
         data={"password": hashed_password.decode("utf-8")}
     )
     
-    r_cache.delete(f"forgot_password_otp:{email}")
+    r_cache.delete(f"forgot_password_otp:{data.email}")
     
     return {"message": "Password reset successfully"}
 
@@ -680,7 +611,7 @@ async def check_user(data: CheckUser_Request):
         "exists": True,
         "has_password": bool(user.password),
         "is_google": bool(user.googleAuthId),
-        "recovery_email_hint": f"{user.recoveryEmail[:4]}****@{user.recoveryEmail.split('@')[1]}" if user.recoveryEmail else None,
+        "recovery_email_hint": mask_email(user.recoveryEmail) if user.recoveryEmail else None,
         "otp_sent": False
     }
 

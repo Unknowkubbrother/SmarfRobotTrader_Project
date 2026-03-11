@@ -1,9 +1,8 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { useRouter } from "next/navigation";
+import { useState, useEffect, useRef } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { z } from "zod";
 // import { useForm } from "react-hook-form";
 // import { zodResolver } from "@hookform/resolvers/zod";
 import { Eye, EyeOff } from "lucide-react";
@@ -14,11 +13,6 @@ import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
 import TurnstileWidget from "@/components/ui/TurnstileWidget";
-
-const loginSchema = z.object({
-    email: z.string().trim().email({ message: "Invalid email address" }),
-    password: z.string().min(6, { message: "Password must be at least 6 characters" }),
-});
 
 export default function Login() {
     const [showPassword, setShowPassword] = useState(false);
@@ -33,13 +27,38 @@ export default function Login() {
     const [countdown, setCountdown] = useState(0);
     const [devOtp, setDevOtp] = useState<string | null>(null);
     const [cfToken, setCfToken] = useState<string>("");
+    const handledResetRef = useRef(false);
 
     const router = useRouter();
-    const { user, loading, signIn, signInWithGoogle, loginVerify, checkUser, loginOtpInit, setPassword: setAuthPassword } = useAuth();
+    const searchParams = useSearchParams();
+    const { user, loading, signIn, signInWithGoogle, loginVerify, checkUser, setPassword: setAuthPassword } = useAuth();
+    const forgotPasswordParams = new URLSearchParams();
+    if (email) forgotPasswordParams.set("email", email);
+    const forgotPasswordHref = forgotPasswordParams.toString()
+        ? `/auth/forgot-password?${forgotPasswordParams.toString()}`
+        : "/auth/forgot-password";
 
     useEffect(() => {
         if (!loading && user) router.push("/dashboard");
     }, [loading, user, router]);
+
+    useEffect(() => {
+        const prefilledEmail = searchParams.get("email")?.trim();
+        if (prefilledEmail) {
+            setEmail((currentEmail) => currentEmail || prefilledEmail);
+        }
+    }, [searchParams]);
+
+    useEffect(() => {
+        if (handledResetRef.current || searchParams.get("reset") !== "success") return;
+
+        handledResetRef.current = true;
+        toast.success("Password reset successfully. Please sign in.");
+
+        const params = new URLSearchParams(searchParams.toString());
+        params.delete("reset");
+        router.replace(params.toString() ? `/auth/login?${params.toString()}` : "/auth/login");
+    }, [router, searchParams]);
 
     useEffect(() => {
         if (countdown > 0) {
@@ -61,6 +80,7 @@ export default function Login() {
                 if (result.email) setEmail(result.email);
                 setRecoveryHint(result.recoveryEmailHint || "");
                 setIsGoogleUser(true); // Treat as google user flow
+                setCountdown(60);
                 setStep(3); // Go to OTP
                 toast.success("OTP sent to your recovery email");
             } else if (result.requireRegister) {
@@ -148,6 +168,7 @@ export default function Login() {
 
             if (result.requireOtp) {
                 setRecoveryHint(result.recoveryEmailHint || "");
+                setCountdown(60);
                 setStep(3);
                 toast.success("OTP sent to your recovery email");
             } else {
@@ -175,7 +196,7 @@ export default function Login() {
 
             // Check if we need to set password
             if (isGoogleUser && !hasPassword) {
-                // setStep(4);
+                setStep(4);
                 toast.success("Login verified!");
             } else {
                 toast.success("Login verified!");
@@ -202,32 +223,6 @@ export default function Login() {
             }
             toast.success("Password set successfully! Welcome.");
             router.push("/dashboard");
-        } finally {
-            setIsLoading(false);
-        }
-    };
-
-    const resendOTP = async (token?: string) => {
-        if (countdown > 0) return;
-
-        // If we require token and none provided (unless we want to allow one-click retry if backend allows? No, backend enforces it)
-        if (!token) {
-            // In this design, we use Turnstile onVerify to trigger this, so token should differ.
-            // But if we call it from button click?
-            // We won't have a button, we have the widget.
-            return;
-        }
-
-        setIsLoading(true);
-        try {
-            const result = await loginOtpInit(email, token);
-            if (result.error) {
-                toast.error(result.error.message);
-                return;
-            }
-            if (result.devOtp) setDevOtp(result.devOtp);
-            setCountdown(60);
-            toast.success("OTP resent!");
         } finally {
             setIsLoading(false);
         }
@@ -319,9 +314,9 @@ export default function Login() {
 
                                 <form onSubmit={handlePasswordLogin} className="space-y-4">
                                     <div className="space-y-2">
-                                        <div className="flex justify-between">
+                                        <div className="flex items-center justify-between">
                                             <label className="text-sm font-medium leading-none">Password</label>
-                                            <Link href="/auth/forgot-password" className="text-xs text-muted-foreground hover:text-foreground">
+                                            <Link href={forgotPasswordHref} className="text-xs text-muted-foreground hover:text-foreground">
                                                 Forgot Password?
                                             </Link>
                                         </div>

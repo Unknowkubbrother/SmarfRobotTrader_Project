@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { z } from "zod";
 import { useForm } from "react-hook-form";
@@ -38,6 +38,7 @@ export default function ForgotPassword() {
     const [email, setEmail] = useState("");
     const [recoveryEmailHint, setRecoveryEmailHint] = useState("");
     const router = useRouter();
+    const searchParams = useSearchParams();
 
     const emailForm = useForm<z.infer<typeof emailSchema>>({
         resolver: zodResolver(emailSchema),
@@ -48,6 +49,19 @@ export default function ForgotPassword() {
         resolver: zodResolver(passwordSchema),
         defaultValues: { password: "", confirmPassword: "" },
     });
+
+    const watchedEmail = emailForm.watch("email");
+    const loginParams = new URLSearchParams();
+    const preservedEmail = watchedEmail || email;
+    if (preservedEmail) loginParams.set("email", preservedEmail);
+    const loginHref = loginParams.toString() ? `/auth/login?${loginParams.toString()}` : "/auth/login";
+
+    useEffect(() => {
+        const prefilledEmail = searchParams.get("email")?.trim();
+        if (!prefilledEmail) return;
+        emailForm.reset({ email: prefilledEmail });
+        setEmail(prefilledEmail);
+    }, [emailForm, searchParams]);
 
     useEffect(() => {
         if (countdown > 0) {
@@ -100,7 +114,7 @@ export default function ForgotPassword() {
                 new_password: data.password,
             });
             toast.success("Password reset successfully!");
-            router.push("/auth/login");
+            router.push(`/auth/login?${new URLSearchParams({ email, reset: "success" }).toString()}`);
         } catch (error: any) {
             toast.error(error.message);
         } finally {
@@ -149,7 +163,7 @@ export default function ForgotPassword() {
                     </div>
 
                     <div className="bg-card rounded-2xl shadow-lg p-8 border border-border">
-                        <Link href="/auth/login" className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground mb-4">
+                        <Link href={loginHref} className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground mb-4">
                             <ArrowLeft className="w-4 h-4" />
                             Back to login
                         </Link>
