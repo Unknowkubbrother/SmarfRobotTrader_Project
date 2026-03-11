@@ -44,6 +44,31 @@ function toLocalClockText(rawUtc?: string, fallback?: string): string {
   return parsed.toLocaleTimeString([], { hour12: false });
 }
 
+function isSameLocalDay(left: Date, right: Date): boolean {
+  return (
+    left.getFullYear() === right.getFullYear()
+    && left.getMonth() === right.getMonth()
+    && left.getDate() === right.getDate()
+  );
+}
+
+function toLocalLogTimestampText(rawUtc?: string, fallback?: string): string {
+  const parsed = parseUtcLike(String(rawUtc || ""));
+  if (!parsed) {
+    return String(fallback || "--:--:--");
+  }
+
+  const now = new Date();
+  const clock = parsed.toLocaleTimeString([], { hour12: false });
+  if (isSameLocalDay(parsed, now)) {
+    return clock;
+  }
+
+  const day = String(parsed.getDate()).padStart(2, "0");
+  const month = String(parsed.getMonth() + 1).padStart(2, "0");
+  return `${day}/${month} ${clock}`;
+}
+
 function normalizeBrokerDateTimeText(raw?: string): string {
   const text = String(raw || "").trim();
   if (!text) return "";
@@ -191,6 +216,15 @@ function toReviewLogType(value: unknown): LogEntry["type"] {
   return "analysis";
 }
 
+function toReviewTimingText(review: Partial<BotLiveIntrabarReview>): string {
+  const reviewClock = toLocalClockText(
+    typeof review.reviewed_at_bar_end_utc === "string" ? review.reviewed_at_bar_end_utc : review.bar_end_utc,
+    "",
+  );
+  if (reviewClock) return `Broker Review ${reviewClock}`;
+  return "";
+}
+
 function toReviewLogMessage(review: Partial<BotLiveIntrabarReview>): string {
   const ticket = String(review.ticket || "").trim();
   const side = String(review.side || "").trim().toUpperCase();
@@ -207,7 +241,8 @@ function toReviewLogMessage(review: Partial<BotLiveIntrabarReview>): string {
     .filter(Boolean)
     .join(" | ");
   const triggerText = triggerReasons ? ` | trigger: ${triggerReasons}` : "";
-  return `${subject} | ${headline} | actual ${actualMoney} (${actualChange}) vs close ${holdMoney} (${holdChange}) | ${sourceLabel}${triggerText}`;
+  const timingText = toReviewTimingText(review);
+  return `${timingText ? `${timingText} | ` : ""}${subject} | ${headline} | actual ${actualMoney} (${actualChange}) vs close ${holdMoney} (${holdChange}) | ${sourceLabel}${triggerText}`;
 }
 
 function shouldHideLog(log: Partial<BotLiveLogEntry>): boolean {
@@ -512,7 +547,7 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
       if (phase === "INTRABAR" && event === "review" && recentIntrabarReviews.length > 0) continue;
       const insufficientFunds = isInsufficientFundsLog(row);
       const rawUtc = typeof row?.timestamp_utc === "string" ? row.timestamp_utc : undefined;
-      const timestamp = toLocalClockText(
+      const timestamp = toLocalLogTimestampText(
         rawUtc,
         String(row?.timestamp || "")
       );
@@ -538,9 +573,10 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
       const review = recentIntrabarReviews[i];
       const ticketKey = String(review.ticket || "").trim();
       const reviewLogTimestampUtc = ticketKey ? reviewLogTimestampByTicket.get(ticketKey) : "";
-      const timestampUtc = reviewLogTimestampUtc
+      const timestampUtc = (typeof review.triggered_at_utc === "string" ? review.triggered_at_utc : "")
+        || reviewLogTimestampUtc
         || (typeof review.reviewed_at_bar_end_utc === "string" ? review.reviewed_at_bar_end_utc : review.bar_end_utc);
-      const timestamp = toLocalClockText(timestampUtc, "--:--:--");
+      const timestamp = toLocalLogTimestampText(timestampUtc, "--:--:--");
       const message = toReviewLogMessage(review);
       const type = toReviewLogType(review.review_outcome);
       const key = `${timestamp}|${type}|${message}`;
@@ -572,7 +608,7 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
         || (typeof liveState?.last_bar_time === "string" ? liveState.last_bar_time : "");
       const llmSortKey = parseUtcLike(llmTimestampUtc);
       const ts = llmSortKey
-        ? toLocalClockText(llmTimestampUtc)
+        ? toLocalLogTimestampText(llmTimestampUtc)
         : (rows.length > 0 ? rows[rows.length - 1].timestamp : "--:--:--");
       const message = `AI Analysis: ${llmSummary}`;
       rows.push({
