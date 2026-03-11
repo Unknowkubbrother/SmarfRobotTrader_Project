@@ -58,9 +58,6 @@ export function Sidebar() {
             collapsed && "gap-0"
           )}
         >
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">
-            SR
-          </div>
           {!collapsed && (
             <div className="flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap">
               <span className="text-lg font-bold text-foreground">RoBot</span>
