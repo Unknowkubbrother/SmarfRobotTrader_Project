@@ -63,27 +63,47 @@ const filterByTimeframe = (rows: ChartDataPoint[], timeframe: ChartTimeframe): C
 interface PerformanceChartProps {
   liveState?: BotLiveState;
   botId?: string;
+  accountId?: string;
   className?: string;
 }
 
-export function PerformanceChart({ liveState, botId, className }: PerformanceChartProps) {
+export function PerformanceChart({ liveState, botId, accountId, className }: PerformanceChartProps) {
   const [selectedTimeframe, setSelectedTimeframe] = useState<ChartTimeframe>("1M");
   const [historyData, setHistoryData] = useState<ChartDataPoint[]>([]);
-  const lastBotIdRef = useRef<string>("");
+  const lastScopeRef = useRef<string>("");
   const [historyLoaded, setHistoryLoaded] = useState(false);
 
   const isLive = !!liveState?.connected;
   const activeBotId = String(botId || liveState?.bot_config_id || "").trim();
+  const activeAccountId = String(accountId || "").trim();
+  const scopeKey = `${activeAccountId}:${activeBotId}`;
+  const liveRealizedPnl = Number(liveState?.total_pnl);
+  const liveFloatingPnl = Number(liveState?.unrealized_pnl);
+  const currencyCode = String(liveState?.currency || "USD").trim().toUpperCase() || "USD";
+  const formatMoney = useMemo(() => {
+    const fallback = (value: number) =>
+      `${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currencyCode}`.trim();
+    try {
+      const formatter = new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: currencyCode,
+        maximumFractionDigits: 2,
+      });
+      return (value: number) => formatter.format(value);
+    } catch {
+      return fallback;
+    }
+  }, [currencyCode]);
 
   useEffect(() => {
     if (!activeBotId) return;
-    if (lastBotIdRef.current && lastBotIdRef.current !== activeBotId) {
-      // Avoid mixing equity histories when user switches selected bot.
+    if (lastScopeRef.current && lastScopeRef.current !== scopeKey) {
+      // Avoid mixing histories when the selected bot/account scope changes.
       setHistoryData([]);
       setHistoryLoaded(false);
     }
-    lastBotIdRef.current = activeBotId;
-  }, [activeBotId]);
+    lastScopeRef.current = scopeKey;
+  }, [activeBotId, scopeKey]);
 
   useEffect(() => {
     if (!activeBotId || historyLoaded) return;
@@ -100,7 +120,14 @@ export function PerformanceChart({ liveState, botId, className }: PerformanceCha
         const responses = await Promise.all(
           monthRefs.map(({ year, month }) =>
             api
-              .get("/trading/calendar", { params: { year, month } })
+              .get("/trading/calendar", {
+                params: {
+                  year,
+                  month,
+                  ...(activeAccountId ? { accountId: activeAccountId } : {}),
+                  botConfigId: activeBotId,
+                },
+              })
               .then((res) => ({ ok: true, data: res.data, year, month }))
               .catch(() => ({ ok: false, data: null, year, month }))
           )
@@ -133,9 +160,8 @@ export function PerformanceChart({ liveState, botId, className }: PerformanceCha
 
         if (cancelled || seeded.length === 0) return;
 
-        const liveBalance = Number(liveState?.balance);
-        if (Number.isFinite(liveBalance) && liveBalance > 0) {
-          const offset = liveBalance - seeded[seeded.length - 1].balance;
+        if (Number.isFinite(liveRealizedPnl)) {
+          const offset = liveRealizedPnl - seeded[seeded.length - 1].balance;
           for (const point of seeded) {
             point.balance += offset;
             point.equity += offset;
@@ -159,15 +185,15 @@ export function PerformanceChart({ liveState, botId, className }: PerformanceCha
     return () => {
       cancelled = true;
     };
-  }, [activeBotId, historyLoaded, liveState?.balance]);
+  }, [activeAccountId, activeBotId, historyLoaded, liveRealizedPnl]);
 
   useEffect(() => {
-    if (!isLive || !liveState) return;
-    const balance = Number(liveState.balance);
-    const equity = Number(liveState.equity);
-    if (!Number.isFinite(balance) || !Number.isFinite(equity) || balance <= 0 || equity <= 0) {
+    if (!isLive) return;
+    if (!Number.isFinite(liveRealizedPnl) && !Number.isFinite(liveFloatingPnl)) {
       return;
     }
+    const balance = Number.isFinite(liveRealizedPnl) ? liveRealizedPnl : 0;
+    const equity = balance + (Number.isFinite(liveFloatingPnl) ? liveFloatingPnl : 0);
 
     setHistoryData((prev) => {
       const now = Date.now();
@@ -192,8 +218,7 @@ export function PerformanceChart({ liveState, botId, className }: PerformanceCha
       const maxKeep = 3000;
       return next.length > maxKeep ? next.slice(next.length - maxKeep) : next;
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isLive, liveState?.balance, liveState?.equity]);
+  }, [isLive, liveFloatingPnl, liveRealizedPnl]);
 
   const chartData = useMemo<ChartRenderPoint[]>(() => {
     const scoped = filterByTimeframe(historyData, selectedTimeframe);
@@ -216,7 +241,7 @@ export function PerformanceChart({ liveState, botId, className }: PerformanceCha
               </span>
             )}
           </div>
-          <p className="text-sm text-muted-foreground">Balance & Equity over time</p>
+          <p className="text-sm text-muted-foreground">Realized and floating P&amp;L for this bot</p>
         </div>
         <div className="flex items-center gap-1 p-1 rounded-lg bg-secondary">
           {timeframes.map((tf) => (
@@ -240,7 +265,7 @@ export function PerformanceChart({ liveState, botId, className }: PerformanceCha
         {chartData.length === 0 ? (
           <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
             <div className="text-center space-y-2">
-              <div>{isLive ? "Waiting for live balance/equity data..." : "Connect bot to show performance chart"}</div>
+              <div>{isLive ? "Waiting for live bot performance data..." : "Connect bot to show performance chart"}</div>
               <Link href="/calendar" className="inline-flex items-center gap-1 text-primary hover:underline">
                 View history in Profit Calendar
                 <ArrowUpRight className="w-3.5 h-3.5" />
@@ -272,7 +297,7 @@ export function PerformanceChart({ liveState, botId, className }: PerformanceCha
                 axisLine={false}
                 tickLine={false}
                 tick={{ fill: "hsl(220, 9%, 46%)", fontSize: 11 }}
-                tickFormatter={(value) => `$${Number(value).toLocaleString()}`}
+                tickFormatter={(value) => formatMoney(Number(value))}
                 domain={["auto", "auto"]}
               />
               <Tooltip
@@ -287,7 +312,7 @@ export function PerformanceChart({ liveState, botId, className }: PerformanceCha
                   if (!ts) return "";
                   return new Date(ts).toLocaleString("en-US", { hour12: false });
                 }}
-                formatter={(value: number, name: string) => [`$${value.toLocaleString()}`, name]}
+                formatter={(value: number, name: string) => [formatMoney(Number(value)), name]}
               />
               <Legend
                 verticalAlign="top"
@@ -298,7 +323,7 @@ export function PerformanceChart({ liveState, botId, className }: PerformanceCha
               <Area
                 type="monotone"
                 dataKey="balance"
-                name="Balance"
+                name="Realized P&L"
                 stroke="hsl(220, 90%, 56%)"
                 strokeWidth={2}
                 fill="url(#balanceGradient)"
@@ -307,7 +332,7 @@ export function PerformanceChart({ liveState, botId, className }: PerformanceCha
               <Area
                 type="monotone"
                 dataKey="equity"
-                name="Equity"
+                name="P&L + Floating"
                 stroke="hsl(142, 72%, 42%)"
                 strokeWidth={2}
                 fill="url(#equityGradient)"

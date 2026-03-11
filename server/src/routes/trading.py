@@ -304,6 +304,37 @@ async def _resolve_requested_account_id(
     return str(account.id)
 
 
+async def _resolve_requested_bot_configuration(
+    user_id: str,
+    requested_bot_config_id: str | None,
+    *,
+    include_archived: bool,
+    requested_account_id: str | None = None,
+):
+    bot_config_id = str(requested_bot_config_id or "").strip()
+    if not bot_config_id:
+        return None
+
+    account_where: dict = {"userId": user_id}
+    if not include_archived:
+        account_where["recordStatus"] = ACTIVE_RECORD_STATUS
+
+    config_where: dict = {
+        "id": bot_config_id,
+        "account": account_where,
+    }
+    if not include_archived:
+        config_where["recordStatus"] = ACTIVE_RECORD_STATUS
+    if requested_account_id:
+        config_where["accountId"] = requested_account_id
+
+    config = await db.botconfiguration.find_first(where=config_where)
+    if not config:
+        raise HTTPException(status_code=404, detail="Bot configuration not found")
+
+    return config
+
+
 def _combine_where_and(*conditions: dict) -> dict:
     valid_conditions = [c for c in conditions if c]
     if not valid_conditions:
@@ -311,6 +342,37 @@ def _combine_where_and(*conditions: dict) -> dict:
     if len(valid_conditions) == 1:
         return valid_conditions[0]
     return {"AND": valid_conditions}
+
+
+def _build_bot_order_filter(bot_config) -> dict:
+    if not bot_config:
+        return {}
+
+    account_id = str(getattr(bot_config, "accountId", "") or "").strip()
+    bot_instance_id = int(getattr(bot_config, "botInstanceId", 0) or 0)
+    magic_number = int(getattr(bot_config, "magicNumber", 0) or 0)
+
+    filters: list[dict] = []
+    if account_id and bot_instance_id > 0:
+        filters.append(
+            {
+                "accountId": account_id,
+                "botInstanceId": bot_instance_id,
+            }
+        )
+    if account_id and magic_number > 0:
+        filters.append(
+            {
+                "accountId": account_id,
+                "magicNumber": magic_number,
+            }
+        )
+
+    if not filters:
+        return {"accountId": account_id, "ticketId": -1} if account_id else {"ticketId": -1}
+    if len(filters) == 1:
+        return filters[0]
+    return {"OR": filters}
 
 
 async def _sync_daily_aggregates_from_orders(
@@ -409,6 +471,7 @@ async def get_trading_calendar(
     month: int,
     include_archived: bool = Query(True, alias="includeArchived"),
     account_id: str | None = Query(None, alias="accountId"),
+    bot_config_id: str | None = Query(None, alias="botConfigId"),
 ):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
@@ -417,6 +480,14 @@ async def get_trading_calendar(
         account_id,
         include_archived=include_archived,
     )
+    selected_bot_config = await _resolve_requested_bot_configuration(
+        request.state.user_id,
+        bot_config_id,
+        include_archived=include_archived,
+        requested_account_id=selected_account_id,
+    )
+    if selected_bot_config and not selected_account_id:
+        selected_account_id = str(getattr(selected_bot_config, "accountId", "") or "").strip() or None
     
     # Calculate start and end date for the month
     try:
@@ -428,20 +499,22 @@ async def get_trading_calendar(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid year or month")
     
-    # Pull monthly trade history into daily_aggregates so calendar stays synced
-    try:
-        day_rollup = await _sync_daily_aggregates_from_orders(
-            user_id=request.state.user_id,
-            start_date=start_date,
-            end_date=end_date,
-            include_archived_accounts=True,
-        )
-    except Exception as e:
-        print(f"[WARN] trading calendar sync failed: {e}")
-        day_rollup = {}
+    day_rollup = {}
+    if not selected_bot_config:
+        # Pull monthly trade history into daily_aggregates so calendar stays synced.
+        try:
+            day_rollup = await _sync_daily_aggregates_from_orders(
+                user_id=request.state.user_id,
+                start_date=start_date,
+                end_date=end_date,
+                include_archived_accounts=True,
+            )
+        except Exception as e:
+            print(f"[WARN] trading calendar sync failed: {e}")
+            day_rollup = {}
 
     calendar_data = {}
-    if include_archived:
+    if include_archived and not selected_bot_config:
         account_filter: dict = {"userId": request.state.user_id}
         aggregate_where: dict = {
             "account": account_filter,
@@ -501,7 +574,7 @@ async def get_trading_calendar(
         day_rollup = {}
         _, order_scope = await _build_user_order_scope(
             request.state.user_id,
-            include_archived=False,
+            include_archived=include_archived,
         )
         if order_scope:
             where_scope = _combine_where_and(
@@ -513,6 +586,7 @@ async def get_trading_calendar(
                         "lt": datetime.combine(end_date, datetime.min.time()),
                     },
                 },
+                _build_bot_order_filter(selected_bot_config),
             )
             orders = await db.orderhistory.find_many(
                 where=where_scope,
