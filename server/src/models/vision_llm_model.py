@@ -3,11 +3,24 @@ from datetime import datetime
 from typing import Optional
 
 
+class VisionLLMChartRate(BaseModel):
+    time: int
+    open: float
+    high: float
+    low: float
+    close: float
+    tick_volume: float = 0.0
+
+
 class VisionLLMRequest(BaseModel):
     date_time: datetime
     symbol: str
     timeframe: str = "H1"
     bot_config_id: Optional[str] = None
+    chart_rates: Optional[list[VisionLLMChartRate]] = None
+    resolved_bar_time: Optional[str] = None
+    source_server: Optional[str] = None
+    source_login: Optional[str] = None
 
     @field_validator("date_time", mode="before")
     @classmethod

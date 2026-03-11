@@ -29,6 +29,10 @@ def generate_llm_text_for_bar(
     timeframe: str = "H1",
     dataset_json: Optional[str] = None,
     bot_config_id: Optional[str] = None,
+    chart_rates: Optional[list[dict]] = None,
+    resolved_bar_time: Optional[str] = None,
+    source_server: Optional[str] = None,
+    source_login: Optional[str] = None,
 ) -> Tuple[str, ChartImageResult]:
     """Generate a full RAG-based analysis text for one chart bar."""
     runtime = get_runtime(dataset_json)
@@ -37,6 +41,10 @@ def generate_llm_text_for_bar(
         symbol=symbol,
         timeframe=timeframe,
         bot_config_id=bot_config_id,
+        chart_rates=chart_rates,
+        resolved_bar_time=resolved_bar_time,
+        source_server=source_server,
+        source_login=source_login,
     )
     answer = run_rag_pipeline(
         chart_db=runtime["chart_db"],
@@ -54,6 +62,10 @@ def generate_llm_cls_for_bar(
     timeframe: str = "H1",
     dataset_json: Optional[str] = None,
     bot_config_id: Optional[str] = None,
+    chart_rates: Optional[list[dict]] = None,
+    resolved_bar_time: Optional[str] = None,
+    source_server: Optional[str] = None,
+    source_login: Optional[str] = None,
 ) -> Tuple[str, np.ndarray, ChartImageResult]:
     """Generate analysis text *and* its CLS embedding vector."""
     llm_text, chart_result = generate_llm_text_for_bar(
@@ -62,6 +74,10 @@ def generate_llm_cls_for_bar(
         timeframe=timeframe,
         dataset_json=dataset_json,
         bot_config_id=bot_config_id,
+        chart_rates=chart_rates,
+        resolved_bar_time=resolved_bar_time,
+        source_server=source_server,
+        source_login=source_login,
     )
     cls_vec = text_to_cls_embedding(llm_text)
     return llm_text, cls_vec, chart_result

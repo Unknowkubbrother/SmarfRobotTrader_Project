@@ -156,13 +156,18 @@ async def vision_llm(request: Request, data: VisionLLMRequest):
 
         try:
             start = time.perf_counter()
+            chart_rates_payload = [row.model_dump() for row in (data.chart_rates or [])] or None
             result, cls_vec, chart_result = await asyncio.to_thread(
                 generate_llm_cls_for_bar,
                 date_time=data.date_time,
                 symbol=symbol,
                 timeframe=timeframe,
                 dataset_json=None,
-                bot_config_id=bot_config_id or None,
+                bot_config_id=(bot_config_id or None) if chart_rates_payload else None,
+                chart_rates=chart_rates_payload,
+                resolved_bar_time=str(getattr(data, "resolved_bar_time", "") or "").strip() or None,
+                source_server=str(getattr(data, "source_server", "") or "").strip() or None,
+                source_login=str(getattr(data, "source_login", "") or "").strip() or None,
             )
             elapsed = time.perf_counter() - start
 

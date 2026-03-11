@@ -605,9 +605,6 @@ export function AIConsole({ botName = "Bot", liveState }: AIConsoleProps) {
             <Terminal className="w-4 h-4 text-muted-foreground" />
             <h3 className="font-semibold text-foreground">Activity Log</h3>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">
-            Left time is local event time. Broker candle time is the chart candle label from MT5.
-          </p>
         </div>
         {isLive && (
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-success/10 text-success">

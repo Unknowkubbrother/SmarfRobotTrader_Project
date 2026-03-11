@@ -640,15 +640,22 @@ if [[ -z "$resolved_bot_dir" || "$resolved_bot_dir" == "$BOT_SCRIPT_DEFAULT" ]];
   resolved_bot_dir="$(dirname "$BOT_SCRIPT_DEFAULT")"
 fi
 resolved_bot_dir="$(printf '%s' "$resolved_bot_dir" | sed -E 's#^/+##')"
+cache_identity="$(printf '%s' "$(sanitize_version_token "$MT5_SERVER_VAL")" | tr '[:upper:]' '[:lower:]')"
+if [[ -z "$cache_identity" ]]; then
+  cache_identity="$(printf '%s' "$(sanitize_version_token "${PROFILE}")" | tr '[:upper:]' '[:lower:]')"
+fi
+if [[ -z "$cache_identity" ]]; then
+  cache_identity="default"
+fi
 
 if [[ -z "${LIVE_MODELS_DIR:-}" ]]; then
   export LIVE_MODELS_DIR="/bots/${resolved_bot_dir}/models"
 fi
 if [[ -z "${LIVE_LLM_SEMANTIC_CACHE_FILE:-}" ]]; then
-  export LIVE_LLM_SEMANTIC_CACHE_FILE="${LIVE_MODELS_DIR}/time_to_embedding_llm_cls.joblib"
+  export LIVE_LLM_SEMANTIC_CACHE_FILE="${LIVE_MODELS_DIR}/cache/broker-${cache_identity}/time_to_embedding_llm_cls.joblib"
 fi
 if [[ -z "${LIVE_LLM_TEXT_LOG_FILE:-}" ]]; then
-  export LIVE_LLM_TEXT_LOG_FILE="${LIVE_MODELS_DIR}/time_to_llm_text.jsonl"
+  export LIVE_LLM_TEXT_LOG_FILE="${LIVE_MODELS_DIR}/cache/broker-${cache_identity}/time_to_llm_text.jsonl"
 fi
 if [[ -z "${LIVE_PREWARM_SEMANTIC_ON_START:-}" ]]; then
   export LIVE_PREWARM_SEMANTIC_ON_START="1"

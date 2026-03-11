@@ -329,6 +329,39 @@ def _render_chart(df: pd.DataFrame) -> str:
     return base64.b64encode(buf.read()).decode("utf-8")
 
 
+def _build_chart_result_from_payload(
+    *,
+    chart_rates: list[dict] | None,
+    resolved_bar_time: str | None,
+    bot_config_id: str | None,
+    source_server: str | None,
+    source_login: str | None,
+) -> ChartImageResult | None:
+    if not chart_rates:
+        return None
+
+    df = _rates_to_dataframe(chart_rates)
+    label_parts = ["bot payload"]
+    server_name = str(source_server or "").strip()
+    login_id = str(source_login or "").strip()
+    bot_id = str(bot_config_id or "").strip()
+    if server_name:
+        label_parts.append(server_name)
+    if login_id:
+        label_parts.append(f"login {login_id}")
+    if bot_id:
+        label_parts.append(f"bot {bot_id[:8]}")
+    resolved_bar = str(resolved_bar_time or "").strip()
+    if not resolved_bar and len(df.index) > 0:
+        resolved_bar = df.index[0].strftime("%Y-%m-%d %H:%M:%S")
+    return ChartImageResult(
+        image_base64=_render_chart(df),
+        source_mode="bot_runtime_payload",
+        source_label=" | ".join(label_parts),
+        resolved_bar_time=resolved_bar,
+    )
+
+
 def _fetch_rates_from_bot_container(
     date_time: datetime,
     *,
@@ -446,10 +479,24 @@ def generate_image_result(
     symbol: str = "EURUSD",
     timeframe: str = "H1",
     bot_config_id: str | None = None,
+    chart_rates: list[dict] | None = None,
+    resolved_bar_time: str | None = None,
+    source_server: str | None = None,
+    source_login: str | None = None,
 ) -> ChartImageResult:
     symbol_text = str(symbol or "EURUSD").strip().upper()
     timeframe_text = str(timeframe or "H1").strip().upper()
     bot_id = str(bot_config_id or "").strip()
+
+    payload_result = _build_chart_result_from_payload(
+        chart_rates=chart_rates,
+        resolved_bar_time=resolved_bar_time,
+        bot_config_id=bot_id,
+        source_server=source_server,
+        source_login=source_login,
+    )
+    if payload_result is not None:
+        return payload_result
 
     if bot_id:
         rates, source_mode, source_label, resolved_bar_time = _fetch_rates_from_bot_container(

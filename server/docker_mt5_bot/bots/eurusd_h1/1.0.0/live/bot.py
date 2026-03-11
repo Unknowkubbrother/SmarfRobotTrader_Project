@@ -1935,7 +1935,106 @@ class LiveTradingBot:
         self._save_llm_semantic_cache(reason=source)
         print(f"\n [SEM] ready ({source}) ts={ts_key} dim={vec.size}")
 
-    def _request_llm_semantic_from_server(self, ts_key: str):
+    def _parse_semantic_ts_key(self, ts_key: str) -> datetime:
+        text = str(ts_key or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y.%m.%d %H.%M", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        raise ValueError(f"invalid semantic timestamp: {text}")
+
+    def _build_llm_chart_payload(self, ts_key: str) -> dict:
+        target_dt = self._parse_semantic_ts_key(ts_key)
+        tf_secs = max(60, int(self.timeframe_seconds or 3600))
+        epoch = int(target_dt.astimezone(timezone.utc).timestamp())
+        aligned_epoch = epoch - (epoch % tf_secs)
+        start_utc = datetime.fromtimestamp(aligned_epoch, tz=timezone.utc)
+        end_utc = start_utc + timedelta(seconds=tf_secs)
+        tf_m1 = getattr(mt5, "TIMEFRAME_M1", None)
+        if tf_m1 is None:
+            return {}
+
+        try:
+            mt5.symbol_select(SYMBOL, True)
+        except Exception:
+            pass
+
+        rates = None
+        try:
+            rates = mt5.copy_rates_range(SYMBOL, tf_m1, start_utc, end_utc)
+        except Exception:
+            rates = None
+
+        if rates is None or len(rates) == 0:
+            try:
+                anchor_dt = end_utc - timedelta(seconds=1)
+                m1_count = max(3, int((end_utc - start_utc).total_seconds() // 60) + 3)
+                rates = mt5.copy_rates_from(SYMBOL, tf_m1, anchor_dt, m1_count)
+            except Exception:
+                rates = None
+
+        if rates is None or len(rates) == 0:
+            return {}
+
+        df = pd.DataFrame(rates)
+        required_cols = {"time", "open", "high", "low", "close"}
+        if df.empty or not required_cols.issubset(df.columns):
+            return {}
+        if "tick_volume" not in df.columns:
+            df["tick_volume"] = 0.0
+
+        df["time"] = pd.to_numeric(df["time"], errors="coerce").fillna(0).astype(int)
+        start_ts = int(start_utc.timestamp())
+        end_ts = int(end_utc.timestamp())
+        df = df[(df["time"] >= start_ts) & (df["time"] < end_ts)].copy()
+        if df.empty:
+            return {}
+
+        df = df.sort_values("time").drop_duplicates(subset=["time"], keep="last")
+        chart_rates = [
+            {
+                "time": int(row.time),
+                "open": float(row.open),
+                "high": float(row.high),
+                "low": float(row.low),
+                "close": float(row.close),
+                "tick_volume": float(getattr(row, "tick_volume", 0.0) or 0.0),
+            }
+            for row in df.itertuples(index=False)
+        ]
+        if len(chart_rates) == 0:
+            return {}
+
+        payload = {
+            "chart_rates": chart_rates,
+            "resolved_bar_time": start_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        try:
+            account = mt5.account_info()
+        except Exception:
+            account = None
+        if account is not None:
+            server_name = str(getattr(account, "server", "") or "").strip()
+            if server_name:
+                payload["source_server"] = server_name
+            try:
+                login_value = int(getattr(account, "login", 0) or 0)
+                if login_value > 0:
+                    payload["source_login"] = str(login_value)
+            except Exception:
+                login_text = str(getattr(account, "login", "") or "").strip()
+                if login_text:
+                    payload["source_login"] = login_text
+        elif self.mt5_server:
+            payload["source_server"] = str(self.mt5_server).strip()
+            if self.mt5_login_id is not None:
+                payload["source_login"] = str(int(self.mt5_login_id))
+
+        return payload
+
+    def _request_llm_semantic_from_server(self, ts_key: str, chart_payload: dict | None = None):
         if not self.vision_llm_api_url:
             raise RuntimeError("VISION_LLM_API_URL is empty")
 
@@ -1945,6 +2044,8 @@ class LiveTradingBot:
             "timeframe": TIMEFRAME_NAME.upper(),
             "bot_config_id": BOT_CONFIG_ID,
         }
+        if isinstance(chart_payload, dict) and chart_payload:
+            payload.update(chart_payload)
         body = json.dumps(payload).encode("utf-8")
         req = urlrequest.Request(
             self.vision_llm_api_url,
@@ -1985,10 +2086,24 @@ class LiveTradingBot:
         result = {}
         error = {}
         done = threading.Event()
+        chart_payload = {}
+
+        try:
+            chart_payload = self._build_llm_chart_payload(ts_key)
+        except Exception as exc:
+            chart_payload = {}
+            print(f"\n [SEM] chart payload unavailable ts={ts_key}: {exc}")
+            self._add_log(
+                "warning",
+                f"Chart payload unavailable for {ts_key}",
+                phase="sem",
+                event="chart_payload_unavailable",
+                meta={"ts": ts_key, "error": str(exc)},
+            )
 
         def _worker():
             try:
-                llm_text, cls_vec = self._request_llm_semantic_from_server(ts_key)
+                llm_text, cls_vec = self._request_llm_semantic_from_server(ts_key, chart_payload=chart_payload)
                 result["llm_text"] = llm_text
                 result["cls_vec"] = cls_vec
             except Exception as exc:

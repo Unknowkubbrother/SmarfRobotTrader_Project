@@ -423,13 +423,19 @@ BASE_COLUMNS = [
 
 
 # ---- Runtime artifacts
+cache_identity = _safe_token(_env_first("MT5_SERVER"), fallback="")
+if not cache_identity:
+    cache_identity = _safe_token(f"{SYMBOL}_{TIMEFRAME_NAME}")
+
+cache_dir = os.path.join(MODELS_DIR, "cache", f"broker-{cache_identity}")
+
 LLM_SEMANTIC_CACHE_FILE = (
     _env_first("LIVE_LLM_SEMANTIC_CACHE_FILE")
-    or os.path.join(MODELS_DIR, "time_to_embedding_llm_cls.joblib")
+    or os.path.join(cache_dir, "time_to_embedding_llm_cls.joblib")
 )
 LLM_TEXT_LOG_FILE = (
     _env_first("LIVE_LLM_TEXT_LOG_FILE")
-    or os.path.join(MODELS_DIR, "time_to_llm_text.jsonl")
+    or os.path.join(cache_dir, "time_to_llm_text.jsonl")
 )
 LLM_SEMANTIC_CACHE_SCHEMA = "utc_v2"
 STATE_FILE = _env_first("LIVE_STATE_FILE")
@@ -437,7 +443,10 @@ if not STATE_FILE:
     state_identity = (
         _safe_token(BOT_CONFIG_ID)
         if BOT_CONFIG_ID
-        else _safe_token(_env_first("MT5_LOGIN"), fallback="")
+        else _safe_token(
+            f"{_env_first('MT5_LOGIN')}|{_env_first('MT5_SERVER')}|{SYMBOL}_{TIMEFRAME_NAME}",
+            fallback="",
+        )
     )
     if not state_identity:
         state_identity = _safe_token(f"{SYMBOL}_{TIMEFRAME_NAME}")
