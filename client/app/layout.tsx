@@ -3,11 +3,14 @@ import { Providers } from "./providers";
 import "./globals.css";
 
 export const metadata: Metadata = {
-    title: "AlgoTrade AI - AI-Powered Algorithmic Trading Platform",
+    title: "SmarfRobotTrade | AI Trading",
     description: "Advanced AI-powered algorithmic trading platform using Reinforcement Learning and LLM for automated, transparent, and secure trading.",
-    authors: [{ name: "AlgoTrade AI" }],
+    authors: [{ name: "SmarfRobotTrade" }],
+    icons: {
+        icon: "/logo.png",
+    },
     openGraph: {
-        title: "AlgoTrade AI - AI Trading Platform",
+        title: "SmarfRobotTrade | AI Trading",
         description: "Advanced AI-powered algorithmic trading with RL and LLM technology",
         type: "website",
     },

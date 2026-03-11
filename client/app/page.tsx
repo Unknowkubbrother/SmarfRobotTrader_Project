@@ -13,9 +13,10 @@ import {
     Zap,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import Image from "next/image";
 
 export const metadata: Metadata = {
-    title: "SmarfRobotTrader | AI Trading Control Center",
+    title: "SmarfRobotTrade | AI Trading",
     description:
         "Automated AI trading platform. Connect your MT5 account, deploy AI bots, and track performance — all from a single dashboard.",
 };
@@ -98,11 +99,15 @@ export default function HomePage() {
                 {/* Header */}
                 <header className="bg-white border border-border rounded-2xl flex items-center justify-between px-6 py-4 shadow-sm">
                     <div className="flex items-center gap-3">
-                        <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary text-sm font-semibold text-primary-foreground">
-                            SR
-                        </div>
+                        <Image
+                            src="/logo1.png"
+                            alt="Logo"
+                            width={40}
+                            height={40}
+                            className="rounded-full object-cover"
+                        />
                         <div>
-                            <p className="text-base font-semibold">SmarfRobotTrader</p>
+                            <p className="text-base font-semibold">SmarfRobotTrade</p>
                             <p className="text-sm text-muted-foreground">AI Trading Control Center</p>
                         </div>
                     </div>
@@ -149,7 +154,7 @@ export default function HomePage() {
                                 <span className="text-primary">You Just Watch the Results</span>
                             </h1>
                             <p className="max-w-2xl text-lg leading-8 text-muted-foreground">
-                                SmarfRobotTrader lets you connect your MT5 account and deploy AI bots
+                                SmarfRobotTrade lets you connect your MT5 account and deploy AI bots
                                 that analyze charts and place orders automatically
                                 — just sit back and monitor your performance from the dashboard.
                             </p>
