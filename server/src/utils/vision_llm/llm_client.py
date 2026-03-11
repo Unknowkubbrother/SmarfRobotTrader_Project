@@ -1,8 +1,3 @@
-"""
-LLM client and RAG pipeline — wraps LangChain's chat model and
-orchestrates the multi-step retrieval-augmented generation workflow.
-"""
-
 import os
 import threading
 from urllib.parse import urlparse
@@ -104,6 +99,7 @@ class VisionLLMClient:
         self.llm = init_chat_model(
             model=os.getenv("LLM_MODEL", "ministral-3:14b"),
             model_provider=os.getenv("LLM_MODEL_PROVIDER", "ollama"),
+            api_key=os.getenv("LLM_API_KEY",""),
             base_url=self.base_url,
             sync_client_kwargs={"timeout": timeout},
             async_client_kwargs={"timeout": timeout},
