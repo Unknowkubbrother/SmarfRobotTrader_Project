@@ -1,7 +1,7 @@
 import os
 import threading
 from urllib.parse import urlparse
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 import ollama
@@ -37,6 +37,24 @@ _DEFAULT_DATASET_JSON = os.getenv(
 _runtime_cache: dict = {}
 _runtime_locks: dict[str, threading.Lock] = {}
 _runtime_locks_guard = threading.Lock()
+_PROVIDER_ALIASES = {
+    "chatgpt": "openai",
+    "gemini": "google_genai",
+    "google": "google_genai",
+    "google_genai": "google_genai",
+    "google-genai": "google_genai",
+}
+_DEFAULT_PROVIDER = "ollama"
+_CLOUD_PROVIDERS = {"openai", "google_genai"}
+_DEFAULT_MODELS = {
+    "ollama": "ministral-3:14b",
+    "openai": "gpt-4o-mini",
+    "google_genai": "gemini-2.0-flash",
+}
+_PROVIDER_PACKAGES = {
+    "openai": "langchain-openai",
+    "google_genai": "langchain-google-genai",
+}
 
 
 # ── Errors ───────────────────────────────────────────────────────────
@@ -58,11 +76,20 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
     return max(float(minimum), value)
 
 
-def _normalize_llm_base_url(raw_value: Optional[str]) -> str:
-    """Normalize and validate LLM base URL from environment."""
-    base_url = str(raw_value or "").strip().strip('"').strip("'")
+def _clean_env_text(raw_value: Optional[str]) -> str:
+    return str(raw_value or "").strip().strip('"').strip("'")
+
+
+def _normalize_base_url(
+    raw_value: Optional[str],
+    *,
+    default: str = "",
+    env_name: str = "LLM_BASE_URL",
+) -> str:
+    """Normalize and validate a base URL from environment."""
+    base_url = _clean_env_text(raw_value)
     if not base_url:
-        base_url = "http://localhost:11434"
+        base_url = default
 
     # Common typo recovery: "http:/host:port" -> "http://host:port"
     if base_url.startswith("http:/") and not base_url.startswith("http://"):
@@ -70,12 +97,107 @@ def _normalize_llm_base_url(raw_value: Optional[str]) -> str:
     elif base_url.startswith("https:/") and not base_url.startswith("https://"):
         base_url = "https://" + base_url[len("https:/"):].lstrip("/")
 
+    if not base_url:
+        return ""
+
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise VisionLLMConfigError(
-            f"Invalid LLM_BASE_URL={raw_value!r}. Expected format: http://host:port"
+            f"Invalid {env_name}={raw_value!r}. Expected format: http://host:port"
         )
     return base_url.rstrip("/")
+
+
+def _normalize_model_provider(raw_value: Optional[str]) -> str:
+    provider = _clean_env_text(raw_value).lower().replace("-", "_")
+    if not provider:
+        return _DEFAULT_PROVIDER
+    return _PROVIDER_ALIASES.get(provider, provider)
+
+
+def _resolve_api_key(provider: str) -> str:
+    if provider == "openai":
+        return _clean_env_text(os.getenv("OPENAI_API_KEY"))
+    if provider == "google_genai":
+        return _clean_env_text(os.getenv("GOOGLE_API_KEY"))
+    return ""
+
+
+def _resolve_model_name(active_provider: str, requested_provider: str) -> str:
+    provider_model_env = {
+        "ollama": "LLM_OLLAMA_MODEL",
+        "openai": "LLM_OPENAI_MODEL",
+        "google_genai": "LLM_GOOGLE_MODEL",
+    }.get(active_provider)
+    provider_model = _clean_env_text(os.getenv(provider_model_env)) if provider_model_env else ""
+    if provider_model:
+        return provider_model
+
+    if active_provider == "google_genai":
+        alt_google_model = _clean_env_text(os.getenv("LLM_GOOGLE_GENAI_MODEL"))
+        if alt_google_model:
+            return alt_google_model
+
+    return _DEFAULT_MODELS[active_provider]
+
+
+def _resolve_model_settings(
+    connect_timeout_sec: float,
+    request_timeout_sec: float,
+) -> tuple[dict[str, Any], str, str]:
+    requested_provider = _normalize_model_provider(os.getenv("LLM_MODEL_PROVIDER"))
+    if requested_provider not in _CLOUD_PROVIDERS | {"ollama"}:
+        raise VisionLLMConfigError(
+            "Unsupported LLM_MODEL_PROVIDER="
+            f"{requested_provider!r}. Supported providers: ollama, openai, google_genai."
+        )
+
+    api_key = _resolve_api_key(requested_provider)
+    active_provider = requested_provider
+    if requested_provider in _CLOUD_PROVIDERS and not api_key:
+        active_provider = "ollama"
+
+    model_name = _resolve_model_name(active_provider, requested_provider)
+    kwargs: dict[str, Any] = {
+        "model": model_name,
+        "model_provider": active_provider,
+    }
+
+    if active_provider == "ollama":
+        base_url = _normalize_base_url(
+            os.getenv("LLM_BASE_URL"),
+            default="http://localhost:11434",
+            env_name="LLM_BASE_URL",
+        )
+        timeout = httpx.Timeout(
+            connect=connect_timeout_sec,
+            read=request_timeout_sec,
+            write=request_timeout_sec,
+            pool=connect_timeout_sec,
+        )
+        kwargs["base_url"] = base_url
+        kwargs["sync_client_kwargs"] = {"timeout": timeout}
+        kwargs["async_client_kwargs"] = {"timeout": timeout}
+        return kwargs, active_provider, base_url
+
+    kwargs["api_key"] = api_key
+    if active_provider == "openai":
+        base_url = _normalize_base_url(
+            os.getenv("LLM_OPENAI_BASE_URL"),
+            env_name="LLM_OPENAI_BASE_URL",
+        )
+        kwargs["timeout"] = httpx.Timeout(
+            connect=connect_timeout_sec,
+            read=request_timeout_sec,
+            write=request_timeout_sec,
+            pool=connect_timeout_sec,
+        )
+        if base_url:
+            kwargs["base_url"] = base_url
+        return kwargs, active_provider, base_url or "OpenAI API"
+
+    kwargs["timeout"] = request_timeout_sec
+    return kwargs, active_provider, "Google Gemini API"
 
 
 # ── VisionLLMClient ──────────────────────────────────────────────────
@@ -85,25 +207,22 @@ class VisionLLMClient:
 
     def __init__(self) -> None:
         load_dotenv()
-        self.base_url = _normalize_llm_base_url(
-            os.getenv("LLM_BASE_URL", "http://localhost:11434")
-        )
         self.connect_timeout_sec = _env_float("LLM_CONNECT_TIMEOUT_SEC", 10.0, minimum=0.5)
         self.request_timeout_sec = _env_float("LLM_REQUEST_TIMEOUT_SEC", 300.0, minimum=1.0)
-        timeout = httpx.Timeout(
-            connect=self.connect_timeout_sec,
-            read=self.request_timeout_sec,
-            write=self.request_timeout_sec,
-            pool=self.connect_timeout_sec,
+        model_kwargs, self.provider, self.service_target = _resolve_model_settings(
+            self.connect_timeout_sec,
+            self.request_timeout_sec,
         )
-        self.llm = init_chat_model(
-            model=os.getenv("LLM_MODEL", "ministral-3:14b"),
-            model_provider=os.getenv("LLM_MODEL_PROVIDER", "ollama"),
-            api_key=os.getenv("LLM_API_KEY",""),
-            base_url=self.base_url,
-            sync_client_kwargs={"timeout": timeout},
-            async_client_kwargs={"timeout": timeout},
-        )
+        try:
+            self.llm = init_chat_model(**model_kwargs)
+        except ImportError as exc:
+            package_name = _PROVIDER_PACKAGES.get(self.provider)
+            extra = f" Install `{package_name}`." if package_name else ""
+            raise VisionLLMConfigError(
+                f"Missing dependency for LLM provider {self.provider!r}.{extra}"
+            ) from exc
+        except ValueError as exc:
+            raise VisionLLMConfigError(str(exc)) from exc
 
     def invoke(self, text: str, image_base64: str) -> str:
         """Send a text + image prompt and return the cleaned response."""
@@ -122,30 +241,31 @@ class VisionLLMClient:
             response = self.llm.invoke(messages)
         except httpx.ConnectTimeout as exc:
             raise VisionLLMServiceUnavailableError(
-                f"Timed out connecting to LLM service at {self.base_url} "
+                f"Timed out connecting to {self.provider} service at {self.service_target} "
                 f"after {self.connect_timeout_sec:.1f}s."
             ) from exc
         except httpx.ReadTimeout as exc:
             raise VisionLLMServiceUnavailableError(
-                f"Timed out waiting for LLM response from {self.base_url} "
+                f"Timed out waiting for LLM response from {self.provider} service at "
+                f"{self.service_target} "
                 f"after {self.request_timeout_sec:.1f}s."
             ) from exc
         except httpx.ConnectError as exc:
             raise VisionLLMServiceUnavailableError(
-                f"Cannot connect to LLM service at {self.base_url}. "
-                "Ensure Ollama is running and LLM_BASE_URL is correct."
+                f"Cannot connect to {self.provider} service at {self.service_target}. "
+                "Ensure the provider is reachable and LLM_BASE_URL is correct when used."
             ) from exc
         except httpx.RequestError as exc:
             raise VisionLLMServiceUnavailableError(
-                f"LLM request failed at {self.base_url}: {exc}"
+                f"LLM request failed for {self.provider} at {self.service_target}: {exc}"
             ) from exc
         except ollama.RequestError as exc:
             raise VisionLLMServiceUnavailableError(
-                f"Ollama request failed at {self.base_url}: {exc}"
+                f"Ollama request failed at {self.service_target}: {exc}"
             ) from exc
         except ollama.ResponseError as exc:
             raise VisionLLMServiceUnavailableError(
-                f"Ollama returned an error at {self.base_url}: {exc}"
+                f"Ollama returned an error at {self.service_target}: {exc}"
             ) from exc
         return strip_markdown(response.content)
 

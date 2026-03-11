@@ -28,6 +28,8 @@ langchain
 langchain-community
 langchain-chroma
 langchain-ollama
+langchain-openai
+langchain-google-genai
 ollama
 
 # Vector Database
