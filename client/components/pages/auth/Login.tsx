@@ -40,9 +40,16 @@ export default function Login() {
     const forgotPasswordHref = forgotPasswordParams.toString()
         ? `/auth/forgot-password?${forgotPasswordParams.toString()}`
         : "/auth/forgot-password";
+    const nextPath = (() => {
+        const next = searchParams.get("next")?.trim();
+        if (!next || !next.startsWith("/") || next.startsWith("//") || next.startsWith("/auth")) {
+            return "/dashboard";
+        }
+        return next;
+    })();
 
     const redirectToDashboard = () => {
-        router.replace("/dashboard");
+        router.replace(nextPath);
     };
 
     useEffect(() => {
@@ -55,7 +62,7 @@ export default function Login() {
         if (user) {
             router.replace("/dashboard");
         }
-    }, [loading, user, router]);
+    }, [loading, nextPath, user, router]);
 
     useEffect(() => {
         const prefilledEmail = searchParams.get("email")?.trim();
