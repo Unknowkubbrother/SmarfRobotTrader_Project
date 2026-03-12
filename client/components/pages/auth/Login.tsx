@@ -102,6 +102,7 @@ export default function Login() {
                 if (result.email) setEmail(result.email);
                 setRecoveryHint(result.recoveryEmailHint || "");
                 setIsGoogleUser(true); // Treat as google user flow
+                setHasPassword(!!result.hasPassword);
                 setCountdown(60);
                 setStep(3); // Go to OTP
                 toast.success("OTP sent to your recovery email");

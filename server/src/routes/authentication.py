@@ -260,7 +260,8 @@ async def google_auth(response: Response, google_auth: GoogleAuth):
             "require_otp": True,
             "message": "OTP sent to your recovery email",
             "email": user.email,
-            "recovery_email_hint": mask_email(user.recoveryEmail)
+            "recovery_email_hint": mask_email(user.recoveryEmail),
+            "has_password": bool(user.password),
         }
 
 

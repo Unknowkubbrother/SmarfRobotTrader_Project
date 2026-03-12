@@ -27,7 +27,7 @@ interface AuthContextType {
   refreshUser: () => Promise<void>;
   signIn: (email: string, password: string, cfToken?: string) => Promise<{ error: Error | null; requireOtp?: boolean; recoveryEmailHint?: string }>;
   loginVerify: (email: string, otp: string) => Promise<{ error: Error | null }>;
-  signInWithGoogle: () => Promise<{ error: Error | null; requireOtp?: boolean; requireRegister?: boolean; recoveryEmailHint?: string; googleInfo?: any; email?: string }>;
+  signInWithGoogle: () => Promise<{ error: Error | null; requireOtp?: boolean; requireRegister?: boolean; recoveryEmailHint?: string; googleInfo?: any; email?: string; hasPassword?: boolean }>;
   signOut: () => Promise<void>;
 
   registerOTP: (email: string, recoveryEmail: string, password: string, cfToken?: string) => Promise<{ error: Error | null; devOtp?: string }>;
@@ -116,7 +116,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           error: null,
           requireOtp: true,
           recoveryEmailHint: data.recovery_email_hint,
-          email
+          email,
+          hasPassword: data.has_password,
         };
       }
 
