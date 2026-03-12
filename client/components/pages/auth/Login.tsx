@@ -38,8 +38,32 @@ export default function Login() {
         ? `/auth/forgot-password?${forgotPasswordParams.toString()}`
         : "/auth/forgot-password";
 
+    const redirectToDashboard = () => {
+        router.replace("/dashboard");
+        router.refresh();
+
+        if (typeof window !== "undefined") {
+            window.setTimeout(() => {
+                if (window.location.pathname !== "/dashboard") {
+                    window.location.assign("/dashboard");
+                }
+            }, 200);
+        }
+    };
+
     useEffect(() => {
-        if (!loading && user) router.push("/dashboard");
+        if (!loading && user) {
+            router.replace("/dashboard");
+            router.refresh();
+
+            if (typeof window !== "undefined") {
+                window.setTimeout(() => {
+                    if (window.location.pathname !== "/dashboard") {
+                        window.location.assign("/dashboard");
+                    }
+                }, 200);
+            }
+        }
     }, [loading, user, router]);
 
     useEffect(() => {
@@ -90,7 +114,7 @@ export default function Login() {
                 router.push(`/auth/register?${params.toString()}`);
             } else {
                 toast.success("Welcome!");
-                router.push("/dashboard");
+                redirectToDashboard();
             }
         } finally {
             setIsLoading(false);
@@ -174,7 +198,7 @@ export default function Login() {
             } else {
                 toast.success("Welcome back!");
                 setCfToken(""); // Reset token
-                router.push("/dashboard");
+                redirectToDashboard();
             }
         } finally {
             setIsLoading(false);
@@ -200,7 +224,7 @@ export default function Login() {
                 toast.success("Login verified!");
             } else {
                 toast.success("Login verified!");
-                router.push("/dashboard");
+                redirectToDashboard();
             }
         } finally {
             setIsLoading(false);
@@ -221,8 +245,9 @@ export default function Login() {
                 toast.error(error.message);
                 return;
             }
+            setHasPassword(true);
             toast.success("Password set successfully! Welcome.");
-            router.push("/dashboard");
+            redirectToDashboard();
         } finally {
             setIsLoading(false);
         }

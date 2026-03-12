@@ -234,6 +234,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const setPassword = async (password: string) => {
     try {
       await api.post("/auth/set-password", { new_password: password });
+      await fetchCurrentUser();
       return { error: null };
     } catch (error: any) {
       return { error: error };
