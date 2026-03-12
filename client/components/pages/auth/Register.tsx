@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { z } from "zod";
@@ -16,6 +16,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import TurnstileWidget from "@/components/ui/TurnstileWidget";
 
 type RegisterStep = 1 | 2 | 3 | 4;
+const PENDING_GOOGLE_REGISTER_KEY = "pending-google-register";
 
 const step1Schema = z.object({
     email: z.string().trim().email({ message: "Invalid email address" }),
@@ -42,9 +43,10 @@ export default function Register() {
     const [countdown, setCountdown] = useState(0);
     const [devOtp, setDevOtp] = useState<string | null>(null);
     const [cfToken, setCfToken] = useState<string>("");
+    const checkedExistingSessionRef = useRef(false);
+    const appliedGooglePrefillRef = useRef(false);
 
     const searchParams = useSearchParams();
-    const mode = searchParams.get("mode");
 
     const [regData, setRegData] = useState({
         email: "",
@@ -55,7 +57,7 @@ export default function Register() {
     });
 
     const router = useRouter();
-    const { user, signInWithGoogle, registerOTP, verifyOTP, completeRegistration, googleRegisterOTP, googleRegisterVerify, googleRegisterComplete } = useAuth();
+    const { user, loading, signInWithGoogle, registerOTP, verifyOTP, completeRegistration, googleRegisterOTP, googleRegisterVerify, googleRegisterComplete } = useAuth();
 
     const step1Form = useForm<z.infer<typeof step1Schema>>({
         resolver: zodResolver(step1Schema),
@@ -72,9 +74,73 @@ export default function Register() {
         defaultValues: { username: "" },
     });
 
+    const redirectToDashboard = () => {
+        router.replace("/dashboard");
+    };
+
+    const redirectToLogin = (email?: string) => {
+        const params = new URLSearchParams();
+        if (email) {
+            params.set("email", email);
+        }
+        router.replace(params.toString() ? `/auth/login?${params.toString()}` : "/auth/login");
+    };
+
     useEffect(() => {
-        if (user) router.push("/dashboard");
-    }, [user, router]);
+        if (checkedExistingSessionRef.current || loading) {
+            return;
+        }
+
+        checkedExistingSessionRef.current = true;
+
+        if (user) {
+            router.replace("/dashboard");
+        }
+    }, [loading, user, router]);
+
+    useEffect(() => {
+        const prefilledEmail = searchParams.get("email")?.trim();
+        if (prefilledEmail) {
+            step1Form.setValue("email", prefilledEmail);
+            setRegData((current) => current.email ? current : { ...current, email: prefilledEmail });
+        }
+    }, [searchParams, step1Form]);
+
+    useEffect(() => {
+        if (appliedGooglePrefillRef.current || searchParams.get("mode") !== "google" || typeof window === "undefined") {
+            return;
+        }
+
+        appliedGooglePrefillRef.current = true;
+
+        try {
+            const raw = window.sessionStorage.getItem(PENDING_GOOGLE_REGISTER_KEY);
+            if (!raw) {
+                return;
+            }
+
+            const pending = JSON.parse(raw) as { email?: string; idToken?: string };
+            const nextIdToken = String(pending.idToken || "").trim();
+            if (!nextIdToken) {
+                return;
+            }
+
+            const nextEmail = String(pending.email || "").trim();
+            if (nextEmail) {
+                step1Form.setValue("email", nextEmail);
+            }
+
+            setRegData((current) => ({
+                ...current,
+                email: nextEmail || current.email,
+                isGoogle: true,
+                googleIdToken: nextIdToken,
+            }));
+            setStep(2);
+        } catch {
+            window.sessionStorage.removeItem(PENDING_GOOGLE_REGISTER_KEY);
+        }
+    }, [searchParams, step1Form]);
 
     useEffect(() => {
         if (countdown > 0) {
@@ -100,14 +166,21 @@ export default function Register() {
                     googleIdToken: result.googleInfo?.idToken
                 }));
 
+                if (typeof window !== "undefined" && result.googleInfo?.idToken) {
+                    window.sessionStorage.setItem(PENDING_GOOGLE_REGISTER_KEY, JSON.stringify({
+                        email: result.email || "",
+                        idToken: result.googleInfo.idToken,
+                    }));
+                }
+
                 setStep(2);
                 toast.info("Please set a recovery email to complete registration.");
             } else if (result.requireOtp) {
                 toast.info("Account already exists. Please login.");
-                router.push("/auth/login");
+                redirectToLogin(result.email);
             } else {
                 toast.success("Welcome!");
-                router.push("/dashboard");
+                redirectToDashboard();
             }
         } finally {
             setIsLoading(false);
@@ -115,11 +188,6 @@ export default function Register() {
     };
 
     const handleStep1 = async (data: z.infer<typeof step1Schema>) => {
-        if (!cfToken) {
-            toast.error("Please complete the security check");
-            return;
-        }
-
         setRegData(prev => ({ ...prev, email: data.email, password: data.password, isGoogle: false }));
         setStep(2);
     };
@@ -203,11 +271,14 @@ export default function Register() {
             }
 
             if (regData.isGoogle) {
+                if (typeof window !== "undefined") {
+                    window.sessionStorage.removeItem(PENDING_GOOGLE_REGISTER_KEY);
+                }
                 toast.success("Registration complete!");
-                router.push("/dashboard");
+                redirectToDashboard();
             } else {
                 toast.success("Registration complete! Please login.");
-                router.push("/auth/login");
+                redirectToLogin(regData.email);
             }
         } finally {
             setIsLoading(false);
@@ -216,14 +287,22 @@ export default function Register() {
 
     const resendOTP = async () => {
         if (countdown > 0) return;
+
+        if (!cfToken) {
+            toast.error("Please complete the security check");
+            return;
+        }
+
         setIsLoading(true);
         try {
             let result;
             if (regData.isGoogle) {
-                result = await googleRegisterOTP(regData.googleIdToken, regData.recoveryEmail);
+                result = await googleRegisterOTP(regData.googleIdToken, regData.recoveryEmail, cfToken);
             } else {
-                result = await registerOTP(regData.email, regData.recoveryEmail, regData.password);
+                result = await registerOTP(regData.email, regData.recoveryEmail, regData.password, cfToken);
             }
+
+            setCfToken("");
 
             if (result.error) {
                 toast.error(result.error.message);
@@ -324,7 +403,6 @@ export default function Register() {
                                                 <FormMessage />
                                             </FormItem>
                                         )} />
-                                        <TurnstileWidget onVerify={setCfToken} />
                                         <Button type="submit" className="w-full h-11 rounded-full bg-gradient-to-r from-[#1e3a5f] to-[#3b82f6]">NEXT</Button>
                                     </form>
                                 </Form>
@@ -402,9 +480,18 @@ export default function Register() {
                                         {isLoading ? "Verifying..." : "Verify"}
                                     </Button>
 
-                                    <button onClick={resendOTP} disabled={countdown > 0} className="text-sm text-muted-foreground hover:text-foreground disabled:opacity-50">
+                                    <button
+                                        type="button"
+                                        onClick={resendOTP}
+                                        disabled={isLoading || countdown > 0 || !cfToken}
+                                        className="text-sm text-muted-foreground hover:text-foreground disabled:opacity-50"
+                                    >
                                         {countdown > 0 ? `Resend OTP in ${countdown}s` : "Resend OTP"}
                                     </button>
+
+                                    {countdown === 0 && !cfToken && (
+                                        <TurnstileWidget onVerify={setCfToken} />
+                                    )}
                                 </div>
                             </>
                         )}

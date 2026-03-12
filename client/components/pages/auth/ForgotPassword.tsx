@@ -114,7 +114,7 @@ export default function ForgotPassword() {
                 new_password: data.password,
             });
             toast.success("Password reset successfully!");
-            router.push(`/auth/login?${new URLSearchParams({ email, reset: "success" }).toString()}`);
+            router.replace(`/auth/login?${new URLSearchParams({ email, reset: "success" }).toString()}`);
         } catch (error: any) {
             toast.error(error.message);
         } finally {

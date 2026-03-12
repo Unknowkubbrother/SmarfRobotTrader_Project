@@ -14,6 +14,8 @@ import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
 import TurnstileWidget from "@/components/ui/TurnstileWidget";
 
+const PENDING_GOOGLE_REGISTER_KEY = "pending-google-register";
+
 export default function Login() {
     const [showPassword, setShowPassword] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
@@ -28,10 +30,11 @@ export default function Login() {
     const [devOtp, setDevOtp] = useState<string | null>(null);
     const [cfToken, setCfToken] = useState<string>("");
     const handledResetRef = useRef(false);
+    const checkedExistingSessionRef = useRef(false);
 
     const router = useRouter();
     const searchParams = useSearchParams();
-    const { user, loading, signIn, signInWithGoogle, loginVerify, checkUser, setPassword: setAuthPassword } = useAuth();
+    const { user, loading, signIn, signInWithGoogle, loginVerify, loginOtpInit, checkUser, setPassword: setAuthPassword } = useAuth();
     const forgotPasswordParams = new URLSearchParams();
     if (email) forgotPasswordParams.set("email", email);
     const forgotPasswordHref = forgotPasswordParams.toString()
@@ -40,29 +43,17 @@ export default function Login() {
 
     const redirectToDashboard = () => {
         router.replace("/dashboard");
-        router.refresh();
-
-        if (typeof window !== "undefined") {
-            window.setTimeout(() => {
-                if (window.location.pathname !== "/dashboard") {
-                    window.location.assign("/dashboard");
-                }
-            }, 200);
-        }
     };
 
     useEffect(() => {
-        if (!loading && user) {
-            router.replace("/dashboard");
-            router.refresh();
+        if (checkedExistingSessionRef.current || loading) {
+            return;
+        }
 
-            if (typeof window !== "undefined") {
-                window.setTimeout(() => {
-                    if (window.location.pathname !== "/dashboard") {
-                        window.location.assign("/dashboard");
-                    }
-                }, 200);
-            }
+        checkedExistingSessionRef.current = true;
+
+        if (user) {
+            router.replace("/dashboard");
         }
     }, [loading, user, router]);
 
@@ -110,8 +101,15 @@ export default function Login() {
             } else if (result.requireRegister) {
                 const params = new URLSearchParams();
                 params.set("mode", "google");
+                if (result.email) params.set("email", result.email);
+                if (typeof window !== "undefined" && result.googleInfo?.idToken) {
+                    window.sessionStorage.setItem(PENDING_GOOGLE_REGISTER_KEY, JSON.stringify({
+                        email: result.email || "",
+                        idToken: result.googleInfo.idToken,
+                    }));
+                }
                 toast.info("New account. Please complete registration.", { duration: 4000 });
-                router.push(`/auth/register?${params.toString()}`);
+                router.replace(`/auth/register?${params.toString()}`);
             } else {
                 toast.success("Welcome!");
                 redirectToDashboard();
@@ -144,9 +142,13 @@ export default function Login() {
                 return;
             }
 
+            setCfToken("");
+
             if (!result.exists) {
                 toast.info("Account not found. Redirecting to registration.");
-                router.push("/auth/register");
+                const params = new URLSearchParams();
+                params.set("email", email);
+                router.replace(`/auth/register?${params.toString()}`);
                 return;
             }
 
@@ -177,14 +179,9 @@ export default function Login() {
     const handlePasswordLogin = async (e: React.FormEvent) => {
         e.preventDefault();
 
-        if (!cfToken) {
-            toast.error("Please complete the security check");
-            return;
-        }
-
         setIsLoading(true);
         try {
-            const result = await signIn(email, password, cfToken);
+            const result = await signIn(email, password);
             if (result.error) {
                 toast.error(result.error.message);
                 return;
@@ -226,6 +223,35 @@ export default function Login() {
                 toast.success("Login verified!");
                 redirectToDashboard();
             }
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const handleResendOtp = async () => {
+        if (countdown > 0) {
+            return;
+        }
+
+        if (!cfToken) {
+            toast.error("Please complete the security check");
+            return;
+        }
+
+        setIsLoading(true);
+        try {
+            const { error, devOtp: nextDevOtp } = await loginOtpInit(email, cfToken);
+            if (error) {
+                toast.error(error.message);
+                return;
+            }
+
+            setCfToken("");
+            if (nextDevOtp) {
+                setDevOtp(nextDevOtp);
+            }
+            setCountdown(60);
+            toast.success("OTP resent!");
         } finally {
             setIsLoading(false);
         }
@@ -395,6 +421,19 @@ export default function Login() {
                                 {countdown > 0 && (
                                     <p className="text-sm text-muted-foreground text-center">Resend OTP in {countdown}s</p>
                                 )}
+
+                                {countdown === 0 && !cfToken && (
+                                    <TurnstileWidget onVerify={setCfToken} />
+                                )}
+
+                                <button
+                                    type="button"
+                                    onClick={handleResendOtp}
+                                    disabled={isLoading || countdown > 0 || !cfToken}
+                                    className="text-sm text-muted-foreground hover:underline disabled:opacity-50"
+                                >
+                                    Resend OTP
+                                </button>
 
                                 <button onClick={() => setStep(1)} className="text-sm text-muted-foreground hover:underline">Back to Login</button>
                             </div>
