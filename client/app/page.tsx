@@ -1,8 +1,6 @@
 import type { Metadata } from "next";
-import { cookies } from "next/headers";
 import Link from "next/link";
 import {
-    ArrowRight,
     BarChart3,
     Bot,
     Brain,
@@ -12,8 +10,9 @@ import {
     Shield,
     Zap,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import Image from "next/image";
+import { Button } from "@/components/ui/button";
+import HomeAuthActions from "@/components/pages/HomeAuthActions";
 
 export const metadata: Metadata = {
     title: "SmarfRobotTrade | AI Trading",
@@ -91,8 +90,6 @@ const startSteps = [
 ];
 
 export default function HomePage() {
-    const hasAccessToken = Boolean(cookies().get("access_token")?.value);
-
     return (
         <main className="min-h-screen bg-background text-foreground">
             <div className="mx-auto max-w-7xl px-6 py-6 lg:py-8">
@@ -113,29 +110,7 @@ export default function HomePage() {
                     </div>
 
                     <div className="flex items-center gap-3">
-                        {hasAccessToken ? (
-                            <Button asChild size="lg" className="rounded-full px-6">
-                                <Link href="/dashboard">
-                                    Go to Dashboard
-                                    <ArrowRight className="h-4 w-4" />
-                                </Link>
-                            </Button>
-                        ) : (
-                            <>
-                                <Link
-                                    href="/auth/login"
-                                    className="hidden rounded-full border border-border px-4 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground sm:inline-flex"
-                                >
-                                    Sign In
-                                </Link>
-                                <Button asChild size="lg" className="rounded-full px-6">
-                                    <Link href="/auth/register">
-                                        Get Started
-                                        <ArrowRight className="h-4 w-4" />
-                                    </Link>
-                                </Button>
-                            </>
-                        )}
+                        <HomeAuthActions placement="header" />
                     </div>
                 </header>
 
@@ -161,31 +136,7 @@ export default function HomePage() {
                         </div>
 
                         <div className="flex flex-col gap-4 sm:flex-row">
-                            {hasAccessToken ? (
-                                <>
-                                    <Button asChild size="xl" className="rounded-full px-8">
-                                        <Link href="/dashboard">
-                                            Open Dashboard
-                                            <ArrowRight className="h-4 w-4" />
-                                        </Link>
-                                    </Button>
-                                    <Button asChild size="xl" variant="outline" className="rounded-full px-8">
-                                        <Link href="/bot-control">Manage Bots</Link>
-                                    </Button>
-                                </>
-                            ) : (
-                                <>
-                                    <Button asChild size="xl" className="rounded-full px-8">
-                                        <Link href="/auth/register">
-                                            Start for Free
-                                            <ArrowRight className="h-4 w-4" />
-                                        </Link>
-                                    </Button>
-                                    <Button asChild size="xl" variant="outline" className="rounded-full px-8">
-                                        <Link href="/auth/login">Sign In</Link>
-                                    </Button>
-                                </>
-                            )}
+                            <HomeAuthActions placement="hero" />
                         </div>
 
                         {/* Highlight Stats */}
