@@ -118,7 +118,8 @@ CREATE TABLE "trading_accounts" (
   "margin_level" NUMERIC(10, 2) DEFAULT 0,
   
   "created_at" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-  "updated_at" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+  "updated_at" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT "trading_accounts_mt5_login_id_key" UNIQUE ("mt5_login_id")
 );
 
 CREATE TABLE "orders_history" (
@@ -218,6 +219,9 @@ ALTER TABLE "bot_configurations"
   ADD COLUMN IF NOT EXISTS "record_status" VARCHAR(20) NOT NULL DEFAULT 'active',
   ADD COLUMN IF NOT EXISTS "deleted_at" TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS "magic_number" INT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS "trading_accounts_mt5_login_id_key"
+  ON "trading_accounts" ("mt5_login_id");
 ALTER TABLE "bot_configurations"
   ALTER COLUMN "magic_number" SET NOT NULL;
 

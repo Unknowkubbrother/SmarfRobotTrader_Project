@@ -228,7 +228,7 @@ model TradingAccount {
   userId       String    @map("user_id") @db.Uuid
   brokerName   String?   @map("broker_name") @db.VarChar(100)
   serverName   String?   @map("server_name") @db.VarChar(100)
-  mt5LoginId   String?   @map("mt5_login_id") @db.VarChar(50)
+  mt5LoginId   String?   @unique(map: "trading_accounts_mt5_login_id_key") @map("mt5_login_id") @db.VarChar(50)
   mt5Password  String?   @map("mt5_password") @db.VarChar(255)
   recordStatus String    @default("active") @map("record_status") @db.VarChar(20)
   deletedAt    DateTime? @map("deleted_at") @db.Timestamptz

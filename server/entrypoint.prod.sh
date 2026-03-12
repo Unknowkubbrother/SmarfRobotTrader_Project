@@ -92,7 +92,12 @@ if is_truthy "${PRISMA_DB_PUSH_ON_START:-0}"; then
     | python -m prisma db execute --stdin --schema="$SCHEMA_PATH"
 
   echo "[startup] prisma db push"
-  python -m prisma db push --schema="$SCHEMA_PATH" --skip-generate
+  db_push_args=(--schema="$SCHEMA_PATH" --skip-generate)
+  if is_truthy "${PRISMA_DB_PUSH_ACCEPT_DATA_LOSS:-0}"; then
+    echo "[startup] prisma db push will accept data-loss warnings"
+    db_push_args+=(--accept-data-loss)
+  fi
+  python -m prisma db push "${db_push_args[@]}"
 fi
 
 echo "[startup] starting uvicorn on 0.0.0.0:${PORT} workers=${UVICORN_WORKERS}"

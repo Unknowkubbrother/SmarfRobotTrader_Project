@@ -4,6 +4,10 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from cryptography.fernet import Fernet
 from prisma import Json
+try:
+    from prisma.errors import UniqueViolationError
+except Exception:
+    UniqueViolationError = None
 import base64
 import hashlib
 import os
@@ -116,6 +120,25 @@ def _format_trading_account_label(account) -> str:
 def _fallback_trading_account_label(account_id: str | None) -> str:
     safe_id = str(account_id or "").strip()
     return f"Account {safe_id[:8]}" if safe_id else "Unknown account"
+
+
+async def _assert_mt5_login_id_available(
+    mt5_login_id: str,
+    *,
+    exclude_account_id: str | None = None,
+) -> None:
+    normalized_login_id = str(mt5_login_id or "").strip()
+    if not normalized_login_id:
+        return
+
+    existing_account = await db.tradingaccount.find_first(
+        where={"mt5LoginId": normalized_login_id},
+    )
+    if existing_account and str(getattr(existing_account, "id", "") or "") != str(exclude_account_id or ""):
+        raise HTTPException(
+            status_code=409,
+            detail="mt5LoginId is already linked to another trading account",
+        )
 
 
 def _serialize_trading_account_source(account) -> dict:
@@ -1226,21 +1249,30 @@ async def create_account(request: Request, data: Create_Trading_Account):
     pair_ok, pair_error = validate_mt5_broker_server_pair(broker_name, server_name)
     if not pair_ok:
         raise HTTPException(status_code=400, detail=pair_error or "Invalid brokerName/serverName")
+    await _assert_mt5_login_id_available(mt5_login_id)
 
     encrypted_password = _encrypt_mt5_password(mt5_password)
     userId = request.state.user_id
 
-    trading_account = await db.tradingaccount.create(
-        data={
-            "userId": userId,
-            "brokerName": broker_name,
-            "serverName": server_name,
-            "mt5LoginId": mt5_login_id,
-            "mt5Password": encrypted_password,
-            "recordStatus": ACTIVE_RECORD_STATUS,
-            "deletedAt": None,
-        }
-    )
+    try:
+        trading_account = await db.tradingaccount.create(
+            data={
+                "userId": userId,
+                "brokerName": broker_name,
+                "serverName": server_name,
+                "mt5LoginId": mt5_login_id,
+                "mt5Password": encrypted_password,
+                "recordStatus": ACTIVE_RECORD_STATUS,
+                "deletedAt": None,
+            }
+        )
+    except Exception as error:
+        if UniqueViolationError is not None and isinstance(error, UniqueViolationError):
+            raise HTTPException(
+                status_code=409,
+                detail="mt5LoginId is already linked to another trading account",
+            ) from error
+        raise
 
     if not trading_account:
         raise HTTPException(status_code=400, detail="Trading account creation failed")
@@ -1303,6 +1335,7 @@ async def update_account(request: Request, data: Update_Trading_Account):
         mt5_login_id = str(data.mt5LoginId).strip()
         if not mt5_login_id:
             raise HTTPException(status_code=400, detail="mt5LoginId cannot be empty")
+        await _assert_mt5_login_id_available(mt5_login_id, exclude_account_id=data.accountId)
         update_payload["mt5LoginId"] = mt5_login_id
 
     if data.mt5Password is not None:
@@ -1326,10 +1359,18 @@ async def update_account(request: Request, data: Update_Trading_Account):
     if linked_bots > 0:
         stopped_instances = await _stop_account_bot_instances(data.accountId)
 
-    await db.tradingaccount.update(
-        where={"id": data.accountId},
-        data=update_payload,
-    )
+    try:
+        await db.tradingaccount.update(
+            where={"id": data.accountId},
+            data=update_payload,
+        )
+    except Exception as error:
+        if UniqueViolationError is not None and isinstance(error, UniqueViolationError):
+            raise HTTPException(
+                status_code=409,
+                detail="mt5LoginId is already linked to another trading account",
+            ) from error
+        raise
 
     updated_account = await db.tradingaccount.find_unique(where={"id": data.accountId})
 
@@ -1396,6 +1437,8 @@ async def delete_account(request: Request, data: Delete_Trading_Account):
     await db.tradingaccount.update(
         where={"id": data.accountId},
         data={
+            "mt5LoginId": None,
+            "mt5Password": None,
             "recordStatus": "deleted",
             "deletedAt": datetime.utcnow(),
         },
