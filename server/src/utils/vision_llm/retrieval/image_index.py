@@ -4,6 +4,7 @@ from io import BytesIO
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import math
+import logging
 import shutil
 from typing import List, Tuple, Optional
 
@@ -64,6 +65,8 @@ W_STRUCT = 0.40
 
 SOFTMAX_TEMP = 1.2
 
+logger = logging.getLogger(__name__)
+
 
 # ============================================================
 # LAZY MODEL LOADER
@@ -76,7 +79,14 @@ def get_clip() -> Tuple[CLIPModel, CLIPProcessor]:
     global _clip_model, _processor
     if _clip_model is None or _processor is None:
         _clip_model = CLIPModel.from_pretrained(MODEL_NAME).to(DEVICE).eval()
-        _processor = CLIPProcessor.from_pretrained(MODEL_NAME, use_fast=True)
+        try:
+            _processor = CLIPProcessor.from_pretrained(MODEL_NAME, use_fast=True)
+        except ImportError as exc:
+            logger.warning(
+                "Falling back to CLIP slow image processor because fast processor dependencies are unavailable: %s",
+                exc,
+            )
+            _processor = CLIPProcessor.from_pretrained(MODEL_NAME, use_fast=False)
     return _clip_model, _processor
 
 

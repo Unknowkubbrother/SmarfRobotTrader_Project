@@ -1717,18 +1717,26 @@ case "$use_shared_pydeps_lc" in
     if [ ! -x "$shared_venv_dir/bin/python" ]; then
       echo "  creating shared python venv: $shared_venv_dir"
       rm -rf "$shared_venv_dir"
-      python3 -m venv "$shared_venv_dir"
-      venv_recreated=1
+      if python3 -m venv "$shared_venv_dir"; then
+        venv_recreated=1
+      else
+        echo "  warning: python3 venv support unavailable in MT5 image, falling back to system Python deps"
+        rm -rf "$shared_venv_dir"
+      fi
     fi
-    python_cmd="$shared_venv_dir/bin/python"
-    # Ensure pip exists in the venv even if previous creation was interrupted.
-    if ! "$python_cmd" -m pip --version >/dev/null 2>&1; then
-      "$python_cmd" -m ensurepip --upgrade >/dev/null 2>&1 || true
-      "$python_cmd" -m pip install --upgrade pip >/dev/null 2>&1 || true
+    if [ -x "$shared_venv_dir/bin/python" ]; then
+      python_cmd="$shared_venv_dir/bin/python"
+      # Ensure pip exists in the venv even if previous creation was interrupted.
+      if ! "$python_cmd" -m pip --version >/dev/null 2>&1; then
+        "$python_cmd" -m ensurepip --upgrade >/dev/null 2>&1 || true
+        "$python_cmd" -m pip install --upgrade pip >/dev/null 2>&1 || true
+      fi
+      pip_mode="venv"
+      pip_install_base=("$python_cmd" -m pip install --no-cache-dir)
+      stamp_dir="$shared_pydeps_dir/.requirements-cache"
+    else
+      echo "  shared python venv unavailable, continuing with system Python"
     fi
-    pip_mode="venv"
-    pip_install_base=("$python_cmd" -m pip install --no-cache-dir)
-    stamp_dir="$shared_pydeps_dir/.requirements-cache"
     ;;
   *)
     ;;
@@ -1768,6 +1776,41 @@ else
   echo "  torch $installed_torch already installed"
 fi
 
+detect_missing_requirement_modules() {
+  local req_path="$1"
+  "$python_cmd" - "$req_path" <<"PY"
+import importlib.util
+import re
+import sys
+from pathlib import Path
+
+req_path = Path(sys.argv[1])
+name_to_module = {
+    "stable-baselines3": "stable_baselines3",
+    "python-dateutil": "dateutil",
+    "opencv-python": "cv2",
+    "opencv-python-headless": "cv2",
+}
+missing: list[str] = []
+
+for raw_line in req_path.read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or line.startswith("git+"):
+        continue
+    line = line.split(";", 1)[0].strip()
+    package_name = re.split(r"[<>=!~\[]", line, 1)[0].strip()
+    if not package_name:
+        continue
+    module_name = name_to_module.get(package_name, package_name.replace("-", "_"))
+    if module_name in missing:
+        continue
+    if importlib.util.find_spec(module_name) is None:
+        missing.append(module_name)
+
+print(" ".join(missing))
+PY
+}
+
 if [ ! -f "$req_file" ]; then
   echo "Error: requirements file not found after fallback: $req_file"
   exit 1
@@ -1775,11 +1818,22 @@ fi
 
 req_hash="$(sha256sum "$req_file" | awk "{print \$1}")"
 stamp_file="${stamp_dir}/bot_requirements_${req_hash}"
+missing_modules="$(detect_missing_requirement_modules "$req_file")"
+if [ -n "$missing_modules" ] && [ -f "$stamp_file" ]; then
+  echo "  requirements cache hit but modules are missing: $missing_modules"
+  rm -f "$stamp_file"
+fi
+
 if [ ! -f "$stamp_file" ]; then
   if ! "${pip_install_base[@]}" -r "$req_file"; then
     echo "  full requirements install failed, retry without git+ lines..."
     grep -Ev "^[[:space:]]*git\\+" "$req_file" > /tmp/bot_requirements_nogit.txt
     "${pip_install_base[@]}" -r /tmp/bot_requirements_nogit.txt
+  fi
+  missing_modules="$(detect_missing_requirement_modules "$req_file")"
+  if [ -n "$missing_modules" ]; then
+    echo "Error: requirements install finished but modules are still missing: $missing_modules"
+    exit 1
   fi
   touch "$stamp_file"
 else
@@ -1897,7 +1951,7 @@ compose exec -T \
   -e MT5_RETRY_SECONDS="${MT5_RETRY_SECONDS_VAL:-5}" \
   -e MT5_RPC_TIMEOUT_MS="${MT5_RPC_TIMEOUT_MS_VAL:-180000}" \
   "$SERVICE_NAME" \
-  bash -lc "set -euo pipefail; py_cmd='${bot_python_cmd}'; require_shared='${require_shared_python}'; if [ ! -x \"\$py_cmd\" ]; then if [ \"\$require_shared\" = '1' ]; then echo \"Error: shared python not found at \$py_cmd\"; exit 1; fi; py_cmd='python3'; fi; echo \"  bot python: \$py_cmd\"; cd /bots && nohup env PYTHONUNBUFFERED=1 \"\$py_cmd\" -u /bots/${BOT_SCRIPT} > '${BOT_LOG}' 2>&1 &" 2>&1
+  bash -lc "set -euo pipefail; py_cmd='${bot_python_cmd}'; require_shared='${require_shared_python}'; if [ ! -x \"\$py_cmd\" ]; then if [ \"\$require_shared\" = '1' ]; then echo \"  warning: shared python not found at \$py_cmd, falling back to system python3\"; fi; py_cmd='python3'; fi; echo \"  bot python: \$py_cmd\"; cd /bots && nohup env PYTHONUNBUFFERED=1 \"\$py_cmd\" -u /bots/${BOT_SCRIPT} > '${BOT_LOG}' 2>&1 &" 2>&1
 )"
 if [[ -n "${step5_output:-}" ]]; then
   printf '%s\n' "$step5_output"

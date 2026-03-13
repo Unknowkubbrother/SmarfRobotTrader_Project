@@ -16,12 +16,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
-    python3-venv \
-    wget \
     curl \
     xdotool \
-    gnupg2 \
-    software-properties-common \
     ca-certificates \
     && dpkg --add-architecture i386 \
     && apt-get update \
@@ -40,9 +36,9 @@ RUN mkdir -p /defaults/installers \
     && curl -o /defaults/installers/python-3.11.9-embed-amd64.zip https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip \
     && curl -o /defaults/installers/mt5setup.exe https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe
 
-COPY /Metatrader /Metatrader
+COPY Metatrader /Metatrader
 RUN chmod +x /Metatrader/start.sh
-COPY /root /
+COPY root /
 
 # Fix KasmVNC auth generation when PASSWORD starts with '-' (treat as value, not option).
 RUN sed -i 's/openssl passwd -apr1 ${PASSWORD}/openssl passwd -apr1 -- "${PASSWORD}"/' /etc/s6-overlay/s6-rc.d/init-nginx/run

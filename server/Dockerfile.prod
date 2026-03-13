@@ -1,35 +1,57 @@
 FROM docker:28-cli AS dockercli
 
-FROM python:3.11-slim
+FROM python:3.11-slim AS builder
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive \
-    PIP_NO_CACHE_DIR=1
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    VIRTUAL_ENV=/opt/venv
 
 WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-      build-essential \
-      ca-certificates \
-      curl \
-      git \
-      libgl1 \
-      libglib2.0-0 \
-      zlib1g-dev \
+    build-essential \
+    ca-certificates \
+    git \
+    zlib1g-dev \
+    && python -m venv "$VIRTUAL_ENV" \
+    && "$VIRTUAL_ENV/bin/pip" install --upgrade pip \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+RUN "$VIRTUAL_ENV/bin/pip" install --no-compile -r /app/requirements.txt
+
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=dockercli /usr/local/bin/docker-compose /usr/local/bin/docker-compose
 COPY --from=dockercli /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
+COPY --from=builder /opt/venv /opt/venv
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip \
-    && pip install -r /app/requirements.txt
+COPY src /app/src
+COPY lib /app/lib
+COPY entrypoint.prod.sh /app/entrypoint.prod.sh
+COPY smarfrobottrade-firebase.json /app/smarfrobottrade-firebase.json
 
-COPY . /app
-RUN chmod +x /app/entrypoint.prod.sh
+RUN mkdir -p /app/uploads \
+    && chmod +x /app/entrypoint.prod.sh
 
 EXPOSE 8000
 
