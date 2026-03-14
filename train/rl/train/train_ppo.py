@@ -57,7 +57,7 @@ def _build_config() -> TrainConfig:
     ae_batch_size = int(os.getenv("TRAIN_AE_BATCH_SIZE", "256"))
     ae_lr = float(os.getenv("TRAIN_AE_LR", "0.001"))
     ae_weight_decay = float(os.getenv("TRAIN_AE_WEIGHT_DECAY", "0.00001"))
-    total_timesteps = int(os.getenv("TRAIN_TIMESTEPS", "400000"))
+    total_timesteps = int(os.getenv("TRAIN_TIMESTEPS", "500000"))
     max_hold_steps = int(os.getenv("TRAIN_MAX_HOLD_STEPS", "16"))
     recent_bias = float(os.getenv("TRAIN_RECENT_BIAS", "0.65"))
     recent_lookback = int(os.getenv("TRAIN_RECENT_LOOKBACK", "1200"))
@@ -185,7 +185,7 @@ class TradingMetricsCallback(BaseCallback):
 
 def load_training_data() -> pd.DataFrame:
     base_file = os.getenv("TRAIN_DATA_FILE", "h1_ohlc_delta.csv").strip() or "h1_ohlc_delta.csv"
-    train_date_from = os.getenv("TRAIN_DATE_FROM", "2024-01-01").strip()
+    train_date_from = os.getenv("TRAIN_DATE_FROM", "2020-01-01").strip()
     train_date_to = os.getenv("TRAIN_DATE_TO", "2026-03-06 23:59:59").strip()
     data_path = os.path.join(DATASETS_DIR, base_file)
     df = pd.read_csv(data_path)
