@@ -601,7 +601,7 @@ export default function Dashboard() {
                 <div className="mb-3 flex flex-col gap-3 rounded-xl border bg-white px-4 py-3 shadow-sm sm:flex-row sm:items-center sm:justify-between">
                   <TabsList className="grid w-full grid-cols-2 sm:w-auto">
                     <TabsTrigger value="tradingview">TradingView Chart</TabsTrigger>
-                    <TabsTrigger value="execution">RealTime Order Chart</TabsTrigger>
+                    <TabsTrigger value="execution">RealTimeOrder Chart</TabsTrigger>
                   </TabsList>
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] font-medium text-muted-foreground">

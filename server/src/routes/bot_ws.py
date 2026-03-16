@@ -328,9 +328,23 @@ async def _persist_closed_orders_only(
         _BOT_OPEN_POSITIONS[bot_config_id] = current_positions
         return
 
-    close_dt = datetime.now(timezone.utc)
+    last_quote_time = _safe_int((state.get("last_quote") or {}).get("time"), 0)
+    
     for ticket in closed_ticket_ids:
         pos = previous_positions.get(ticket) or {}
+        
+        close_dt = None
+        if last_quote_time > 0:
+            close_dt = datetime.fromtimestamp(last_quote_time, tz=timezone.utc)
+            
+        open_time = pos.get("openTime")
+        if isinstance(open_time, datetime):
+            if close_dt is None or close_dt < open_time:
+                close_dt = open_time + timedelta(seconds=1)
+                
+        if close_dt is None:
+            close_dt = datetime.now(timezone.utc)
+        
         data = {
             "botInstanceId": bot_instance_id,
             "magicNumber": _safe_int(pos.get("magic", 0), 0) or None,

@@ -287,9 +287,15 @@ def _build_chart_marker_payload(order, *, timeframe: str) -> list[dict]:
     if open_marker:
         markers.append(open_marker)
 
+    close_when = getattr(order, "closeTime", None)
+    open_when = getattr(order, "openTime", None)
+    if isinstance(close_when, datetime) and isinstance(open_when, datetime):
+        if close_when < open_when:
+            close_when = open_when
+
     close_marker = _event_payload(
         action="CLOSE",
-        when=getattr(order, "closeTime", None),
+        when=close_when,
         price=getattr(order, "closePrice", None),
     )
     if close_marker:

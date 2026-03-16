@@ -256,9 +256,22 @@ function mergeMarkers(...groups: Array<ChartMarkerPayload[] | null | undefined>)
       byId.set(id, marker);
     }
   }
-  return Array.from(byId.values()).sort(
-    (left, right) => (Number(left.time || 0) - Number(right.time || 0)) || String(left.id).localeCompare(String(right.id)),
-  );
+  return Array.from(byId.values()).sort((left, right) => {
+    const timeDiff = Number(left.time || 0) - Number(right.time || 0);
+    if (timeDiff !== 0) return timeDiff;
+
+    if (left.action !== right.action) {
+      return left.action === "OPEN" ? 1 : -1;
+    }
+
+    const leftActual = left.actualTime ? new Date(left.actualTime).getTime() : 0;
+    const rightActual = right.actualTime ? new Date(right.actualTime).getTime() : 0;
+    if (leftActual && rightActual && leftActual !== rightActual) {
+      return leftActual - rightActual;
+    }
+
+    return String(left.id).localeCompare(String(right.id));
+  });
 }
 
 function liveRefreshBarsForTimeframe(timeframe: string, bars: number): number {
@@ -841,10 +854,16 @@ export default function OrderAnnotatedChart({
       const hoveredId = String(param.hoveredObjectId ?? "").trim();
       const markerMapById = markersByIdRef.current;
       const markerMapByTime = markersByTimeRef.current;
+      
+      let targetTime: number | null = null;
       if (hoveredId && markerMapById.has(hoveredId)) {
-        hoveredMarkers = [markerMapById.get(hoveredId)!];
+        targetTime = Number(markerMapById.get(hoveredId)!.time);
       } else if (typeof param.time === "number") {
-        hoveredMarkers = markerMapByTime.get(Number(param.time)) || [];
+        targetTime = Number(param.time);
+      }
+
+      if (targetTime !== null) {
+        hoveredMarkers = markerMapByTime.get(targetTime) || [];
       }
 
       if (hoveredMarkers.length === 0) {
@@ -993,7 +1012,7 @@ export default function OrderAnnotatedChart({
         shape: marker.shape,
         color: marker.color,
         price: marker.price,
-        size: marker.action === "OPEN" ? 1.1 : 0.9,
+        size: marker.action === "OPEN" ? 1.0 : 1.3,
       }));
 
       if (!markerPluginRef.current) {
