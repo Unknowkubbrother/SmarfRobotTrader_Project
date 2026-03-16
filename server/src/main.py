@@ -117,130 +117,26 @@ def _resolve_cors_origins() -> list[str]:
 
 import asyncio
 import logging
-from datetime import datetime, timezone
 
-from .routes.bot_ws import _get_cached, _set_cached
-from .utils.vision_llm.use_llm import generate_llm_cls_for_bar
-from .utils.vision_llm.chart import MT5ConnectionError, NoMarketDataError
-from .utils.vision_llm.llm_client import (
-    VisionLLMConfigError,
-    VisionLLMServiceUnavailableError,
-)
 from .utils.notification_runtime import (
     run_summary_notification_worker,
     run_threshold_notification_worker,
 )
 from .utils.subscription_billing import run_subscription_billing_worker
-from .utils.ws_manager import bot_hub
 
 logger = logging.getLogger(__name__)
-
-# Symbol:Timeframe pairs, comma-separated  (e.g. "EURUSD:H1,EURUSD:M15,USDJPY:H1")
-_raw_pairs = os.getenv("CRON_PAIRS", "EURUSD:H1")
-CRON_PAIRS: list[tuple[str, str]] = []
-for p in _raw_pairs.split(","):
-    p = p.strip()
-    if ":" in p:
-        sym, tf = p.split(":", 1)
-        CRON_PAIRS.append((sym.strip().upper(), tf.strip().upper()))
-CRON_ENABLED = os.getenv("CRON_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
-
-# Timeframe → seconds
-_TF_SECS = {
-    "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
-    "H1": 3600, "H4": 14400, "D1": 86400,
-}
-
-
-async def _cron_worker(symbol: str, timeframe: str):
-    import time as _time
-    interval = _TF_SECS.get(timeframe, 3600)
-    logger.info("cron_worker started  | %s/%s  interval=%ds", symbol, timeframe, interval)
-
-    while True:
-        now = datetime.now(timezone.utc)
-        epoch = int(now.timestamp())
-        seconds_to_next = interval - (epoch % interval) + 5
-        logger.info("cron  💤  %s/%s  sleeping %ds", symbol, timeframe, seconds_to_next)
-        await asyncio.sleep(seconds_to_next)
-
-        now = datetime.now(timezone.utc)
-        epoch = int(now.timestamp())
-        aligned = epoch - (epoch % interval)
-        candle_open_epoch = aligned - interval
-        candle_dt = datetime.fromtimestamp(candle_open_epoch, tz=timezone.utc)
-        dt_str = candle_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-        try:
-            cached = _get_cached(symbol, timeframe, dt_str)
-            if cached:
-                result_data = cached
-                logger.info("cron  ⚡  cache hit %s/%s  %s", symbol, timeframe, dt_str)
-            else:
-                start = _time.perf_counter()
-                result, cls_vec = await asyncio.to_thread(
-                    generate_llm_cls_for_bar, candle_dt, symbol, timeframe,
-                )
-                elapsed = _time.perf_counter() - start
-                result_data = {
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "date_time": dt_str,
-                    "llm_text": result,
-                    "cls_vec": cls_vec.tolist(),
-                    "elapsed_seconds": round(elapsed, 2),
-                }
-                _set_cached(symbol, timeframe, dt_str, result_data)
-                logger.info("cron  ✔  %s/%s  %s  %.1fs", symbol, timeframe, dt_str, elapsed)
-
-            await bot_hub.broadcast_llm(symbol, timeframe, result_data)
-        except NoMarketDataError as exc:
-            logger.warning(
-                "cron skip %s/%s at %s: %s",
-                symbol,
-                timeframe,
-                dt_str,
-                exc,
-            )
-        except MT5ConnectionError as exc:
-            logger.warning(
-                "cron mt5 unavailable %s/%s at %s: %s",
-                symbol,
-                timeframe,
-                dt_str,
-                exc,
-            )
-        except (VisionLLMConfigError, VisionLLMServiceUnavailableError) as exc:
-            logger.warning(
-                "cron llm unavailable %s/%s at %s: %s",
-                symbol,
-                timeframe,
-                dt_str,
-                exc,
-            )
-        except Exception as exc:
-            logger.exception("cron failed %s/%s: %s", symbol, timeframe, exc)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.connect()
 
-    cron_tasks = []
     background_tasks = []
-    if CRON_ENABLED and CRON_PAIRS:
-        for symbol, timeframe in CRON_PAIRS:
-            task = asyncio.create_task(_cron_worker(symbol, timeframe))
-            cron_tasks.append(task)
-
     background_tasks.append(asyncio.create_task(run_threshold_notification_worker()))
     background_tasks.append(asyncio.create_task(run_summary_notification_worker()))
     background_tasks.append(asyncio.create_task(run_subscription_billing_worker()))
 
     yield
 
-    for task in cron_tasks:
-        task.cancel()
     for task in background_tasks:
         task.cancel()
     await db.disconnect()

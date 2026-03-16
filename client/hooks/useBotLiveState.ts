@@ -50,6 +50,15 @@ export interface BotLiveIntrabarReview {
     exit_meta?: Record<string, unknown>;
 }
 
+export interface BotLiveCandle {
+    time: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+}
+
 export interface BotLiveState {
     bot_config_id: string;
     symbol?: string;
@@ -82,6 +91,12 @@ export interface BotLiveState {
     currency?: string;
     server?: string;
     login?: number;
+    recent_candles?: BotLiveCandle[];
+    last_quote?: {
+        bid?: number;
+        ask?: number;
+        time?: number;
+    };
     // MT5 Positions
     positions?: MT5Position[];
     // Logs

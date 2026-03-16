@@ -194,6 +194,8 @@ async def _extract_runtime_context(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     magic_number = await _ensure_bot_magic_number(config)
+    runtime_risk_level = _enum_value(getattr(config, "riskLevel", None))
+    runtime_schedule = normalize_trading_schedule(getattr(config, "tradingSchedule", None))
 
     runtime_env = build_bot_runtime_env(
         bot_config_id=str(config.id),
@@ -206,6 +208,8 @@ async def _extract_runtime_context(
         docker_image_id=image_ref,
         bot_version_tag=effective_version_tag,
         magic_number=magic_number,
+        risk_level=str(runtime_risk_level or "").strip() or None,
+        trading_schedule=runtime_schedule,
     )
 
     return {

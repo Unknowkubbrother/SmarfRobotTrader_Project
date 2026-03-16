@@ -11,7 +11,7 @@ except Exception:
 import base64
 import hashlib
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from ..models.trading_model import (
     Create_Trading_Account,
     Delete_Trading_Account,
@@ -32,10 +32,40 @@ from ..utils.notification_delivery import (
 )
 from ..utils.subscription_access import assert_user_subscription_allows_bot_usage
 from ..utils.trading_schedule import normalize_trading_schedule
+from ..utils.ws_manager import bot_hub
+from ..utils.vision_llm.chart import (
+    ChartRatesResult,
+    MT5ConnectionError,
+    NoMarketDataError,
+    fetch_chart_rates_result,
+)
 
 trading_router = APIRouter()
 ACTIVE_RECORD_STATUS = "active"
 _TRADING_NOTIFICATION_RELATED_LINK = "/dashboard"
+_MAX_CHART_HISTORY_BARS = 2000
+_MAX_CHART_MARKERS = 2000
+_CHART_TIMEFRAME_SECONDS = {
+    "M1": 60,
+    "M2": 120,
+    "M3": 180,
+    "M4": 240,
+    "M5": 300,
+    "M6": 360,
+    "M10": 600,
+    "M12": 720,
+    "M15": 900,
+    "M20": 1200,
+    "M30": 1800,
+    "H1": 3600,
+    "H2": 7200,
+    "H3": 10800,
+    "H4": 14400,
+    "H6": 21600,
+    "H8": 28800,
+    "H12": 43200,
+    "D1": 86400,
+}
 
 
 def _as_date(value) -> date:
@@ -79,6 +109,193 @@ def _order_net_profit(order) -> float:
     commission = _to_float(getattr(order, "commission", 0.0), 0.0)
     swap = _to_float(getattr(order, "swap", 0.0), 0.0)
     return profit + commission + swap
+
+
+def _to_utc_datetime(value: datetime | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _safe_iso_datetime(value: datetime | None) -> str | None:
+    normalized = _to_utc_datetime(value)
+    return normalized.isoformat() if normalized else None
+
+
+def _parse_chart_query_datetime(value: str | None) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        numeric = float(text)
+    except Exception:
+        numeric = None
+    if numeric is not None:
+        epoch = int(numeric)
+        if epoch > 1_000_000_000_000:
+            epoch //= 1000
+        if epoch > 0:
+            return datetime.fromtimestamp(epoch, tz=timezone.utc)
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return _to_utc_datetime(parsed)
+
+
+def _chart_timeframe_seconds(timeframe: str) -> int:
+    tf = str(timeframe or "H1").strip().upper()
+    return int(_CHART_TIMEFRAME_SECONDS.get(tf, 3600))
+
+
+def _align_datetime_to_bar_epoch(value: datetime | None, timeframe: str) -> int | None:
+    normalized = _to_utc_datetime(value)
+    if normalized is None:
+        return None
+    tf_secs = _chart_timeframe_seconds(timeframe)
+    epoch = int(normalized.timestamp())
+    return epoch - (epoch % tf_secs)
+
+
+async def _fetch_chart_rates_from_connected_bot(
+    *,
+    bot_config_id: str | None,
+    symbol: str,
+    timeframe: str,
+    date_time: datetime,
+    bars: int,
+) -> ChartRatesResult | None:
+    bot_id = str(bot_config_id or "").strip()
+    if not bot_id or bot_hub.get_bot(bot_id) is None:
+        return None
+
+    command_id = await bot_hub.send_bot_command(
+        bot_id,
+        "fetch_chart_history",
+        payload={
+            "symbol": str(symbol or "").strip().upper(),
+            "timeframe": str(timeframe or "").strip().upper(),
+            "date_time": _safe_iso_datetime(_to_utc_datetime(date_time)),
+            "bars": int(bars),
+        },
+    )
+    if not command_id:
+        return None
+
+    ack = await bot_hub.wait_for_command_ack(bot_id, command_id, timeout_sec=15.0)
+    if not isinstance(ack, dict) or not bool(ack.get("ok")):
+        return None
+
+    payload = ack.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    rates = payload.get("rates")
+    if not isinstance(rates, list) or len(rates) == 0:
+        return None
+
+    try:
+        last_rate_epoch = int((rates[-1] or {}).get("time", 0) or 0)
+    except Exception:
+        last_rate_epoch = 0
+    requested_epoch = _align_datetime_to_bar_epoch(date_time, timeframe)
+    tf_secs = _chart_timeframe_seconds(timeframe)
+    if (
+        last_rate_epoch > 0
+        and requested_epoch is not None
+        and last_rate_epoch < int(requested_epoch) - max(60, int(tf_secs))
+    ):
+        return None
+
+    server_name = str(payload.get("server", "") or "").strip()
+    login_id = str(payload.get("login", "") or "").strip()
+    label_parts = [f"bot runtime {bot_id[:8]}"]
+    if server_name:
+        label_parts.append(server_name)
+    if login_id:
+        label_parts.append(f"login {login_id}")
+
+    return ChartRatesResult(
+        rates=list(rates),
+        source_mode="bot_runtime_ws",
+        source_label=" | ".join(label_parts) or "bot runtime websocket",
+        resolved_from_time=str(payload.get("resolved_from_time", "") or "").strip(),
+        resolved_to_time=str(payload.get("resolved_to_time", "") or "").strip(),
+    )
+
+
+def _build_chart_marker_payload(order, *, timeframe: str) -> list[dict]:
+    order_type = _normalize_order_type_display(getattr(order, "type", ""))
+    if order_type not in {"BUY", "SELL"}:
+        return []
+
+    ticket_id = int(getattr(order, "ticketId", 0) or 0)
+    volume = _to_float(getattr(order, "volume", 0.0), 0.0)
+    symbol = str(getattr(order, "symbol", "") or "").strip().upper()
+    profit = round(_to_float(getattr(order, "profit", 0.0), 0.0), 2)
+    net_profit = round(_order_net_profit(order), 2)
+    timeframe_text = str(timeframe or "H1").strip().upper()
+
+    def _event_payload(*, action: str, when: datetime | None, price: float | None) -> dict | None:
+        aligned_time = _align_datetime_to_bar_epoch(when, timeframe_text)
+        actual_time = _safe_iso_datetime(when)
+        safe_price = _to_optional_price(price)
+        if aligned_time is None or actual_time is None or safe_price is None:
+            return None
+
+        if action == "OPEN":
+            is_buy = order_type == "BUY"
+            shape = "arrowUp" if is_buy else "arrowDown"
+            position = "atPriceBottom" if is_buy else "atPriceTop"
+            color = "#16a34a" if is_buy else "#dc2626"
+            text = f"OPEN {order_type} {volume:.2f}"
+        else:
+            is_buy = order_type == "BUY"
+            shape = "circle"
+            position = "atPriceTop" if is_buy else "atPriceBottom"
+            color = "#0f766e" if is_buy else "#b45309"
+            pnl_prefix = "+" if net_profit >= 0 else ""
+            text = f"CLOSE {order_type} {pnl_prefix}{net_profit:.2f}"
+
+        return {
+            "id": f"{ticket_id}:{action.lower()}",
+            "ticketId": ticket_id,
+            "symbol": symbol,
+            "time": int(aligned_time),
+            "actualTime": actual_time,
+            "price": float(safe_price),
+            "side": order_type,
+            "action": action,
+            "shape": shape,
+            "position": position,
+            "color": color,
+            "text": text,
+            "volume": round(float(volume), 2),
+            "profit": profit,
+            "netProfit": net_profit,
+        }
+
+    markers: list[dict] = []
+    open_marker = _event_payload(
+        action="OPEN",
+        when=getattr(order, "openTime", None),
+        price=getattr(order, "openPrice", None),
+    )
+    if open_marker:
+        markers.append(open_marker)
+
+    close_marker = _event_payload(
+        action="CLOSE",
+        when=getattr(order, "closeTime", None),
+        price=getattr(order, "closePrice", None),
+    )
+    if close_marker:
+        markers.append(close_marker)
+
+    return markers
 
 
 def _normalize_string_list(value) -> list[str]:
@@ -775,6 +992,353 @@ async def get_trading_history_by_day(
             "netProfit": round(float(total_profit), 2),
             "wins": int(wins),
             "losses": int(losses),
+        },
+    }
+
+
+@trading_router.get("/chart_orders", tags=["trading"])
+async def get_trading_chart_orders(
+    request: Request,
+    account_id: str | None = Query(None, alias="accountId"),
+    bot_config_id: str | None = Query(None, alias="botConfigId"),
+    symbol: str | None = Query(None),
+    timeframe: str | None = Query(None),
+    bars: int = 240,
+    before_time: str | None = Query(None, alias="beforeTime"),
+    anchor_mode: str | None = Query(None, alias="anchorMode"),
+    include_archived: bool = Query(True, alias="includeArchived"),
+):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    safe_bars = max(40, min(int(bars), _MAX_CHART_HISTORY_BARS))
+    selected_account_id = await _resolve_requested_account_id(
+        request.state.user_id,
+        account_id,
+        include_archived=include_archived,
+    )
+    selected_bot_config = await _resolve_requested_bot_configuration(
+        request.state.user_id,
+        bot_config_id,
+        include_archived=include_archived,
+        requested_account_id=selected_account_id,
+    )
+    if selected_bot_config and not selected_account_id:
+        selected_account_id = str(getattr(selected_bot_config, "accountId", "") or "").strip() or None
+
+    bot_config_with_version = None
+    if selected_bot_config:
+        bot_config_with_version = await db.botconfiguration.find_first(
+            where={"id": str(getattr(selected_bot_config, "id", "") or "")},
+            include={"botVersion": True},
+        )
+
+    _, order_scope = await _build_user_order_scope(
+        request.state.user_id,
+        include_archived=include_archived,
+    )
+    if not order_scope and selected_account_id:
+        order_scope = {"accountId": selected_account_id}
+    if not order_scope:
+        return {
+            "status_code": 200,
+            "data": {
+                "symbol": str(symbol or "").strip().upper() or "XAUUSD",
+                "timeframe": str(timeframe or "H1").strip().upper(),
+                "bars": safe_bars,
+                "candles": [],
+                "markers": [],
+                "sourceMode": "unavailable",
+                "sourceLabel": "No trading account scope",
+                "visibleFrom": None,
+                "visibleTo": None,
+            },
+        }
+
+    base_order_filter = _combine_where_and(
+        order_scope,
+        {"accountId": selected_account_id} if selected_account_id else {},
+        _build_bot_order_filter(selected_bot_config),
+    )
+
+    latest_order = await db.orderhistory.find_first(
+        where=base_order_filter,
+        order={"closeTime": "desc"},
+    )
+
+    symbol_text = str(symbol or "").strip().upper()
+    if not symbol_text:
+        symbol_text = str(
+            getattr(getattr(bot_config_with_version, "botVersion", None), "symbol", "") or ""
+        ).strip().upper()
+    if not symbol_text:
+        symbol_text = str(getattr(latest_order, "symbol", "") or "").strip().upper()
+    if not symbol_text:
+        symbol_text = "XAUUSD"
+
+    timeframe_text = str(timeframe or "").strip().upper()
+    if not timeframe_text:
+        timeframe_text = str(
+            getattr(getattr(bot_config_with_version, "botVersion", None), "timeframe", "") or ""
+        ).strip().upper()
+    if not timeframe_text:
+        timeframe_text = "H1"
+
+    selected_bot_id = str(getattr(selected_bot_config, "id", "") or "").strip() or None
+    if not selected_bot_id:
+        raise HTTPException(
+            status_code=400,
+            detail="botConfigId is required to load chart candles from bot runtime",
+        )
+
+    tf_secs = _chart_timeframe_seconds(timeframe_text)
+    now_utc = datetime.now(timezone.utc)
+    before_dt = _parse_chart_query_datetime(before_time)
+    anchor_mode_text = str(anchor_mode or "").strip().lower()
+    latest_event_time = _to_utc_datetime(
+        getattr(latest_order, "closeTime", None) or getattr(latest_order, "openTime", None)
+    )
+    anchor_dt = before_dt or now_utc
+    if before_dt is None and latest_event_time is not None and anchor_mode_text != "market":
+        visible_span_sec = tf_secs * max(40, safe_bars - 20)
+        age_sec = max(0.0, (now_utc - latest_event_time).total_seconds())
+        if age_sec > visible_span_sec:
+            anchor_dt = latest_event_time + timedelta(seconds=tf_secs * 24)
+
+    chart_rates_result = await _fetch_chart_rates_from_connected_bot(
+        bot_config_id=selected_bot_id,
+        symbol=symbol_text,
+        timeframe=timeframe_text,
+        date_time=anchor_dt,
+        bars=safe_bars,
+    )
+    if chart_rates_result is None:
+        try:
+            chart_rates_result = await asyncio.to_thread(
+                fetch_chart_rates_result,
+                date_time=anchor_dt,
+                symbol=symbol_text,
+                timeframe=timeframe_text,
+                bot_config_id=selected_bot_id,
+                bars=safe_bars,
+            )
+        except (MT5ConnectionError, NoMarketDataError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=f"Unable to load chart data: {exc}")
+
+    visible_from = None
+    visible_to = None
+    try:
+        if chart_rates_result.resolved_from_time:
+            visible_from = datetime.strptime(
+                chart_rates_result.resolved_from_time,
+                "%Y-%m-%d %H:%M:%S",
+            ).replace(tzinfo=timezone.utc)
+        if chart_rates_result.resolved_to_time:
+            visible_to = datetime.strptime(
+                chart_rates_result.resolved_to_time,
+                "%Y-%m-%d %H:%M:%S",
+            ).replace(tzinfo=timezone.utc) + timedelta(seconds=tf_secs)
+    except ValueError:
+        visible_from = None
+        visible_to = None
+
+    if visible_from is None and chart_rates_result.rates:
+        visible_from = datetime.fromtimestamp(
+            int(chart_rates_result.rates[0]["time"]),
+            tz=timezone.utc,
+        )
+    if visible_to is None and chart_rates_result.rates:
+        visible_to = datetime.fromtimestamp(
+            int(chart_rates_result.rates[-1]["time"]),
+            tz=timezone.utc,
+        ) + timedelta(seconds=tf_secs)
+
+    marker_orders = []
+    marker_filter = _combine_where_and(
+        base_order_filter,
+        {"symbol": symbol_text},
+        {
+            "OR": [
+                {
+                    "openTime": {
+                        "gte": visible_from,
+                        "lte": visible_to,
+                    }
+                },
+                {
+                    "closeTime": {
+                        "gte": visible_from,
+                        "lte": visible_to,
+                    }
+                },
+            ]
+        } if visible_from and visible_to else {},
+    )
+    if marker_filter:
+        marker_orders = await db.orderhistory.find_many(
+            where=marker_filter,
+            order={"openTime": "asc"},
+            take=max(200, min(safe_bars * 4, _MAX_CHART_MARKERS)),
+        )
+
+    markers: list[dict] = []
+    for order in marker_orders:
+        markers.extend(_build_chart_marker_payload(order, timeframe=timeframe_text))
+    markers.sort(key=lambda item: (int(item.get("time", 0) or 0), str(item.get("id", ""))))
+
+    candles = [
+        {
+            "time": int(row["time"]),
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
+            "volume": float(row.get("tick_volume", 0.0) or 0.0),
+        }
+        for row in chart_rates_result.rates
+    ]
+
+    return {
+        "status_code": 200,
+        "data": {
+            "accountId": selected_account_id,
+            "botConfigId": selected_bot_id,
+            "symbol": symbol_text,
+            "timeframe": timeframe_text,
+            "bars": safe_bars,
+            "candles": candles,
+            "markers": markers,
+            "sourceMode": chart_rates_result.source_mode,
+            "sourceLabel": chart_rates_result.source_label,
+            "visibleFrom": visible_from.isoformat() if visible_from else None,
+            "visibleTo": visible_to.isoformat() if visible_to else None,
+            "latestOrderTime": _safe_iso_datetime(latest_event_time),
+            "beforeTime": _safe_iso_datetime(before_dt),
+        },
+    }
+
+
+@trading_router.get("/chart_markers", tags=["trading"])
+async def get_trading_chart_markers(
+    request: Request,
+    account_id: str | None = Query(None, alias="accountId"),
+    bot_config_id: str | None = Query(None, alias="botConfigId"),
+    symbol: str | None = Query(None),
+    timeframe: str | None = Query(None),
+    limit: int = 200,
+    include_archived: bool = Query(True, alias="includeArchived"),
+):
+    if not request.state.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+
+    safe_limit = max(40, min(int(limit), _MAX_CHART_MARKERS))
+    selected_account_id = await _resolve_requested_account_id(
+        request.state.user_id,
+        account_id,
+        include_archived=include_archived,
+    )
+    selected_bot_config = await _resolve_requested_bot_configuration(
+        request.state.user_id,
+        bot_config_id,
+        include_archived=include_archived,
+        requested_account_id=selected_account_id,
+    )
+    if selected_bot_config and not selected_account_id:
+        selected_account_id = str(getattr(selected_bot_config, "accountId", "") or "").strip() or None
+
+    bot_config_with_version = None
+    if selected_bot_config:
+        bot_config_with_version = await db.botconfiguration.find_first(
+            where={"id": str(getattr(selected_bot_config, "id", "") or "")},
+            include={"botVersion": True},
+        )
+
+    _, order_scope = await _build_user_order_scope(
+        request.state.user_id,
+        include_archived=include_archived,
+    )
+    if not order_scope and selected_account_id:
+        order_scope = {"accountId": selected_account_id}
+    if not order_scope:
+        return {
+            "status_code": 200,
+            "data": {
+                "symbol": str(symbol or "").strip().upper() or "XAUUSD",
+                "timeframe": str(timeframe or "H1").strip().upper(),
+                "bars": 0,
+                "candles": [],
+                "markers": [],
+                "sourceMode": "order_history",
+                "sourceLabel": "Order history only",
+                "visibleFrom": None,
+                "visibleTo": None,
+                "latestOrderTime": None,
+            },
+        }
+
+    base_order_filter = _combine_where_and(
+        order_scope,
+        {"accountId": selected_account_id} if selected_account_id else {},
+        _build_bot_order_filter(selected_bot_config),
+    )
+
+    latest_order = await db.orderhistory.find_first(
+        where=base_order_filter,
+        order={"closeTime": "desc"},
+    )
+
+    symbol_text = str(symbol or "").strip().upper()
+    if not symbol_text:
+        symbol_text = str(
+            getattr(getattr(bot_config_with_version, "botVersion", None), "symbol", "") or ""
+        ).strip().upper()
+    if not symbol_text:
+        symbol_text = str(getattr(latest_order, "symbol", "") or "").strip().upper()
+    if not symbol_text:
+        symbol_text = "XAUUSD"
+
+    timeframe_text = str(timeframe or "").strip().upper()
+    if not timeframe_text:
+        timeframe_text = str(
+            getattr(getattr(bot_config_with_version, "botVersion", None), "timeframe", "") or ""
+        ).strip().upper()
+    if not timeframe_text:
+        timeframe_text = "H1"
+
+    marker_filter = _combine_where_and(
+        base_order_filter,
+        {"symbol": symbol_text},
+    )
+    marker_orders = await db.orderhistory.find_many(
+        where=marker_filter,
+        order={"openTime": "desc"},
+        take=safe_limit,
+    )
+
+    markers: list[dict] = []
+    for order in reversed(marker_orders):
+        markers.extend(_build_chart_marker_payload(order, timeframe=timeframe_text))
+    markers.sort(key=lambda item: (int(item.get("time", 0) or 0), str(item.get("id", ""))))
+
+    latest_event_time = _to_utc_datetime(
+        getattr(latest_order, "closeTime", None) or getattr(latest_order, "openTime", None)
+    )
+
+    return {
+        "status_code": 200,
+        "data": {
+            "accountId": selected_account_id,
+            "botConfigId": str(getattr(selected_bot_config, "id", "") or "").strip() or None,
+            "symbol": symbol_text,
+            "timeframe": timeframe_text,
+            "bars": 0,
+            "candles": [],
+            "markers": markers,
+            "sourceMode": "order_history",
+            "sourceLabel": "Order history only",
+            "visibleFrom": None,
+            "visibleTo": None,
+            "latestOrderTime": _safe_iso_datetime(latest_event_time),
         },
     }
 

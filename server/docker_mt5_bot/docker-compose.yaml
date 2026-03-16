@@ -35,4 +35,5 @@ services:
 volumes:
   config:
   pydeps:
+    external: true
     name: mt5_pydeps_shared

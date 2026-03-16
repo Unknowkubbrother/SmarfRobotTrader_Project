@@ -42,6 +42,9 @@ from .config import (
     INTRABAR_TRAIL_KEEP_RATIO_TIGHT,
     INTRABAR_TRAIL_KEEP_RATIO_TREND,
     LIVE_DYNAMIC_LOT,
+    LIVE_MANAGE_MANUAL_POSITIONS,
+    LIVE_STATUS_LINE_ENABLED,
+    LIVE_STATUS_LOG_INTERVAL_SEC,
     LIVE_SYNC_ACCOUNT_STATE,
     LLM_SEMANTIC_CACHE_FILE,
     LLM_SEMANTIC_CACHE_SCHEMA,
@@ -133,8 +136,17 @@ class LiveTradingBot:
         self._ws_connected = False
         self._ws_send_lock = threading.Lock()
         self._ws_state_lock = threading.Lock()
+        self._runtime_command_lock = threading.Lock()
         self._ws_pending_state_payload = None
         self._ws_last_enqueued_at = 0.0
+        self._pending_runtime_commands = []
+        self._status_line_enabled = bool(LIVE_STATUS_LINE_ENABLED)
+        self._status_log_interval_sec = max(0.0, float(LIVE_STATUS_LOG_INTERVAL_SEC or 0.0))
+        self._last_status_log_at = 0.0
+        try:
+            self._status_line_is_tty = bool(sys.stdout.isatty())
+        except Exception:
+            self._status_line_is_tty = False
         self._open_position_tickets = set()
         self._closed_deal_cursor_msc = 0
         self._last_closed_deal_poll_at = 0.0
@@ -153,6 +165,9 @@ class LiveTradingBot:
         self._sem_retry_not_before = {}  # ts_key -> epoch seconds
         self.last_action = "HOLD"
         self._last_status_tick = None  # {"bid": float, "ask": float, "time": int}
+        self._last_current_bar = None
+        self._recent_chart_candles = []
+        self._chart_candle_limit = max(1200, int(BAR_HISTORY) + 240)
         self._rt_delta_cache = {
             "bar_open_ts": 0,
             "tick_time_ts": 0,
@@ -222,6 +237,7 @@ class LiveTradingBot:
             _env_float_runtime("LIVE_TRADE_ALLOWED_WARN_COOLDOWN_SEC", 10.0),
         )
         self._last_trade_allowed_blocked_log_at = 0.0
+        self._last_market_inactive_log_at = 0.0
         self.semantic_alias_hours = tuple(int(v) for v in (LIVE_SEMANTIC_ALIAS_HOURS or (0,)))
         if 0 not in self.semantic_alias_hours:
             self.semantic_alias_hours = (0,) + self.semantic_alias_hours
@@ -543,11 +559,30 @@ class LiveTradingBot:
         finally:
             self._mt5_reconnect_lock.release()
 
-    def _order_send_with_ipc_retry(self, req: dict, reason: str, refresh_price_fn=None):
+    def _order_send_with_ipc_retry(self, req: dict, reason: str, refresh_price_fn=None, confirm_applied_fn=None):
+        def _confirmed_result(comment_text: str):
+            return SimpleNamespace(
+                retcode=getattr(mt5, "TRADE_RETCODE_DONE", 10009),
+                comment=str(comment_text or "Broker state confirmed"),
+            )
+
+        def _confirm_applied(comment_text: str):
+            if not callable(confirm_applied_fn):
+                return None
+            try:
+                applied = bool(confirm_applied_fn())
+            except Exception:
+                applied = False
+            return _confirmed_result(comment_text) if applied else None
+
         res = mt5.order_send(req)
         retried = False
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
             return res, retried
+
+        confirmed = _confirm_applied(f"broker_confirmed_after_initial_send:{reason}")
+        if confirmed is not None:
+            return confirmed, retried
 
         retcode = getattr(res, "retcode", None) if res is not None else None
         comment = str(getattr(res, "comment", "") or "").strip() if res is not None else ""
@@ -556,9 +591,12 @@ class LiveTradingBot:
                 reason=f"order_send:{reason}",
                 action_label="Order retry",
                 force_log=True,
-            ):
+                ):
                 return res, retried
             retried = True
+            confirmed = _confirm_applied(f"broker_confirmed_before_retry:{reason}")
+            if confirmed is not None:
+                return confirmed, retried
             if callable(refresh_price_fn):
                 try:
                     next_price = refresh_price_fn()
@@ -590,6 +628,10 @@ class LiveTradingBot:
         if not self._try_reconnect_mt5(reason=f"order_send:{reason}"):
             return res, retried
 
+        confirmed = _confirm_applied(f"broker_confirmed_after_reconnect:{reason}")
+        if confirmed is not None:
+            return confirmed, retried
+
         if callable(refresh_price_fn):
             try:
                 next_price = refresh_price_fn()
@@ -604,6 +646,73 @@ class LiveTradingBot:
         except Exception:
             res = None
         return res, retried
+
+    def _snapshot_bridge_runtime_state(self):
+        if self.bridge is None:
+            return None
+        return {
+            "position": int(self.bridge.position),
+            "entry_price": float(self.bridge.entry_price),
+            "hold_steps": int(self.bridge.hold_steps),
+            "first_bar": bool(self.bridge.first_bar),
+            "trade_cooldown": int(self.bridge.trade_cooldown),
+            "defensive_mode_bars": int(self.bridge.defensive_mode_bars),
+            "defensive_triggers": int(self.bridge.defensive_triggers),
+            "loss_streak": int(self.bridge.loss_streak),
+            "skipped_signals": int(self.bridge.skipped_signals),
+            "margin_skips": int(self.bridge.margin_skips),
+            "defensive_skips": int(self.bridge.defensive_skips),
+            "semantic_skips": int(self.bridge.semantic_skips),
+            "trades": int(self.bridge.trades),
+            "wins": int(self.bridge.wins),
+            "total_pnl": float(self.bridge.total_pnl),
+            "total_fees": float(self.bridge.total_fees),
+            "balance": float(self.bridge.balance),
+            "equity": float(self.bridge.equity),
+            "max_equity": float(self.bridge.max_equity),
+            "unrealized_pnl": float(self.bridge.unrealized_pnl),
+            "lot_size": float(self.bridge.lot_size),
+            "spread_cost": float(self.bridge.spread_cost),
+            "recent_trade_pips": [float(x) for x in list(self.bridge.recent_trade_pips)],
+            "last_decision": dict(getattr(self.bridge, "last_decision", {}) or {}),
+        }
+
+    def _restore_bridge_runtime_state(self, snapshot, preserved_last_decision=None):
+        if self.bridge is None or not isinstance(snapshot, dict):
+            return
+        self.bridge.position = int(snapshot.get("position", self.bridge.position))
+        self.bridge.entry_price = float(snapshot.get("entry_price", self.bridge.entry_price))
+        self.bridge.hold_steps = int(snapshot.get("hold_steps", self.bridge.hold_steps))
+        self.bridge.first_bar = bool(snapshot.get("first_bar", self.bridge.first_bar))
+        self.bridge.trade_cooldown = int(snapshot.get("trade_cooldown", self.bridge.trade_cooldown))
+        self.bridge.defensive_mode_bars = int(snapshot.get("defensive_mode_bars", self.bridge.defensive_mode_bars))
+        self.bridge.defensive_triggers = int(snapshot.get("defensive_triggers", self.bridge.defensive_triggers))
+        self.bridge.loss_streak = int(snapshot.get("loss_streak", self.bridge.loss_streak))
+        self.bridge.skipped_signals = int(snapshot.get("skipped_signals", self.bridge.skipped_signals))
+        self.bridge.margin_skips = int(snapshot.get("margin_skips", self.bridge.margin_skips))
+        self.bridge.defensive_skips = int(snapshot.get("defensive_skips", self.bridge.defensive_skips))
+        self.bridge.semantic_skips = int(snapshot.get("semantic_skips", self.bridge.semantic_skips))
+        self.bridge.trades = int(snapshot.get("trades", self.bridge.trades))
+        self.bridge.wins = int(snapshot.get("wins", self.bridge.wins))
+        self.bridge.total_pnl = float(snapshot.get("total_pnl", self.bridge.total_pnl))
+        self.bridge.total_fees = float(snapshot.get("total_fees", self.bridge.total_fees))
+        self.bridge.balance = float(snapshot.get("balance", self.bridge.balance))
+        self.bridge.equity = float(snapshot.get("equity", self.bridge.equity))
+        self.bridge.max_equity = float(snapshot.get("max_equity", self.bridge.max_equity))
+        self.bridge.unrealized_pnl = float(snapshot.get("unrealized_pnl", self.bridge.unrealized_pnl))
+        self.bridge.lot_size = float(snapshot.get("lot_size", self.bridge.lot_size))
+        self.bridge.spread_cost = float(snapshot.get("spread_cost", self.bridge.spread_cost))
+        try:
+            self.bridge.recent_trade_pips.clear()
+            maxlen = int(self.bridge.recent_trade_pips.maxlen or 20)
+            for value in list(snapshot.get("recent_trade_pips", []))[-maxlen:]:
+                self.bridge.recent_trade_pips.append(float(value))
+        except Exception:
+            pass
+        if preserved_last_decision is not None:
+            self.bridge.last_decision = dict(preserved_last_decision or {})
+        else:
+            self.bridge.last_decision = dict(snapshot.get("last_decision", {}) or {})
 
     def _trade_retcode_name(self, retcode) -> str:
         try:
@@ -1381,9 +1490,7 @@ class LiveTradingBot:
                                 continue
                             msg_type = msg.get("type")
                             if msg_type == "llm_result":
-                                # WS llm_result is broadcast by symbol/timeframe only.
-                                # Keep semantic ownership on the bot's direct HTTP request path.
-                                pass
+                                self._handle_llm_result_push(msg)
                             elif msg_type == "bot_config":
                                 self._apply_runtime_config(msg, source="ws")
                             elif msg_type == "bot_command":
@@ -1553,6 +1660,69 @@ class LiveTradingBot:
         except Exception:
             return False
 
+    def _handle_llm_result_push(self, payload: dict):
+        if not isinstance(payload, dict):
+            return
+
+        target_bot_id = str(payload.get("bot_config_id", "") or "").strip()
+        if not target_bot_id or target_bot_id != str(BOT_CONFIG_ID or "").strip():
+            return
+
+        ts_raw = str(payload.get("date_time", "") or "").strip()
+        if not ts_raw:
+            self._add_log(
+                "warning",
+                "Ignored WS AI analysis with missing date_time",
+                phase="sem",
+                event="ws_push_ignored",
+            )
+            return
+
+        try:
+            ts_key = self._parse_semantic_ts_key(ts_raw).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception as exc:
+            self._add_log(
+                "warning",
+                "Ignored WS AI analysis with invalid timestamp",
+                phase="sem",
+                event="ws_push_invalid_timestamp",
+                meta={"date_time": ts_raw, "error": str(exc)},
+            )
+            return
+
+        cls_raw = payload.get("cls_vec")
+        if cls_raw is None:
+            self._add_log(
+                "warning",
+                f"Ignored WS AI analysis for {ts_key}: missing cls_vec",
+                phase="sem",
+                event="ws_push_missing_vector",
+            )
+            return
+
+        llm_text = str(payload.get("llm_text", "") or "")
+        try:
+            self._save_llm_semantic_entry(
+                ts_key,
+                np.asarray(cls_raw, dtype=np.float32),
+                llm_text,
+                source="ws_push",
+            )
+        except Exception as exc:
+            self._add_log(
+                "warning",
+                f"WS AI analysis rejected for {ts_key}",
+                phase="sem",
+                event="ws_push_failed",
+                meta={"ts": ts_key, "error": str(exc)},
+            )
+            return
+
+        try:
+            self._push_state_to_server(action_name=self.last_action or "HOLD")
+        except Exception:
+            pass
+
     def _send_bot_command_ack(
         self,
         command: str,
@@ -1560,8 +1730,9 @@ class LiveTradingBot:
         ok: bool,
         detail: str,
         meta: dict | None = None,
+        payload: dict | None = None,
     ):
-        payload = {
+        packet = {
             "type": "bot_command_ack",
             "bot_config_id": BOT_CONFIG_ID,
             "command": str(command or "").strip().lower(),
@@ -1572,8 +1743,570 @@ class LiveTradingBot:
         }
         clean_meta = self._sanitize_log_meta(meta)
         if clean_meta:
-            payload["meta"] = clean_meta
-        self._send_ws_payload(payload)
+            packet["meta"] = clean_meta
+        if isinstance(payload, dict) and payload:
+            packet["payload"] = payload
+        self._send_ws_payload(packet)
+
+    def _queue_runtime_command(self, payload: dict):
+        if not isinstance(payload, dict):
+            return
+        with self._runtime_command_lock:
+            self._pending_runtime_commands.append(dict(payload))
+            if len(self._pending_runtime_commands) > 32:
+                self._pending_runtime_commands = self._pending_runtime_commands[-32:]
+
+    def _drain_runtime_commands(self) -> list[dict]:
+        with self._runtime_command_lock:
+            queued = list(self._pending_runtime_commands)
+            self._pending_runtime_commands = []
+        return queued
+
+    def _parse_chart_command_datetime(self, raw) -> datetime:
+        if isinstance(raw, datetime):
+            dt = raw
+        else:
+            text = str(raw or "").strip()
+            if not text:
+                raise ValueError("date_time is required")
+            dt = None
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y.%m.%d %H.%M",
+            ):
+                try:
+                    dt = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+            if dt is None:
+                try:
+                    dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                except Exception as exc:
+                    raise ValueError(f"invalid date_time: {text}") from exc
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def _normalize_chart_rate_rows(self, rows) -> list[dict]:
+        if not isinstance(rows, list):
+            return []
+        normalized = []
+        seen_times = set()
+        for row in sorted(rows, key=lambda item: int((item or {}).get("time", 0) or 0)):
+            if not isinstance(row, dict):
+                continue
+            try:
+                row_time = int(row.get("time", 0) or 0)
+                open_px = float(row.get("open", 0.0) or 0.0)
+                high_px = float(row.get("high", 0.0) or 0.0)
+                low_px = float(row.get("low", 0.0) or 0.0)
+                close_px = float(row.get("close", 0.0) or 0.0)
+                volume = float(row.get("tick_volume", row.get("volume", 0.0)) or 0.0)
+            except Exception:
+                continue
+            if row_time <= 0 or row_time in seen_times:
+                continue
+            if open_px <= 0.0 or high_px <= 0.0 or low_px <= 0.0 or close_px <= 0.0:
+                continue
+            seen_times.add(row_time)
+            normalized.append(
+                {
+                    "time": row_time,
+                    "open": open_px,
+                    "high": max(high_px, open_px, close_px),
+                    "low": min(low_px, open_px, close_px),
+                    "close": close_px,
+                    "tick_volume": max(0.0, volume),
+                }
+            )
+        return normalized
+
+    def _get_chart_quote_snapshot(self, symbol_text: str) -> dict | None:
+        try:
+            mt5.symbol_select(symbol_text, True)
+        except Exception:
+            pass
+        try:
+            tick = mt5.symbol_info_tick(symbol_text)
+        except Exception:
+            tick = None
+        if tick is None:
+            return None
+
+        bid = float(getattr(tick, "bid", 0.0) or 0.0)
+        ask = float(getattr(tick, "ask", 0.0) or 0.0)
+        tick_time = int(getattr(tick, "time", 0) or 0)
+        price = bid if bid > 0.0 else ask
+        if price <= 0.0 or tick_time <= 0:
+            return None
+
+        if symbol_text == SYMBOL.upper():
+            self._last_status_tick = {
+                "bid": bid,
+                "ask": ask,
+                "time": tick_time,
+            }
+
+        return {
+            "price": float(price),
+            "bid": float(bid),
+            "ask": float(ask),
+            "time": int(tick_time),
+        }
+
+    def _chart_server_offset_seconds(self, quote: dict | None, request_epoch: int) -> int:
+        if not isinstance(quote, dict):
+            return 0
+        quote_time = int(quote.get("time", 0) or 0)
+        if quote_time <= 0:
+            return 0
+        raw_offset = int(quote_time - int(request_epoch))
+        return int(round(raw_offset / 60.0) * 60)
+
+    def _fetch_chart_rates_from_pos(self, symbol_text: str, timeframe_value, count: int) -> list[dict]:
+        if timeframe_value is None or int(count or 0) <= 0:
+            return []
+        try:
+            mt5.symbol_select(symbol_text, True)
+        except Exception:
+            pass
+        try:
+            rates = mt5.copy_rates_from_pos(symbol_text, timeframe_value, 0, int(count))
+        except Exception:
+            rates = None
+        if rates is None or len(rates) == 0:
+            return []
+
+        rows = []
+        for row in rates:
+            try:
+                rows.append(
+                    {
+                        "time": int(row["time"]),
+                        "open": float(row["open"]),
+                        "high": float(row["high"]),
+                        "low": float(row["low"]),
+                        "close": float(row["close"]),
+                        "tick_volume": float(row["tick_volume"]),
+                    }
+                )
+            except Exception:
+                continue
+        return self._normalize_chart_rate_rows(rows)
+
+    def _aggregate_chart_rate_rows(
+        self,
+        rows: list[dict],
+        *,
+        tf_secs: int,
+        start_epoch: int,
+        end_epoch: int,
+    ) -> list[dict]:
+        normalized = [
+            row
+            for row in self._normalize_chart_rate_rows(rows)
+            if start_epoch <= int(row.get("time", 0) or 0) < end_epoch
+        ]
+        if tf_secs <= 60:
+            return normalized
+
+        aggregated = []
+        for row in normalized:
+            bucket_time = (int(row["time"]) // tf_secs) * tf_secs
+            if aggregated and int(aggregated[-1]["time"]) == bucket_time:
+                aggregated[-1]["high"] = max(float(aggregated[-1]["high"]), float(row["high"]))
+                aggregated[-1]["low"] = min(float(aggregated[-1]["low"]), float(row["low"]))
+                aggregated[-1]["close"] = float(row["close"])
+                aggregated[-1]["tick_volume"] = float(aggregated[-1]["tick_volume"]) + float(row["tick_volume"])
+                continue
+            aggregated.append(
+                {
+                    "time": int(bucket_time),
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "tick_volume": float(row["tick_volume"]),
+                }
+            )
+        return aggregated
+
+    def _overlay_chart_quote(
+        self,
+        rows: list[dict],
+        *,
+        quote: dict | None,
+        tf_secs: int,
+        start_epoch: int,
+        end_epoch: int,
+    ) -> list[dict]:
+        normalized = list(self._normalize_chart_rate_rows(rows))
+        if not isinstance(quote, dict):
+            return normalized
+
+        quote_epoch = int(quote.get("time", 0) or 0)
+        quote_price = float(quote.get("price", 0.0) or 0.0)
+        if quote_epoch <= 0 or quote_price <= 0.0:
+            return normalized
+
+        quote_bucket = (quote_epoch // tf_secs) * tf_secs
+        if quote_bucket < start_epoch or quote_bucket >= end_epoch:
+            return normalized
+
+        if normalized and int(normalized[-1].get("time", 0) or 0) == quote_bucket:
+            normalized[-1]["high"] = max(float(normalized[-1]["high"]), quote_price)
+            normalized[-1]["low"] = min(float(normalized[-1]["low"]), quote_price)
+            normalized[-1]["close"] = quote_price
+            normalized[-1]["tick_volume"] = max(1.0, float(normalized[-1]["tick_volume"]))
+            return normalized
+
+        open_price = float(normalized[-1]["close"]) if normalized else quote_price
+        normalized.append(
+            {
+                "time": int(quote_bucket),
+                "open": open_price,
+                "high": max(open_price, quote_price),
+                "low": min(open_price, quote_price),
+                "close": quote_price,
+                "tick_volume": 1.0,
+            }
+        )
+        return self._normalize_chart_rate_rows(normalized)
+
+    def _build_chart_rate_rows_from_ticks(
+        self,
+        *,
+        symbol_text: str,
+        timeframe_text: str,
+        start_utc: datetime,
+        end_utc: datetime,
+        seed_close: float = 0.0,
+    ) -> list[dict]:
+        tf_secs = int(TIMEFRAME_SECONDS_MAP.get(timeframe_text, self.timeframe_seconds or 3600))
+        if tf_secs <= 0 or end_utc <= start_utc:
+            return []
+
+        try:
+            mt5.symbol_select(symbol_text, True)
+        except Exception:
+            pass
+
+        ticks = None
+        try:
+            ticks = mt5.copy_ticks_range(symbol_text, start_utc, end_utc + timedelta(seconds=1), mt5.COPY_TICKS_ALL)
+        except Exception:
+            ticks = None
+
+        rows = []
+        start_epoch = int(start_utc.timestamp())
+        end_epoch = int(end_utc.timestamp())
+        carry_close = float(seed_close or 0.0)
+
+        if ticks is not None and len(ticks) > 0:
+            try:
+                tdf = pd.DataFrame(ticks)
+                if "time_msc" in tdf.columns:
+                    tdf["tick_epoch"] = (pd.to_numeric(tdf["time_msc"], errors="coerce").fillna(0) // 1000).astype("int64")
+                elif "time" in tdf.columns:
+                    tdf["tick_epoch"] = pd.to_numeric(tdf["time"], errors="coerce").fillna(0).astype("int64")
+                else:
+                    tdf["tick_epoch"] = 0
+
+                price_series = None
+                for col in ("bid", "last", "ask"):
+                    if col not in tdf.columns:
+                        continue
+                    candidate = pd.to_numeric(tdf[col], errors="coerce")
+                    if bool((candidate > 0.0).any()):
+                        price_series = candidate
+                        break
+                if price_series is not None:
+                    tdf["price"] = price_series
+                    tdf = tdf[
+                        (pd.to_numeric(tdf["price"], errors="coerce").fillna(0.0) > 0.0)
+                        & (pd.to_numeric(tdf["tick_epoch"], errors="coerce").fillna(0).astype("int64") > 0)
+                    ].copy()
+                    if len(tdf) > 0:
+                        tdf["bucket_time"] = (
+                            pd.to_numeric(tdf["tick_epoch"], errors="coerce").fillna(0).astype("int64") // tf_secs
+                        ) * tf_secs
+                        tdf = tdf[
+                            (tdf["bucket_time"] >= start_epoch)
+                            & (tdf["bucket_time"] < end_epoch)
+                        ].copy()
+                        if len(tdf) > 0:
+                            grouped = (
+                                tdf.groupby("bucket_time", sort=True)["price"]
+                                .agg(["first", "max", "min", "last", "count"])
+                                .reset_index()
+                            )
+                            for _, item in grouped.iterrows():
+                                row = {
+                                    "time": int(item["bucket_time"]),
+                                    "open": float(item["first"]),
+                                    "high": float(item["max"]),
+                                    "low": float(item["min"]),
+                                    "close": float(item["last"]),
+                                    "tick_volume": float(item["count"]),
+                                }
+                                rows.append(row)
+                            if rows:
+                                carry_close = float(rows[-1]["close"])
+            except Exception:
+                rows = []
+
+        quote = self._get_chart_quote_snapshot(symbol_text)
+        if quote is not None:
+            quote_epoch = int(quote.get("time", 0) or 0)
+            quote_price = float(quote.get("price", 0.0) or 0.0)
+            quote_bucket = (quote_epoch // tf_secs) * tf_secs if quote_epoch > 0 else 0
+            if quote_price > 0.0 and start_epoch <= quote_bucket < end_epoch:
+                if rows and int(rows[-1].get("time", 0) or 0) == quote_bucket:
+                    rows[-1]["high"] = max(float(rows[-1].get("high", 0.0) or 0.0), quote_price)
+                    rows[-1]["low"] = min(float(rows[-1].get("low", quote_price) or quote_price), quote_price)
+                    rows[-1]["close"] = quote_price
+                    rows[-1]["tick_volume"] = max(1.0, float(rows[-1].get("tick_volume", 0.0) or 0.0))
+                else:
+                    open_price = float(carry_close if carry_close > 0.0 else quote_price)
+                    rows.append(
+                        {
+                            "time": int(quote_bucket),
+                            "open": open_price,
+                            "high": max(open_price, quote_price),
+                            "low": min(open_price, quote_price),
+                            "close": quote_price,
+                            "tick_volume": 1.0,
+                        }
+                    )
+
+        return self._normalize_chart_rate_rows(rows)
+
+    def _fetch_runtime_chart_history_payload(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        date_time,
+        bars: int,
+    ) -> dict:
+        symbol_text = str(symbol or SYMBOL).strip().upper() or SYMBOL.upper()
+        if symbol_text != SYMBOL.upper():
+            raise ValueError(f"unsupported_symbol:{symbol_text}")
+
+        timeframe_text = str(timeframe or TIMEFRAME_NAME).strip().upper() or TIMEFRAME_NAME.upper()
+        timeframe_value = getattr(mt5, f"TIMEFRAME_{timeframe_text}", None)
+        if timeframe_value is None:
+            raise ValueError(f"unsupported_timeframe:{timeframe_text}")
+
+        safe_bars = max(20, min(int(bars or 240), 2000))
+        target_dt = self._parse_chart_command_datetime(date_time)
+        tf_secs = int(TIMEFRAME_SECONDS_MAP.get(timeframe_text, self.timeframe_seconds or 3600))
+        request_epoch = int(target_dt.astimezone(timezone.utc).timestamp())
+        quote = self._get_chart_quote_snapshot(symbol_text)
+        time_offset_sec = self._chart_server_offset_seconds(quote, request_epoch)
+        broker_epoch = int(request_epoch + time_offset_sec)
+        aligned_epoch = broker_epoch - (broker_epoch % max(60, tf_secs))
+        end_utc = datetime.fromtimestamp(aligned_epoch, tz=timezone.utc) + timedelta(seconds=tf_secs)
+        start_utc = end_utc - timedelta(seconds=tf_secs * safe_bars)
+
+        try:
+            mt5.symbol_select(symbol_text, True)
+        except Exception:
+            pass
+
+        rates = None
+        try:
+            rates = mt5.copy_rates_range(symbol_text, timeframe_value, start_utc, end_utc)
+        except Exception:
+            rates = None
+
+        if rates is None or len(rates) == 0:
+            try:
+                anchor_dt = end_utc - timedelta(seconds=1)
+                rates = mt5.copy_rates_from(symbol_text, timeframe_value, anchor_dt, safe_bars + 16)
+            except Exception:
+                rates = None
+
+        if rates is None or len(rates) == 0:
+            raise ValueError(
+                f"no_rates_data:{symbol_text}:{timeframe_text}:{start_utc.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+        rows = []
+        for row in rates:
+            try:
+                rows.append(
+                    {
+                        "time": int(row["time"]),
+                        "open": float(row["open"]),
+                        "high": float(row["high"]),
+                        "low": float(row["low"]),
+                        "close": float(row["close"]),
+                        "tick_volume": float(row["tick_volume"]),
+                    }
+                )
+            except Exception:
+                continue
+
+        deduped = self._normalize_chart_rate_rows(rows)[-safe_bars:]
+        start_epoch = int(start_utc.timestamp())
+        end_epoch = int(end_utc.timestamp())
+        quote_bucket = (
+            (int(quote.get("time", 0) or 0) // tf_secs) * tf_secs
+            if isinstance(quote, dict)
+            else 0
+        )
+        full_m1_count = int(((end_epoch - start_epoch) // 60) + 8)
+        tf_m1 = getattr(mt5, "TIMEFRAME_M1", None)
+
+        if timeframe_text in {"M1", "M5", "M15"} and tf_m1 is not None and full_m1_count <= 20000:
+            m1_rows = self._fetch_chart_rates_from_pos(symbol_text, tf_m1, max(120, full_m1_count))
+            agg_rows = self._aggregate_chart_rate_rows(
+                m1_rows,
+                tf_secs=tf_secs,
+                start_epoch=start_epoch,
+                end_epoch=end_epoch,
+            )
+            if agg_rows:
+                deduped = agg_rows[-safe_bars:]
+
+        last_row_time = int(deduped[-1].get("time", 0) or 0) if deduped else 0
+        need_fresh_tail = bool(
+            not deduped
+            or (quote_bucket > 0 and last_row_time < quote_bucket - max(60, tf_secs))
+        )
+
+        if need_fresh_tail and tf_m1 is not None:
+            tail_start_epoch = max(
+                start_epoch,
+                last_row_time if last_row_time > 0 else end_epoch - min(end_epoch - start_epoch, 6 * 3600),
+            )
+            needed_m1_count = min(
+                20000,
+                max(120, int(((end_epoch - tail_start_epoch) // 60) + 16)),
+            )
+            m1_rows = self._fetch_chart_rates_from_pos(symbol_text, tf_m1, needed_m1_count)
+            tail_rows = self._aggregate_chart_rate_rows(
+                m1_rows,
+                tf_secs=tf_secs,
+                start_epoch=tail_start_epoch,
+                end_epoch=end_epoch,
+            )
+            if tail_rows:
+                tail_first_time = int(tail_rows[0]["time"])
+                deduped = self._normalize_chart_rate_rows(
+                    [row for row in deduped if int(row.get("time", 0) or 0) < tail_first_time] + tail_rows
+                )[-safe_bars:]
+                last_row_time = int(deduped[-1].get("time", 0) or 0) if deduped else 0
+                need_fresh_tail = bool(
+                    not deduped
+                    or (quote_bucket > 0 and last_row_time < quote_bucket - max(60, tf_secs))
+                )
+
+        if need_fresh_tail:
+            tick_tail_start_epoch = max(
+                start_epoch,
+                last_row_time + tf_secs if last_row_time > 0 else end_epoch - min(end_epoch - start_epoch, 6 * 3600),
+            )
+            tick_tail_seed_close = float(deduped[-1].get("close", 0.0) or 0.0) if deduped else 0.0
+            if tick_tail_start_epoch < end_epoch:
+                tick_rows = self._build_chart_rate_rows_from_ticks(
+                    symbol_text=symbol_text,
+                    timeframe_text=timeframe_text,
+                    start_utc=datetime.fromtimestamp(int(tick_tail_start_epoch), tz=timezone.utc),
+                    end_utc=end_utc,
+                    seed_close=tick_tail_seed_close,
+                )
+                if tick_rows:
+                    deduped = self._normalize_chart_rate_rows(list(deduped) + list(tick_rows))[-safe_bars:]
+
+        deduped = self._overlay_chart_quote(
+            deduped,
+            quote=quote,
+            tf_secs=tf_secs,
+            start_epoch=start_epoch,
+            end_epoch=end_epoch,
+        )[-safe_bars:]
+
+        if len(deduped) == 0:
+            raise ValueError(
+                f"no_rates_data:{symbol_text}:{timeframe_text}:{start_utc.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+        payload = {
+            "symbol": symbol_text,
+            "timeframe": timeframe_text,
+            "bars": int(safe_bars),
+            "rates": deduped,
+            "resolved_from_time": datetime.fromtimestamp(
+                int(deduped[0]["time"]), tz=timezone.utc
+            ).strftime("%Y-%m-%d %H:%M:%S"),
+            "resolved_to_time": datetime.fromtimestamp(
+                int(deduped[-1]["time"]), tz=timezone.utc
+            ).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        try:
+            account = mt5.account_info()
+        except Exception:
+            account = None
+        if account is not None:
+            server_name = str(getattr(account, "server", "") or "").strip()
+            if server_name:
+                payload["server"] = server_name
+            try:
+                login_value = int(getattr(account, "login", 0) or 0)
+                if login_value > 0:
+                    payload["login"] = str(login_value)
+            except Exception:
+                login_text = str(getattr(account, "login", "") or "").strip()
+                if login_text:
+                    payload["login"] = login_text
+        return payload
+
+    def _process_pending_runtime_commands(self):
+        queued = self._drain_runtime_commands()
+        if not queued:
+            return
+
+        for command_payload in queued:
+            command = str(command_payload.get("command", "")).strip().lower()
+            command_id = str(command_payload.get("command_id", "")).strip()
+            if not command or not command_id:
+                continue
+
+            if command == "fetch_chart_history":
+                try:
+                    payload = self._fetch_runtime_chart_history_payload(
+                        symbol=command_payload.get("symbol", SYMBOL),
+                        timeframe=command_payload.get("timeframe", TIMEFRAME_NAME),
+                        date_time=command_payload.get("date_time"),
+                        bars=command_payload.get("bars", 240),
+                    )
+                    self._send_bot_command_ack(
+                        command=command,
+                        command_id=command_id,
+                        ok=True,
+                        detail="Chart history ready",
+                        payload=payload,
+                    )
+                except Exception as exc:
+                    self._send_bot_command_ack(
+                        command=command,
+                        command_id=command_id,
+                        ok=False,
+                        detail=f"Chart history fetch failed: {exc}",
+                    )
+                continue
+
+            self._send_bot_command_ack(
+                command=command,
+                command_id=command_id,
+                ok=False,
+                detail=f"Unsupported command: {command}",
+            )
 
     def _handle_runtime_command(self, payload: dict):
         if not isinstance(payload, dict):
@@ -1585,6 +2318,10 @@ class LiveTradingBot:
             return
         if not command_id:
             command_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+        if command == "fetch_chart_history":
+            self._queue_runtime_command(payload)
+            return
 
         if command in {"emergency_close_all", "close_all_positions", "close_all"}:
             started_at = time.time()
@@ -1626,13 +2363,6 @@ class LiveTradingBot:
                 meta={"elapsed_sec": elapsed_sec},
             )
             return
-
-        self._send_bot_command_ack(
-            command=command,
-            command_id=command_id,
-            ok=False,
-            detail=f"Unsupported command: {command}",
-        )
 
     def _flush_pending_state_to_server(self):
         """Flush queued state payload from WS thread."""
@@ -1810,7 +2540,10 @@ class LiveTradingBot:
             "symbol": SYMBOL,
             "timeframe": TIMEFRAME_NAME,
             "magic_number": int(MAGIC_NUMBER),
-            "manage_manual_positions": bool(0 in set(int(v) for v in (LIVE_MANAGED_MAGIC_SET or set()))),
+            "manage_manual_positions": bool(
+                LIVE_MANAGE_MANUAL_POSITIONS
+                and 0 in set(int(v) for v in (LIVE_MANAGED_MAGIC_SET or set()))
+            ),
             # Bot model state
             "position": int(current_pos),
             "entry_price": float(self.bridge.entry_price) if self.bridge else 0.0,
@@ -1833,6 +2566,8 @@ class LiveTradingBot:
             # MT5 Positions
             "positions": positions_data,
             "closed_deals": closed_deals,
+            "recent_candles": self._build_recent_chart_candles(),
+            "last_quote": dict(self._last_status_tick or {}),
             # Logs
             "llm_text": llm_text,
             "recent_logs": list(getattr(self, "recent_logs", [])[-40:]),
@@ -1848,6 +2583,59 @@ class LiveTradingBot:
         with self._ws_state_lock:
             self._ws_pending_state_payload = payload
             self._ws_last_enqueued_at = now
+
+    def _serialize_chart_candle_row(self, row) -> dict | None:
+        if row is None or not hasattr(row, "get"):
+            return None
+        try:
+            raw_time = row.get("time")
+            if raw_time is None:
+                return None
+            ts = pd.Timestamp(raw_time).to_pydatetime()
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            else:
+                ts = ts.astimezone(timezone.utc)
+            open_px = float(row.get("open", 0.0) or 0.0)
+            high_px = float(row.get("high", 0.0) or 0.0)
+            low_px = float(row.get("low", 0.0) or 0.0)
+            close_px = float(row.get("close", 0.0) or 0.0)
+            volume = float(row.get("tick_volume", row.get("volume", 0.0)) or 0.0)
+            if open_px <= 0.0 or high_px <= 0.0 or low_px <= 0.0 or close_px <= 0.0:
+                return None
+            return {
+                "time": int(ts.timestamp()),
+                "open": open_px,
+                "high": max(high_px, open_px, close_px),
+                "low": min(low_px, open_px, close_px),
+                "close": close_px,
+                "volume": volume,
+            }
+        except Exception:
+            return None
+
+    def _cache_recent_chart_candles(self, window_df: pd.DataFrame | None) -> None:
+        if window_df is None or len(window_df) <= 0:
+            return
+        rows = []
+        for _, row in window_df.tail(int(self._chart_candle_limit)).iterrows():
+            candle = self._serialize_chart_candle_row(row)
+            if candle is not None:
+                rows.append(candle)
+        if rows:
+            self._recent_chart_candles = rows[-int(self._chart_candle_limit):]
+
+    def _build_recent_chart_candles(self) -> list[dict]:
+        candles = list(getattr(self, "_recent_chart_candles", []) or [])
+        current_bar = self._serialize_chart_candle_row(getattr(self, "_last_current_bar", None))
+        if current_bar is not None:
+            if candles and int(candles[-1].get("time", 0) or 0) == int(current_bar["time"]):
+                candles[-1] = current_bar
+            else:
+                candles.append(current_bar)
+        if len(candles) > int(self._chart_candle_limit):
+            candles = candles[-int(self._chart_candle_limit):]
+        return candles
 
     def _sanitize_log_meta(self, meta):
         if not isinstance(meta, dict):
@@ -2571,6 +3359,8 @@ class LiveTradingBot:
         except Exception:
             magic = 0
         allowed = set(int(v) for v in (LIVE_MANAGED_MAGIC_SET or set()))
+        if int(magic) == 0 and not bool(LIVE_MANAGE_MANUAL_POSITIONS):
+            return False
         if len(allowed) == 0:
             return True
         return int(magic) in allowed
@@ -2581,6 +3371,8 @@ class LiveTradingBot:
         except Exception:
             magic = 0
         allowed = set(int(v) for v in (LIVE_PERFORMANCE_MAGIC_SET or set()))
+        if int(magic) == 0 and not bool(LIVE_MANAGE_MANUAL_POSITIONS):
+            return False
         if len(allowed) == 0:
             return True
         return int(magic) in allowed
@@ -3137,9 +3929,12 @@ class LiveTradingBot:
             return None
 
         df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(None)
-        df = df[["time", "open", "high", "low", "close"]].sort_values("time").reset_index(drop=True)
+        if "tick_volume" not in df.columns:
+            df["tick_volume"] = 0.0
+        df = df[["time", "open", "high", "low", "close", "tick_volume"]].sort_values("time").reset_index(drop=True)
         if len(df) > BAR_HISTORY:
             df = df.tail(BAR_HISTORY).reset_index(drop=True)
+        self._cache_recent_chart_candles(df)
         return df
 
     def _calc_delta_between(self, start_dt: datetime, end_dt: datetime, quick: bool = False):
@@ -3439,7 +4234,22 @@ class LiveTradingBot:
                 except Exception:
                     latest = None
         if latest is None or len(latest) == 0:
+            self._last_current_bar = None
             return 0
+        try:
+            row = latest[0]
+            dtype_obj = getattr(latest, "dtype", None)
+            dtype_names = tuple(getattr(dtype_obj, "names", ()) or ())
+            self._last_current_bar = {
+                "time": datetime.fromtimestamp(int(row["time"]), tz=timezone.utc).replace(tzinfo=None),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "tick_volume": float(row["tick_volume"]) if "tick_volume" in dtype_names else 0.0,
+            }
+        except Exception:
+            self._last_current_bar = None
         return int(latest[0]["time"])
 
     def _discover_missed_bar_ends(self, prev_bar_time: int, current_bar_time: int):
@@ -3592,10 +4402,22 @@ class LiveTradingBot:
                     return None
                 return retry_tick.bid if pos.type == mt5.ORDER_TYPE_BUY else retry_tick.ask
 
+            def _confirm_close_applied():
+                try:
+                    remaining_raw = mt5.positions_get(symbol=SYMBOL)
+                except Exception:
+                    remaining_raw = None
+                if remaining_raw is None:
+                    return False
+                remaining_positions = self._filter_managed_symbol_positions(list(remaining_raw))
+                target_ticket = int(getattr(pos, "ticket", 0) or 0)
+                return all(int(getattr(item, "ticket", 0) or 0) != target_ticket for item in remaining_positions)
+
             res, _ = self._order_send_with_ipc_retry(
                 req,
                 reason=f"close:{int(pos.ticket)}",
                 refresh_price_fn=_refresh_close_price,
+                confirm_applied_fn=_confirm_close_applied,
             )
             if res and res.retcode == mt5.TRADE_RETCODE_DONE:
                 print(f" Closed Position | ticket={pos.ticket} | PnL={pos.profit:+.2f}")
@@ -3717,6 +4539,45 @@ class LiveTradingBot:
         if isinstance(self._last_status_tick, dict):
             return self._last_status_tick, True
         return None, False
+
+    def _is_market_data_fresh(self, current_bar_time: int | None = None) -> tuple[bool, str]:
+        tick_data, stale_tick = self._get_status_tick()
+        if tick_data is None:
+            return False, "no_status_tick"
+
+        now_epoch = int(time.time())
+        tick_time_ts = int(tick_data.get("time", 0) or 0)
+        if tick_time_ts <= 0:
+            return False, "tick_time_missing"
+
+        stale_age_sec = max(0, now_epoch - tick_time_ts)
+        max_stale_sec = max(5, int(round(float(POLL_SECONDS) * 3.0)))
+        if stale_tick and stale_age_sec > max_stale_sec:
+            return False, f"stale_tick({stale_age_sec}s)"
+
+        bar_open_ts = int(current_bar_time or 0)
+        if bar_open_ts > 0 and int(self.timeframe_seconds) > 0:
+            bar_age_sec = max(0, now_epoch - bar_open_ts)
+            max_bar_age_sec = int(self.timeframe_seconds) + max(300, int(round(float(POLL_SECONDS) * 6.0)))
+            if bar_age_sec > max_bar_age_sec:
+                return False, f"stale_bar({bar_age_sec}s)"
+
+        return True, ""
+
+    def _log_market_inactive_wait(self, phase: str, reason: str) -> None:
+        now_epoch = time.time()
+        if (now_epoch - float(self._last_market_inactive_log_at)) < max(15.0, float(POLL_SECONDS) * 4.0):
+            return
+        self._last_market_inactive_log_at = now_epoch
+        msg = f"{phase}: deferred until fresh market tick ({reason})"
+        print(f"\n [MARKET] {msg}")
+        self._add_log(
+            "info",
+            msg,
+            phase="market",
+            event="deferred_stale_tick",
+            meta={"phase": str(phase), "reason": str(reason)},
+        )
 
     def _clear_intrabar_trailing_state(self) -> bool:
         state = dict(getattr(self, "intrabar_trailing_state", {}) or {})
@@ -4508,6 +5369,9 @@ class LiveTradingBot:
         self._save_runtime_state(reason="intrabar_flat")
 
     def send_order(self, order_type):
+        desired_pos = 1 if order_type == mt5.ORDER_TYPE_BUY else -1
+        current_pos_before, pos_before = self._get_mt5_position()
+        prior_ticket = int(getattr(pos_before, "ticket", 0) or self.last_known_ticket or 0)
         if not self._ensure_trade_allowed_before_order(
             reason="open_buy" if order_type == mt5.ORDER_TYPE_BUY else "open_sell",
             action_label="Open order",
@@ -4585,10 +5449,20 @@ class LiveTradingBot:
                 return None
             return retry_tick.ask if order_type == mt5.ORDER_TYPE_BUY else retry_tick.bid
 
+        def _confirm_open_applied():
+            current_pos_after, pos_after = self._get_mt5_position()
+            if current_pos_after != desired_pos or pos_after is None:
+                return False
+            current_ticket = int(getattr(pos_after, "ticket", 0) or 0)
+            if current_pos_before == 0 and prior_ticket > 0 and current_ticket == prior_ticket:
+                return False
+            return True
+
         res, _ = self._order_send_with_ipc_retry(
             req,
             reason="open_buy" if order_type == mt5.ORDER_TYPE_BUY else "open_sell",
             refresh_price_fn=_refresh_open_price,
+            confirm_applied_fn=_confirm_open_applied,
         )
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
             price = float(req.get("price", price))
@@ -4694,7 +5568,19 @@ class LiveTradingBot:
             expected_after = 0
 
         mismatch = broker_pos_after != expected_after
-        if order_ok and not mismatch:
+        if not mismatch:
+            if not order_ok:
+                self._add_log(
+                    "info",
+                    "Broker state matched expected action after uncertain order result",
+                    phase="order",
+                    event="broker_reconcile_confirmed",
+                    meta={
+                        "action": int(action),
+                        "expected_pos": int(expected_after),
+                        "actual_pos": int(broker_pos_after),
+                    },
+                )
             return
 
         print(
@@ -4729,6 +5615,8 @@ class LiveTradingBot:
             self.bridge.total_fees = max(0.0, float(self.bridge.total_fees) - float(self.bridge.spread_cost))
 
     def _print_status_line(self, current_bar_time: int | None = None):
+        if not self._status_line_enabled:
+            return
         tick_data, stale_tick = self._get_status_tick()
         if tick_data is None:
             return
@@ -4760,6 +5648,20 @@ class LiveTradingBot:
             f"Eq:{self.bridge.equity:.2f} | dT:{rt_delta_tick:d} | dP:{rt_delta_price:.5f} | "
             f"{server_time_utc}{stale_note}"
         )
+
+        if not self._status_line_is_tty:
+            if self._status_log_interval_sec <= 0.0:
+                return
+            now_monotonic = time.monotonic()
+            if (
+                self._last_status_log_at > 0.0
+                and (now_monotonic - float(self._last_status_log_at)) < self._status_log_interval_sec
+            ):
+                return
+            self._last_status_log_at = now_monotonic
+            print(line, flush=True)
+            return
+
         width = max(40, int(shutil.get_terminal_size(fallback=(120, 20)).columns) - 1)
         if len(line) > width:
             line = line[:width]
@@ -4825,6 +5727,7 @@ class LiveTradingBot:
         self.bridge.gate_stats = self.gate_provider.update(window_df)
 
         self._sync_bridge_from_mt5()
+        bridge_state_before = self._snapshot_bridge_runtime_state() if not execute_orders else None
         pre_trade_cooldown = int(self.bridge.trade_cooldown) if self.bridge is not None else 0
         pre_defensive_mode = int(self.bridge.defensive_mode_bars) if self.bridge is not None else 0
         action, model_price = self.bridge.process_bar(window_df, delta_tick, delta_price)
@@ -4999,6 +5902,9 @@ class LiveTradingBot:
             },
         )
 
+        if bridge_state_before is not None:
+            self._restore_bridge_runtime_state(bridge_state_before, preserved_last_decision=decision)
+
         broker_pos_before, _ = self._get_mt5_position()
         order_ok = True
         if execute_orders:
@@ -5145,19 +6051,63 @@ class LiveTradingBot:
                     time.sleep(POLL_SECONDS)
                     continue
 
+                self._process_pending_runtime_commands()
+
                 if startup_eval_pending:
+                    market_fresh, market_reason = self._is_market_data_fresh(current_bar_time=current_bar_time)
+                    if not market_fresh:
+                        self._log_market_inactive_wait("startup_eval", market_reason)
+                        self._sync_bridge_from_mt5()
+                        self._push_state_to_server()
+                        self._print_status_line(current_bar_time=current_bar_time)
+                        time.sleep(POLL_SECONDS)
+                        continue
+
                     startup_eval_pending = False
                     if self.last_bar_time == 0:
-                        print("\n 🚀 [STARTUP] no last_bar_time in state -> process latest closed bar with live orders")
-                        self._add_log(
-                            "info",
-                            "Startup: no last_bar_time -> execute latest closed bar",
-                            phase="startup",
-                            event="no_state_bar",
-                            meta={"execute_orders": True},
-                        )
-                        self.last_bar_time = current_bar_time
-                        self._process_closed_bar(current_bar_time, mode="Startup", execute_orders=True)
+                        has_exposure, pos_count, order_count, exposure_meta = self._broker_exposure_summary()
+                        if has_exposure:
+                            pos_tickets = list(exposure_meta.get("pos_tickets", []) or [])
+                            order_tickets = list(exposure_meta.get("order_tickets", []) or [])
+                            foreign_order_count = int(exposure_meta.get("foreign_order_count", 0) or 0)
+                            print(
+                                "\n 🚀 [STARTUP] no last_bar_time in state; "
+                                f"broker exposure detected (positions={pos_count}, orders={order_count}) "
+                                "-> exposure sync only"
+                            )
+                            self._add_log(
+                                "info",
+                                "Startup: no state with broker exposure -> sync only",
+                                phase="startup",
+                                event="no_state_exposure_sync",
+                                meta={
+                                    "positions": int(pos_count),
+                                    "orders": int(order_count),
+                                    "pos_tickets": ",".join(str(x) for x in pos_tickets) if pos_tickets else "",
+                                    "order_tickets": ",".join(str(x) for x in order_tickets) if order_tickets else "",
+                                    "ignored_foreign_orders": int(foreign_order_count),
+                                },
+                            )
+                            self.last_bar_time = current_bar_time
+                            self._process_closed_bar(
+                                current_bar_time,
+                                mode="Startup Exposure Sync",
+                                execute_orders=True,
+                                persist_state=True,
+                                allow_entry_orders=False,
+                                preserve_timers_on_hold=True,
+                            )
+                        else:
+                            print("\n 🚀 [STARTUP] no last_bar_time in state; no exposure -> wait next candle")
+                            self._add_log(
+                                "info",
+                                "Startup: no state and no exposure -> wait next candle",
+                                phase="startup",
+                                event="no_state_wait_next_candle",
+                                meta={"execute_orders": False},
+                            )
+                            self.last_bar_time = current_bar_time
+                            self._save_runtime_state(reason="startup_wait_next_candle")
                         self._sync_bridge_from_mt5()
                         self._push_state_to_server()
                         self._print_status_line(current_bar_time=current_bar_time)
@@ -5199,23 +6149,16 @@ class LiveTradingBot:
                         else:
                             print(
                                 "\n 🚀 [STARTUP] current bar already processed; "
-                                "no open exposure -> execute startup action now"
+                                "no open exposure -> wait next candle"
                             )
                             self._add_log(
                                 "info",
-                                "Startup immediate: no exposure -> execute action",
+                                "Startup: current bar already processed and no exposure -> wait next candle",
                                 phase="startup",
-                                event="startup_immediate",
-                                meta={"execute_orders": True},
+                                event="startup_wait_next_candle",
+                                meta={"execute_orders": False},
                             )
-                            self._process_closed_bar(
-                                current_bar_time,
-                                mode="Startup Immediate",
-                                execute_orders=True,
-                                persist_state=True,
-                                allow_entry_orders=True,
-                                preserve_timers_on_hold=True,
-                            )
+                            self._save_runtime_state(reason="startup_wait_next_candle")
                         self._sync_bridge_from_mt5()
                         self._push_state_to_server()
                         self._print_status_line(current_bar_time=current_bar_time)
@@ -5233,6 +6176,15 @@ class LiveTradingBot:
                     continue
 
                 if current_bar_time != self.last_bar_time:
+                    market_fresh, market_reason = self._is_market_data_fresh(current_bar_time=current_bar_time)
+                    if not market_fresh:
+                        self._log_market_inactive_wait("new_candle", market_reason)
+                        self._sync_bridge_from_mt5()
+                        self._push_state_to_server()
+                        self._print_status_line(current_bar_time=current_bar_time)
+                        time.sleep(POLL_SECONDS)
+                        continue
+
                     closed_utc = datetime.fromtimestamp(current_bar_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
                     print(f"\n 🕐 [CLOCK] New closed candle detected at {closed_utc}")
                     self._add_log(
