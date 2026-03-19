@@ -221,7 +221,7 @@ async def _fetch_chart_rates_from_connected_bot(
     return ChartRatesResult(
         rates=list(rates),
         source_mode="bot_runtime_ws",
-        source_label=" | ".join(label_parts) or "bot runtime websocket",
+        source_label=" | ".join(label_parts) or "bot runtime",
         resolved_from_time=str(payload.get("resolved_from_time", "") or "").strip(),
         resolved_to_time=str(payload.get("resolved_to_time", "") or "").strip(),
     )

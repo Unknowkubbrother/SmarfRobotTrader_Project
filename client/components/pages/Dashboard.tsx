@@ -378,7 +378,7 @@ export default function Dashboard() {
     ? liveState?.last_quote
     : undefined;
   const runtimeChartSourceLabel = liveState?.symbol === currentSymbol
-    ? `bot runtime websocket${liveState?.server ? ` | ${liveState.server}` : ""}${liveState?.login ? ` | login ${liveState.login}` : ""}`
+    ? `bot runtime ${liveState?.server ? ` | ${liveState.server}` : ""}${liveState?.login ? ` | login ${liveState.login}` : ""}`
     : null;
   const selectedAccountPendingUpdates = selectedAccount ? getPendingUpdatesCount(selectedAccount) : 0;
   const totalPendingUpdates = accounts.reduce((sum, account) => sum + getPendingUpdatesCount(account), 0);

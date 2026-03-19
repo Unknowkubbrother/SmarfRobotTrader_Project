@@ -505,7 +505,7 @@ export default function OrderAnnotatedChart({
       markers,
       sourceMode: usesRuntimeCandles ? "bot_runtime_ws" : (remoteData?.sourceMode || "bot_runtime"),
       sourceLabel: usesRuntimeCandles
-        ? (String(runtimeSourceLabel || "").trim() || "bot runtime websocket")
+        ? (String(runtimeSourceLabel || "").trim() || "bot runtime")
         : (remoteData?.sourceLabel || "bot runtime"),
       visibleFrom: firstCandle ? new Date(firstCandle.time * 1000).toISOString() : null,
       visibleTo: lastCandle ? new Date(lastCandle.time * 1000).toISOString() : null,
@@ -854,7 +854,7 @@ export default function OrderAnnotatedChart({
       const hoveredId = String(param.hoveredObjectId ?? "").trim();
       const markerMapById = markersByIdRef.current;
       const markerMapByTime = markersByTimeRef.current;
-      
+
       let targetTime: number | null = null;
       if (hoveredId && markerMapById.has(hoveredId)) {
         targetTime = Number(markerMapById.get(hoveredId)!.time);
