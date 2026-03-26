@@ -1,12 +1,28 @@
-import { useEffect, useRef, memo } from 'react';
+import { memo, useEffect, useRef } from "react";
 
 interface TradingViewWidgetProps {
     symbol: string;
-    theme?: 'light' | 'dark';
+    interval?: string;
+    theme?: "light" | "dark";
     autosize?: boolean;
 }
 
-function TradingViewWidget({ symbol, theme = 'dark', autosize = true }: TradingViewWidgetProps) {
+const TRADINGVIEW_INTERVALS: Record<string, string> = {
+    M1: "1",
+    M5: "5",
+    M15: "15",
+    M30: "30",
+    H1: "60",
+    H4: "240",
+    D1: "1D",
+};
+
+function TradingViewWidget({
+    symbol,
+    interval = "H1",
+    theme = "light",
+    autosize = true,
+}: TradingViewWidgetProps) {
     const container = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -26,32 +42,36 @@ function TradingViewWidget({ symbol, theme = 'dark', autosize = true }: TradingV
         // Ensure symbol has a valid format. If it's a pair like "XAUUSD", it usually works.
         // We can add a prefix if needed, e.g., "OANDA:".
         // For now, let's try the raw symbol first.
-        const widgetSymbol = symbol.includes(':') ? symbol : `OANDA:${symbol}`;
+        const widgetSymbol = symbol.includes(":") ? symbol : `OANDA:${symbol}`;
+        const widgetInterval = TRADINGVIEW_INTERVALS[String(interval || "H1").toUpperCase()] || "60";
 
         script.innerHTML = JSON.stringify({
-            "autosize": autosize,
-            "symbol": widgetSymbol,
-            "interval": "H1",
-            "timezone": "Etc/UTC",
-            "theme": theme,
-            "style": "1",
-            "locale": "en",
-            "enable_publishing": false,
-            "allow_symbol_change": true,
-            "calendar": false,
-            "support_host": "https://www.tradingview.com"
+            autosize,
+            symbol: widgetSymbol,
+            interval: widgetInterval,
+            timezone: "Etc/UTC",
+            theme,
+            style: "1",
+            locale: "en",
+            enable_publishing: false,
+            allow_symbol_change: true,
+            calendar: false,
+            hide_top_toolbar: false,
+            hide_legend: false,
+            save_image: false,
+            support_host: "https://www.tradingview.com"
         });
 
         el.appendChild(script);
 
         return () => {
             // Cleanup is handled by clearing innerHTML on next effect run
-            el.innerHTML = '';
+            el.innerHTML = "";
         };
-    }, [symbol, theme, autosize]);
+    }, [autosize, interval, symbol, theme]);
 
     return (
-        <div className="tradingview-widget-container" ref={container} style={{ height: "100%", width: "100%" }}>
+        <div className="tradingview-widget-container h-full w-full" ref={container}>
             <div className="tradingview-widget-container__widget" style={{ height: "calc(100% - 32px)", width: "100%" }}></div>
             <div className="tradingview-widget-copyright">
                 <a href="https://www.tradingview.com/" rel="noopener nofollow" target="_blank">

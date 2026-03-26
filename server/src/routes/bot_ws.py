@@ -22,7 +22,7 @@ from ..utils.vision_llm.llm_client import (
     VisionLLMConfigError,
     VisionLLMServiceUnavailableError,
 )
-from ..utils.trading_schedule import normalize_trading_schedule
+from ..utils.bot_runtime_config import parse_bot_runtime_settings
 from ..utils.vision_llm.source_context import build_vision_cache_key, resolve_vision_source_context
 from ..utils.vision_llm.use_llm import generate_llm_cls_for_bar
 from ..utils.ws_manager import bot_hub
@@ -38,6 +38,8 @@ _BOT_CONTEXT: dict[str, dict] = {}
 _BOT_OPEN_POSITIONS: dict[str, dict[int, dict]] = {}
 _BOT_ACCOUNT_SYNC_CACHE: dict[str, dict] = {}
 _BOT_INSUFFICIENT_FUNDS_ALERT_CACHE: dict[str, dict[str, float]] = {}
+_CRON_INFLIGHT_LOCKS: dict[str, asyncio.Lock] = {}
+_CRON_INFLIGHT_LOCKS_GUARD = asyncio.Lock()
 _ACCOUNT_SYNC_MIN_INTERVAL_SEC = 5.0
 _ACCOUNT_SYNC_FORCE_INTERVAL_SEC = 60.0
 _INSUFFICIENT_FUNDS_ALERT_TTL_SEC = 60.0 * 60.0 * 6.0
@@ -326,9 +328,23 @@ async def _persist_closed_orders_only(
         _BOT_OPEN_POSITIONS[bot_config_id] = current_positions
         return
 
-    close_dt = datetime.now(timezone.utc)
+    last_quote_time = _safe_int((state.get("last_quote") or {}).get("time"), 0)
+    
     for ticket in closed_ticket_ids:
         pos = previous_positions.get(ticket) or {}
+        
+        close_dt = None
+        if last_quote_time > 0:
+            close_dt = datetime.fromtimestamp(last_quote_time, tz=timezone.utc)
+            
+        open_time = pos.get("openTime")
+        if isinstance(open_time, datetime):
+            if close_dt is None or close_dt < open_time:
+                close_dt = open_time + timedelta(seconds=1)
+                
+        if close_dt is None:
+            close_dt = datetime.now(timezone.utc)
+        
         data = {
             "botInstanceId": bot_instance_id,
             "magicNumber": _safe_int(pos.get("magic", 0), 0) or None,
@@ -757,6 +773,27 @@ def _set_cached(symbol: str, timeframe: str, dt_str: str, source_context, data: 
         logger.warning("Redis cache set failed: %s", exc)
 
 
+async def _acquire_cron_inflight_lock(cache_key: str) -> asyncio.Lock:
+    async with _CRON_INFLIGHT_LOCKS_GUARD:
+        lock = _CRON_INFLIGHT_LOCKS.get(cache_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _CRON_INFLIGHT_LOCKS[cache_key] = lock
+    await lock.acquire()
+    return lock
+
+
+async def _release_cron_inflight_lock(cache_key: str, lock: asyncio.Lock) -> None:
+    try:
+        lock.release()
+    except Exception:
+        pass
+    async with _CRON_INFLIGHT_LOCKS_GUARD:
+        current = _CRON_INFLIGHT_LOCKS.get(cache_key)
+        if current is lock and not lock.locked():
+            _CRON_INFLIGHT_LOCKS.pop(cache_key, None)
+
+
 # ── WS /ws — Bot connection ──────────────────────────────────────────
 
 @bot_ws_router.websocket("/ws")
@@ -818,13 +855,17 @@ async def bot_websocket(websocket: WebSocket):
                             "mt5_login_id": str(getattr(getattr(config, "account", None), "mt5LoginId", "") or ""),
                             "bot_label": str(getattr(getattr(config, "botVersion", None), "label", "") or ""),
                         }
-                        raw_schedule = getattr(config, "tradingSchedule", None)
-                        schedule = normalize_trading_schedule(raw_schedule)
+                        runtime_settings = parse_bot_runtime_settings(
+                            getattr(config, "tradingSchedule", None),
+                            risk_level=_enum_value(getattr(config, "riskLevel", None)),
+                        )
                         await bot_hub.send_bot_config(
                             bot_config_id,
                             {
-                                "risk_level": _enum_value(getattr(config, "riskLevel", None)),
-                                "trading_schedule": schedule,
+                                "risk_level": runtime_settings["risk_level"],
+                                "risk_mode": runtime_settings["risk_mode"],
+                                "custom_lot": runtime_settings["custom_lot"],
+                                "trading_schedule": runtime_settings["schedule"],
                             },
                         )
                     except Exception as exc:
@@ -912,58 +953,89 @@ async def bot_ws_cron(data: VisionLLMRequest):
 
     # Check cache
     cached = _get_cached(data.symbol, timeframe, dt_str, source_context)
+    cache_hit = bool(cached)
+    should_broadcast = bool(bot_config_id)
     if cached:
         result_data = cached
         logger.info("cron  ⚡  cache hit %s/%s", data.symbol, timeframe)
     else:
+        cache_key = _cache_key(data.symbol, timeframe, dt_str, source_context)
+        lock = await _acquire_cron_inflight_lock(cache_key)
         try:
-            start = time.perf_counter()
-            result, cls_vec, chart_result = await asyncio.to_thread(
-                generate_llm_cls_for_bar,
-                date_time=data.date_time,
-                symbol=data.symbol,
-                timeframe=timeframe,
-                dataset_json=None,
-                bot_config_id=bot_config_id or None,
-            )
-            elapsed = time.perf_counter() - start
-            result_data = {
-                "symbol": data.symbol.upper(),
-                "timeframe": timeframe.upper(),
-                "date_time": dt_str,
-                "llm_text": result,
-                "cls_vec": cls_vec.tolist(),
-                "elapsed_seconds": round(elapsed, 2),
-                "chart_source": {
-                    "cache_scope": source_context.cache_scope,
-                    "requested_label": source_context.display_label,
-                    "mode": chart_result.source_mode,
-                    "label": chart_result.source_label,
-                    "resolved_bar_time": chart_result.resolved_bar_time,
-                },
-            }
-            _set_cached(data.symbol, timeframe, dt_str, source_context, result_data)
-        except NoMarketDataError as exc:
-            logger.warning("cron skip %s/%s %s: %s", data.symbol, timeframe, dt_str, exc)
-            return {
-                "message": "skipped_no_market_data",
-                "symbol": data.symbol,
-                "timeframe": timeframe,
-                "date_time": dt_str,
-                "detail": str(exc),
-            }
-        except MT5ConnectionError as exc:
-            logger.warning("cron MT5 unavailable %s/%s %s: %s", data.symbol, timeframe, dt_str, exc)
-            raise HTTPException(status_code=503, detail=str(exc))
-        except (VisionLLMConfigError, VisionLLMServiceUnavailableError) as exc:
-            logger.warning("cron LLM unavailable %s/%s %s: %s", data.symbol, timeframe, dt_str, exc)
-            raise HTTPException(status_code=503, detail=str(exc))
-        except Exception as exc:
-            logger.exception("cron pipeline failed for %s", data.symbol)
-            raise HTTPException(status_code=500, detail=str(exc))
+            cached_after_wait = _get_cached(data.symbol, timeframe, dt_str, source_context)
+            if cached_after_wait:
+                logger.info("cron  ⚡  cache hit after wait %s/%s", data.symbol, timeframe)
+                result_data = cached_after_wait
+                cache_hit = True
+                should_broadcast = bool(bot_config_id)
+            else:
+                try:
+                    start = time.perf_counter()
+                    result, cls_vec, chart_result = await asyncio.to_thread(
+                        generate_llm_cls_for_bar,
+                        date_time=data.date_time,
+                        symbol=data.symbol,
+                        timeframe=timeframe,
+                        dataset_json=None,
+                        bot_config_id=bot_config_id or None,
+                    )
+                    elapsed = time.perf_counter() - start
+                    result_data = {
+                        "symbol": data.symbol.upper(),
+                        "timeframe": timeframe.upper(),
+                        "date_time": dt_str,
+                        "llm_text": result,
+                        "cls_vec": cls_vec.tolist(),
+                        "elapsed_seconds": round(elapsed, 2),
+                        "chart_source": {
+                            "cache_scope": source_context.cache_scope,
+                            "requested_label": source_context.display_label,
+                            "mode": chart_result.source_mode,
+                            "label": chart_result.source_label,
+                            "resolved_bar_time": chart_result.resolved_bar_time,
+                        },
+                    }
+                    _set_cached(data.symbol, timeframe, dt_str, source_context, result_data)
+                except NoMarketDataError as exc:
+                    logger.warning("cron skip %s/%s %s: %s", data.symbol, timeframe, dt_str, exc)
+                    return {
+                        "message": "skipped_no_market_data",
+                        "symbol": data.symbol,
+                        "timeframe": timeframe,
+                        "date_time": dt_str,
+                        "detail": str(exc),
+                    }
+                except MT5ConnectionError as exc:
+                    logger.warning("cron MT5 unavailable %s/%s %s: %s", data.symbol, timeframe, dt_str, exc)
+                    raise HTTPException(status_code=503, detail=str(exc))
+                except ValueError as exc:
+                    logger.warning("cron invalid source %s/%s %s: %s", data.symbol, timeframe, dt_str, exc)
+                    raise HTTPException(status_code=400, detail=str(exc))
+                except (VisionLLMConfigError, VisionLLMServiceUnavailableError) as exc:
+                    logger.warning("cron LLM unavailable %s/%s %s: %s", data.symbol, timeframe, dt_str, exc)
+                    raise HTTPException(status_code=503, detail=str(exc))
+                except Exception as exc:
+                    logger.exception("cron pipeline failed for %s", data.symbol)
+                    raise HTTPException(status_code=500, detail=str(exc))
+        finally:
+            await _release_cron_inflight_lock(cache_key, lock)
 
-    # Broadcast to matching bots
-    await bot_hub.broadcast_llm(data.symbol, timeframe, result_data)
+    if bot_config_id and result_data.get("llm_text"):
+        await bot_hub.patch_bot_state(bot_config_id, {"llm_text": str(result_data.get("llm_text") or "")})
+
+    # Cron chart generation can be source-specific to one bot/runtime context, so only
+    # targeted broadcasts are delivered back into a live bot.
+    if should_broadcast and bot_config_id:
+        result_data = {
+            **result_data,
+            "bot_config_id": bot_config_id,
+        }
+        await bot_hub.broadcast_llm(
+            data.symbol,
+            timeframe,
+            result_data,
+            bot_config_id=bot_config_id,
+        )
 
     return {
         "message": "success",
@@ -971,4 +1043,6 @@ async def bot_ws_cron(data: VisionLLMRequest):
         "timeframe": timeframe,
         "date_time": dt_str,
         "elapsed_seconds": result_data.get("elapsed_seconds", 0),
+        "cached": bool(cache_hit),
+        "broadcasted": bool(should_broadcast and bot_config_id),
     }

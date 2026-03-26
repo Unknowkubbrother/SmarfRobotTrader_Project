@@ -6,11 +6,14 @@ import { ActivePositions } from "@/components/dashboard/ActivePositions";
 import { AIConsole } from "@/components/dashboard/AIConsole";
 import { AccountSelector, AccountWithBots } from "@/components/dashboard/AccountSelector";
 import { BotCard } from "@/components/dashboard/BotCard";
+import OrderAnnotatedChart from "@/components/dashboard/OrderAnnotatedChart";
 import TradingViewWidget from "@/components/dashboard/TradingViewWidget";
 import { AddBotDialog } from "@/components/dialogs/AddBotDialog";
 import { AddAccountDialog } from "@/components/dialogs/AddAccountDialog";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAuth } from "@/contexts/AuthContext";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -37,6 +40,18 @@ function toBrokerBarClockText(raw?: string): string {
   return matched ? matched[1] : normalized;
 }
 
+const CHART_TIMEFRAME_OPTIONS = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"] as const;
+
+const CHART_HISTORY_BARS: Record<(typeof CHART_TIMEFRAME_OPTIONS)[number], number> = {
+  M1: 1800,
+  M5: 1500,
+  M15: 1200,
+  M30: 1200,
+  H1: 1200,
+  H4: 1000,
+  D1: 730,
+};
+
 export default function Dashboard() {
   const { user } = useAuth();
   const { accounts, loading, updateBotStatus, deleteBot, updateAccount, deleteAccount, refetch, getPendingUpdatesCount } = useTradingAccounts();
@@ -44,6 +59,8 @@ export default function Dashboard() {
   const [selectedBotId, setSelectedBotId] = useState<string | null>(null);
   const [addBotOpen, setAddBotOpen] = useState(false);
   const [addAccountOpen, setAddAccountOpen] = useState(false);
+  const [chartTimeframe, setChartTimeframe] = useState<string>("H1");
+  const [chartView, setChartView] = useState<string>("tradingview");
   const [botActionState, setBotActionState] = useState<PersistedBotAction | null>(null);
   const [storeReady, setStoreReady] = useState(false);
   const processedLifecycleIdsRef = useRef<Set<string>>(new Set());
@@ -344,6 +361,25 @@ export default function Dashboard() {
   const bots = selectedAccount?.bot_configurations || [];
   const currentBot = bots.find(b => b.id === selectedBotId);
   const currentSymbol = currentBot?.bot_version?.symbol || "XAUUSD";
+  const currentTimeframe = liveState?.timeframe || currentBot?.bot_version?.timeframe || "H1";
+  const resolvedDefaultChartTimeframe = CHART_TIMEFRAME_OPTIONS.includes(currentTimeframe as (typeof CHART_TIMEFRAME_OPTIONS)[number])
+    ? currentTimeframe
+    : "H1";
+  const activeChartTimeframe = chartTimeframe || resolvedDefaultChartTimeframe;
+  const chartHistoryBars = CHART_HISTORY_BARS[
+    (CHART_TIMEFRAME_OPTIONS.includes(activeChartTimeframe as (typeof CHART_TIMEFRAME_OPTIONS)[number])
+      ? activeChartTimeframe
+      : "H1") as (typeof CHART_TIMEFRAME_OPTIONS)[number]
+  ];
+  const runtimeChartCandles = activeChartTimeframe === currentTimeframe
+    ? liveState?.recent_candles
+    : undefined;
+  const runtimeChartQuote = liveState?.symbol === currentSymbol
+    ? liveState?.last_quote
+    : undefined;
+  const runtimeChartSourceLabel = liveState?.symbol === currentSymbol
+    ? `bot runtime ${liveState?.server ? ` | ${liveState.server}` : ""}${liveState?.login ? ` | login ${liveState.login}` : ""}`
+    : null;
   const selectedAccountPendingUpdates = selectedAccount ? getPendingUpdatesCount(selectedAccount) : 0;
   const totalPendingUpdates = accounts.reduce((sum, account) => sum + getPendingUpdatesCount(account), 0);
   const subscriptionBlocked = Boolean(user?.subscription_blocked);
@@ -358,6 +394,10 @@ export default function Dashboard() {
     }
     setAddBotOpen(true);
   };
+
+  useEffect(() => {
+    setChartTimeframe(resolvedDefaultChartTimeframe);
+  }, [resolvedDefaultChartTimeframe, selectedBotId]);
 
   return (
     <div className="space-y-6">
@@ -395,6 +435,7 @@ export default function Dashboard() {
               selectedBotId={selectedBotId}
               onBotSelect={setSelectedBotId}
               accountId={selectedAccount.id}
+              accountBalance={selectedAccount.balance}
               onBotAdded={refetch}
               getBotPnl={(botId, fallbackPnl) => getBotState(botId)?.total_pnl ?? fallbackPnl}
               addBotDisabled={subscriptionBlocked}
@@ -555,9 +596,79 @@ export default function Dashboard() {
 
           {/* Main Grid: Chart & Status */}
           <div className="grid lg:grid-cols-3 gap-6">
-            {/* TradingView Chart (2/3) */}
-            <div className="lg:col-span-2 bg-white border rounded-xl shadow-sm p-1 overflow-hidden animate-slide-up h-[500px]">
-              <TradingViewWidget symbol={currentSymbol} theme="light" />
+            {/* Live chart with order markers (2/3) */}
+            <div className="lg:col-span-2 animate-slide-up">
+              <Tabs value={chartView} onValueChange={setChartView} className="w-full">
+                <div className="mb-3 flex flex-col gap-3 rounded-xl border bg-white px-4 py-3 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+                  <TabsList className="grid w-full grid-cols-2 sm:w-auto">
+                    <TabsTrigger value="tradingview">TradingView Chart</TabsTrigger>
+                    <TabsTrigger value="execution">RealTimeOrder Chart</TabsTrigger>
+                  </TabsList>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] font-medium text-muted-foreground">
+                      Timeframe
+                    </span>
+                    <Select value={activeChartTimeframe} onValueChange={setChartTimeframe}>
+                      <SelectTrigger className="h-8 w-[96px] bg-white text-xs">
+                        <SelectValue placeholder="H1" />
+                      </SelectTrigger>
+                      <SelectContent align="end">
+                        {CHART_TIMEFRAME_OPTIONS.map((option) => (
+                          <SelectItem key={option} value={option}>
+                            {option}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+
+                <TabsContent value="tradingview" className="mt-0">
+                  <div className="overflow-hidden rounded-xl border bg-white shadow-sm">
+                    <div className="border-b border-border px-4 py-3">
+                      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-2">
+                            <h3 className="text-sm font-semibold text-foreground">TradingView Market Chart</h3>
+                            <span className="inline-flex items-center gap-1 rounded-full bg-sky-50 px-2 py-0.5 text-[11px] font-medium text-sky-700">
+                              Display only
+                            </span>
+                          </div>
+                          <p className="text-xs text-muted-foreground">
+                            {currentSymbol} • {activeChartTimeframe} • TradingView market view
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="h-[500px] p-1">
+                      <TradingViewWidget
+                        symbol={currentSymbol}
+                        interval={activeChartTimeframe}
+                        theme="light"
+                        autosize={true}
+                      />
+                    </div>
+                  </div>
+                </TabsContent>
+
+                <TabsContent value="execution" className="mt-0">
+                  <OrderAnnotatedChart
+                    accountId={selectedAccount?.id}
+                    botConfigId={selectedBotId}
+                    symbol={currentSymbol}
+                    timeframe={activeChartTimeframe}
+                    runtimeCandles={runtimeChartCandles}
+                    runtimeQuote={runtimeChartQuote}
+                    runtimeSourceLabel={runtimeChartSourceLabel}
+                    live={true}
+                    pollMs={3000}
+                    bars={chartHistoryBars}
+                    showMarkers={true}
+                    title="Live Trading Chart"
+                    subtitle={`${currentSymbol} • ${activeChartTimeframe} • realtime market with trade markers`}
+                  />
+                </TabsContent>
+              </Tabs>
             </div>
 
             {/* Account Status (1/3) */}
@@ -598,6 +709,7 @@ export default function Dashboard() {
           open={addBotOpen}
           onOpenChange={setAddBotOpen}
           accountId={selectedAccount.id}
+          accountBalance={selectedAccount.balance}
           existingBots={selectedAccount.bot_configurations}
           onBotAdded={refetch}
           blockedReason={subscriptionBlocked ? subscriptionBlockedReason : null}

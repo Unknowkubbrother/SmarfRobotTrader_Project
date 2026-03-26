@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { Power, AlertOctagon, Clock, Shield, Play, Activity, TrendingUp, RefreshCw, Sparkles, Trash2, AlertTriangle, DownloadCloud } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { useAuth } from "@/contexts/AuthContext";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -42,6 +43,17 @@ import {
 } from "@/lib/botOperationStore";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
+import {
+  DEFAULT_RISK_LEVEL,
+  DEFAULT_RISK_MODE,
+  RISK_LEVEL_OPTIONS,
+  type BotRiskMode,
+  estimateBotLotSize,
+  formatLotSize,
+  normalizeCustomLot,
+  normalizeRiskLevel,
+  normalizeRiskMode,
+} from "@/lib/botRisk";
 
 function normalizeBrokerBarText(raw: string): string {
   const text = String(raw || "").trim();
@@ -54,12 +66,6 @@ function toBrokerBarClockText(raw?: string): string {
   const matched = normalized.match(/(\d{2}:\d{2}:\d{2})$/);
   return matched ? matched[1] : (normalized || "—");
 }
-
-const riskLevels = [
-  { id: "low", label: "Low", description: "Conservative trading with minimal risk", color: "text-success" },
-  { id: "medium", label: "Medium", description: "Balanced approach with moderate risk", color: "text-warning" },
-  { id: "high", label: "High", description: "Aggressive trading strategy", color: "text-destructive" },
-];
 
 const defaultSchedule = [
   { day: "Mon", enabled: true },
@@ -117,6 +123,11 @@ const normalizeTradingSchedule = (value: unknown): Record<string, boolean> => {
     payload = value as Record<string, unknown>;
   }
 
+  const nestedSchedule = payload.schedule;
+  if (nestedSchedule && typeof nestedSchedule === "object") {
+    payload = nestedSchedule as Record<string, unknown>;
+  }
+
   for (const [rawKey, rawValue] of Object.entries(payload)) {
     const dayKey = DAY_ALIAS_TO_KEY[String(rawKey).trim().toLowerCase()];
     if (!dayKey) continue;
@@ -159,6 +170,12 @@ const getBotPairKey = (symbol: string | null | undefined, timeframe: string | nu
   return `${normalizedSymbol}__${normalizedTimeframe}`;
 };
 
+type PendingRiskConfig = {
+  riskLevel: string;
+  riskMode: BotRiskMode;
+  customLot: number | null;
+};
+
 export default function BotControl() {
   const { user } = useAuth();
   const searchParams = useSearchParams();
@@ -187,7 +204,10 @@ export default function BotControl() {
 
   const [selectedAccount, setSelectedAccount] = useState<AccountWithBots | null>(null);
   const [selectedBot, setSelectedBot] = useState<BotConfigWithVersion | null>(null);
-  const [selectedRisk, setSelectedRisk] = useState("medium");
+  const [selectedRisk, setSelectedRisk] = useState(DEFAULT_RISK_LEVEL);
+  const [selectedRiskMode, setSelectedRiskMode] = useState<BotRiskMode>(DEFAULT_RISK_MODE);
+  const [customLotInput, setCustomLotInput] = useState("");
+  const [customLotDraftInput, setCustomLotDraftInput] = useState("");
   const [schedule, setSchedule] = useState(defaultSchedule);
   const [showModelDialog, setShowModelDialog] = useState(false);
   const [addBotOpen, setAddBotOpen] = useState(false);
@@ -197,7 +217,7 @@ export default function BotControl() {
   const [stopConfirmOpen, setStopConfirmOpen] = useState(false);
   const [panicConfirmOpen, setPanicConfirmOpen] = useState(false);
   const [riskConfirmOpen, setRiskConfirmOpen] = useState(false);
-  const [pendingRiskId, setPendingRiskId] = useState<string | null>(null);
+  const [pendingRiskConfig, setPendingRiskConfig] = useState<PendingRiskConfig | null>(null);
   const [modelConfirmOpen, setModelConfirmOpen] = useState(false);
   const [pendingModelId, setPendingModelId] = useState<string | null>(null);
   const [scheduleConfirmOpen, setScheduleConfirmOpen] = useState(false);
@@ -272,6 +292,21 @@ export default function BotControl() {
     const enabled = days.filter(([k]) => src[k]).map(([, l]) => l);
     return enabled.length > 0 ? enabled.join(" ") : "None";
   })();
+  const configuredCustomLot = normalizeCustomLot(customLotInput)
+    ?? normalizeCustomLot(liveState?.fixed_lot ?? selectedBot?.custom_lot);
+  const draftCustomLot = normalizeCustomLot(customLotDraftInput);
+  const configuredLotPreview = estimateBotLotSize({
+    balance: liveBalance,
+    riskLevel: selectedRisk,
+    riskMode: selectedRiskMode,
+    customLot: configuredCustomLot,
+    riskProfileMap: liveState?.risk_profile_map ?? undefined,
+  });
+  const configuredRiskSummary = selectedRiskMode === "custom_lot"
+    ? configuredCustomLot !== null
+      ? `Custom • ${formatLotSize(configuredCustomLot)}`
+      : "Custom • Pending input"
+    : `${RISK_LEVEL_OPTIONS.find((level) => level.id === selectedRisk)?.label || "Medium"} • ${formatLotSize(configuredLotPreview)}`;
 
   // Load available bot versions on mount
   useEffect(() => {
@@ -347,12 +382,21 @@ export default function BotControl() {
   // Load bot settings when selected bot changes
   useEffect(() => {
     if (selectedBot) {
-      setSelectedRisk(selectedBot.risk_level || "medium");
+      setSelectedRisk(normalizeRiskLevel(selectedBot.risk_level));
+      setSelectedRiskMode(normalizeRiskMode(selectedBot.risk_mode));
+      const nextCustomLot = selectedBot.custom_lot ? selectedBot.custom_lot.toFixed(2) : "";
+      setCustomLotInput(nextCustomLot);
+      setCustomLotDraftInput(nextCustomLot);
       const savedSchedule = normalizeTradingSchedule(selectedBot.trading_schedule);
       setSchedule(defaultSchedule.map((s) => ({
         ...s,
         enabled: savedSchedule[s.day.toLowerCase()] ?? s.enabled,
       })));
+    } else {
+      setSelectedRisk(DEFAULT_RISK_LEVEL);
+      setSelectedRiskMode(DEFAULT_RISK_MODE);
+      setCustomLotInput("");
+      setCustomLotDraftInput("");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedBot]);
@@ -826,32 +870,71 @@ export default function BotControl() {
 
   const handleRiskClick = (riskId: string) => {
     if (isBusy) return;
-    if (riskId === selectedRisk) return;
-    setPendingRiskId(riskId);
+    if (selectedRiskMode === "level" && riskId === selectedRisk) return;
+    setPendingRiskConfig({
+      riskLevel: normalizeRiskLevel(riskId),
+      riskMode: "level",
+      customLot: null,
+    });
+    setRiskConfirmOpen(true);
+  };
+
+  const handleCustomLotApply = () => {
+    if (isBusy) return;
+    const resolvedCustomLot = normalizeCustomLot(customLotDraftInput);
+    if (resolvedCustomLot === null) {
+      toast.error("Please enter a custom lot of at least 0.01");
+      return;
+    }
+    if (selectedRiskMode === "custom_lot" && normalizeCustomLot(selectedBot?.custom_lot) === resolvedCustomLot) {
+      return;
+    }
+    setPendingRiskConfig({
+      riskLevel: selectedRisk,
+      riskMode: "custom_lot",
+      customLot: resolvedCustomLot,
+    });
     setRiskConfirmOpen(true);
   };
 
   const performRiskChange = async () => {
     if (isBusy) return;
-    if (!selectedBot || !pendingRiskId) return;
+    if (!selectedBot || !pendingRiskConfig) return;
+    const pendingLotLabel = pendingRiskConfig.customLot !== null ? formatLotSize(pendingRiskConfig.customLot) : null;
     startUiAction(
       "Updating Risk",
       "Applying risk profile to running bot...",
-      `Updating risk to ${pendingRiskId.toUpperCase()}`,
+      pendingRiskConfig.riskMode === "custom_lot"
+        ? `Updating custom lot to ${pendingLotLabel}`
+        : `Updating risk to ${pendingRiskConfig.riskLevel.toUpperCase()}`,
       {
         botId: selectedBot.id,
         kind: "update_risk",
       }
     );
-    setSelectedRisk(pendingRiskId);
-    const success = await updateBotRisk(selectedBot.id, pendingRiskId);
+    setSelectedRisk(normalizeRiskLevel(pendingRiskConfig.riskLevel));
+    setSelectedRiskMode(pendingRiskConfig.riskMode);
+    if (pendingRiskConfig.riskMode === "custom_lot" && pendingRiskConfig.customLot !== null) {
+      const nextCustomLot = pendingRiskConfig.customLot.toFixed(2);
+      setCustomLotInput(nextCustomLot);
+      setCustomLotDraftInput(nextCustomLot);
+    }
+    const success = await updateBotRisk(selectedBot.id, {
+      riskLevel: pendingRiskConfig.riskLevel,
+      riskMode: pendingRiskConfig.riskMode,
+      customLot: pendingRiskConfig.customLot,
+    });
     if (success) {
-      appendActionLog("success", "Risk level updated", selectedBot.id);
+      appendActionLog(
+        "success",
+        pendingRiskConfig.riskMode === "custom_lot" ? "Custom lot updated" : "Risk level updated",
+        selectedBot.id
+      );
     } else {
-      appendActionLog("error", "Risk level update failed", selectedBot.id);
+      appendActionLog("error", "Risk update failed", selectedBot.id);
     }
     setRiskConfirmOpen(false);
-    setPendingRiskId(null);
+    setPendingRiskConfig(null);
     finishUiAction();
   };
 
@@ -988,7 +1071,11 @@ export default function BotControl() {
     }
   };
 
-  const pendingRiskLabel = riskLevels.find(r => r.id === pendingRiskId)?.label;
+  const pendingRiskLabel = pendingRiskConfig?.riskMode === "custom_lot"
+    ? pendingRiskConfig.customLot !== null
+      ? `Custom Lot (${formatLotSize(pendingRiskConfig.customLot)})`
+      : "Custom Lot"
+    : RISK_LEVEL_OPTIONS.find((level) => level.id === pendingRiskConfig?.riskLevel)?.label;
   const pendingModelLabel = availableModels.find(m => m.model_id === pendingModelId)?.label;
 
   return (
@@ -1025,6 +1112,7 @@ export default function BotControl() {
                 if (bot) setSelectedBot(bot);
               }}
               accountId={selectedAccount.id}
+              accountBalance={selectedAccount.balance}
               onBotAdded={refetch}
               getBotPnl={(botId, fallbackPnl) => getBotState(botId)?.total_pnl ?? fallbackPnl}
               addBotDisabled={subscriptionBlocked}
@@ -1419,28 +1507,97 @@ export default function BotControl() {
                   <Shield className="w-5 h-5 text-primary" />
                   <h3 className="font-semibold">Risk Level</h3>
                 </div>
+                <div className="mb-4 rounded-xl bg-secondary/40 p-4 space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-sm text-muted-foreground">Current Config</span>
+                    <span className="text-sm font-medium">{configuredRiskSummary}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-sm text-muted-foreground">Live Lot</span>
+                    <span className="text-sm font-medium font-mono">
+                      {isLiveHubConnected ? formatLotSize(liveLotSize) : "Offline"}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-sm text-muted-foreground">Balance Used</span>
+                    <span className="text-sm font-medium font-mono">${liveBalance.toFixed(2)}</span>
+                  </div>
+                </div>
                 <div className="space-y-3">
-                  {riskLevels.map((level) => (
+                  {RISK_LEVEL_OPTIONS.map((level) => (
                     <button
                       key={level.id}
                       onClick={() => handleRiskClick(level.id)}
                       disabled={isBusy}
                       className={cn(
                         "w-full p-4 rounded-xl border text-left transition-all",
-                        selectedRisk === level.id
+                        selectedRiskMode === "level" && selectedRisk === level.id
                           ? "border-primary bg-primary/5"
                           : "border-border hover:border-primary/50 hover:bg-secondary/50"
                       )}
                     >
                       <div className="flex items-center justify-between mb-1">
                         <span className={cn("font-semibold", level.color)}>{level.label}</span>
-                        {selectedRisk === level.id && (
+                        <span className="text-xs text-muted-foreground">
+                          Est. {formatLotSize(
+                            estimateBotLotSize({
+                              balance: liveBalance,
+                              riskLevel: level.id,
+                              riskMode: "level",
+                              riskProfileMap: liveState?.risk_profile_map ?? undefined,
+                            })
+                          )}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-sm text-muted-foreground">{level.description}</p>
+                        {selectedRiskMode === "level" && selectedRisk === level.id && (
                           <span className="text-xs bg-primary text-primary-foreground px-2 py-0.5 rounded-full">Active</span>
                         )}
                       </div>
-                      <p className="text-sm text-muted-foreground">{level.description}</p>
                     </button>
                   ))}
+                  <div
+                    className={cn(
+                      "rounded-xl border p-4 transition-all",
+                      selectedRiskMode === "custom_lot"
+                        ? "border-primary bg-primary/5"
+                        : "border-border hover:border-primary/50 hover:bg-secondary/50"
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-3 mb-2">
+                      <span className="font-semibold text-primary">Custom Lot</span>
+                      {selectedRiskMode === "custom_lot" && (
+                        <span className="text-xs bg-primary text-primary-foreground px-2 py-0.5 rounded-full">Active</span>
+                      )}
+                    </div>
+                    <p className="text-sm text-muted-foreground">
+                      Set a fixed lot size instead of auto risk by balance.
+                    </p>
+                    <div className="mt-3 flex flex-col gap-3 sm:flex-row">
+                      <Input
+                        type="number"
+                        min="0.01"
+                        step="0.01"
+                        inputMode="decimal"
+                        value={customLotDraftInput}
+                        onChange={(event) => setCustomLotDraftInput(event.target.value)}
+                        disabled={isBusy}
+                        placeholder="0.05"
+                        className="sm:max-w-[180px]"
+                      />
+                      <Button onClick={handleCustomLotApply} disabled={isBusy}>
+                        Apply Custom Lot
+                      </Button>
+                    </div>
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      {draftCustomLot !== null
+                        ? `Ready to apply ${formatLotSize(draftCustomLot)}`
+                        : configuredCustomLot !== null
+                        ? `Current fixed lot: ${formatLotSize(configuredCustomLot)}`
+                        : "Minimum 0.01 lot"}
+                    </p>
+                  </div>
                 </div>
               </div>
 
@@ -1583,6 +1740,7 @@ export default function BotControl() {
           open={addBotOpen}
           onOpenChange={setAddBotOpen}
           accountId={selectedAccount.id}
+          accountBalance={selectedAccount.balance}
           existingBots={selectedAccount.bot_configurations}
           onBotAdded={refetch}
           blockedReason={subscriptionBlocked ? subscriptionBlockedReason : null}
@@ -1663,18 +1821,26 @@ export default function BotControl() {
       </AlertDialog>
 
       {/* Risk Change Confirmation */}
-      <AlertDialog open={riskConfirmOpen} onOpenChange={setRiskConfirmOpen}>
+      <AlertDialog
+        open={riskConfirmOpen}
+        onOpenChange={(open) => {
+          setRiskConfirmOpen(open);
+          if (!open) {
+            setPendingRiskConfig(null);
+          }
+        }}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Change Risk Level</AlertDialogTitle>
+            <AlertDialogTitle>Change Risk Setting</AlertDialogTitle>
             <AlertDialogDescription>
-              Are you sure you want to change the risk level to <strong>{pendingRiskLabel}</strong>?
+              Are you sure you want to change the risk setting to <strong>{pendingRiskLabel}</strong>?
               <br />
-              This will affect position sizing and stop-loss parameters for future trades.
+              This will affect position sizing for future trades.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel onClick={() => setPendingRiskId(null)}>Cancel</AlertDialogCancel>
+            <AlertDialogCancel onClick={() => setPendingRiskConfig(null)}>Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={performRiskChange} disabled={isBusy}>
               Confirm Change
             </AlertDialogAction>

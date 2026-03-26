@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback } from "react";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
 import { api, type ApiClientError } from "@/lib/api";
+import type { BotRiskMode } from "@/lib/botRisk";
+import { normalizeCustomLot, normalizeRiskMode } from "@/lib/botRisk";
 
 export interface Create_Trading_Account {
   brokerName: string;
@@ -46,6 +48,9 @@ export interface BotConfigWithVersion {
   bot_instance_id: number;
   magic_number?: number | null;
   risk_level: string | null;
+  risk_mode: BotRiskMode;
+  custom_lot: number | null;
+  estimated_lot_size: number | null;
   trading_schedule: any;
   is_active: boolean;
   docker_container_id: string | null;
@@ -201,6 +206,11 @@ const normalizeTradingSchedule = (value: unknown): Record<string, boolean> => {
     payload = value as Record<string, unknown>;
   }
 
+  const nestedSchedule = payload.schedule;
+  if (nestedSchedule && typeof nestedSchedule === "object") {
+    payload = nestedSchedule as Record<string, unknown>;
+  }
+
   for (const [rawKey, rawValue] of Object.entries(payload)) {
     const key = DAY_ALIAS_TO_KEY[String(rawKey).trim().toLowerCase()];
     if (!key) continue;
@@ -236,6 +246,11 @@ export function useTradingAccounts() {
         bot_configurations: (account.bot_configurations || []).map((config: any) => ({
           ...config,
           trading_schedule: normalizeTradingSchedule(config.trading_schedule),
+          risk_mode: normalizeRiskMode(config.risk_mode),
+          custom_lot: normalizeCustomLot(config.custom_lot),
+          estimated_lot_size: typeof config.estimated_lot_size === "number"
+            ? config.estimated_lot_size
+            : Number(config.estimated_lot_size ?? 0) || null,
           status: config.container_status || "stopped",
           has_pending_update: Boolean(config.has_pending_update),
           installed_version_tag: config.installed_version_tag || null,
@@ -299,15 +314,27 @@ export function useTradingAccounts() {
   };
 
   // Update bot risk level
-  const updateBotRisk = async (botConfigId: string, riskLevel: string) => {
+  const updateBotRisk = async (
+    botConfigId: string,
+    risk: string | { riskLevel?: string | null; riskMode?: BotRiskMode; customLot?: number | null }
+  ) => {
+    const payload =
+      typeof risk === "string"
+        ? { botConfigId, riskLevel: risk, riskMode: "level" as BotRiskMode }
+        : {
+            botConfigId,
+            riskLevel: risk.riskLevel ?? undefined,
+            riskMode: normalizeRiskMode(risk.riskMode),
+            customLot: normalizeCustomLot(risk.customLot) ?? undefined,
+          };
     try {
-      await api.patch("/bot/update_risk", { botConfigId, riskLevel });
+      await api.patch("/bot/update_risk", payload);
       await fetchAccounts();
-      toast.success("Risk level updated");
+      toast.success(payload.riskMode === "custom_lot" ? "Custom lot updated" : "Risk level updated");
       return true;
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error updating risk level:", error);
-      toast.error("Failed to update risk level");
+      toast.error(error?.response?.data?.detail || error?.message || "Failed to update risk level");
       return false;
     }
   };
@@ -423,13 +450,16 @@ export function useTradingAccounts() {
   const createBot = async (
     accountId: string,
     modelId: string,
-    riskLevel: string = "medium"
+    riskLevel: string = "medium",
+    riskOptions?: { riskMode?: BotRiskMode; customLot?: number | null }
   ) => {
     try {
       await api.post("/bot/create_bot_configuration", {
         accountId,
         modelId,
         riskLevel,
+        riskMode: normalizeRiskMode(riskOptions?.riskMode),
+        customLot: normalizeCustomLot(riskOptions?.customLot) ?? undefined,
       });
 
       await fetchAccounts();
@@ -437,7 +467,7 @@ export function useTradingAccounts() {
       return true;
     } catch (error: any) {
       console.error("Error creating bot:", error);
-      toast.error(error.message || "Failed to add bot");
+      toast.error(error?.response?.data?.detail || error.message || "Failed to add bot");
       return false;
     }
   };

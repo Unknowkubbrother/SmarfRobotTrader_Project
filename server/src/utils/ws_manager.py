@@ -171,19 +171,42 @@ class BotHub:
 
     # ── Vision LLM broadcast ────────────────────────────────────────
 
-    async def broadcast_llm(self, symbol: str, timeframe: str, data: dict) -> None:
-        """Push vision_llm result to all bots matching symbol+timeframe."""
+    async def broadcast_llm(
+        self,
+        symbol: str,
+        timeframe: str,
+        data: dict,
+        bot_config_id: str | None = None,
+    ) -> None:
+        """Push vision_llm result to one bot or to all bots matching symbol/timeframe."""
         symbol = symbol.upper()
         timeframe = timeframe.upper()
-        matching = [
-            conn for conn in self._bots.values()
-            if conn.symbol == symbol and conn.timeframe == timeframe
-        ]
+        target_bot_id = str(bot_config_id or data.get("bot_config_id", "") or "").strip()
+        if target_bot_id:
+            conn = self._bots.get(target_bot_id)
+            matching = (
+                [conn]
+                if conn is not None and conn.symbol == symbol and conn.timeframe == timeframe
+                else []
+            )
+        else:
+            matching = [
+                conn for conn in self._bots.values()
+                if conn.symbol == symbol and conn.timeframe == timeframe
+            ]
         if not matching:
-            logger.info("llm broadcast  📡  %s/%s  no matching bots", symbol, timeframe)
+            logger.info(
+                "llm broadcast  📡  %s/%s  no matching bots%s",
+                symbol,
+                timeframe,
+                f" target={target_bot_id}" if target_bot_id else "",
+            )
             return
 
-        message = json.dumps({"type": "llm_result", **data}, ensure_ascii=False)
+        payload = dict(data or {})
+        if target_bot_id and not str(payload.get("bot_config_id", "") or "").strip():
+            payload["bot_config_id"] = target_bot_id
+        message = json.dumps({"type": "llm_result", **payload}, ensure_ascii=False)
         disconnected = []
 
         async def _send(conn: BotConnection):
@@ -198,9 +221,10 @@ class BotHub:
             self.disconnect_bot(bid)
 
         logger.info(
-            "llm broadcast  📡  %s/%s  sent=%d  dropped=%d",
+            "llm broadcast  📡  %s/%s  sent=%d  dropped=%d%s",
             symbol, timeframe,
             len(matching) - len(disconnected), len(disconnected),
+            f" target={target_bot_id}" if target_bot_id else "",
         )
 
     async def send_bot_config(self, bot_config_id: str, config_data: dict) -> bool:

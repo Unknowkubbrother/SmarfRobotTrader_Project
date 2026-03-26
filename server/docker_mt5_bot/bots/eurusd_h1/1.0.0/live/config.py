@@ -183,6 +183,12 @@ _default_risk = float(RISK_PROFILE_MAP.get(RISK_LEVEL, 1.0))
 RISK_PERCENT = _env_float(_default_risk, "LIVE_RISK_PERCENT", "RISK_PERCENT")
 if RISK_PERCENT <= 0:
     RISK_PERCENT = _default_risk
+RISK_MODE = (_env_first("LIVE_RISK_MODE") or "level").strip().lower()
+if RISK_MODE not in {"level", "custom_lot"}:
+    RISK_MODE = "level"
+FIXED_LOT = max(0.0, _env_float(0.0, "LIVE_FIXED_LOT", "LIVE_CUSTOM_LOT"))
+if RISK_MODE == "custom_lot" and FIXED_LOT < 0.01:
+    RISK_MODE = "level"
 
 TRADING_SCHEDULE_DEFAULT = _parse_trading_schedule(_env_first("LIVE_TRADING_SCHEDULE_JSON"))
 
@@ -217,6 +223,8 @@ EXECUTE_STALE_REPLAY_ORDERS = _env_bool(False, "LIVE_CATCHUP_EXECUTE_STALE")
 LIVE_SYNC_ACCOUNT_STATE = _env_bool(True, "LIVE_SYNC_ACCOUNT_STATE")
 LIVE_DYNAMIC_LOT = _env_bool(True, "LIVE_DYNAMIC_LOT")
 LIVE_MANAGE_MANUAL_POSITIONS = _env_bool(False, "LIVE_MANAGE_MANUAL_POSITIONS")
+LIVE_STATUS_LINE_ENABLED = _env_bool(True, "LIVE_STATUS_LINE_ENABLED")
+LIVE_STATUS_LOG_INTERVAL_SEC = max(0.0, _env_float(60.0, "LIVE_STATUS_LOG_INTERVAL_SEC"))
 LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS = max(
     10.0,
     _env_float(180.0, "LIVE_SEMANTIC_NO_DATA_RETRY_SECONDS"),
@@ -276,8 +284,11 @@ LIVE_MT5_HISTORY_END_AHEAD_HOURS = min(
 LIVE_PERFORMANCE_SCOPE = (_env_first("LIVE_PERFORMANCE_SCOPE") or "symbol").strip().lower()
 if LIVE_PERFORMANCE_SCOPE not in {"managed", "symbol", "account"}:
     LIVE_PERFORMANCE_SCOPE = "symbol"
+_default_managed_magic_set = {int(MAGIC_NUMBER), 123456, 12345}
+if LIVE_MANAGE_MANUAL_POSITIONS:
+    _default_managed_magic_set.add(0)
 LIVE_MANAGED_MAGIC_SET = _env_int_set(
-    {int(MAGIC_NUMBER), 123456, 12345, 0},
+    _default_managed_magic_set,
     "LIVE_MANAGED_MAGIC_SET",
     "LIVE_MANAGED_MAGIC_NUMBERS",
     "LIVE_MAGIC_SET",

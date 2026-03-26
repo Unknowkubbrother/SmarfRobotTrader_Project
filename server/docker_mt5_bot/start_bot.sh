@@ -45,6 +45,20 @@ is_truthy() {
   [[ "$raw" =~ ^(1|true|yes|on)$ ]]
 }
 
+docker_image_exists_locally() {
+  local image_ref="${1:-}"
+  [[ -n "$image_ref" ]] || return 1
+  docker image inspect "$image_ref" >/dev/null 2>&1
+}
+
+is_local_bot_image_ref() {
+  local image_ref="${1:-}"
+  local image_name="${image_ref##*/}"
+  image_name="${image_name%%@*}"
+  image_name="${image_name%%:*}"
+  [[ "$image_name" == docker_image_* ]]
+}
+
 read_dotenv_value() {
   local key="$1"
   local value=""
@@ -231,11 +245,15 @@ ensure_image_ready() {
   fi
 
   if (( should_pull == 1 )); then
-    echo "[0/6] Pulling MT5 image (${image_name})..."
-    if compose pull "$SERVICE_NAME"; then
-      pull_succeeded=1
+    if docker_image_exists_locally "$image_name" && is_local_bot_image_ref "$image_name"; then
+      echo "[0/6] Local bot image detected (${image_name}). Skip pull."
     else
-      echo "  warning: docker pull failed, fallback to local image/build."
+      echo "[0/6] Pulling MT5 image (${image_name})..."
+      if compose pull "$SERVICE_NAME"; then
+        pull_succeeded=1
+      else
+        echo "  warning: docker pull failed, fallback to local image/build."
+      fi
     fi
   fi
 
@@ -250,7 +268,7 @@ ensure_image_ready() {
     return 0
   fi
 
-  if ! docker image inspect "$image_name" >/dev/null 2>&1; then
+  if ! docker_image_exists_locally "$image_name"; then
     echo "[0/6] MT5 image not found locally. Trying pull once..."
     if compose pull "$SERVICE_NAME"; then
       return 0
@@ -1535,6 +1553,8 @@ record_bot_runtime_version_state() {
     state_dir="$(dirname "$state_file")"
   fi
 
+  mkdir -p "$state_dir" >/dev/null 2>&1 || true
+
   if [[ -f "$state_file" ]]; then
     # shellcheck disable=SC1090
     source "$state_file" || true
@@ -1550,17 +1570,23 @@ record_bot_runtime_version_state() {
   else
     append_bot_log_marker "[RUNNER] bot_version_unchanged tag=${current_tag} script=${current_script}"
   fi
-
-  mkdir -p "$state_dir" >/dev/null 2>&1 || true
   {
     printf "RUNNER_BOT_VERSION_TAG=%q\n" "$current_tag"
     printf "RUNNER_BOT_SCRIPT_PATH=%q\n" "$current_script"
   } > "$state_file" 2>/dev/null || true
 }
 
+ensure_shared_pydeps_volume() {
+  if ! is_truthy "$USE_SHARED_PYDEPS"; then
+    return 0
+  fi
+  docker volume create mt5_pydeps_shared >/dev/null 2>&1 || true
+}
+
 ensure_image_ready
 
 echo "[1/6] Starting MT5 container..."
+ensure_shared_pydeps_volume
 compose up -d --no-build "$SERVICE_NAME"
 STACK_STARTED=1
 if ! enable_bot_log_stream_if_needed; then
@@ -1915,6 +1941,8 @@ compose exec -T \
   -e MT5_LOGIN="$MT5_LOGIN_VAL" \
   -e MT5_PASSWORD="$MT5_PASSWORD_VAL" \
   -e MT5_SERVER="$MT5_SERVER_VAL" \
+  -e LIVE_RISK_LEVEL="${LIVE_RISK_LEVEL:-}" \
+  -e LIVE_TRADING_SCHEDULE_JSON="${LIVE_TRADING_SCHEDULE_JSON:-}" \
   -e LIVE_MAGIC_NUMBER="${LIVE_MAGIC_NUMBER:-}" \
   -e LIVE_MANAGE_MANUAL_POSITIONS="${LIVE_MANAGE_MANUAL_POSITIONS:-0}" \
   -e LIVE_MODELS_DIR="${LIVE_MODELS_DIR:-}" \

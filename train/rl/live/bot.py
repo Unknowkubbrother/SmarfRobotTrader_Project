@@ -30,6 +30,7 @@ from .config import (
     EVAL_ON_START,
     EMBED_QUALITY_MIN,
     EXECUTE_STALE_REPLAY_ORDERS,
+    FIXED_LOT,
     INTRABAR_TAKE_PROFIT_CHANGE_PCT,
     INTRABAR_TAKE_PROFIT_MONEY,
     INTRABAR_TAKE_PROFIT_PIPS,
@@ -76,6 +77,7 @@ from .config import (
     POLL_SECONDS,
     RISK_PERCENT,
     RISK_LEVEL,
+    RISK_MODE,
     RISK_PROFILE_MAP,
     SPREAD_PIPS,
     STATE_FILE,
@@ -178,8 +180,14 @@ class LiveTradingBot:
         self.risk_profile_map = dict(RISK_PROFILE_MAP or {"low": 0.5, "medium": 1.0, "high": 1.5})
         self.risk_level = str(RISK_LEVEL or "medium").lower()
         self.risk_percent = float(RISK_PERCENT)
+        self.risk_mode = str(RISK_MODE or "level").strip().lower()
+        self.fixed_lot = self._normalize_runtime_lot(FIXED_LOT, fallback=0.0)
         if self.risk_level not in self.risk_profile_map:
             self.risk_level = "medium"
+        if self.risk_mode not in {"level", "custom_lot"}:
+            self.risk_mode = "level"
+        if self.risk_mode == "custom_lot" and self.fixed_lot < 0.01:
+            self.risk_mode = "level"
         self.trading_schedule = dict(TRADING_SCHEDULE_DEFAULT)
         self._mt5_reconnect_lock = threading.Lock()
         self._mt5_last_reconnect_at = 0.0
@@ -407,10 +415,7 @@ class LiveTradingBot:
             raise RuntimeError(f"symbol_select({SYMBOL}) failed")
 
         self.initial_balance = float(account_info.balance)
-        self.current_lot = max(
-            0.01,
-            calc_auto_lot(self.initial_balance, risk_pct=self._resolve_runtime_risk_percent()),
-        )
+        self.current_lot = self._resolve_runtime_lot(self.initial_balance)
         self.point = float(symbol_info.point)
         self.digits = int(symbol_info.digits)
         self.pip_size = self.point * 10 if self.digits in (3, 5) else self.point
@@ -419,11 +424,11 @@ class LiveTradingBot:
             " [MT5] "
             f"account={account_info.login} symbol={SYMBOL} tf={TIMEFRAME_NAME} "
             f"balance={self.initial_balance:.2f} lot={self.current_lot:.2f} "
-            f"risk={self.risk_level}:{self.risk_percent:.2f}%"
+            f"risk={self._runtime_risk_label()}"
         )
         self._add_log(
             "success",
-            f"MT5 connected | account={account_info.login} | risk={self.risk_level}:{self.risk_percent:.2f}%",
+            f"MT5 connected | account={account_info.login} | risk={self._runtime_risk_label()}",
             phase="boot",
             event="mt5_connected",
             meta={
@@ -433,7 +438,9 @@ class LiveTradingBot:
                 "balance": float(self.initial_balance),
                 "lot": float(self.current_lot),
                 "risk_level": self.risk_level,
+                "risk_mode": self.risk_mode,
                 "risk_percent": float(self.risk_percent),
+                "fixed_lot": float(self.fixed_lot),
             },
         )
 
@@ -1237,13 +1244,7 @@ class LiveTradingBot:
             [
                 lambda: TradingEnv(
                     mock_df,
-                    lot_size=max(
-                        0.01,
-                        calc_auto_lot(
-                            self.initial_balance or 100.0,
-                            risk_pct=self._resolve_runtime_risk_percent(),
-                        ),
-                    ),
+                    lot_size=self._resolve_runtime_lot(self.initial_balance or 100.0),
                 )
             ]
         )
@@ -1413,16 +1414,43 @@ class LiveTradingBot:
             return float(self.risk_percent)
         return 1.0
 
-    def _refresh_lot_from_account(self):
-        if not self.dynamic_lot:
-            return
-        account = mt5.account_info()
-        if account is None:
-            return
-        next_lot = max(
+    def _normalize_runtime_lot(self, value, fallback: float = 0.01) -> float:
+        try:
+            lot = float(value)
+        except Exception:
+            lot = float(fallback)
+        return round(max(0.01, lot), 2)
+
+    def _is_custom_lot_mode(self) -> bool:
+        return str(self.risk_mode or "").strip().lower() == "custom_lot" and float(self.fixed_lot or 0.0) >= 0.01
+
+    def _resolve_runtime_lot(self, balance: float | None = None) -> float:
+        if self._is_custom_lot_mode():
+            return self._normalize_runtime_lot(self.fixed_lot)
+        try:
+            current_balance = float(balance)
+        except Exception:
+            current_balance = float(self.initial_balance or 0.0)
+        return max(
             0.01,
-            calc_auto_lot(float(account.balance), risk_pct=self._resolve_runtime_risk_percent()),
+            calc_auto_lot(current_balance, risk_pct=self._resolve_runtime_risk_percent()),
         )
+
+    def _runtime_risk_label(self) -> str:
+        if self._is_custom_lot_mode():
+            return f"custom_lot:{self._normalize_runtime_lot(self.fixed_lot):.2f}"
+        return f"{self.risk_level}:{self.risk_percent:.2f}%"
+
+    def _refresh_lot_from_account(self):
+        if self._is_custom_lot_mode():
+            next_lot = self._resolve_runtime_lot()
+        else:
+            if not self.dynamic_lot:
+                return
+            account = mt5.account_info()
+            if account is None:
+                return
+            next_lot = self._resolve_runtime_lot(float(account.balance))
         self.current_lot = float(next_lot)
         if self.bridge is not None:
             self.bridge.lot_size = float(next_lot)
@@ -1506,6 +1534,20 @@ class LiveTradingBot:
                 self.risk_level = lvl
                 changed = True
 
+        incoming_mode = payload.get("risk_mode")
+        if incoming_mode is not None:
+            mode = str(incoming_mode).strip().lower()
+            if mode in {"level", "custom_lot"} and mode != self.risk_mode:
+                self.risk_mode = mode
+                changed = True
+
+        incoming_custom_lot = payload.get("custom_lot")
+        if incoming_custom_lot is not None:
+            lot = self._normalize_runtime_lot(incoming_custom_lot, fallback=0.0)
+            if lot != self.fixed_lot:
+                self.fixed_lot = lot
+                changed = True
+
         incoming_percent = payload.get("risk_percent")
         if incoming_percent is not None:
             try:
@@ -1524,15 +1566,23 @@ class LiveTradingBot:
                 changed = True
 
         if changed:
+            if self.risk_mode == "custom_lot" and self.fixed_lot < 0.01:
+                self.risk_mode = "level"
             effective_risk = self._resolve_runtime_risk_percent()
             self.risk_percent = float(effective_risk)
             self._refresh_lot_from_account()
             self._add_log(
                 "info",
-                f"Runtime config updated ({source}) | risk={self.risk_level}:{self.risk_percent:.2f}%",
+                f"Runtime config updated ({source}) | risk={self._runtime_risk_label()}",
                 phase="config",
                 event="runtime_updated",
-                meta={"source": source, "risk_level": self.risk_level, "risk_percent": float(self.risk_percent)},
+                meta={
+                    "source": source,
+                    "risk_level": self.risk_level,
+                    "risk_mode": self.risk_mode,
+                    "risk_percent": float(self.risk_percent),
+                    "fixed_lot": float(self.fixed_lot),
+                },
             )
 
     def _send_ws_payload(self, payload: dict) -> bool:
@@ -1821,7 +1871,9 @@ class LiveTradingBot:
             "lot_size": float(self.current_lot),
             "unrealized_pnl": float(pos.profit) if pos is not None else 0.0,
             "risk_level": self.risk_level,
+            "risk_mode": self.risk_mode,
             "risk_percent": float(self.risk_percent),
+            "fixed_lot": float(self.fixed_lot),
             "risk_profile_map": self.risk_profile_map,
             "trading_schedule": self.trading_schedule,
             # MT5 Account
@@ -2418,7 +2470,9 @@ class LiveTradingBot:
             "timeframe": TIMEFRAME_NAME,
             "runtime_config": {
                 "risk_level": self.risk_level,
+                "risk_mode": self.risk_mode,
                 "risk_percent": float(self.risk_percent),
+                "custom_lot": float(self.fixed_lot),
                 "risk_profile_map": dict(self.risk_profile_map),
                 "trading_schedule": dict(self.trading_schedule),
             },
@@ -3071,15 +3125,11 @@ class LiveTradingBot:
 
         if SYNC_EXTERNAL_LOT and pos is not None and float(pos.volume) > 0:
             self.bridge.lot_size = float(pos.volume)
+        elif self._is_custom_lot_mode():
+            self.bridge.lot_size = self._resolve_runtime_lot()
         elif self.dynamic_lot:
             if account is not None:
-                self.bridge.lot_size = max(
-                    0.01,
-                    calc_auto_lot(
-                        float(account.balance),
-                        risk_pct=self._resolve_runtime_risk_percent(),
-                    ),
-                )
+                self.bridge.lot_size = self._resolve_runtime_lot(float(account.balance))
             else:
                 self.bridge.lot_size = max(0.01, float(self.bridge.lot_size))
         else:
@@ -4506,16 +4556,12 @@ class LiveTradingBot:
         side = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
-        if self.dynamic_lot:
+        if self._is_custom_lot_mode():
+            self.current_lot = self._resolve_runtime_lot()
+        elif self.dynamic_lot:
             account = mt5.account_info()
             if account is not None:
-                self.current_lot = max(
-                    0.01,
-                    calc_auto_lot(
-                        float(account.balance),
-                        risk_pct=self._resolve_runtime_risk_percent(),
-                    ),
-                )
+                self.current_lot = self._resolve_runtime_lot(float(account.balance))
         elif self.bridge is not None:
             self.current_lot = max(0.01, float(self.bridge.lot_size))
 

@@ -17,6 +17,7 @@ interface BotSelectorProps {
   selectedBotId: string | null;
   onBotSelect: (botId: string) => void;
   accountId: string;
+  accountBalance?: number | null;
   onBotAdded: () => void;
   getBotPnl?: (botId: string, fallbackPnl: number) => number;
   addBotDisabled?: boolean;
@@ -28,6 +29,7 @@ export function BotSelector({
   selectedBotId,
   onBotSelect,
   accountId,
+  accountBalance = 0,
   onBotAdded,
   getBotPnl,
   addBotDisabled = false,
@@ -191,6 +193,7 @@ export function BotSelector({
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         accountId={accountId}
+        accountBalance={accountBalance}
         existingBots={bots}
         blockedReason={addBotDisabled ? addBotDisabledReason : null}
         onBotAdded={() => {

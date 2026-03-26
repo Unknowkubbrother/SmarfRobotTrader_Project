@@ -135,6 +135,10 @@ def build_bot_runtime_env(
     docker_image_id: str | None = None,
     bot_version_tag: str | None = None,
     magic_number: int | None = None,
+    risk_level: str | None = None,
+    risk_mode: str | None = None,
+    custom_lot: float | None = None,
+    trading_schedule: dict[str, bool] | str | None = None,
 ) -> dict[str, str]:
     public_host = str(
         os.getenv("BOT_RUNNER_PUBLIC_HOST")
@@ -285,6 +289,33 @@ def build_bot_runtime_env(
 
     if magic_number is not None:
         env["LIVE_MAGIC_NUMBER"] = str(int(magic_number))
+
+    resolved_risk_level = str(risk_level or "").strip().lower()
+    if resolved_risk_level in {"low", "medium", "high"}:
+        env["LIVE_RISK_LEVEL"] = resolved_risk_level
+
+    resolved_risk_mode = str(risk_mode or "").strip().lower()
+    if resolved_risk_mode in {"level", "custom_lot"}:
+        env["LIVE_RISK_MODE"] = resolved_risk_mode
+
+    if custom_lot is not None:
+        try:
+            normalized_custom_lot = round(max(0.01, float(custom_lot)), 2)
+        except (TypeError, ValueError):
+            normalized_custom_lot = None
+        if normalized_custom_lot is not None:
+            env["LIVE_FIXED_LOT"] = f"{normalized_custom_lot:.2f}"
+
+    schedule_json = ""
+    if isinstance(trading_schedule, str):
+        schedule_json = str(trading_schedule).strip()
+    elif trading_schedule is not None:
+        try:
+            schedule_json = json.dumps(trading_schedule, ensure_ascii=True, separators=(",", ":"))
+        except Exception:
+            schedule_json = ""
+    if schedule_json:
+        env["LIVE_TRADING_SCHEDULE_JSON"] = schedule_json
 
     resolved_image_ref = _resolve_image_ref_with_version(docker_image_id, bot_version_tag)
     if resolved_image_ref:

@@ -31,7 +31,7 @@ def resolve_vision_source_context(bot_config_id: str | None = None) -> VisionSou
     if not bot_id:
         return VisionSourceContext(
             cache_scope="shared",
-            display_label="shared server MT5 source",
+            display_label="shared chart payload source",
             bot_config_id="",
             server_name="",
             login_id="",

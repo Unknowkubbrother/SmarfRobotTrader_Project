@@ -11,15 +11,21 @@ class Create_Bot_Version(BaseModel):
     releaseNotes: List[str]
 
 
-class RiskLevelEnum(Enum):
+class RiskLevelEnum(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
 
+class RiskModeEnum(str, Enum):
+    LEVEL = "level"
+    CUSTOM_LOT = "custom_lot"
+
 class Create_Bot_Configuration(BaseModel):
     accountId: str
     modelId: str
-    riskLevel: RiskLevelEnum
+    riskLevel: RiskLevelEnum = RiskLevelEnum.MEDIUM
+    riskMode: RiskModeEnum = RiskModeEnum.LEVEL
+    customLot: Optional[float] = None
 
 class Update_Bot_Status(BaseModel):
     botConfigId: str
@@ -27,7 +33,9 @@ class Update_Bot_Status(BaseModel):
 
 class Update_Bot_Risk(BaseModel):
     botConfigId: str
-    riskLevel: RiskLevelEnum
+    riskLevel: Optional[RiskLevelEnum] = None
+    riskMode: RiskModeEnum = RiskModeEnum.LEVEL
+    customLot: Optional[float] = None
 
 class Update_Bot_Schedule(BaseModel):
     botConfigId: str
