@@ -3,11 +3,20 @@ import { Activity, AlertTriangle, Shield, Sparkles } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { useAuth } from "@/contexts/AuthContext";
 import { api } from "@/lib/api";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import type { BotConfigWithVersion } from "@/hooks/useTradingAccounts";
+import {
+  DEFAULT_RISK_LEVEL,
+  DEFAULT_RISK_MODE,
+  RISK_LEVEL_OPTIONS,
+  estimateBotLotSize,
+  formatLotSize,
+  normalizeCustomLot,
+} from "@/lib/botRisk";
 
 interface BotVersion {
   id: string;
@@ -24,16 +33,11 @@ interface AddBotDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   accountId: string;
+  accountBalance?: number | null;
   existingBots?: BotConfigWithVersion[];
   onBotAdded: () => void;
   blockedReason?: string | null;
 }
-
-const riskLevels = [
-  { id: "low", label: "Low", description: "Conservative trading", color: "text-success" },
-  { id: "medium", label: "Medium", description: "Balanced approach", color: "text-warning" },
-  { id: "high", label: "High", description: "Aggressive trading", color: "text-destructive" },
-];
 
 const normalizePairValue = (value: string | null | undefined): string =>
   String(value || "").trim().toUpperCase();
@@ -51,6 +55,7 @@ export function AddBotDialog({
   open,
   onOpenChange,
   accountId,
+  accountBalance = 0,
   existingBots = [],
   onBotAdded,
   blockedReason = null,
@@ -58,7 +63,9 @@ export function AddBotDialog({
   const { user } = useAuth();
   const [botVersions, setBotVersions] = useState<BotVersion[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
-  const [selectedRisk, setSelectedRisk] = useState("medium");
+  const [selectedRisk, setSelectedRisk] = useState(DEFAULT_RISK_LEVEL);
+  const [selectedRiskMode, setSelectedRiskMode] = useState(DEFAULT_RISK_MODE);
+  const [customLotInput, setCustomLotInput] = useState("");
   const [loading, setLoading] = useState(false);
   const subscriptionBlocked = Boolean(blockedReason ?? user?.subscription_blocked);
   const subscriptionBlockedReason =
@@ -86,7 +93,9 @@ export function AddBotDialog({
   useEffect(() => {
     if (!open) {
       setSelectedModel(null);
-      setSelectedRisk("medium");
+      setSelectedRisk(DEFAULT_RISK_LEVEL);
+      setSelectedRiskMode(DEFAULT_RISK_MODE);
+      setCustomLotInput("");
       return;
     }
 
@@ -130,26 +139,39 @@ export function AddBotDialog({
       return;
     }
 
+    const resolvedCustomLot = normalizeCustomLot(customLotInput);
+    if (selectedRiskMode === "custom_lot" && resolvedCustomLot === null) {
+      toast.error("Please enter a custom lot of at least 0.01");
+      return;
+    }
+
     setLoading(true);
     try {
       await api.post("/bot/create_bot_configuration", {
         accountId,
         modelId: selectedModel,
         riskLevel: selectedRisk,
+        riskMode: selectedRiskMode,
+        customLot: resolvedCustomLot ?? undefined,
       });
 
       toast.success("Bot added successfully");
       onOpenChange(false);
       onBotAdded();
       setSelectedModel(null);
-      setSelectedRisk("medium");
+      setSelectedRisk(DEFAULT_RISK_LEVEL);
+      setSelectedRiskMode(DEFAULT_RISK_MODE);
+      setCustomLotInput("");
     } catch (error: any) {
       console.error("Error creating bot:", error);
-      toast.error(error.message || "Failed to add bot");
+      toast.error(error?.response?.data?.detail || error.message || "Failed to add bot");
     } finally {
       setLoading(false);
     }
   };
+
+  const balanceForPreview = Number(accountBalance ?? 0);
+  const customLotPreview = normalizeCustomLot(customLotInput);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -258,15 +280,23 @@ export function AddBotDialog({
               <Shield className="w-4 h-4" />
               Risk Level
             </h3>
-            <div className="grid grid-cols-3 gap-3">
-              {riskLevels.map((level) => (
+            <div className="mb-3 rounded-xl border border-border/60 bg-secondary/30 p-3 text-xs text-muted-foreground">
+              {balanceForPreview > 0
+                ? `Estimated lots are based on current account balance $${balanceForPreview.toFixed(2)}.`
+                : "Estimated lots use the default balance fallback until account balance is available."}
+            </div>
+            <div className="grid gap-3 md:grid-cols-4">
+              {RISK_LEVEL_OPTIONS.map((level) => (
                 <button
                   key={level.id}
-                  onClick={() => setSelectedRisk(level.id)}
+                  onClick={() => {
+                    setSelectedRisk(level.id);
+                    setSelectedRiskMode("level");
+                  }}
                   disabled={subscriptionBlocked}
                   className={cn(
                     "p-3 rounded-xl border text-left transition-all",
-                    selectedRisk === level.id
+                    selectedRiskMode === "level" && selectedRisk === level.id
                       ? "border-primary bg-primary/5"
                       : "border-border hover:border-primary/50"
                   )}
@@ -277,8 +307,84 @@ export function AddBotDialog({
                   <p className="text-xs text-muted-foreground mt-0.5">
                     {level.description}
                   </p>
+                  <p className="text-xs text-muted-foreground mt-2">
+                    Est. {formatLotSize(
+                      estimateBotLotSize({
+                        balance: balanceForPreview,
+                        riskLevel: level.id,
+                        riskMode: "level",
+                      })
+                    )}
+                  </p>
+                  {selectedRiskMode === "level" && selectedRisk === level.id && (
+                    <span className="mt-2 inline-flex rounded-full bg-primary px-2 py-0.5 text-[11px] font-medium text-primary-foreground">
+                      Active
+                    </span>
+                  )}
                 </button>
               ))}
+
+              <div
+                className={cn(
+                  "rounded-xl border p-3 transition-all",
+                  selectedRiskMode === "custom_lot"
+                    ? "border-primary bg-primary/5"
+                    : "border-border hover:border-primary/50"
+                )}
+                onClick={() => setSelectedRiskMode("custom_lot")}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium text-sm text-primary">Custom Lot</span>
+                  {selectedRiskMode === "custom_lot" && (
+                    <span className="inline-flex rounded-full bg-primary px-2 py-0.5 text-[11px] font-medium text-primary-foreground">
+                      Active
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Use a fixed lot size instead of auto risk.
+                </p>
+                <Input
+                  type="number"
+                  min="0.01"
+                  step="0.01"
+                  inputMode="decimal"
+                  value={customLotInput}
+                  onClick={(event) => event.stopPropagation()}
+                  onFocus={() => setSelectedRiskMode("custom_lot")}
+                  onChange={(event) => {
+                    setSelectedRiskMode("custom_lot");
+                    setCustomLotInput(event.target.value);
+                  }}
+                  disabled={subscriptionBlocked}
+                  placeholder="0.05"
+                  className="mt-3"
+                />
+                <p className="text-xs text-muted-foreground mt-2">
+                  {customLotPreview !== null
+                    ? `Will trade ${formatLotSize(customLotPreview)}`
+                    : "Minimum 0.01 lot"}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-border/60 bg-secondary/30 p-3 text-sm">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted-foreground">Selected Risk</span>
+              <span className="font-medium">
+                {selectedRiskMode === "custom_lot"
+                  ? customLotPreview !== null
+                    ? `Custom • ${formatLotSize(customLotPreview)}`
+                    : "Custom • Pending input"
+                  : `${RISK_LEVEL_OPTIONS.find((level) => level.id === selectedRisk)?.label || "Medium"} • ${formatLotSize(
+                      estimateBotLotSize({
+                        balance: balanceForPreview,
+                        riskLevel: selectedRisk,
+                        riskMode: "level",
+                      })
+                    )}`}
+              </span>
             </div>
           </div>
 

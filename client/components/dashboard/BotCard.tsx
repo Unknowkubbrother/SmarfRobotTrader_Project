@@ -3,6 +3,7 @@ import { Power, Play, Activity, TrendingUp, Trash2, AlertTriangle, DownloadCloud
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { BotConfigWithVersion } from "@/hooks/useTradingAccounts";
+import { getRiskColorClass, getRiskSummary } from "@/lib/botRisk";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -46,7 +47,12 @@ export function BotCard({
   const isToggleDisabled = isActionLocked || isStartLockedByVersion || isStartBlockedBySubscription;
   const symbol = bot.bot_version?.symbol || "N/A";
   const label = bot.bot_version?.label || "No Model";
-  const riskLevel = bot.risk_level || "medium";
+  const riskSummary = getRiskSummary({
+    riskLevel: bot.risk_level,
+    riskMode: bot.risk_mode,
+    customLot: bot.custom_lot,
+    lotSize: bot.estimated_lot_size,
+  });
 
   const handleToggleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -99,14 +105,6 @@ export function BotCard({
             Stopped
           </span>
         );
-    }
-  };
-
-  const getRiskColor = (risk: string) => {
-    switch (risk) {
-      case "low": return "text-success";
-      case "high": return "text-destructive";
-      default: return "text-warning";
     }
   };
 
@@ -174,7 +172,7 @@ export function BotCard({
               <p className="text-xs text-muted-foreground mt-0.5">
                 <span className="font-mono">{symbol}</span>
                 <span className="mx-1.5">•</span>
-                <span className={getRiskColor(riskLevel)}>{riskLevel} risk</span>
+                <span className={getRiskColorClass(bot.risk_level, bot.risk_mode)}>{riskSummary}</span>
               </p>
             </div>
           </div>

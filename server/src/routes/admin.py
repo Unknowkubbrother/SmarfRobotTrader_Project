@@ -42,7 +42,7 @@ from ..utils.subscription_billing import (
     notify_invoice_event,
     sync_daily_aggregate_status_for_invoice,
 )
-from ..utils.trading_schedule import normalize_trading_schedule
+from ..utils.bot_runtime_config import parse_bot_runtime_settings
 from .authentication import get_current_active_user
 
 admin_router = APIRouter(tags=["Admin"])
@@ -333,8 +333,10 @@ async def _extract_admin_runtime_context(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     magic_number = await _ensure_bot_config_magic_number(bot_configuration)
-    runtime_risk_level = _enum_value(getattr(bot_configuration, "riskLevel", None))
-    runtime_schedule = normalize_trading_schedule(getattr(bot_configuration, "tradingSchedule", None))
+    runtime_settings = parse_bot_runtime_settings(
+        getattr(bot_configuration, "tradingSchedule", None),
+        risk_level=_enum_value(getattr(bot_configuration, "riskLevel", None)),
+    )
 
     runtime_env = build_bot_runtime_env(
         bot_config_id=str(bot_configuration.id),
@@ -347,8 +349,10 @@ async def _extract_admin_runtime_context(
         docker_image_id=image_ref,
         bot_version_tag=effective_version_tag,
         magic_number=magic_number,
-        risk_level=str(runtime_risk_level or "").strip() or None,
-        trading_schedule=runtime_schedule,
+        risk_level=str(runtime_settings["risk_level"] or "").strip() or None,
+        risk_mode=str(runtime_settings["risk_mode"] or "").strip() or None,
+        custom_lot=runtime_settings["custom_lot"],
+        trading_schedule=runtime_settings["schedule"],
     )
 
     return {

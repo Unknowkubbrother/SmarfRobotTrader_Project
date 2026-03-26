@@ -75,7 +75,9 @@ export interface BotLiveState {
     lot_size?: number;
     unrealized_pnl?: number;
     risk_level?: string;
+    risk_mode?: string;
     risk_percent?: number;
+    fixed_lot?: number;
     risk_profile_map?: Record<string, number>;
     trading_schedule?: Record<string, boolean>;
     connected?: boolean;

@@ -31,7 +31,7 @@ from ..utils.notification_delivery import (
     dispatch_notification_to_user_id,
 )
 from ..utils.subscription_access import assert_user_subscription_allows_bot_usage
-from ..utils.trading_schedule import normalize_trading_schedule
+from ..utils.bot_runtime_config import estimate_lot_size, parse_bot_runtime_settings
 from ..utils.ws_manager import bot_hub
 from ..utils.vision_llm.chart import (
     ChartRatesResult,
@@ -1682,6 +1682,10 @@ async def get_accounts_with_bots(
         for account in trading_accounts:
             bot_configs = []
             for config in account.botConfigurations:
+                runtime_settings = parse_bot_runtime_settings(
+                    getattr(config, "tradingSchedule", None),
+                    risk_level=getattr(config, "riskLevel", None),
+                )
                 bot_version = None
                 latest_image_id = None
                 latest_release_notes = []
@@ -1727,8 +1731,16 @@ async def get_accounts_with_bots(
                     "model_id": str(config.modelId),
                     "bot_instance_id": config.botInstanceId,
                     "magic_number": int(getattr(config, "magicNumber", 0) or 0) or None,
-                    "risk_level": config.riskLevel if config.riskLevel else None,
-                    "trading_schedule": normalize_trading_schedule(config.tradingSchedule),
+                    "risk_level": runtime_settings["risk_level"],
+                    "risk_mode": runtime_settings["risk_mode"],
+                    "custom_lot": runtime_settings["custom_lot"],
+                    "estimated_lot_size": estimate_lot_size(
+                        balance=float(account.balance) if account.balance else 0.0,
+                        risk_level=runtime_settings["risk_level"],
+                        risk_mode=runtime_settings["risk_mode"],
+                        custom_lot=runtime_settings["custom_lot"],
+                    ),
+                    "trading_schedule": runtime_settings["schedule"],
                     "is_active": config.isActive,
                     "docker_container_id": config.dockerContainerId,
                     "installed_docker_image_id": effective_installed_image_id,

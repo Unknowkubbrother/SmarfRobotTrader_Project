@@ -435,6 +435,7 @@ export default function Dashboard() {
               selectedBotId={selectedBotId}
               onBotSelect={setSelectedBotId}
               accountId={selectedAccount.id}
+              accountBalance={selectedAccount.balance}
               onBotAdded={refetch}
               getBotPnl={(botId, fallbackPnl) => getBotState(botId)?.total_pnl ?? fallbackPnl}
               addBotDisabled={subscriptionBlocked}
@@ -708,6 +709,7 @@ export default function Dashboard() {
           open={addBotOpen}
           onOpenChange={setAddBotOpen}
           accountId={selectedAccount.id}
+          accountBalance={selectedAccount.balance}
           existingBots={selectedAccount.bot_configurations}
           onBotAdded={refetch}
           blockedReason={subscriptionBlocked ? subscriptionBlockedReason : null}

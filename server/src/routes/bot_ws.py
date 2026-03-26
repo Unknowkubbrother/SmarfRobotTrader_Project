@@ -22,7 +22,7 @@ from ..utils.vision_llm.llm_client import (
     VisionLLMConfigError,
     VisionLLMServiceUnavailableError,
 )
-from ..utils.trading_schedule import normalize_trading_schedule
+from ..utils.bot_runtime_config import parse_bot_runtime_settings
 from ..utils.vision_llm.source_context import build_vision_cache_key, resolve_vision_source_context
 from ..utils.vision_llm.use_llm import generate_llm_cls_for_bar
 from ..utils.ws_manager import bot_hub
@@ -855,13 +855,17 @@ async def bot_websocket(websocket: WebSocket):
                             "mt5_login_id": str(getattr(getattr(config, "account", None), "mt5LoginId", "") or ""),
                             "bot_label": str(getattr(getattr(config, "botVersion", None), "label", "") or ""),
                         }
-                        raw_schedule = getattr(config, "tradingSchedule", None)
-                        schedule = normalize_trading_schedule(raw_schedule)
+                        runtime_settings = parse_bot_runtime_settings(
+                            getattr(config, "tradingSchedule", None),
+                            risk_level=_enum_value(getattr(config, "riskLevel", None)),
+                        )
                         await bot_hub.send_bot_config(
                             bot_config_id,
                             {
-                                "risk_level": _enum_value(getattr(config, "riskLevel", None)),
-                                "trading_schedule": schedule,
+                                "risk_level": runtime_settings["risk_level"],
+                                "risk_mode": runtime_settings["risk_mode"],
+                                "custom_lot": runtime_settings["custom_lot"],
+                                "trading_schedule": runtime_settings["schedule"],
                             },
                         )
                     except Exception as exc:

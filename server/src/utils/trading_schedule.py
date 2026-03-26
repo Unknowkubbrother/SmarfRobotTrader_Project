@@ -45,6 +45,10 @@ def normalize_trading_schedule(value) -> dict[str, bool]:
     else:
         payload = {}
 
+    nested_schedule = payload.get("schedule") if isinstance(payload, Mapping) else None
+    if isinstance(nested_schedule, Mapping):
+        payload = nested_schedule
+
     normalized = dict(DEFAULT_TRADING_SCHEDULE)
     for raw_key, raw_value in payload.items():
         key = _ALIAS_TO_KEY.get(str(raw_key).strip().lower())

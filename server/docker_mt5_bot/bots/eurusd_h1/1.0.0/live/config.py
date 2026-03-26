@@ -183,6 +183,12 @@ _default_risk = float(RISK_PROFILE_MAP.get(RISK_LEVEL, 1.0))
 RISK_PERCENT = _env_float(_default_risk, "LIVE_RISK_PERCENT", "RISK_PERCENT")
 if RISK_PERCENT <= 0:
     RISK_PERCENT = _default_risk
+RISK_MODE = (_env_first("LIVE_RISK_MODE") or "level").strip().lower()
+if RISK_MODE not in {"level", "custom_lot"}:
+    RISK_MODE = "level"
+FIXED_LOT = max(0.0, _env_float(0.0, "LIVE_FIXED_LOT", "LIVE_CUSTOM_LOT"))
+if RISK_MODE == "custom_lot" and FIXED_LOT < 0.01:
+    RISK_MODE = "level"
 
 TRADING_SCHEDULE_DEFAULT = _parse_trading_schedule(_env_first("LIVE_TRADING_SCHEDULE_JSON"))
 

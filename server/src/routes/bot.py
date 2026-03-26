@@ -15,6 +15,15 @@ from ..models.bot_model import (
     Emergency_Bot_Stop,
 )
 from ..database.client import db
+from ..utils.bot_runtime_config import (
+    CUSTOM_LOT_RISK_MODE,
+    merge_bot_runtime_settings,
+    normalize_custom_lot,
+    normalize_risk_level,
+    normalize_risk_mode,
+    parse_bot_runtime_settings,
+    serialize_bot_runtime_settings,
+)
 from ..utils.trading_schedule import normalize_trading_schedule
 from ..utils.mt5_bot_runner import (
     BotRunnerError,
@@ -194,8 +203,10 @@ async def _extract_runtime_context(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     magic_number = await _ensure_bot_magic_number(config)
-    runtime_risk_level = _enum_value(getattr(config, "riskLevel", None))
-    runtime_schedule = normalize_trading_schedule(getattr(config, "tradingSchedule", None))
+    runtime_settings = parse_bot_runtime_settings(
+        getattr(config, "tradingSchedule", None),
+        risk_level=_enum_value(getattr(config, "riskLevel", None)),
+    )
 
     runtime_env = build_bot_runtime_env(
         bot_config_id=str(config.id),
@@ -208,8 +219,10 @@ async def _extract_runtime_context(
         docker_image_id=image_ref,
         bot_version_tag=effective_version_tag,
         magic_number=magic_number,
-        risk_level=str(runtime_risk_level or "").strip() or None,
-        trading_schedule=runtime_schedule,
+        risk_level=str(runtime_settings["risk_level"] or "").strip() or None,
+        risk_mode=str(runtime_settings["risk_mode"] or "").strip() or None,
+        custom_lot=runtime_settings["custom_lot"],
+        trading_schedule=runtime_settings["schedule"],
     )
 
     return {
@@ -434,14 +447,23 @@ async def create_bot_configuration(request: Request, data: Create_Bot_Configurat
         bot_instance_id=int(botInstanceId),
     )
     
-    tradingSchedule = normalize_trading_schedule({})
+    requested_risk_mode = normalize_risk_mode(_enum_value(getattr(data, "riskMode", None)))
+    requested_custom_lot = normalize_custom_lot(getattr(data, "customLot", None))
+    if requested_risk_mode == CUSTOM_LOT_RISK_MODE and requested_custom_lot is None:
+        raise HTTPException(status_code=400, detail="Custom lot must be at least 0.01")
+
+    trading_settings = serialize_bot_runtime_settings(
+        schedule={},
+        risk_mode=requested_risk_mode,
+        custom_lot=requested_custom_lot,
+    )
 
     bot_configuration = await db.botconfiguration.create(
         data={
             "account": {"connect": {"id": data.accountId}},
             "botVersion": {"connect": {"modelId": data.modelId}},
             "riskLevel": data.riskLevel.value,
-            "tradingSchedule": Json(tradingSchedule),
+            "tradingSchedule": Json(trading_settings),
             "isActive": False,
             "recordStatus": ACTIVE_RECORD_STATUS,
             "deletedAt": None,
@@ -747,15 +769,45 @@ async def update_bot_risk(request: Request, data: Update_Bot_Risk):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
 
-    await verify_bot_ownership(data.botConfigId, request.state.user_id)
+    config = await verify_bot_ownership(data.botConfigId, request.state.user_id)
+
+    requested_risk_mode = normalize_risk_mode(_enum_value(getattr(data, "riskMode", None)))
+    requested_custom_lot = normalize_custom_lot(getattr(data, "customLot", None))
+    if requested_risk_mode == CUSTOM_LOT_RISK_MODE and requested_custom_lot is None:
+        raise HTTPException(status_code=400, detail="Custom lot must be at least 0.01")
+
+    current_risk_level = normalize_risk_level(_enum_value(getattr(config, "riskLevel", None)))
+    next_risk_level = (
+        normalize_risk_level(data.riskLevel.value)
+        if getattr(data, "riskLevel", None) is not None
+        else current_risk_level
+    )
+    next_trading_settings = merge_bot_runtime_settings(
+        getattr(config, "tradingSchedule", None),
+        risk_mode=requested_risk_mode,
+        custom_lot=requested_custom_lot if requested_risk_mode == CUSTOM_LOT_RISK_MODE else None,
+    )
+
+    update_payload: dict[str, object] = {
+        "tradingSchedule": Json(next_trading_settings),
+    }
+    if requested_risk_mode == CUSTOM_LOT_RISK_MODE:
+        if getattr(data, "riskLevel", None) is not None:
+            update_payload["riskLevel"] = next_risk_level
+    else:
+        update_payload["riskLevel"] = next_risk_level
 
     await db.botconfiguration.update(
         where={"id": data.botConfigId},
-        data={"riskLevel": data.riskLevel.value}
+        data=update_payload,
     )
     await bot_hub.send_bot_config(
         data.botConfigId,
-        {"risk_level": data.riskLevel.value},
+        {
+            "risk_level": next_risk_level,
+            "risk_mode": requested_risk_mode,
+            "custom_lot": requested_custom_lot if requested_risk_mode == CUSTOM_LOT_RISK_MODE else None,
+        },
     )
 
     # Log Activity
@@ -766,7 +818,12 @@ async def update_bot_risk(request: Request, data: Update_Bot_Risk):
             data={
                 "userId": request.state.user_id,
                 "topic": "Bot Config",
-                "detail": f"Bot {data.botConfigId} risk level updated to {data.riskLevel.value}",
+                "detail": (
+                    f"Bot {data.botConfigId} risk updated to custom lot "
+                    f"{requested_custom_lot:.2f}"
+                    if requested_risk_mode == CUSTOM_LOT_RISK_MODE and requested_custom_lot is not None
+                    else f"Bot {data.botConfigId} risk level updated to {next_risk_level}"
+                ),
                 "ipAddress": ip_address,
                 "deviceInfo": user_agent[:255]
             }
@@ -774,7 +831,14 @@ async def update_bot_risk(request: Request, data: Update_Bot_Risk):
     except Exception as e:
         print(f"Failed to log activity: {e}")
 
-    return {"status_code": 200, "message": "Risk level updated"}
+    return {
+        "status_code": 200,
+        "message": (
+            f"Risk updated to custom lot {requested_custom_lot:.2f}"
+            if requested_risk_mode == CUSTOM_LOT_RISK_MODE and requested_custom_lot is not None
+            else f"Risk level updated to {next_risk_level}"
+        ),
+    }
 
 
 @bot_router.patch('/update_schedule', tags=["bot"])
@@ -782,13 +846,17 @@ async def update_bot_schedule(request: Request, data: Update_Bot_Schedule):
     if not request.state.user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
 
-    await verify_bot_ownership(data.botConfigId, request.state.user_id)
+    config = await verify_bot_ownership(data.botConfigId, request.state.user_id)
 
     normalized_schedule = normalize_trading_schedule(data.tradingSchedule)
+    next_trading_settings = merge_bot_runtime_settings(
+        getattr(config, "tradingSchedule", None),
+        schedule=normalized_schedule,
+    )
 
     await db.botconfiguration.update(
         where={"id": data.botConfigId},
-        data={"tradingSchedule": Json(normalized_schedule)}
+        data={"tradingSchedule": Json(next_trading_settings)}
     )
     await bot_hub.send_bot_config(
         data.botConfigId,
