@@ -249,6 +249,33 @@ async def _stripe_call(callable_obj, *args, **kwargs):
     return await asyncio.to_thread(callable_obj, *args, **kwargs)
 
 
+def _stripe_object_get(value: Any, key: str, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        result = value.get(key, default)
+        return default if result is None else result
+    try:
+        result = getattr(value, key)
+    except AttributeError:
+        try:
+            result = value[key]
+        except Exception:
+            return default
+    except Exception:
+        return default
+    return default if result is None else result
+
+
+def _stripe_object_list(value: Any, key: str) -> list[Any]:
+    items = _stripe_object_get(value, key, [])
+    if isinstance(items, list):
+        return items
+    if isinstance(items, tuple):
+        return list(items)
+    return []
+
+
 def _resolve_frontend_base_url() -> str:
     frontend_url = build_absolute_related_link("/") or "http://localhost:3000/"
     return str(frontend_url).rstrip("/")
@@ -276,7 +303,10 @@ def _build_checkout_cancel_url(invoice_id: str) -> str:
 
 
 def _checkout_session_is_reusable(session) -> bool:
-    return str(session.get("status") or "").strip().lower() == "open" and bool(session.get("url"))
+    return (
+        str(_stripe_object_get(session, "status") or "").strip().lower() == "open"
+        and bool(_stripe_object_get(session, "url"))
+    )
 
 
 def _extract_stripe_object_id(value) -> str | None:
@@ -441,7 +471,7 @@ async def _get_or_create_stripe_customer(current_user):
     if customer_id:
         try:
             customer = await _stripe_call(stripe.Customer.retrieve, customer_id)
-            if customer and not customer.get("deleted", False):
+            if customer and not bool(_stripe_object_get(customer, "deleted", False)):
                 return customer_id
         except Exception:
             pass
@@ -452,7 +482,7 @@ async def _get_or_create_stripe_customer(current_user):
         name=current_user.username,
         metadata={"user_id": user_id},
     )
-    customer_id = customer.get("id")
+    customer_id = _extract_stripe_object_id(customer)
     if not customer_id:
         raise HTTPException(status_code=500, detail="Failed to create Stripe customer")
 
@@ -468,8 +498,8 @@ async def _upsert_local_payment_method(
     stripe_payment_method,
     is_default: bool,
 ):
-    provider_method_id = stripe_payment_method.get("id")
-    card = stripe_payment_method.get("card") or {}
+    provider_method_id = _extract_stripe_object_id(stripe_payment_method)
+    card = _stripe_object_get(stripe_payment_method, "card", {}) or {}
 
     existing = await db.userpaymentmethod.find_first(
         where={
@@ -479,11 +509,11 @@ async def _upsert_local_payment_method(
     )
 
     update_data = {
-        "type": stripe_payment_method.get("type"),
-        "cardLast4": card.get("last4"),
-        "cardBrand": card.get("brand"),
-        "expiryMonth": card.get("exp_month"),
-        "expiryYear": card.get("exp_year"),
+        "type": _stripe_object_get(stripe_payment_method, "type"),
+        "cardLast4": _stripe_object_get(card, "last4"),
+        "cardBrand": _stripe_object_get(card, "brand"),
+        "expiryMonth": _stripe_object_get(card, "exp_month"),
+        "expiryYear": _stripe_object_get(card, "exp_year"),
         "isActive": True,
         "isDefault": is_default,
     }
@@ -508,10 +538,8 @@ async def _sync_customer_payment_methods(user_id: str, stripe_customer_id: str):
         return
 
     customer = await _stripe_call(stripe.Customer.retrieve, stripe_customer_id)
-    invoice_settings = customer.get("invoice_settings") or {}
-    default_payment_method_id = invoice_settings.get("default_payment_method")
-    if isinstance(default_payment_method_id, dict):
-        default_payment_method_id = default_payment_method_id.get("id")
+    invoice_settings = _stripe_object_get(customer, "invoice_settings", {}) or {}
+    default_payment_method_id = _extract_stripe_object_id(_stripe_object_get(invoice_settings, "default_payment_method"))
 
     methods_response = await _stripe_call(
         stripe.PaymentMethod.list,
@@ -519,11 +547,11 @@ async def _sync_customer_payment_methods(user_id: str, stripe_customer_id: str):
         type="card",
         limit=20,
     )
-    methods = methods_response.get("data") or []
-    stripe_ids = {method.get("id") for method in methods if method.get("id")}
+    methods = _stripe_object_list(methods_response, "data")
+    stripe_ids = {_extract_stripe_object_id(method) for method in methods if _extract_stripe_object_id(method)}
 
     for method in methods:
-        provider_method_id = method.get("id")
+        provider_method_id = _extract_stripe_object_id(method)
         await _upsert_local_payment_method(
             user_id=user_id,
             stripe_payment_method=method,
@@ -552,7 +580,7 @@ async def _sync_checkout_card_payment_method(
     if not stripe_customer_id or not _stripe_enabled():
         return None
 
-    provider_method_id = _extract_stripe_object_id((stripe_payment_intent or {}).get("payment_method"))
+    provider_method_id = _extract_stripe_object_id(_stripe_object_get(stripe_payment_intent, "payment_method"))
     existing_local_method = None
     if provider_method_id:
         existing_local_method = await db.userpaymentmethod.find_first(
@@ -720,9 +748,9 @@ def _filter_user_visible_invoices(invoices: list[Any]) -> list[Any]:
 
 
 def _checkout_session_is_paid(session: Any) -> bool:
-    if not session or not hasattr(session, "get"):
+    if not session:
         return False
-    return str(session.get("payment_status") or "").strip().lower() == "paid"
+    return str(_stripe_object_get(session, "payment_status") or "").strip().lower() == "paid"
 
 
 async def _find_paid_checkout_session_for_invoice(
@@ -745,8 +773,8 @@ async def _find_paid_checkout_session_for_invoice(
             )
         except Exception:
             return None
-        metadata = (session.get("metadata") or {}) if hasattr(session, "get") else {}
-        if str(metadata.get("invoice_id") or "").strip() != invoice_id:
+        metadata = _stripe_object_get(session, "metadata", {}) or {}
+        if str(_stripe_object_get(metadata, "invoice_id") or "").strip() != invoice_id:
             return None
         if _checkout_session_is_paid(session):
             return session
@@ -768,23 +796,23 @@ async def _find_paid_checkout_session_for_invoice(
     except Exception:
         return None
 
-    for payment_intent in (payment_intents.get("data") or []):
-        metadata = (payment_intent.get("metadata") or {}) if hasattr(payment_intent, "get") else {}
-        if str(metadata.get("invoice_id") or "").strip() != invoice_id:
+    for payment_intent in _stripe_object_list(payment_intents, "data"):
+        metadata = _stripe_object_get(payment_intent, "metadata", {}) or {}
+        if str(_stripe_object_get(metadata, "invoice_id") or "").strip() != invoice_id:
             continue
-        if str(payment_intent.get("status") or "").strip().lower() != "succeeded":
+        if str(_stripe_object_get(payment_intent, "status") or "").strip().lower() != "succeeded":
             continue
 
-        payment_details = payment_intent.get("payment_details") or {}
-        order_reference = str(payment_details.get("order_reference") or "").strip()
+        payment_details = _stripe_object_get(payment_intent, "payment_details", {}) or {}
+        order_reference = str(_stripe_object_get(payment_details, "order_reference") or "").strip()
         paid_session = await try_session(order_reference)
         if paid_session:
             return paid_session
 
         return {
-            "id": order_reference or f"checkout-{payment_intent.get('id')}",
+            "id": order_reference or f"checkout-{_stripe_object_get(payment_intent, 'id')}",
             "customer": stripe_customer_id,
-            "payment_intent": payment_intent.get("id"),
+            "payment_intent": _stripe_object_get(payment_intent, "id"),
             "payment_status": "paid",
             "status": "complete",
             "metadata": metadata,
@@ -833,8 +861,8 @@ async def _build_checkout_charge_result(
     local_payment_method,
     status: str,
 ):
-    latest_charge = (stripe_payment_intent or {}).get("latest_charge") or {}
-    if not isinstance(latest_charge, dict) and not hasattr(latest_charge, "get"):
+    latest_charge = _stripe_object_get(stripe_payment_intent, "latest_charge") or {}
+    if not isinstance(latest_charge, dict) and not hasattr(latest_charge, "id"):
         latest_charge = {}
     invoice_amount_usd = round(_to_float(getattr(invoice, "calculatedFee", None), 0.0), 2)
     amount_details = get_invoice_payment_amount_details(invoice)
@@ -855,10 +883,10 @@ async def _build_checkout_charge_result(
         paid_at=datetime.utcnow() if status == "paid" else None,
         note=_checkout_note_for_status(status),
         local_payment_method_id=str(getattr(local_payment_method, "id", "") or "").strip() or None,
-        provider_payment_method_id=_extract_stripe_object_id((stripe_payment_intent or {}).get("payment_method")),
+        provider_payment_method_id=_extract_stripe_object_id(_stripe_object_get(stripe_payment_intent, "payment_method")),
         request_id=_extract_request_id(stripe_payment_intent) or getattr(invoice, "processorRequestId", None),
         charge_id=_extract_stripe_object_id(latest_charge),
-        balance_transaction_id=_extract_stripe_object_id(latest_charge.get("balance_transaction")),
+        balance_transaction_id=_extract_stripe_object_id(_stripe_object_get(latest_charge, "balance_transaction")),
         payment_breakdown=merge_payment_breakdown_with_expected_amount(
             payment_breakdown,
             invoice_amount_usd=invoice_amount_usd,
@@ -868,7 +896,7 @@ async def _build_checkout_charge_result(
         ),
         payment_method_details=_build_payment_method_details(
             local_payment_method=local_payment_method,
-            stripe_payment_method=(stripe_payment_intent or {}).get("payment_method"),
+            stripe_payment_method=_stripe_object_get(stripe_payment_intent, "payment_method"),
         ),
         payment_error_details=_build_payment_error_details(None, payment_intent=stripe_payment_intent),
     )
@@ -889,7 +917,7 @@ async def _finalize_checkout_invoice(
         raise HTTPException(status_code=404, detail="Subscription not found for invoice")
 
     stripe_payment_intent = None
-    payment_intent_id = _extract_stripe_object_id((stripe_session or {}).get("payment_intent"))
+    payment_intent_id = _extract_stripe_object_id(_stripe_object_get(stripe_session, "payment_intent"))
     if payment_intent_id:
         try:
             stripe_payment_intent = await _stripe_call(
@@ -901,13 +929,13 @@ async def _finalize_checkout_invoice(
             stripe_payment_intent = None
 
     local_payment_method = None
-    stripe_customer_id = _extract_stripe_object_id((stripe_session or {}).get("customer")) or str(
+    stripe_customer_id = _extract_stripe_object_id(_stripe_object_get(stripe_session, "customer")) or str(
         getattr(user, "stripeCustomerId", "") or ""
     ).strip() or None
-    payment_method_data = (stripe_payment_intent or {}).get("payment_method") or {}
+    payment_method_data = _stripe_object_get(stripe_payment_intent, "payment_method", {}) or {}
     payment_method_type = ""
-    if isinstance(payment_method_data, dict):
-        payment_method_type = str(payment_method_data.get("type") or "").strip().lower()
+    if payment_method_data:
+        payment_method_type = str(_stripe_object_get(payment_method_data, "type") or "").strip().lower()
 
     if stripe_payment_intent and stripe_customer_id and payment_method_type == "card":
         local_payment_method = await _sync_checkout_card_payment_method(
@@ -1162,7 +1190,7 @@ async def create_setup_intent(
     except Exception as error:
         raise HTTPException(status_code=400, detail=f"Stripe error: {str(error)}")
 
-    client_secret = setup_intent.get("client_secret")
+    client_secret = _stripe_object_get(setup_intent, "client_secret")
     if not client_secret:
         raise HTTPException(status_code=500, detail="Failed to create Stripe setup intent")
 
@@ -1190,10 +1218,13 @@ async def attach_payment_method(
     except Exception as error:
         raise HTTPException(status_code=400, detail=f"Stripe error: {str(error)}")
 
-    if stripe_payment_method.get("type") != "card":
+    if _stripe_object_get(stripe_payment_method, "type") != "card":
         raise HTTPException(status_code=400, detail="Only card payment methods are supported")
 
-    attached_customer = stripe_payment_method.get("customer")
+    attached_customer = _extract_stripe_object_id(_stripe_object_get(stripe_payment_method, "customer")) or _stripe_object_get(
+        stripe_payment_method,
+        "customer",
+    )
     if attached_customer and attached_customer != customer_id:
         raise HTTPException(status_code=400, detail="Payment method belongs to another customer")
 
@@ -1394,11 +1425,12 @@ async def create_invoice_checkout_session(
     if existing_session_id.startswith("cs_"):
         try:
             existing_session = await _stripe_call(stripe.checkout.Session.retrieve, existing_session_id)
-            existing_flow = str((existing_session.get("metadata") or {}).get("payment_flow") or "").strip().lower()
+            existing_metadata = _stripe_object_get(existing_session, "metadata", {}) or {}
+            existing_flow = str(_stripe_object_get(existing_metadata, "payment_flow") or "").strip().lower()
             if _checkout_session_is_reusable(existing_session) and existing_flow == payment_flow:
                 return CreateCheckoutSessionResponse(
-                    session_id=str(existing_session.get("id")),
-                    url=existing_session.get("url"),
+                    session_id=str(_stripe_object_get(existing_session, "id")),
+                    url=_stripe_object_get(existing_session, "url"),
                 )
         except Exception:
             pass
@@ -1511,7 +1543,7 @@ async def create_invoice_checkout_session(
     except Exception as error:
         raise HTTPException(status_code=400, detail=f"Stripe error: {str(error)}")
 
-    session_id = str(session.get("id") or "").strip()
+    session_id = str(_stripe_object_get(session, "id") or "").strip()
     if not session_id:
         raise HTTPException(status_code=500, detail="Stripe did not return a checkout session id")
 
@@ -1525,7 +1557,7 @@ async def create_invoice_checkout_session(
 
     return CreateCheckoutSessionResponse(
         session_id=session_id,
-        url=session.get("url"),
+        url=_stripe_object_get(session, "url"),
     )
 
 
@@ -1613,16 +1645,18 @@ async def stripe_webhook(request: Request):
     except Exception as error:
         raise HTTPException(status_code=400, detail=f"Invalid Stripe webhook payload: {str(error)}")
 
-    event_type = str(event.get("type") or "").strip()
+    event_type = str(_stripe_object_get(event, "type") or "").strip()
     if event_type not in {
         "checkout.session.completed",
         "checkout.session.async_payment_succeeded",
         "checkout.session.async_payment_failed",
+        "checkout.session.expired",
     }:
         return {"received": True}
 
-    session = event.get("data", {}).get("object") or {}
-    invoice_id = str((session.get("metadata") or {}).get("invoice_id") or "").strip()
+    session = _stripe_object_get(_stripe_object_get(event, "data", {}) or {}, "object", {}) or {}
+    session_metadata = _stripe_object_get(session, "metadata", {}) or {}
+    invoice_id = str(_stripe_object_get(session_metadata, "invoice_id") or "").strip()
     if not invoice_id:
         return {"received": True}
 
@@ -1639,17 +1673,17 @@ async def stripe_webhook(request: Request):
     if not user:
         return {"received": True}
 
-    if event_type == "checkout.session.async_payment_failed":
+    if event_type in {"checkout.session.async_payment_failed", "checkout.session.expired"}:
         await _finalize_checkout_invoice(
             invoice=invoice,
             user=user,
             stripe_session=session,
             target_status="failed",
-            notify_user=True,
+            notify_user=event_type == "checkout.session.async_payment_failed",
         )
         return {"received": True}
 
-    payment_status = str(session.get("payment_status") or "").strip().lower()
+    payment_status = str(_stripe_object_get(session, "payment_status") or "").strip().lower()
     if event_type == "checkout.session.completed" and payment_status != "paid":
         await _finalize_checkout_invoice(
             invoice=invoice,
