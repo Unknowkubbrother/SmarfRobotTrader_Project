@@ -424,6 +424,24 @@ def _sanitize_json(value: Any) -> Any:
     return str(value)
 
 
+def _stripe_object_get(value: Any, key: str, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        result = value.get(key, default)
+        return default if result is None else result
+    try:
+        result = getattr(value, key)
+    except AttributeError:
+        try:
+            result = value[key]
+        except Exception:
+            return default
+    except Exception:
+        return default
+    return default if result is None else result
+
+
 def _to_prisma_json(value: Any) -> Any:
     sanitized = _sanitize_json(value)
     if Json is None:
@@ -446,10 +464,10 @@ def minor_to_major_amount(amount_minor: Any, currency: str | None) -> float | No
 
 
 def _extract_presentment_breakdown(stripe_object: Any) -> dict[str, Any] | None:
-    if not stripe_object or not hasattr(stripe_object, "get"):
+    if not stripe_object:
         return None
 
-    presentment = _sanitize_json(stripe_object.get("presentment_details") or {})
+    presentment = _sanitize_json(_stripe_object_get(stripe_object, "presentment_details") or {})
     if not isinstance(presentment, dict):
         return None
 
@@ -1425,23 +1443,23 @@ def _build_payment_breakdown(payment_intent: Any) -> dict[str, Any] | None:
     if not payment_intent:
         return None
 
-    latest_charge = _sanitize_json(payment_intent.get("latest_charge"))
+    latest_charge = _sanitize_json(_stripe_object_get(payment_intent, "latest_charge"))
     balance_transaction = None
     if isinstance(latest_charge, dict):
         balance_transaction = _sanitize_json(latest_charge.get("balance_transaction"))
     if not isinstance(balance_transaction, dict):
         balance_transaction = None
 
-    payment_currency = str(payment_intent.get("currency") or "").upper() or None
+    payment_currency = str(_stripe_object_get(payment_intent, "currency") or "").upper() or None
     settlement_currency = str((balance_transaction or {}).get("currency") or "").upper() or None
 
     breakdown = _strip_none_values(
         {
-            "payment_amount_minor": _to_int(payment_intent.get("amount"), None),
-            "payment_amount": _minor_to_major(payment_intent.get("amount"), payment_currency),
+            "payment_amount_minor": _to_int(_stripe_object_get(payment_intent, "amount"), None),
+            "payment_amount": _minor_to_major(_stripe_object_get(payment_intent, "amount"), payment_currency),
             "payment_currency": payment_currency,
-            "amount_received_minor": _to_int(payment_intent.get("amount_received"), None),
-            "amount_received": _minor_to_major(payment_intent.get("amount_received"), payment_currency),
+            "amount_received_minor": _to_int(_stripe_object_get(payment_intent, "amount_received"), None),
+            "amount_received": _minor_to_major(_stripe_object_get(payment_intent, "amount_received"), payment_currency),
             "settlement_amount_minor": _to_int((balance_transaction or {}).get("amount"), None),
             "settlement_amount": _minor_to_major((balance_transaction or {}).get("amount"), settlement_currency),
             "settlement_currency": settlement_currency,
@@ -1523,7 +1541,7 @@ def _build_payment_method_details(
 
 
 def _build_payment_error_details(error: Any | None, *, payment_intent: Any | None = None) -> dict[str, Any] | None:
-    last_payment_error = _sanitize_json(payment_intent.get("last_payment_error")) if payment_intent else None
+    last_payment_error = _sanitize_json(_stripe_object_get(payment_intent, "last_payment_error")) if payment_intent else None
     if last_payment_error is not None and not isinstance(last_payment_error, dict):
         last_payment_error = {"raw": last_payment_error}
 
@@ -1716,9 +1734,9 @@ async def _charge_invoice(
             payment_error_details=_build_payment_error_details(error),
         )
 
-    payment_status = str(payment_intent.get("status") or "").strip().lower()
-    payment_intent_id = payment_intent.get("id")
-    latest_charge = payment_intent.get("latest_charge")
+    payment_status = str(_stripe_object_get(payment_intent, "status") or "").strip().lower()
+    payment_intent_id = _stripe_object_get(payment_intent, "id")
+    latest_charge = _stripe_object_get(payment_intent, "latest_charge")
     latest_charge_data = _sanitize_json(latest_charge) if latest_charge else {}
     if not isinstance(latest_charge_data, dict):
         latest_charge_data = {}
@@ -1735,7 +1753,7 @@ async def _charge_invoice(
     )
     payment_method_details = _build_payment_method_details(
         local_payment_method=local_payment_method,
-        stripe_payment_method=payment_intent.get("payment_method"),
+        stripe_payment_method=_stripe_object_get(payment_intent, "payment_method"),
     )
     error_details = _build_payment_error_details(None, payment_intent=payment_intent)
 
